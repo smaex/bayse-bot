@@ -254,11 +254,11 @@ async def cmd_debug(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
     # Spot prices
     if feeds.spot:
-        lines.append("*Spot prices (CoinGecko):*")
+        lines.append("*Spot prices (Kraken):*")
         for asset, price in feeds.spot.items():
             lines.append(f"  {asset}: ${price:,.2f}")
     else:
-        lines.append("⚠️ *Spot prices: EMPTY* — CoinGecko not loaded yet. SNIPE is disabled.")
+        lines.append("⚠️ *Spot prices: EMPTY* — Kraken feed not loaded yet. SNIPE is disabled.")
 
     # Active markets
     lines.append(f"\n*Active markets: {len(_active_markets)}*")
@@ -509,7 +509,7 @@ _MODES = {
             "A solid all-round setup. Three strategies, all major assets.\n"
             "Good for users who've seen the bot run for a few days.\n\n"
             "• Assets: BTC, ETH, SOL\n"
-            "• Timeframes: 15min, 1h\n"
+            "• Timeframes: 5min, 15min, 1h\n"
             "• Strategies: SNIPE, ARB, CORRELATE\n"
             "• Risk per trade: 3%\n"
             "• Min trade: ₦100\n"
@@ -518,7 +518,7 @@ _MODES = {
         ),
         "settings": {
             "assets":           ["BTC", "ETH", "SOL"],
-            "timeframes":       ["15min", "1h"],
+            "timeframes":       ["5min", "15min", "1h"],
             "strategies":       ["SNIPE", "ARB", "CORRELATE"],
             "risk_pct":         3.0,
             "mintrade":         100,

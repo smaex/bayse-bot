@@ -81,8 +81,8 @@ SNIPE_MIN_CERTAINTY = 0.65   # certainty threshold (was 0.80 — too strict, tra
 SNIPE_MAX_PRICE = 0.92       # never pay more than 0.92 for a "sure thing" (fee protection)
 
 # ── Correlation Signal ─────────────────────────────────────────────────────────
-CORRELATION_THRESHOLD = 0.08  # BTC market must move ≥8% for cross-asset signal
-CORRELATION_WINDOW_SEC = 120  # signal valid for 2 minutes after BTC move
+CORRELATION_THRESHOLD = 0.04  # BTC market must move ≥4% for cross-asset signal (was 8% — never fired)
+CORRELATION_WINDOW_SEC = 180  # signal valid for 3 minutes after BTC move (was 2 min — too short)
 
 # ── Arbitrage (Mint/Burn) ─────────────────────────────────────────────────────
 ARB_TRIGGER = 0.97           # enter burn arb when YES+NO sum ≤ this
