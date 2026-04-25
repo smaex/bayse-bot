@@ -197,11 +197,14 @@ class BayseClient:
         for asset in assets:
             currency = (asset.get("currency") or asset.get("symbol") or "").upper()
             if currency == "NGN":
-                # Try every field name the API might use
-                for field in ("available", "balance", "total", "amount", "free", "value"):
+                # Try fields in priority order; skip zeros so a non-zero field wins
+                for field in ("availableBalance", "available", "balance", "total", "amount", "free", "value"):
                     v = asset.get(field)
-                    if v is not None:
+                    if v is not None and float(v) > 0:
                         return float(v)
+                # All fields are zero — return availableBalance (genuinely empty wallet)
+                v = asset.get("availableBalance")
+                return float(v) if v is not None else 0.0
         return 0.0
 
     async def get_pnl_summary(self) -> dict:
