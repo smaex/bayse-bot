@@ -113,7 +113,7 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
     size_pct = 0.03 * certainty
 
     reason = (
-        f"Binance {asset}={live_price:,.2f} vs threshold={threshold:,.2f} "
+        f"Spot {asset}={live_price:,.2f} vs threshold={threshold:,.2f} "
         f"({distance_pct:+.3%}), {secs:.0f}s to close, certainty={certainty:.2%}"
     )
 
