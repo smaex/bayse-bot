@@ -1,13 +1,9 @@
 """
 Real-time price feeds.
 
-IMPORTANT: Each asset uses a different resolution oracle:
-  BTC → Binance BTC/USDT  (verified from live API: assetSymbolPair = "BTCUSDT")
-  ETH → Binance ETH/USDT
-  SOL → Chainlink SOL/USD  (verified from live API: assetSymbolPair = "SOLUSDT_CHAINLINK")
-
-All spot prices written to module-level `spot` dict, keyed by asset symbol.
-Bayse market prices (YES/NO) written to `market_prices`.
+BTC, ETH, SOL spot prices are all fetched from CoinGecko every 10 seconds.
+Binance WebSocket is not used — it geo-blocks non-US Render servers (HTTP 451).
+Bayse market YES/NO prices come from the Bayse WebSocket.
 """
 
 import asyncio
@@ -15,24 +11,20 @@ import json
 import logging
 import aiohttp
 import websockets
-from config import (
-    WS_MARKETS_URL, BINANCE_WS_URL, BINANCE_SYMBOLS,
-    CHAINLINK_SOL_URL, CHAINLINK_POLL_SEC,
-)
+from config import WS_MARKETS_URL, CHAINLINK_POLL_SEC
 
 log = logging.getLogger(__name__)
 
-# Live oracle prices — keyed by Bayse asset symbol
-# {"BTC": 77800.12, "ETH": 1520.50, "SOL": 86.72}
+# Live spot prices — {"BTC": 77800.12, "ETH": 1520.50, "SOL": 86.72}
 spot: dict[str, float] = {}
 
-# Previous Bayse YES prices — used to detect moves for correlation signals
+# Previous Bayse YES prices — used to detect BTC moves for correlation signals
 prev_yes: dict[str, float] = {}
 
 # Current Bayse market prices — {market_id: {"yes": float, "no": float}}
 market_prices: dict[str, dict] = {}
 
-BINANCE_TO_ASSET = {"btcusdt": "BTC", "ethusdt": "ETH"}
+_CG_IDS = {"bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL"}
 
 
 def _parse_frames(raw: str):
@@ -45,69 +37,48 @@ def _parse_frames(raw: str):
                 pass
 
 
-# ── Binance feed (BTC + ETH) ─────────────────────────────────────────────────
+# ── CoinGecko feed (BTC + ETH + SOL) ─────────────────────────────────────────
 
-async def binance_feed(on_price=None):
-    streams = "/".join(f"{s}@miniTicker" for s in BINANCE_SYMBOLS)
-    url = f"{BINANCE_WS_URL}?streams={streams}"
-    backoff = 1
-    while True:
-        try:
-            async with websockets.connect(url, ping_interval=20) as ws:
-                log.info("Binance feed connected (BTC, ETH)")
-                backoff = 1
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    data = msg.get("data", msg)
-                    symbol = data.get("s", "").lower()
-                    price = data.get("c")
-                    if symbol in BINANCE_TO_ASSET and price:
-                        asset = BINANCE_TO_ASSET[symbol]
-                        spot[asset] = float(price)
-                        log.debug(f"Binance {asset}: {float(price):,.4f}")
-                        if on_price:
-                            on_price(asset, float(price))
-        except Exception as e:
-            log.warning(f"Binance feed error: {e}. Reconnecting in {backoff}s")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-
-
-# ── Chainlink feed (SOL) ─────────────────────────────────────────────────────
-
-async def chainlink_sol_feed(on_price=None):
+async def coingecko_feed(on_price=None):
     """
-    Chainlink doesn't have a public WS — poll their REST API every 10s.
-    Chainlink updates on-chain every 10–30s or when price moves 0.5%.
+    Poll CoinGecko every CHAINLINK_POLL_SEC seconds for all three assets.
+    One API call fetches BTC, ETH, and SOL together — well within free tier limits.
+    No geo-blocking issues (unlike Binance which blocks US server IPs).
     """
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"ids": "bitcoin,ethereum,solana", "vs_currencies": "usd"}
     backoff = 1
+
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                log.info("Chainlink SOL feed polling started")
+                log.info("CoinGecko price feed started (BTC, ETH, SOL)")
                 backoff = 1
                 while True:
                     try:
                         async with session.get(
-                            "https://api.coingecko.com/api/v3/simple/price",
-                            params={"ids": "solana", "vs_currencies": "usd"},
-                            timeout=aiohttp.ClientTimeout(total=5),
+                            url, params=params,
+                            timeout=aiohttp.ClientTimeout(total=8),
                         ) as r:
                             if r.status == 200:
                                 data = await r.json()
-                                price = data.get("solana", {}).get("usd")
-                                if price:
-                                    spot["SOL"] = float(price)
-                                    log.debug(f"Chainlink/CG SOL: {float(price):,.4f}")
-                                    if on_price:
-                                        on_price("SOL", float(price))
+                                for cg_id, asset in _CG_IDS.items():
+                                    price = data.get(cg_id, {}).get("usd")
+                                    if price:
+                                        spot[asset] = float(price)
+                                        log.debug(f"CoinGecko {asset}: {float(price):,.4f}")
+                                        if on_price:
+                                            on_price(asset, float(price))
+                            elif r.status == 429:
+                                log.debug("CoinGecko rate limit — waiting 60s")
+                                await asyncio.sleep(60)
                     except Exception as e:
-                        log.debug(f"SOL price fetch error: {e}")
+                        log.debug(f"CoinGecko fetch error: {e}")
                     await asyncio.sleep(CHAINLINK_POLL_SEC)
         except Exception as e:
-            log.warning(f"Chainlink feed error: {e}. Restarting in {backoff}s")
+            log.warning(f"CoinGecko feed error: {e}. Restarting in {backoff}s")
             await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
+            backoff = min(backoff * 2, 60)
 
 
 # ── Bayse market feed ────────────────────────────────────────────────────────
@@ -158,7 +129,6 @@ def _handle_market(msg: dict, on_update=None):
 
 async def start_feeds(market_ids: list[str], on_price=None, on_update=None):
     await asyncio.gather(
-        binance_feed(on_price),
-        chainlink_sol_feed(on_price),
+        coingecko_feed(on_price),
         bayse_feed(market_ids, on_update),
     )

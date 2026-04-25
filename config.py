@@ -53,7 +53,7 @@ ASSET_ORACLE = {"BTC": "BINANCE", "ETH": "BINANCE", "SOL": "CHAINLINK"}
 # News & sentiment
 NEWSAPI_KEY   = os.getenv("NEWSAPI_KEY", "")  # free at newsapi.org
 NEWS_POLL_SEC = 900       # poll every 15 minutes — free tier allows 100 requests/day
-NEWS_SENTIMENT_THRESHOLD = 0.35  # VADER compound score to trigger a signal (0–1)
+NEWS_SENTIMENT_THRESHOLD = 0.50  # VADER compound score to trigger a signal (0–1)
 NEWS_SIGNAL_DECAY_MIN = 10       # news signal expires after 10 minutes
 
 # Economic calendar events (UTC times — add to this list as needed)

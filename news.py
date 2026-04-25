@@ -113,11 +113,22 @@ async def newsapi_feed():
 
     seen_urls: set = set()
     url = "https://newsapi.org/v2/everything"
+    # Pin to known crypto outlets so off-topic articles never reach the signal engine.
+    _CRYPTO_DOMAINS = (
+        "coindesk.com,cointelegraph.com,decrypt.co,theblock.co,"
+        "bitcoinist.com,cryptoslate.com,cryptobriefing.com,ambcrypto.com"
+    )
+    _CRYPTO_KEYWORDS = {
+        "bitcoin", "btc", "ethereum", "eth", "solana", "sol",
+        "crypto", "blockchain", "defi", "altcoin", "stablecoin",
+        "nft", "web3", "binance", "coinbase", "token", "wallet",
+    }
     params = {
-        "q": "bitcoin OR ethereum OR solana OR crypto OR cryptocurrency",
+        "q": "bitcoin OR ethereum OR solana OR crypto",
         "language": "en",
         "sortBy": "publishedAt",
         "pageSize": 20,
+        "domains": _CRYPTO_DOMAINS,
         "apiKey": NEWSAPI_KEY,
     }
 
@@ -138,6 +149,11 @@ async def newsapi_feed():
                             title = article.get("title") or ""
                             desc  = article.get("description") or ""
                             text  = f"{title}. {desc}".strip()
+
+                            # Hard gate: article must mention a crypto keyword
+                            words = set(text.lower().split())
+                            if not words & _CRYPTO_KEYWORDS:
+                                continue
 
                             assets   = _assets_from_text(text)
                             compound = _score(text)
