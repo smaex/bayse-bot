@@ -1,8 +1,10 @@
 """
 Real-time price feeds.
 
-BTC, ETH, SOL spot prices are all fetched from CoinGecko every 10 seconds.
-Binance WebSocket is not used — it geo-blocks non-US Render servers (HTTP 451).
+BTC, ETH, SOL spot prices are polled from Kraken REST every CHAINLINK_POLL_SEC seconds.
+- Binance (WS + REST): HTTP 451 geo-blocked from Render Oregon (US IPs)
+- CoinCap: DNS resolution failure on Render
+- Kraken: US-based, no geo-block, no API key, 1 req/sec public limit
 Bayse market YES/NO prices come from the Bayse WebSocket.
 """
 
@@ -24,9 +26,6 @@ prev_yes: dict[str, float] = {}
 # Current Bayse market prices — {market_id: {"yes": float, "no": float}}
 market_prices: dict[str, dict] = {}
 
-_CG_IDS = {"bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL"}
-
-
 def _parse_frames(raw: str):
     for line in raw.strip().split("\n"):
         line = line.strip()
@@ -37,24 +36,25 @@ def _parse_frames(raw: str):
                 pass
 
 
-# ── CoinCap feed (BTC + ETH + SOL) ───────────────────────────────────────────
+# ── Kraken REST feed (BTC + ETH + SOL) ───────────────────────────────────────
+# Kraken is a US-based exchange — no geo-block from Render Oregon, no API key needed.
+# Binance (WS + REST) returns HTTP 451 from US IPs; CoinCap has DNS failures on Render.
 
-_COINCAP_IDS = {"bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL"}
+_KRAKEN_PAIRS = {
+    "XXBTZUSD": "BTC",
+    "XETHZUSD": "ETH",
+    "SOLUSD":   "SOL",
+}
 
-async def coincap_feed(on_price=None):
-    """
-    Poll CoinCap.io every CHAINLINK_POLL_SEC seconds.
-    US-based service — no geo-block, no API key needed, 200 req/min free limit.
-    One call fetches BTC, ETH, SOL together.
-    """
-    url = "https://api.coincap.io/v2/assets"
-    params = {"ids": "bitcoin,ethereum,solana"}
+async def kraken_feed(on_price=None):
+    url = "https://api.kraken.com/0/public/Ticker"
+    params = {"pair": "XBTUSD,ETHUSD,SOLUSD"}
     backoff = 1
 
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                log.info("CoinCap price feed started (BTC, ETH, SOL)")
+                log.info("Kraken price feed started (BTC, ETH, SOL)")
                 backoff = 1
                 while True:
                     try:
@@ -64,25 +64,28 @@ async def coincap_feed(on_price=None):
                         ) as r:
                             if r.status == 200:
                                 data = await r.json()
-                                for item in data.get("data", []):
-                                    asset = _COINCAP_IDS.get(item.get("id", ""))
-                                    price_str = item.get("priceUsd")
-                                    if asset and price_str:
-                                        price = float(price_str)
-                                        spot[asset] = price
-                                        log.debug(f"CoinCap {asset}: {price:,.4f}")
-                                        if on_price:
-                                            on_price(asset, price)
+                                errors = data.get("error", [])
+                                if errors:
+                                    log.warning(f"Kraken API error: {errors}")
+                                else:
+                                    for pair, asset in _KRAKEN_PAIRS.items():
+                                        info = data.get("result", {}).get(pair)
+                                        if info:
+                                            price = float(info["c"][0])
+                                            spot[asset] = price
+                                            log.debug(f"Kraken {asset}: {price:,.4f}")
+                                            if on_price:
+                                                on_price(asset, price)
                             elif r.status == 429:
-                                log.warning("CoinCap rate limited — waiting 60s")
+                                log.warning("Kraken rate limited — waiting 60s")
                                 await asyncio.sleep(60)
                             else:
-                                log.warning(f"CoinCap HTTP {r.status}")
+                                log.warning(f"Kraken HTTP {r.status}")
                     except Exception as e:
-                        log.warning(f"CoinCap fetch error: {e}")
+                        log.warning(f"Kraken fetch error: {e}")
                     await asyncio.sleep(CHAINLINK_POLL_SEC)
         except Exception as e:
-            log.warning(f"CoinCap feed crashed: {e}. Restarting in {backoff}s")
+            log.warning(f"Kraken feed crashed: {e}. Restarting in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -135,6 +138,6 @@ def _handle_market(msg: dict, on_update=None):
 
 async def start_feeds(market_ids: list[str], on_price=None, on_update=None):
     await asyncio.gather(
-        coincap_feed(on_price),
+        kraken_feed(on_price),
         bayse_feed(market_ids, on_update),
     )
