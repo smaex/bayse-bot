@@ -55,8 +55,10 @@ def _dec(text: str) -> str:
 
 def _cx() -> psycopg2.extensions.connection:
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not set. Add your Supabase connection string.")
-    return psycopg2.connect(DATABASE_URL)
+        raise RuntimeError("DATABASE_URL not set. Add your CockroachDB connection string.")
+    # verify-full requires a root cert that doesn't exist on Render — require still encrypts
+    url = DATABASE_URL.replace("sslmode=verify-full", "sslmode=require")
+    return psycopg2.connect(url)
 
 def _execute(query: str, params: tuple = ()):
     with _cx() as conn:
