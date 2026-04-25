@@ -56,6 +56,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("resume",     cmd_resume))
     app.add_handler(CommandHandler("learning",   cmd_learning))
     app.add_handler(CommandHandler("learnstats", cmd_learnstats))
+    app.add_handler(CommandHandler("mode",       cmd_mode))
+    app.add_handler(CommandHandler("debug",      cmd_debug))
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))
     app.add_handler(CommandHandler("wallet",     cmd_wallet))
     app.add_handler(CommandHandler("help",       cmd_help))
@@ -180,6 +182,17 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         _set_paused(cid, False)
         _clear_target_hit(cid)
         await query.message.reply_text("▶️ Trading resumed.")
+    elif data in _MODES:
+        mode   = _MODES[data]
+        user   = database.get_user(cid)
+        s      = user["settings"]
+        s.update(mode["settings"])
+        database.update_settings(cid, s)
+        await query.message.reply_text(
+            f"{mode['description']}\n\n✅ *Mode applied. Trading resumes now.*\n"
+            f"Use `/set` to fine-tune any individual setting.",
+            parse_mode="Markdown",
+        )
 
 
 # ── Guard decorator ───────────────────────────────────────────────────────────
@@ -229,6 +242,47 @@ async def cmd_wallet(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
     except Exception as e:
         await update.message.reply_text(f"Error fetching wallet: {e}")
+
+
+@_guard
+async def cmd_debug(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    """Show internal bot state to diagnose why trades aren't firing."""
+    import feeds
+    cid = str(update.effective_chat.id)
+
+    lines = ["🔍 *Bot Debug Info*\n"]
+
+    # Spot prices
+    if feeds.spot:
+        lines.append("*Spot prices (CoinGecko):*")
+        for asset, price in feeds.spot.items():
+            lines.append(f"  {asset}: ${price:,.2f}")
+    else:
+        lines.append("⚠️ *Spot prices: EMPTY* — CoinGecko not loaded yet. SNIPE is disabled.")
+
+    # Active markets
+    lines.append(f"\n*Active markets: {len(_active_markets)}*")
+    user = database.get_user(cid)
+    s = user["settings"] if user else {}
+    ua = s.get("assets", [])
+    ut = s.get("timeframes", [])
+    relevant = [m for m in _active_markets if m.get("asset") in ua and m.get("timeframe") in ut]
+    lines.append(f"Matching your settings ({ua} / {ut}): {len(relevant)}")
+
+    for m in relevant[:6]:
+        secs = int(m.get("secs_to_close", -1))
+        threshold = m.get("threshold")
+        yes_p = m.get("yes_price", 0)
+        no_p  = m.get("no_price", 0)
+        lines.append(
+            f"\n  *{m['asset']} {m['timeframe']}*"
+            f"\n    Closes in: {secs}s"
+            f"\n    Threshold: {threshold if threshold else '⚠️ MISSING'}"
+            f"\n    YES: {yes_p:.3f}  NO: {no_p:.3f}  Sum: {yes_p+no_p:.3f}"
+            f"\n    ARB possible: {'✅' if yes_p+no_p < 0.97 else '❌'}"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 @_guard
@@ -420,6 +474,133 @@ async def cmd_learnstats(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+# ── Risk modes ────────────────────────────────────────────────────────────────
+
+_MODES = {
+    "mode_safe": {
+        "label": "🟢 Safe",
+        "description": (
+            "*🟢 Safe Mode*\n\n"
+            "Built for small balances or first-time users.\n"
+            "Only the two most reliable strategies. Small trades, tight limits.\n\n"
+            "• Assets: BTC, ETH\n"
+            "• Timeframes: 15min, 1h\n"
+            "• Strategies: SNIPE, ARB\n"
+            "• Risk per trade: 2%\n"
+            "• Min trade: ₦50\n"
+            "• Max exposure: 15%\n"
+            "• Daily target: 5× starting balance"
+        ),
+        "settings": {
+            "assets":           ["BTC", "ETH"],
+            "timeframes":       ["15min", "1h"],
+            "strategies":       ["SNIPE", "ARB"],
+            "risk_pct":         2.0,
+            "mintrade":         50,
+            "maxexposure":      15.0,
+            "daily_multiplier": 5,
+            "daily_target_ngn": 0,
+        },
+    },
+    "mode_balanced": {
+        "label": "🔵 Balanced",
+        "description": (
+            "*🔵 Balanced Mode*\n\n"
+            "A solid all-round setup. Three strategies, all major assets.\n"
+            "Good for users who've seen the bot run for a few days.\n\n"
+            "• Assets: BTC, ETH, SOL\n"
+            "• Timeframes: 15min, 1h\n"
+            "• Strategies: SNIPE, ARB, CORRELATE\n"
+            "• Risk per trade: 3%\n"
+            "• Min trade: ₦100\n"
+            "• Max exposure: 25%\n"
+            "• Daily target: 10× starting balance"
+        ),
+        "settings": {
+            "assets":           ["BTC", "ETH", "SOL"],
+            "timeframes":       ["15min", "1h"],
+            "strategies":       ["SNIPE", "ARB", "CORRELATE"],
+            "risk_pct":         3.0,
+            "mintrade":         100,
+            "maxexposure":      25.0,
+            "daily_multiplier": 10,
+            "daily_target_ngn": 0,
+        },
+    },
+    "mode_aggressive": {
+        "label": "🟠 Aggressive",
+        "description": (
+            "*🟠 Aggressive Mode*\n\n"
+            "Higher frequency, more strategies, bigger trades.\n"
+            "Best for users with a proven track record and larger balance.\n\n"
+            "• Assets: BTC, ETH, SOL\n"
+            "• Timeframes: 5min, 15min, 1h\n"
+            "• Strategies: SNIPE, ARB, CORRELATE, NEWS\n"
+            "• Risk per trade: 4%\n"
+            "• Min trade: ₦200\n"
+            "• Max exposure: 35%\n"
+            "• Daily target: 20× starting balance"
+        ),
+        "settings": {
+            "assets":           ["BTC", "ETH", "SOL"],
+            "timeframes":       ["5min", "15min", "1h"],
+            "strategies":       ["SNIPE", "ARB", "CORRELATE", "NEWS"],
+            "risk_pct":         4.0,
+            "mintrade":         200,
+            "maxexposure":      35.0,
+            "daily_multiplier": 20,
+            "daily_target_ngn": 0,
+        },
+    },
+    "mode_degen": {
+        "label": "🔴 Full Send",
+        "description": (
+            "*🔴 Full Send Mode*\n\n"
+            "Maximum aggression. All assets, all timeframes, all strategies.\n"
+            "High reward, high risk. Only for experienced users with capital to absorb losses.\n\n"
+            "• Assets: BTC, ETH, SOL\n"
+            "• Timeframes: 5min, 15min, 1h, 6h\n"
+            "• Strategies: All 4\n"
+            "• Risk per trade: 5%\n"
+            "• Min trade: ₦500\n"
+            "• Max exposure: 50%\n"
+            "• Daily target: 50× starting balance"
+        ),
+        "settings": {
+            "assets":           ["BTC", "ETH", "SOL"],
+            "timeframes":       ["5min", "15min", "1h", "6h"],
+            "strategies":       ["SNIPE", "ARB", "CORRELATE", "NEWS"],
+            "risk_pct":         5.0,
+            "mintrade":         500,
+            "maxexposure":      50.0,
+            "daily_multiplier": 50,
+            "daily_target_ngn": 0,
+        },
+    },
+}
+
+
+@_guard
+async def cmd_mode(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton("🟢 Safe",      callback_data="mode_safe"),
+            InlineKeyboardButton("🔵 Balanced",  callback_data="mode_balanced"),
+        ],
+        [
+            InlineKeyboardButton("🟠 Aggressive", callback_data="mode_aggressive"),
+            InlineKeyboardButton("🔴 Full Send",  callback_data="mode_degen"),
+        ],
+    ]
+    await update.message.reply_text(
+        "⚙️ *Choose a Risk Mode*\n\n"
+        "Each mode applies a full set of recommended settings instantly.\n"
+        "You can fine-tune individual settings with `/set` afterwards.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
 @_guard
 async def cmd_disconnect(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
@@ -444,7 +625,8 @@ async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         "/learning — run intelligence cycle now\n"
         "/learnstats — 7-day win rates by strategy\n"
         "/settings — current configuration\n"
-        "/set — change a setting (type /set for options)\n"
+        "/mode — switch risk mode (Safe / Balanced / Aggressive / Full Send)\n"
+        "/set — change a single setting (type /set for options)\n"
         "/pause — stop all trading\n"
         "/resume — restart trading\n"
         "/disconnect — remove your account",
