@@ -8,13 +8,6 @@ services:
     startCommand: python bot.py
     healthCheckPath: /ping
 
-    # Persistent disk — keeps the user database across every deploy.
-    # Without this, users must reconnect after every push.
-    disk:
-      name: bayse-data
-      mountPath: /data
-      sizeGB: 1
-
     envVars:
       # Required — set these in the Render dashboard
       - key: TELEGRAM_TOKEN
@@ -28,9 +21,9 @@ services:
       - key: NEWSAPI_KEY
         sync: false
 
-      # Points the database at the persistent disk mount
-      - key: DATA_DIR
-        value: /data
+      # Supabase PostgreSQL — add your connection string in the Render dashboard
+      - key: DATABASE_URL
+        sync: false
 
       # Render sets RENDER_EXTERNAL_URL automatically — the bot uses it for self-ping
       - key: PYTHON_VERSION
