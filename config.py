@@ -51,8 +51,8 @@ SERIES = {
 ASSET_ORACLE = {"BTC": "BINANCE", "ETH": "BINANCE", "SOL": "CHAINLINK"}
 
 # News & sentiment
-CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")  # free at cryptopanic.com
-NEWS_POLL_SEC = 30        # how often to check for breaking news
+NEWSAPI_KEY   = os.getenv("NEWSAPI_KEY", "")  # free at newsapi.org
+NEWS_POLL_SEC = 900       # poll every 15 minutes — free tier allows 100 requests/day
 NEWS_SENTIMENT_THRESHOLD = 0.35  # VADER compound score to trigger a signal (0–1)
 NEWS_SIGNAL_DECAY_MIN = 10       # news signal expires after 10 minutes
 

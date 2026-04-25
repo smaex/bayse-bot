@@ -2,7 +2,7 @@
 News & sentiment engine.
 
 Sources:
-  - CryptoPanic API (free tier: crypto-specific news, real-time)
+  - NewsAPI.org (free tier: 100 requests/day, polled every 15 minutes)
   - Economic calendar (FOMC/CPI scheduled events)
 
 Signals:
@@ -20,11 +20,11 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 import aiohttp
 from config import (
-    CRYPTOPANIC_API_KEY, NEWS_POLL_SEC,
+    NEWSAPI_KEY, NEWS_POLL_SEC,
     NEWS_SENTIMENT_THRESHOLD, NEWS_SIGNAL_DECAY_MIN,
     FOMC_DATES_2026,
 )
@@ -99,69 +99,68 @@ def best_signal_for(asset: str) -> Optional[NewsSignal]:
     return max(live, key=lambda s: s.strength(), default=None)
 
 
-# ── CryptoPanic feed ─────────────────────────────────────────────────────────
+# ── NewsAPI.org feed ──────────────────────────────────────────────────────────
 
-async def cryptopanic_feed():
-    """Poll CryptoPanic news API every NEWS_POLL_SEC seconds."""
-    if not CRYPTOPANIC_API_KEY:
-        log.info("No CRYPTOPANIC_API_KEY set — news feed disabled")
+async def newsapi_feed():
+    """
+    Poll NewsAPI.org for crypto news every NEWS_POLL_SEC seconds.
+    Free tier: 100 requests/day → poll every 15 minutes (96/day).
+    Scores headlines + descriptions with VADER sentiment.
+    """
+    if not NEWSAPI_KEY:
+        log.info("No NEWSAPI_KEY set — news feed disabled")
         return
 
-    seen_ids: set = set()
-    url = "https://cryptopanic.com/api/v1/posts/"
+    seen_urls: set = set()
+    url = "https://newsapi.org/v2/everything"
     params = {
-        "auth_token": CRYPTOPANIC_API_KEY,
-        "currencies": "BTC,ETH,SOL",
-        "kind": "news",
-        "filter": "hot",
+        "q": "bitcoin OR ethereum OR solana OR crypto OR cryptocurrency",
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": 20,
+        "apiKey": NEWSAPI_KEY,
     }
 
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params,
-                                       timeout=aiohttp.ClientTimeout(total=10)) as r:
+                async with session.get(
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=15)
+                ) as r:
                     if r.status == 200:
                         data = await r.json()
-                        for post in data.get("results", []):
-                            pid = post.get("id")
-                            if pid in seen_ids:
+                        for article in data.get("articles", []):
+                            article_url = article.get("url", "")
+                            if article_url in seen_urls:
                                 continue
-                            seen_ids.add(pid)
+                            seen_urls.add(article_url)
 
-                            title = post.get("title", "")
-                            currencies = [c["code"] for c in post.get("currencies", [])]
-                            assets = [c for c in currencies if c in ("BTC", "ETH", "SOL")]
-                            if not assets:
-                                assets = _assets_from_text(title)
+                            title = article.get("title") or ""
+                            desc  = article.get("description") or ""
+                            text  = f"{title}. {desc}".strip()
 
-                            compound = _score(title)
-                            if abs(compound) < NEWS_SENTIMENT_THRESHOLD:
-                                continue
-
-                            # CryptoPanic also has votes
-                            votes = post.get("votes", {})
-                            positive = votes.get("positive", 0)
-                            negative = votes.get("negative", 0)
-                            total = positive + negative
-                            if total > 0:
-                                vote_bias = (positive - negative) / total
-                                compound = (compound + vote_bias) / 2
+                            assets   = _assets_from_text(text)
+                            compound = _score(text)
 
                             if compound > NEWS_SENTIMENT_THRESHOLD:
                                 _push_signal(NewsSignal(
                                     direction="BULLISH", assets=assets,
-                                    score=abs(compound), source="CryptoPanic",
+                                    score=abs(compound), source="NewsAPI",
                                     headline=title,
                                 ))
                             elif compound < -NEWS_SENTIMENT_THRESHOLD:
                                 _push_signal(NewsSignal(
                                     direction="BEARISH", assets=assets,
-                                    score=abs(compound), source="CryptoPanic",
+                                    score=abs(compound), source="NewsAPI",
                                     headline=title,
                                 ))
+                    elif r.status == 429:
+                        log.warning("NewsAPI rate limit hit — waiting 1 hour")
+                        await asyncio.sleep(3600)
+                    else:
+                        log.debug(f"NewsAPI returned {r.status}")
         except Exception as e:
-            log.debug(f"CryptoPanic fetch error: {e}")
+            log.debug(f"NewsAPI fetch error: {e}")
 
         await asyncio.sleep(NEWS_POLL_SEC)
 
@@ -191,6 +190,6 @@ async def calendar_monitor():
 
 async def start_news_feeds():
     await asyncio.gather(
-        cryptopanic_feed(),
+        newsapi_feed(),
         calendar_monitor(),
     )

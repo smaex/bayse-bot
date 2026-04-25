@@ -17,8 +17,8 @@ services:
         # Generate with:
         # python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 
-      # Optional — enables news sentiment trading
-      - key: CRYPTOPANIC_API_KEY
+      # Optional — enables NEWS strategy (free at newsapi.org)
+      - key: NEWSAPI_KEY
         sync: false
 
       # Render sets RENDER_EXTERNAL_URL automatically — the bot uses it for self-ping
