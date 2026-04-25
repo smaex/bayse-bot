@@ -93,7 +93,7 @@ def init_db():
                     sec_enc    TEXT NOT NULL,
                     settings   TEXT DEFAULT '{}',
                     is_active  INTEGER DEFAULT 1,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    created_at TEXT
                 )
             """)
             cur.execute("""
@@ -114,7 +114,7 @@ def init_db():
                     spot_vs_threshold_pct REAL,
                     won                   INTEGER,
                     pnl_ngn               REAL,
-                    created_at            TEXT DEFAULT CURRENT_TIMESTAMP,
+                    created_at            TEXT,
                     resolved_at           TEXT
                 )
             """)
@@ -133,10 +133,11 @@ def init_db():
 # ── Users ─────────────────────────────────────────────────────────────────────
 
 def add_user(chat_id: str, public_key: str, secret_key: str) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
     _execute(
-        "INSERT INTO users (chat_id, pub_enc, sec_enc, settings) VALUES (%s,%s,%s,%s) "
+        "INSERT INTO users (chat_id, pub_enc, sec_enc, settings, created_at) VALUES (%s,%s,%s,%s,%s) "
         "ON CONFLICT (chat_id) DO UPDATE SET pub_enc=EXCLUDED.pub_enc, sec_enc=EXCLUDED.sec_enc, is_active=1",
-        (chat_id, _enc(public_key), _enc(secret_key), json.dumps(DEFAULT_SETTINGS)),
+        (chat_id, _enc(public_key), _enc(secret_key), json.dumps(DEFAULT_SETTINGS), now),
     )
     return get_user(chat_id)
 
@@ -169,12 +170,13 @@ def _hydrate(row: dict) -> dict:
 
 def record_trade(chat_id: str, **kw) -> str:
     trade_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
     _execute("""
         INSERT INTO trades
           (trade_id, chat_id, strategy, asset, timeframe, outcome, outcome_id,
            market_id, event_id, entry_price, amount_ngn, certainty,
-           secs_to_close, spot_vs_threshold_pct)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           secs_to_close, spot_vs_threshold_pct, created_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
         trade_id, chat_id,
         kw.get("strategy"), kw.get("asset"), kw.get("timeframe"),
@@ -182,7 +184,7 @@ def record_trade(chat_id: str, **kw) -> str:
         kw.get("market_id"), kw.get("event_id"),
         kw.get("entry_price"), kw.get("amount_ngn"),
         kw.get("certainty"), kw.get("secs_to_close"),
-        kw.get("spot_vs_threshold_pct", 0.0),
+        kw.get("spot_vs_threshold_pct", 0.0), now,
     ))
     return trade_id
 
