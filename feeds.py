@@ -37,46 +37,49 @@ def _parse_frames(raw: str):
                 pass
 
 
-# ── CoinGecko feed (BTC + ETH + SOL) ─────────────────────────────────────────
+# ── Binance REST feed (BTC + ETH + SOL) ──────────────────────────────────────
 
-async def coingecko_feed(on_price=None):
+_BINANCE_SYMBOLS = {"BTCUSDT": "BTC", "ETHUSDT": "ETH", "SOLUSDT": "SOL"}
+
+async def binance_rest_feed(on_price=None):
     """
-    Poll CoinGecko every CHAINLINK_POLL_SEC seconds for all three assets.
-    One API call fetches BTC, ETH, and SOL together — well within free tier limits.
-    No geo-blocking issues (unlike Binance which blocks US server IPs).
+    Poll Binance REST API every CHAINLINK_POLL_SEC seconds.
+    REST is NOT geo-blocked (only the WebSocket was). No API key needed.
+    Rate limit: 1200 req/min — polling every 10s uses ~18 req/min, well within limits.
     """
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": "bitcoin,ethereum,solana", "vs_currencies": "usd"}
+    url = "https://api.binance.com/api/v3/ticker/price"
     backoff = 1
 
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                log.info("CoinGecko price feed started (BTC, ETH, SOL)")
+                log.info("Binance REST price feed started (BTC, ETH, SOL)")
                 backoff = 1
                 while True:
                     try:
-                        async with session.get(
-                            url, params=params,
-                            timeout=aiohttp.ClientTimeout(total=8),
-                        ) as r:
-                            if r.status == 200:
-                                data = await r.json()
-                                for cg_id, asset in _CG_IDS.items():
-                                    price = data.get(cg_id, {}).get("usd")
+                        for symbol, asset in _BINANCE_SYMBOLS.items():
+                            async with session.get(
+                                url, params={"symbol": symbol},
+                                timeout=aiohttp.ClientTimeout(total=8),
+                            ) as r:
+                                if r.status == 200:
+                                    data = await r.json()
+                                    price = float(data.get("price", 0))
                                     if price:
-                                        spot[asset] = float(price)
-                                        log.debug(f"CoinGecko {asset}: {float(price):,.4f}")
+                                        spot[asset] = price
+                                        log.debug(f"Binance REST {asset}: {price:,.4f}")
                                         if on_price:
-                                            on_price(asset, float(price))
-                            elif r.status == 429:
-                                log.debug("CoinGecko rate limit — waiting 60s")
-                                await asyncio.sleep(60)
+                                            on_price(asset, price)
+                                elif r.status == 429:
+                                    log.warning("Binance REST rate limited — waiting 30s")
+                                    await asyncio.sleep(30)
+                                else:
+                                    log.warning(f"Binance REST {symbol}: HTTP {r.status}")
                     except Exception as e:
-                        log.debug(f"CoinGecko fetch error: {e}")
+                        log.warning(f"Binance REST fetch error: {e}")
                     await asyncio.sleep(CHAINLINK_POLL_SEC)
         except Exception as e:
-            log.warning(f"CoinGecko feed error: {e}. Restarting in {backoff}s")
+            log.warning(f"Binance REST feed crashed: {e}. Restarting in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -129,6 +132,6 @@ def _handle_market(msg: dict, on_update=None):
 
 async def start_feeds(market_ids: list[str], on_price=None, on_update=None):
     await asyncio.gather(
-        coingecko_feed(on_price),
+        binance_rest_feed(on_price),
         bayse_feed(market_ids, on_update),
     )
