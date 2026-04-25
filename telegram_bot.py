@@ -332,8 +332,8 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     elif key == "mintrade":
         try:
             amt = float(vals[0])
-            if amt < 100:
-                await update.message.reply_text("Minimum is ₦100."); return
+            if amt < 10:
+                await update.message.reply_text("Minimum is ₦10."); return
             s["mintrade"] = amt;  msg = f"Min trade: ₦{amt:,.0f}"
         except ValueError:
             await update.message.reply_text("Enter a number."); return
