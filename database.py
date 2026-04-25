@@ -15,7 +15,9 @@ from cryptography.fernet import Fernet
 
 log = logging.getLogger(__name__)
 
-DATA_DIR = Path("data")
+# On Render: use the mounted persistent disk (/data).
+# Locally: fall back to ./data so nothing changes for development.
+DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 DB_PATH  = DATA_DIR / "users.db"
 
 DEFAULT_SETTINGS: dict = {

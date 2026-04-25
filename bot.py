@@ -376,11 +376,22 @@ async def main():
     asyncio.create_task(learner.daily_learning_loop(_tg_app))
     asyncio.create_task(_scan_loop())
 
-    # Reconnect all existing users
-    for user in database.get_all_active():
-        start_user(user["chat_id"])
+    # Reconnect all existing users and notify them
+    existing_users = database.get_all_active()
+    for user in existing_users:
+        cid = user["chat_id"]
+        start_user(cid)
         if _scan_client is None:
             _scan_client = _get_client(user)
+        try:
+            await telegram_bot.send_message(
+                _tg_app, cid,
+                "🔄 *Bot restarted — you're still connected.*\n\n"
+                "Your settings and trade history are intact. Trading resumes now.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
 
     # Initial market scan
     if _scan_client:

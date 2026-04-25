@@ -4,9 +4,12 @@ import base64
 import time
 import json
 import asyncio
+import logging
 import aiohttp
 from typing import Optional
 from config import BASE_URL, WRITE_RATE_LIMIT, READ_RATE_LIMIT
+
+log = logging.getLogger(__name__)
 
 
 class RateLimiter:
