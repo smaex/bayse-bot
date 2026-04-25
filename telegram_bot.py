@@ -569,8 +569,9 @@ def _set_paused(cid: str, paused: bool):
 
 
 def _clear_target_hit(cid: str):
-    if cid in _user_daily:
-        _user_daily[cid]["target_hit"] = False
+    # Drop the entry entirely so the next loop tick resets start_balance
+    # to the actual current balance — prevents deposits looking like profit
+    _user_daily.pop(cid, None)
 
 
 # ── Notifications ──────────────────────────────────────────────────────────────
