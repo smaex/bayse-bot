@@ -6,7 +6,7 @@ import json
 import asyncio
 import aiohttp
 from typing import Optional
-from config import BASE_URL, PUBLIC_KEY, SECRET_KEY, WRITE_RATE_LIMIT, READ_RATE_LIMIT
+from config import BASE_URL, WRITE_RATE_LIMIT, READ_RATE_LIMIT
 
 
 class RateLimiter:
@@ -30,7 +30,7 @@ class RateLimiter:
 
 
 class BayseClient:
-    def __init__(self, public_key: str = PUBLIC_KEY, secret_key: str = SECRET_KEY):
+    def __init__(self, public_key: str, secret_key: str):
         self.public_key = public_key
         self.secret_key = secret_key
         self._session: Optional[aiohttp.ClientSession] = None
