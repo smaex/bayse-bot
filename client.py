@@ -186,9 +186,19 @@ class BayseClient:
 
     async def get_balance_ngn(self) -> float:
         wallet = await self.get_wallet()
-        for asset in wallet.get("assets", []):
-            if asset.get("currency") == "NGN":
-                return float(asset.get("available", 0))
+        log.debug(f"Wallet API response: {wallet}")
+
+        # Response may be {"assets": [...]} or a list directly
+        assets = wallet if isinstance(wallet, list) else wallet.get("assets", [])
+
+        for asset in assets:
+            currency = (asset.get("currency") or asset.get("symbol") or "").upper()
+            if currency == "NGN":
+                # Try every field name the API might use
+                for field in ("available", "balance", "total", "amount", "free", "value"):
+                    v = asset.get(field)
+                    if v is not None:
+                        return float(v)
         return 0.0
 
     async def get_pnl_summary(self) -> dict:

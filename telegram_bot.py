@@ -57,6 +57,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("learning",   cmd_learning))
     app.add_handler(CommandHandler("learnstats", cmd_learnstats))
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))
+    app.add_handler(CommandHandler("wallet",     cmd_wallet))
     app.add_handler(CommandHandler("help",       cmd_help))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
@@ -208,6 +209,26 @@ async def cmd_balance(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         await _balance_text(str(update.effective_chat.id)), parse_mode="Markdown"
     )
+
+
+@_guard
+async def cmd_wallet(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    """Show the raw wallet API response — useful for debugging balance issues."""
+    cid    = str(update.effective_chat.id)
+    client = _user_clients.get(cid)
+    if not client:
+        await update.message.reply_text("Bot still starting up. Try again in a moment.")
+        return
+    try:
+        import json
+        data = await client.get_wallet()
+        text = json.dumps(data, indent=2)
+        # Telegram message limit is 4096 chars
+        if len(text) > 3800:
+            text = text[:3800] + "\n… (truncated)"
+        await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"Error fetching wallet: {e}")
 
 
 @_guard
