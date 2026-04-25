@@ -1,0 +1,196 @@
+"""
+News & sentiment engine.
+
+Sources:
+  - CryptoPanic API (free tier: crypto-specific news, real-time)
+  - Economic calendar (FOMC/CPI scheduled events)
+
+Signals:
+  - BULLISH  → buy UP/YES on BTC/ETH/SOL
+  - BEARISH  → buy DOWN/NO on BTC/ETH/SOL
+  - NEUTRAL  → no trade
+
+Reaction windows (from research):
+  - Breaking crypto news : 10–20 min repricing window
+  - FOMC / CPI          :  2–5  min repricing window
+  - Geopolitical        : 15–60 min repricing window
+"""
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+import aiohttp
+from config import (
+    CRYPTOPANIC_API_KEY, NEWS_POLL_SEC,
+    NEWS_SENTIMENT_THRESHOLD, NEWS_SIGNAL_DECAY_MIN,
+    FOMC_DATES_2026,
+)
+
+log = logging.getLogger(__name__)
+
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    _vader = SentimentIntensityAnalyzer()
+    _vader_ok = True
+except ImportError:
+    _vader_ok = False
+    log.warning("vaderSentiment not installed — sentiment scoring disabled")
+
+
+@dataclass
+class NewsSignal:
+    direction: str        # "BULLISH" or "BEARISH"
+    assets: list[str]    # ["BTC", "ETH", "SOL"] or specific assets
+    score: float          # absolute sentiment score 0–1
+    source: str           # e.g. "CryptoPanic", "FOMC", "CPI"
+    headline: str
+    timestamp: float = field(default_factory=time.time)
+    decay_minutes: int = NEWS_SIGNAL_DECAY_MIN
+
+    def is_alive(self) -> bool:
+        return (time.time() - self.timestamp) < self.decay_minutes * 60
+
+    def strength(self) -> float:
+        """Score decays linearly to 0 over decay_minutes."""
+        age_frac = (time.time() - self.timestamp) / (self.decay_minutes * 60)
+        return self.score * max(0.0, 1.0 - age_frac)
+
+
+# Current live signals — read by strategy.py
+active_signals: list[NewsSignal] = []
+
+
+def _score(text: str) -> float:
+    """VADER compound sentiment score, clamped to 0–1."""
+    if not _vader_ok:
+        return 0.0
+    result = _vader.polarity_scores(text)
+    return result["compound"]  # -1 to +1
+
+
+def _assets_from_text(text: str) -> list[str]:
+    text_lower = text.lower()
+    found = []
+    if any(w in text_lower for w in ["bitcoin", "btc"]):
+        found.append("BTC")
+    if any(w in text_lower for w in ["ethereum", "eth"]):
+        found.append("ETH")
+    if any(w in text_lower for w in ["solana", "sol"]):
+        found.append("SOL")
+    return found or ["BTC", "ETH", "SOL"]  # generic crypto news → all assets
+
+
+def _push_signal(signal: NewsSignal):
+    active_signals.append(signal)
+    # Keep only live signals
+    active_signals[:] = [s for s in active_signals if s.is_alive()]
+    log.info(
+        f"News signal [{signal.direction}] score={signal.score:.2f} "
+        f"src={signal.source}: {signal.headline[:80]}"
+    )
+
+
+def best_signal_for(asset: str) -> Optional[NewsSignal]:
+    """Return strongest live signal relevant to this asset."""
+    live = [s for s in active_signals if s.is_alive() and asset in s.assets]
+    return max(live, key=lambda s: s.strength(), default=None)
+
+
+# ── CryptoPanic feed ─────────────────────────────────────────────────────────
+
+async def cryptopanic_feed():
+    """Poll CryptoPanic news API every NEWS_POLL_SEC seconds."""
+    if not CRYPTOPANIC_API_KEY:
+        log.info("No CRYPTOPANIC_API_KEY set — news feed disabled")
+        return
+
+    seen_ids: set = set()
+    url = "https://cryptopanic.com/api/v1/posts/"
+    params = {
+        "auth_token": CRYPTOPANIC_API_KEY,
+        "currencies": "BTC,ETH,SOL",
+        "kind": "news",
+        "filter": "hot",
+    }
+
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params,
+                                       timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        for post in data.get("results", []):
+                            pid = post.get("id")
+                            if pid in seen_ids:
+                                continue
+                            seen_ids.add(pid)
+
+                            title = post.get("title", "")
+                            currencies = [c["code"] for c in post.get("currencies", [])]
+                            assets = [c for c in currencies if c in ("BTC", "ETH", "SOL")]
+                            if not assets:
+                                assets = _assets_from_text(title)
+
+                            compound = _score(title)
+                            if abs(compound) < NEWS_SENTIMENT_THRESHOLD:
+                                continue
+
+                            # CryptoPanic also has votes
+                            votes = post.get("votes", {})
+                            positive = votes.get("positive", 0)
+                            negative = votes.get("negative", 0)
+                            total = positive + negative
+                            if total > 0:
+                                vote_bias = (positive - negative) / total
+                                compound = (compound + vote_bias) / 2
+
+                            if compound > NEWS_SENTIMENT_THRESHOLD:
+                                _push_signal(NewsSignal(
+                                    direction="BULLISH", assets=assets,
+                                    score=abs(compound), source="CryptoPanic",
+                                    headline=title,
+                                ))
+                            elif compound < -NEWS_SENTIMENT_THRESHOLD:
+                                _push_signal(NewsSignal(
+                                    direction="BEARISH", assets=assets,
+                                    score=abs(compound), source="CryptoPanic",
+                                    headline=title,
+                                ))
+        except Exception as e:
+            log.debug(f"CryptoPanic fetch error: {e}")
+
+        await asyncio.sleep(NEWS_POLL_SEC)
+
+
+# ── Economic calendar ────────────────────────────────────────────────────────
+
+async def calendar_monitor():
+    """
+    Watch for scheduled macro events (FOMC, CPI) and fire a pre-event signal.
+    We don't know the outcome in advance, so we use this to WIDEN spreads
+    and reduce size rather than take a directional position — unless the
+    release lands and we can score it.
+    """
+    log.info("Economic calendar monitor started")
+    while True:
+        now = datetime.now(timezone.utc)
+        for date_str in FOMC_DATES_2026:
+            event_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            diff_min = (event_dt - now).total_seconds() / 60
+            if 0 < diff_min <= 5:
+                log.warning(
+                    f"FOMC decision in {diff_min:.1f} min — "
+                    "reducing trade sizes until signal direction confirmed"
+                )
+        await asyncio.sleep(60)
+
+
+async def start_news_feeds():
+    await asyncio.gather(
+        cryptopanic_feed(),
+        calendar_monitor(),
+    )

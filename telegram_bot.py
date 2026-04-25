@@ -1,0 +1,613 @@
+"""
+Telegram bot — multi-user with guided setup flow.
+
+New users: /start → paste Public Key → paste Secret Key → connected.
+Existing users: all commands work immediately.
+"""
+
+import logging
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters,
+)
+
+import database
+import learner
+from config import TELEGRAM_TOKEN
+
+log = logging.getLogger("telegram_bot")
+
+# ── Setup states ──────────────────────────────────────────────────────────────
+_NEED_PUBLIC = 1
+_NEED_SECRET = 2
+_setup_state: dict[str, int] = {}
+_temp_pub:    dict[str, str] = {}
+
+# ── Injected runtime refs ─────────────────────────────────────────────────────
+_user_clients:  dict = {}
+_user_risks:    dict = {}
+_user_daily:    dict = {}
+_active_markets: list = []
+_start_user_fn = None
+
+
+def inject(user_clients, user_risks, user_daily, active_markets, start_user_fn):
+    global _user_clients, _user_risks, _user_daily, _active_markets, _start_user_fn
+    _user_clients   = user_clients
+    _user_risks     = user_risks
+    _user_daily     = user_daily
+    _active_markets = active_markets
+    _start_user_fn  = start_user_fn
+
+
+def build_app() -> Application:
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start",      cmd_start))
+    app.add_handler(CommandHandler("status",     cmd_status))
+    app.add_handler(CommandHandler("balance",    cmd_balance))
+    app.add_handler(CommandHandler("trades",     cmd_trades))
+    app.add_handler(CommandHandler("markets",    cmd_markets))
+    app.add_handler(CommandHandler("analysis",   cmd_analysis))
+    app.add_handler(CommandHandler("settings",   cmd_settings))
+    app.add_handler(CommandHandler("set",        cmd_set))
+    app.add_handler(CommandHandler("pause",      cmd_pause))
+    app.add_handler(CommandHandler("resume",     cmd_resume))
+    app.add_handler(CommandHandler("learning",   cmd_learning))
+    app.add_handler(CommandHandler("learnstats", cmd_learnstats))
+    app.add_handler(CommandHandler("disconnect", cmd_disconnect))
+    app.add_handler(CommandHandler("help",       cmd_help))
+    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    return app
+
+
+# ── Setup flow ────────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    cid = str(update.effective_chat.id)
+    if database.get_user(cid):
+        await _main_menu(update)
+        return
+
+    _setup_state[cid] = _NEED_PUBLIC
+    await update.message.reply_text(
+        "👋 *Welcome to Bayse Bot!*\n\n"
+        "I trade BTC, ETH, and SOL prediction markets automatically.\n\n"
+        "To connect your account:\n\n"
+        "1. Open *app.bayse.markets*\n"
+        "2. Go to *More → Account Settings → API Keys → Create*\n"
+        "3. Copy and paste your *Public Key* here (starts with `pk_`):",
+        parse_mode="Markdown",
+    )
+
+
+async def on_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    cid   = str(update.effective_chat.id)
+    text  = update.message.text.strip()
+    state = _setup_state.get(cid)
+
+    if state == _NEED_PUBLIC:
+        if not text.startswith("pk_"):
+            await update.message.reply_text(
+                "❌ Public keys start with `pk_` — try again:", parse_mode="Markdown"
+            )
+            return
+        _temp_pub[cid]    = text
+        _setup_state[cid] = _NEED_SECRET
+        await update.message.reply_text(
+            "✅ Got it!\n\nNow paste your *Secret Key* (starts with `sk_`):",
+            parse_mode="Markdown",
+        )
+        return
+
+    if state == _NEED_SECRET:
+        if not text.startswith("sk_"):
+            await update.message.reply_text(
+                "❌ Secret keys start with `sk_` — try again:", parse_mode="Markdown"
+            )
+            return
+
+        pub = _temp_pub.pop(cid, "")
+        _setup_state.pop(cid, None)
+
+        msg = await update.message.reply_text("🔄 Connecting to Bayse…")
+        try:
+            from client import BayseClient
+            client  = BayseClient(pub, text)
+            balance = await client.get_balance_ngn()
+            database.add_user(cid, pub, text)
+            _user_clients[cid] = client
+            if _start_user_fn:
+                _start_user_fn(cid)
+            await msg.delete()
+            await update.message.reply_text(
+                f"🎉 *Connected!*\n\n"
+                f"Balance: ₦{balance:,.2f}\n\n"
+                f"The bot is now trading for you. You'll get alerts here for every trade.\n\n"
+                f"Default daily target: *50× your starting balance*. "
+                f"Change it with `/set dailymultiplier 10` (or any number).",
+                parse_mode="Markdown",
+            )
+            await _main_menu(update)
+        except Exception as e:
+            _setup_state[cid] = _NEED_PUBLIC
+            await msg.delete()
+            await update.message.reply_text(
+                f"❌ *Connection failed*\n\n`{e}`\n\nCheck your keys and try /start again.",
+                parse_mode="Markdown",
+            )
+        return
+
+    if not database.get_user(cid):
+        await update.message.reply_text("Use /start to connect your Bayse account.")
+
+
+async def _main_menu(update: Update):
+    keyboard = [
+        [InlineKeyboardButton("📊 Status",   callback_data="status"),
+         InlineKeyboardButton("💰 Balance",  callback_data="balance")],
+        [InlineKeyboardButton("🏦 Markets",  callback_data="markets"),
+         InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
+        [InlineKeyboardButton("⏸ Pause",    callback_data="pause"),
+         InlineKeyboardButton("▶️ Resume",   callback_data="resume")],
+    ]
+    await update.message.reply_text(
+        "🤖 *Bayse Bot — Active*\n\nWhat would you like to check?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    cid = str(query.from_user.id)
+    if not database.get_user(cid):
+        await query.message.reply_text("Use /start to connect your account.")
+        return
+    data = query.data
+    if   data == "status":   await query.message.reply_text(await _status_text(cid), parse_mode="Markdown")
+    elif data == "balance":  await query.message.reply_text(await _balance_text(cid), parse_mode="Markdown")
+    elif data == "markets":  await query.message.reply_text(_markets_text(cid), parse_mode="Markdown")
+    elif data == "settings": await query.message.reply_text(_settings_text(cid), parse_mode="Markdown")
+    elif data == "pause":
+        _set_paused(cid, True)
+        await query.message.reply_text("⏸ Trading paused.")
+    elif data == "resume":
+        _set_paused(cid, False)
+        _clear_target_hit(cid)
+        await query.message.reply_text("▶️ Trading resumed.")
+
+
+# ── Guard decorator ───────────────────────────────────────────────────────────
+
+def _guard(fn):
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        cid = str(update.effective_chat.id)
+        if not database.get_user(cid):
+            await update.message.reply_text("Use /start to connect your account.")
+            return
+        await fn(update, ctx)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+@_guard
+async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        await _status_text(str(update.effective_chat.id)), parse_mode="Markdown"
+    )
+
+
+@_guard
+async def cmd_balance(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        await _balance_text(str(update.effective_chat.id)), parse_mode="Markdown"
+    )
+
+
+@_guard
+async def cmd_trades(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    cid  = str(update.effective_chat.id)
+    rows = database.recent_trades(cid, limit=10)
+    if not rows:
+        await update.message.reply_text("No trades yet.")
+        return
+    lines = ["📋 *Last 10 Trades*\n"]
+    for r in rows:
+        icon = "✅" if r["won"] == 1 else ("❌" if r["won"] == 0 else "⏳")
+        pnl  = f"₦{r['pnl_ngn']:+,.0f}" if r["pnl_ngn"] is not None else "pending"
+        lines.append(f"{icon} {r['strategy']} {r['asset']} {r['timeframe']} {r['outcome']} — {pnl}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@_guard
+async def cmd_markets(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        _markets_text(str(update.effective_chat.id)), parse_mode="Markdown"
+    )
+
+
+@_guard
+async def cmd_analysis(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    import analysis as anal
+    cid    = str(update.effective_chat.id)
+    client = _user_clients.get(cid)
+    if not client:
+        await update.message.reply_text("Bot still starting up. Try again in a moment.")
+        return
+    report = await anal.full_report(client, cid)
+    await update.message.reply_text(report, parse_mode="Markdown")
+
+
+@_guard
+async def cmd_settings(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        _settings_text(str(update.effective_chat.id)), parse_mode="Markdown"
+    )
+
+
+@_guard
+async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    cid  = str(update.effective_chat.id)
+    args = update.message.text.split()[1:]
+    if len(args) < 2:
+        await update.message.reply_text(
+            "*Usage:*\n"
+            "`/set assets BTC ETH SOL`\n"
+            "`/set timeframes 5min 15min 1h`\n"
+            "`/set strategies SNIPE ARB`\n"
+            "`/set risk 3`\n"
+            "`/set mintrade 100`\n"
+            "`/set maxtrade 50000`\n"
+            "`/set maxexposure 25`\n"
+            "`/set dailymultiplier 50`\n"
+            "`/set dailytarget 5000`",
+            parse_mode="Markdown",
+        )
+        return
+
+    user = database.get_user(cid)
+    s    = user["settings"]
+    key, vals = args[0].lower(), args[1:]
+
+    ASSETS     = {"BTC", "ETH", "SOL"}
+    TIMEFRAMES = {"5min", "15min", "1h", "6h", "1d"}
+    STRATEGIES = {"SNIPE", "CORRELATE", "ARB", "NEWS"}
+
+    if key == "assets":
+        bad = [v for v in vals if v.upper() not in ASSETS]
+        if bad:
+            await update.message.reply_text(f"Unknown: {bad}. Valid: BTC ETH SOL"); return
+        s["assets"] = [v.upper() for v in vals]
+        msg = f"Assets: {s['assets']}"
+
+    elif key == "timeframes":
+        bad = [v for v in vals if v.lower() not in TIMEFRAMES]
+        if bad:
+            await update.message.reply_text(f"Unknown: {bad}. Valid: 5min 15min 1h 6h 1d"); return
+        s["timeframes"] = [v.lower() for v in vals]
+        msg = f"Timeframes: {s['timeframes']}"
+
+    elif key == "strategies":
+        bad = [v for v in vals if v.upper() not in STRATEGIES]
+        if bad:
+            await update.message.reply_text(f"Unknown: {bad}. Valid: SNIPE CORRELATE ARB NEWS"); return
+        s["strategies"] = [v.upper() for v in vals]
+        msg = f"Strategies: {s['strategies']}"
+
+    elif key == "risk":
+        try:
+            pct = float(vals[0])
+            if not 0.1 <= pct <= 10: raise ValueError
+            s["risk_pct"] = pct;  msg = f"Risk per trade: {pct}%"
+        except ValueError:
+            await update.message.reply_text("Risk must be a number 0.1–10."); return
+
+    elif key == "mintrade":
+        try:
+            amt = float(vals[0])
+            if amt < 100:
+                await update.message.reply_text("Minimum is ₦100."); return
+            s["mintrade"] = amt;  msg = f"Min trade: ₦{amt:,.0f}"
+        except ValueError:
+            await update.message.reply_text("Enter a number."); return
+
+    elif key == "maxtrade":
+        try:
+            s["maxtrade"] = float(vals[0]);  msg = f"Max trade: ₦{s['maxtrade']:,.0f}"
+        except ValueError:
+            await update.message.reply_text("Enter a number."); return
+
+    elif key == "maxexposure":
+        try:
+            pct = float(vals[0])
+            if not 5 <= pct <= 100: raise ValueError
+            s["maxexposure"] = pct;  msg = f"Max exposure: {pct}% at once"
+        except ValueError:
+            await update.message.reply_text("Exposure must be 5–100."); return
+
+    elif key == "dailymultiplier":
+        try:
+            mult = float(vals[0])
+            if mult <= 0: raise ValueError
+            s["daily_multiplier"] = mult
+            s["daily_target_ngn"] = 0
+            msg = f"Daily target: {mult}× starting balance"
+        except ValueError:
+            await update.message.reply_text("Enter a positive number."); return
+
+    elif key == "dailytarget":
+        try:
+            amt = float(vals[0])
+            s["daily_target_ngn"] = amt
+            s["daily_multiplier"] = 0
+            msg = f"Daily target: ₦{amt:,.0f} absolute"
+        except ValueError:
+            await update.message.reply_text("Enter a number."); return
+
+    else:
+        await update.message.reply_text(f"Unknown setting `{key}`.", parse_mode="Markdown"); return
+
+    database.update_settings(cid, s)
+    await update.message.reply_text(f"✅ {msg}")
+
+
+@_guard
+async def cmd_pause(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    cid = str(update.effective_chat.id)
+    _set_paused(cid, True)
+    await update.message.reply_text("⏸ Trading paused. Use /resume to restart.")
+
+
+@_guard
+async def cmd_resume(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    cid = str(update.effective_chat.id)
+    _set_paused(cid, False)
+    _clear_target_hit(cid)
+    await update.message.reply_text("▶️ Trading resumed.")
+
+
+@_guard
+async def cmd_learning(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    cid = str(update.effective_chat.id)
+    await update.message.reply_text("🧠 Running intelligence cycle…")
+    _, report = learner.run_learning(cid)
+    await update.message.reply_text(report, parse_mode="Markdown")
+
+
+@_guard
+async def cmd_learnstats(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    cid  = str(update.effective_chat.id)
+    rows = database.recent_stats(cid, days=7)
+    if not rows:
+        await update.message.reply_text("No resolved trades in the last 7 days.")
+        return
+    lines = ["📈 *7-Day Performance*\n"]
+    for r in sorted(rows, key=lambda x: -(x.get("total_pnl") or 0)):
+        wr   = r["win_rate"]
+        icon = "✅" if wr >= 0.55 else ("⚠️" if wr >= 0.48 else "❌")
+        pnl  = r.get("total_pnl") or 0
+        lines.append(
+            f"{icon} {r['strategy']}/{r['asset']}/{r['timeframe']}: "
+            f"{wr:.0%} WR ({r['total']} trades) ₦{pnl:,.0f}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@_guard
+async def cmd_disconnect(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    cid = str(update.effective_chat.id)
+    database.deactivate(cid)
+    _user_clients.pop(cid, None)
+    _user_risks.pop(cid, None)
+    _user_daily.pop(cid, None)
+    await update.message.reply_text(
+        "🔌 Account disconnected. Trade history is preserved. Use /start to reconnect."
+    )
+
+
+async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "*Bayse Bot Commands*\n\n"
+        "/start — connect your Bayse account\n"
+        "/status — balance, PnL, drawdown, positions\n"
+        "/balance — wallet balance\n"
+        "/trades — last 10 trades\n"
+        "/markets — active markets you're watching\n"
+        "/analysis — full performance report\n"
+        "/learning — run intelligence cycle now\n"
+        "/learnstats — 7-day win rates by strategy\n"
+        "/settings — current configuration\n"
+        "/set — change a setting (type /set for options)\n"
+        "/pause — stop all trading\n"
+        "/resume — restart trading\n"
+        "/disconnect — remove your account",
+        parse_mode="Markdown",
+    )
+
+
+# ── Text builders ──────────────────────────────────────────────────────────────
+
+async def _status_text(cid: str) -> str:
+    client = _user_clients.get(cid)
+    if not client:
+        return "Bot still starting up. Try again in a moment."
+    try:
+        balance = await client.get_balance_ngn()
+    except Exception:
+        return "Could not fetch balance right now."
+
+    risk  = _user_risks.get(cid)
+    day   = _user_daily.get(cid, {})
+    user  = database.get_user(cid)
+    s     = user["settings"] if user else {}
+
+    profit_today = balance - day.get("start_balance", balance)
+    target       = _calc_target(s, day.get("start_balance", balance))
+
+    dd = deployed = 0.0
+    n_pos = 0
+    if risk:
+        dd       = max(0, (risk.peak_balance - balance) / risk.peak_balance) if risk.peak_balance else 0
+        n_pos    = len(risk.open_positions)
+        deployed = sum(p.get("amount_ngn", 0) for p in risk.open_positions.values())
+
+    stats = database.all_time_stats(cid)
+
+    lines = [
+        "📊 *Bot Status*\n",
+        f"Balance: ₦{balance:,.2f}",
+        f"Today's profit: ₦{profit_today:+,.2f}",
+    ]
+    if target > 0:
+        pct = min(profit_today / target * 100, 100) if target else 0
+        lines.append(f"Daily target: ₦{target:,.0f} ({pct:.0f}% done)")
+    lines += [
+        f"Drawdown from peak: {dd:.1%}",
+        f"Open positions: {n_pos} (₦{deployed:,.0f} deployed)",
+        "",
+        f"All-time: {stats['wins']}/{stats['total']} wins "
+        f"({stats['win_rate']:.0%} WR) ₦{stats['total_pnl']:+,.0f}",
+        f"\nStatus: {'⏸ Paused' if s.get('paused') else '🟢 Active'}",
+    ]
+    return "\n".join(lines)
+
+
+async def _balance_text(cid: str) -> str:
+    client = _user_clients.get(cid)
+    if not client:
+        return "Bot still starting up."
+    try:
+        bal = await client.get_balance_ngn()
+        return f"💰 Balance: ₦{bal:,.2f}"
+    except Exception as e:
+        return f"Could not fetch balance: {e}"
+
+
+def _markets_text(cid: str) -> str:
+    user = database.get_user(cid)
+    if not user:
+        return "Not connected."
+    s  = user["settings"]
+    ua = s.get("assets",     ["BTC", "ETH", "SOL"])
+    ut = s.get("timeframes", ["5min", "15min", "1h"])
+    relevant = [m for m in _active_markets if m.get("asset") in ua and m.get("timeframe") in ut]
+    if not relevant:
+        return "No active markets matching your settings."
+    lines = ["🏦 *Active Markets*\n"]
+    for m in relevant[:15]:
+        mins = (m.get("secs_to_close") or 0) // 60
+        lines.append(
+            f"{'🟢' if m.get('status')=='open' else '🔴'} "
+            f"{m['asset']} {m['timeframe']} | "
+            f"UP:{m.get('yes_price',0):.3f} DN:{m.get('no_price',0):.3f} | {mins}m left"
+        )
+    return "\n".join(lines)
+
+
+def _settings_text(cid: str) -> str:
+    user = database.get_user(cid)
+    if not user:
+        return "Not connected."
+    s    = user["settings"]
+    mult = s.get("daily_multiplier", 50)
+    abs_ = s.get("daily_target_ngn", 0)
+    tgt  = f"₦{abs_:,.0f} (fixed)" if abs_ > 0 else f"{mult}× starting balance"
+    return (
+        "⚙️ *Settings*\n\n"
+        f"Assets:       {s.get('assets')}\n"
+        f"Timeframes:   {s.get('timeframes')}\n"
+        f"Strategies:   {s.get('strategies')}\n"
+        f"Risk/trade:   {s.get('risk_pct', 3)}%\n"
+        f"Min trade:    ₦{s.get('mintrade', 100):,.0f}\n"
+        f"Max trade:    ₦{s.get('maxtrade', 500000):,.0f}\n"
+        f"Max exposure: {s.get('maxexposure', 30)}%\n"
+        f"Daily target: {tgt}\n"
+        f"Status:       {'⏸ Paused' if s.get('paused') else '🟢 Active'}"
+    )
+
+
+def _calc_target(settings: dict, start_balance: float) -> float:
+    abs_ = settings.get("daily_target_ngn", 0)
+    if abs_ > 0:
+        return float(abs_)
+    return start_balance * settings.get("daily_multiplier", 50)
+
+
+def _set_paused(cid: str, paused: bool):
+    user = database.get_user(cid)
+    if user:
+        s = user["settings"]
+        s["paused"] = paused
+        database.update_settings(cid, s)
+
+
+def _clear_target_hit(cid: str):
+    if cid in _user_daily:
+        _user_daily[cid]["target_hit"] = False
+
+
+# ── Notifications ──────────────────────────────────────────────────────────────
+
+async def send_message(app: Application, chat_id: str, text: str, **kwargs):
+    try:
+        await app.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except Exception as e:
+        log.warning(f"Telegram send failed → {chat_id}: {e}")
+
+
+async def notify_trade(app, cid: str, sig, amount: float):
+    icon = "⬆️" if "YES" in sig.outcome.upper() or "UP" in sig.outcome.upper() else "⬇️"
+    await send_message(
+        app, cid,
+        f"🔔 *Trade*\n{sig.strategy} | {sig.asset} {sig.timeframe}\n"
+        f"{icon} {sig.outcome} | ₦{amount:,.0f} @ {sig.certainty:.0%}\n_{sig.reason}_",
+        parse_mode="Markdown",
+    )
+
+
+async def notify_win(app, cid: str, _mid: str, asset: str, tf: str, strat: str, pnl: float):
+    await send_message(app, cid, f"✅ *WIN* — {strat} {asset} {tf}\n+₦{pnl:,.2f}", parse_mode="Markdown")
+
+
+async def notify_loss(app, cid: str, _mid: str, asset: str, tf: str, strat: str, pnl: float):
+    await send_message(app, cid, f"❌ *LOSS* — {strat} {asset} {tf}\n₦{pnl:,.2f}", parse_mode="Markdown")
+
+
+async def notify_drawdown(app, cid: str, balance: float, peak: float, dd: float):
+    await send_message(
+        app, cid,
+        f"⚠️ *Drawdown Alert — Trading Paused*\n\n"
+        f"Peak: ₦{peak:,.0f}  →  Now: ₦{balance:,.0f}\n"
+        f"Drawdown: {dd:.1%}\n\n/resume to override.",
+        parse_mode="Markdown",
+    )
+
+
+async def notify_arb(app, cid: str, sig, pairs: float, profit: float):
+    await send_message(
+        app, cid,
+        f"⚖️ *ARB* | {sig.asset} {sig.timeframe}\n{pairs:.0f} pairs → est ₦{profit:,.2f}",
+        parse_mode="Markdown",
+    )
+
+
+async def notify_news(app, cid: str, headline: str, direction: str, assets: list, strength: float):
+    bull = direction == "BULLISH"
+    await send_message(
+        app, cid,
+        f"📰 *News Signal*\n{headline}\n"
+        f"{'🐂 Bullish' if bull else '🐻 Bearish'} ({strength:.0%}) — {', '.join(assets)}",
+        parse_mode="Markdown",
+    )
+
+
+async def notify_deposit_detected(app, cid: str, amount: float, currency: str):
+    await send_message(
+        app, cid, f"💸 *Deposit Detected* +{currency} {amount:,.0f}", parse_mode="Markdown"
+    )
