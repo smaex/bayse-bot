@@ -26,7 +26,7 @@ DEFAULT_SETTINGS: dict = {
     "mintrade":         100,
     "maxtrade":         500_000,
     "maxexposure":      30.0,
-    "daily_multiplier": 50,
+    "daily_multiplier": 10,
     "daily_target_ngn": 0,
     "paused":           False,
     "learned":          {},

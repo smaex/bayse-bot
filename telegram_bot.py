@@ -129,8 +129,8 @@ async def on_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
                 f"🎉 *Connected!*\n\n"
                 f"Balance: ₦{balance:,.2f}\n\n"
                 f"The bot is now trading for you. You'll get alerts here for every trade.\n\n"
-                f"Default daily target: *50× your starting balance*. "
-                f"Change it with `/set dailymultiplier 10` (or any number).",
+                f"Default daily target: *10% of your starting balance*. "
+                f"Change it with `/set dailymultiplier 20` (or any number 1–100).",
                 parse_mode="Markdown",
             )
             await _main_menu(update)
@@ -386,8 +386,8 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     elif key == "mintrade":
         try:
             amt = float(vals[0])
-            if amt < 10:
-                await update.message.reply_text("Minimum is ₦10."); return
+            if amt < 100:
+                await update.message.reply_text("Minimum is ₦100 (Bayse platform limit)."); return
             s["mintrade"] = amt;  msg = f"Min trade: ₦{amt:,.0f}"
         except ValueError:
             await update.message.reply_text("Enter a number."); return
@@ -409,12 +409,12 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     elif key == "dailymultiplier":
         try:
             mult = float(vals[0])
-            if mult <= 0: raise ValueError
+            if mult <= 0 or mult > 100: raise ValueError
             s["daily_multiplier"] = mult
             s["daily_target_ngn"] = 0
-            msg = f"Daily target: {mult}× starting balance"
+            msg = f"Daily target: {mult}% of starting balance"
         except ValueError:
-            await update.message.reply_text("Enter a positive number."); return
+            await update.message.reply_text("Enter a number between 1 and 100."); return
 
     elif key == "dailytarget":
         try:
@@ -487,16 +487,16 @@ _MODES = {
             "• Timeframes: 15min, 1h\n"
             "• Strategies: SNIPE, ARB\n"
             "• Risk per trade: 2%\n"
-            "• Min trade: ₦50\n"
+            "• Min trade: ₦100\n"
             "• Max exposure: 15%\n"
-            "• Daily target: 5× starting balance"
+            "• Daily target: 5% of starting balance"
         ),
         "settings": {
             "assets":           ["BTC", "ETH"],
             "timeframes":       ["15min", "1h"],
             "strategies":       ["SNIPE", "ARB"],
             "risk_pct":         2.0,
-            "mintrade":         50,
+            "mintrade":         100,
             "maxexposure":      15.0,
             "daily_multiplier": 5,
             "daily_target_ngn": 0,
@@ -514,7 +514,7 @@ _MODES = {
             "• Risk per trade: 3%\n"
             "• Min trade: ₦100\n"
             "• Max exposure: 25%\n"
-            "• Daily target: 10× starting balance"
+            "• Daily target: 10% of starting balance"
         ),
         "settings": {
             "assets":           ["BTC", "ETH", "SOL"],
@@ -539,7 +539,7 @@ _MODES = {
             "• Risk per trade: 4%\n"
             "• Min trade: ₦200\n"
             "• Max exposure: 35%\n"
-            "• Daily target: 20× starting balance"
+            "• Daily target: 20% of starting balance"
         ),
         "settings": {
             "assets":           ["BTC", "ETH", "SOL"],
@@ -564,7 +564,7 @@ _MODES = {
             "• Risk per trade: 5%\n"
             "• Min trade: ₦500\n"
             "• Max exposure: 50%\n"
-            "• Daily target: 50× starting balance"
+            "• Daily target: 50% of starting balance"
         ),
         "settings": {
             "assets":           ["BTC", "ETH", "SOL"],
@@ -720,7 +720,7 @@ def _settings_text(cid: str) -> str:
     s    = user["settings"]
     mult = s.get("daily_multiplier", 50)
     abs_ = s.get("daily_target_ngn", 0)
-    tgt  = f"₦{abs_:,.0f} (fixed)" if abs_ > 0 else f"{mult}× starting balance"
+    tgt  = f"₦{abs_:,.0f} (fixed)" if abs_ > 0 else f"{mult}% of starting balance"
     return (
         "⚙️ *Settings*\n\n"
         f"Assets:       {s.get('assets')}\n"

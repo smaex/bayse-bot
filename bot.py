@@ -71,7 +71,8 @@ def _daily_target(settings: dict, start_balance: float) -> float:
     absolute = settings.get("daily_target_ngn", 0)
     if absolute > 0:
         return float(absolute)
-    return start_balance * settings.get("daily_multiplier", 50)
+    # daily_multiplier is a percentage — 10 means 10% of starting balance
+    return start_balance * settings.get("daily_multiplier", 10) / 100
 
 
 # ── User lifecycle ─────────────────────────────────────────────────────────────
