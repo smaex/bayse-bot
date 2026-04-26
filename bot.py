@@ -60,11 +60,15 @@ def _get_risk(chat_id: str) -> RiskManager:
     return _user_risks[chat_id]
 
 
-def _daily(chat_id: str, balance: float) -> dict:
+def _daily(chat_id: str, balance: float, settings: dict) -> dict:
     today = date.today().isoformat()
-    if _user_daily.get(chat_id, {}).get("date") != today:
-        _user_daily[chat_id] = {"date": today, "start_balance": balance, "target_hit": False}
-    return _user_daily[chat_id]
+    ds = settings.get("daily_state", {})
+    if ds.get("date") != today:
+        ds = {"date": today, "start_balance": balance, "target_hit": False}
+        settings["daily_state"] = ds
+        database.update_settings(chat_id, settings)
+    _user_daily[chat_id] = ds  # keep in-memory cache in sync
+    return ds
 
 
 def _daily_target(settings: dict, start_balance: float) -> float:
@@ -123,11 +127,12 @@ async def _user_loop(chat_id: str):
         risk.update_peak(balance)
 
         # ── Daily target ───────────────────────────────────────────────────────
-        day          = _daily(chat_id, balance)
+        day          = _daily(chat_id, balance, settings)
         profit_today = balance - day["start_balance"]
         target       = _daily_target(settings, day["start_balance"])
         if target > 0 and profit_today >= target and not day["target_hit"]:
             day["target_hit"] = True
+            settings["daily_state"] = day
             settings["paused"] = True
             database.update_settings(chat_id, settings)
             if _tg_app:
