@@ -94,15 +94,22 @@ def start_user(chat_id: str):
 async def _user_loop(chat_id: str):
     """Per-user async trading loop — runs every 10 seconds."""
     last_news = ""
+    iter_count = 0
 
     while True:
         await asyncio.sleep(10)
+        iter_count += 1
         user = database.get_user(chat_id)
         if not user or not user.get("is_active"):
+            log.info(f"[{chat_id}] trading loop exiting (user inactive)")
             break
         settings = user["settings"]
         if settings.get("paused"):
+            if iter_count % 18 == 0:  # log every 3 minutes while paused
+                log.info(f"[{chat_id}] trading paused — send /resume to restart")
             continue
+        if iter_count % 18 == 0:  # heartbeat every 3 minutes
+            log.info(f"[{chat_id}] loop alive (iter={iter_count}, spot={feeds.spot})")
 
         client = _get_client(user)
         risk   = _get_risk(chat_id)
@@ -163,28 +170,31 @@ async def _user_loop(chat_id: str):
         active_strats = [s for s in user_strats if s not in suspended]
         max_exp      = settings.get("maxexposure", 30.0) / 100.0
 
-        for market in active_markets:
-            if market.get("status") != "open":
-                continue
-            if market["asset"] not in user_assets:
-                continue
-            if market["timeframe"] not in user_tfs:
-                continue
+        try:
+            for market in active_markets:
+                if market.get("status") != "open":
+                    continue
+                if market["asset"] not in user_assets:
+                    continue
+                if market["timeframe"] not in user_tfs:
+                    continue
 
-            ws = feeds.market_prices.get(market["market_id"])
-            if ws:
-                market["yes_price"] = ws["yes"]
-                market["no_price"]  = ws["no"]
+                ws = feeds.market_prices.get(market["market_id"])
+                if ws:
+                    market["yes_price"] = ws["yes"]
+                    market["no_price"]  = ws["no"]
 
-            signals = strategy.evaluate(market, strategies=active_strats, learned=learned)
-            for sig in signals:
-                if sig.strategy == "ARB":
-                    await _execute_arb(chat_id, sig, client, balance, settings)
-                elif not risk.already_in(sig.market_id):
-                    await _execute_trade(
-                        chat_id, sig, client, risk, balance, settings, learned, max_exp
-                    )
-                break  # best signal per market per tick
+                signals = strategy.evaluate(market, strategies=active_strats, learned=learned)
+                for sig in signals:
+                    if sig.strategy == "ARB":
+                        await _execute_arb(chat_id, sig, client, balance, settings)
+                    elif not risk.already_in(sig.market_id):
+                        await _execute_trade(
+                            chat_id, sig, client, risk, balance, settings, learned, max_exp
+                        )
+                    break  # best signal per market per tick
+        except Exception as e:
+            log.error(f"[{chat_id}] market eval error (iter={iter_count}): {e}", exc_info=True)
 
 
 async def _execute_trade(chat_id, sig, client, risk, balance, settings, learned, max_exp):

@@ -79,6 +79,7 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
 
     live_price = feeds.spot.get(asset)
     if not live_price:
+        log.warning(f"SNIPE [{asset} {market['timeframe']}] {secs:.0f}s left — no spot price in feeds.spot")
         return None
 
     distance_pct = (live_price - threshold) / threshold  # positive = above = YES wins
