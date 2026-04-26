@@ -3,7 +3,7 @@ Risk manager: position sizing, drawdown control, exposure limits.
 """
 
 import logging
-from config import MAX_DRAWDOWN_STOP
+from config import MAX_DRAWDOWN_STOP, MAX_PORTFOLIO_EXPOSURE
 
 log = logging.getLogger(__name__)
 
@@ -31,8 +31,8 @@ class RiskManager:
                 )
             self.paused = True
             return False
-        if self.paused and dd < MAX_DRAWDOWN_STOP * 0.5:
-            log.info("Drawdown recovered — resuming trading")
+        if self.paused and dd < MAX_DRAWDOWN_STOP * 0.25:
+            log.info(f"Drawdown recovered to {dd:.1%} — resuming trading")
             self.paused = False
         return not self.paused
 
@@ -43,7 +43,7 @@ class RiskManager:
         if (self.deployed() + amount) > balance * max_exposure:
             log.debug(
                 f"Exposure cap: deployed=₦{self.deployed():,.0f} + "
-                f"₦{amount:,.0f} > {MAX_PORTFOLIO_EXPOSURE:.0%} of ₦{balance:,.0f}"
+                f"₦{amount:,.0f} > {max_exposure:.0%} of ₦{balance:,.0f}"
             )
             return False
         return True

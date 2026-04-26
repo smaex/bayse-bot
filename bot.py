@@ -11,7 +11,6 @@ import asyncio
 import logging
 import os
 import sys
-import time
 from datetime import date
 
 from aiohttp import web, ClientSession, ClientTimeout
@@ -23,7 +22,6 @@ import scanner
 import strategy
 import learner
 import telegram_bot
-import analysis
 from risk import RiskManager
 from client import BayseClient
 from config import (
@@ -214,7 +212,10 @@ async def _execute_trade(chat_id, sig, client, risk, balance, settings, learned,
     if not risk.can_trade(balance, amount, max_exp):
         return
 
-    log.info(f"[{chat_id}] [{sig.strategy}] {sig.asset} {sig.timeframe} {sig.outcome} ₦{amount:,.0f}")
+    log.info(
+        f"[{chat_id}] PLACING {sig.strategy} | {sig.asset} {sig.timeframe} {sig.outcome} "
+        f"@ {sig.market_price:.3f} certainty={sig.certainty:.0%} ₦{amount:,.0f}"
+    )
 
     try:
         resp = await client.place_order(
@@ -224,6 +225,11 @@ async def _execute_trade(chat_id, sig, client, risk, balance, settings, learned,
         )
         order        = resp.get("order", resp)
         filled_price = float(order.get("price", sig.market_price) or sig.market_price)
+
+        log.info(
+            f"[{chat_id}] PLACED {sig.strategy} | {sig.asset} {sig.timeframe} {sig.outcome} "
+            f"filled={filled_price:.3f} ₦{amount:,.0f} trade_id pending"
+        )
 
         market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
         spot_vs_thresh = 0.0
@@ -258,8 +264,11 @@ async def _execute_arb(chat_id, sig, client, balance, settings):
     if not market:
         return
 
-    yes_p, no_p = market["yes_price"], market["no_price"]
-    if yes_p + no_p >= 1.00:
+    # Re-fetch live prices from WebSocket cache — signal may be stale
+    ws = feeds.market_prices.get(sig.market_id)
+    yes_p = ws["yes"] if ws else market["yes_price"]
+    no_p  = ws["no"]  if ws else market["no_price"]
+    if yes_p + no_p >= 0.99:  # tight buffer — any sum ≥0.99 is not worth the slippage
         return
 
     max_t     = settings.get("maxtrade", 500_000)

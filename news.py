@@ -64,11 +64,10 @@ active_signals: list[NewsSignal] = []
 
 
 def _score(text: str) -> float:
-    """VADER compound sentiment score, clamped to 0–1."""
+    """VADER compound score, -1 to +1. Sign = direction, magnitude = confidence."""
     if not _vader_ok:
         return 0.0
-    result = _vader.polarity_scores(text)
-    return result["compound"]  # -1 to +1
+    return _vader.polarity_scores(text)["compound"]
 
 
 def _assets_from_text(text: str) -> list[str]:
@@ -176,7 +175,7 @@ async def newsapi_feed():
                     else:
                         log.debug(f"NewsAPI returned {r.status}")
         except Exception as e:
-            log.debug(f"NewsAPI fetch error: {e}")
+            log.warning(f"NewsAPI fetch error: {e}")
 
         await asyncio.sleep(NEWS_POLL_SEC)
 
@@ -192,15 +191,18 @@ async def calendar_monitor():
     """
     log.info("Economic calendar monitor started")
     while True:
-        now = datetime.now(timezone.utc)
-        for date_str in FOMC_DATES_2026:
-            event_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            diff_min = (event_dt - now).total_seconds() / 60
-            if 0 < diff_min <= 5:
-                log.warning(
-                    f"FOMC decision in {diff_min:.1f} min — "
-                    "reducing trade sizes until signal direction confirmed"
-                )
+        try:
+            now = datetime.now(timezone.utc)
+            for date_str in FOMC_DATES_2026:
+                event_dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                diff_min = (event_dt - now).total_seconds() / 60
+                if 0 < diff_min <= 5:
+                    log.warning(
+                        f"FOMC decision in {diff_min:.1f} min — "
+                        "reducing trade sizes until signal direction confirmed"
+                    )
+        except Exception as e:
+            log.warning(f"Calendar monitor error: {e}")
         await asyncio.sleep(60)
 
 

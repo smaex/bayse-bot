@@ -86,6 +86,7 @@ async def kraken_feed(on_price=None):
                     await asyncio.sleep(CHAINLINK_POLL_SEC)
         except Exception as e:
             log.warning(f"Kraken feed crashed: {e}. Restarting in {backoff}s")
+            spot.clear()  # don't trade on stale prices while feed is down
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 

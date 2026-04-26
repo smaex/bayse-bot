@@ -55,7 +55,12 @@ def effective_fee(fee_rate: float, price: float) -> float:
 def breakeven_probability(market_price: float, fee_rate: float) -> float:
     """Minimum true probability needed to be profitable at this price."""
     fee = effective_fee(fee_rate, market_price)
-    return market_price + fee
+    return market_price / (1.0 - fee) if fee < 1.0 else 1.0
+
+
+def certainty_to_prob(certainty: float) -> float:
+    """Map certainty score (0–1) to an estimated win probability (0.50–0.95)."""
+    return 0.50 + 0.45 * min(certainty, 1.0)
 
 
 # ── Strategy 1: Near-close sniping ───────────────────────────────────────────
@@ -113,11 +118,12 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
         log.info(f"SNIPE [{asset} {market['timeframe']}] REJECTED — price {market_price:.3f} > max {SNIPE_MAX_PRICE}")
         return None  # already priced in, not worth it
 
-    # Check fee-adjusted profitability
+    # Check fee-adjusted profitability — map certainty score to estimated probability
     fee_rate = market.get("fee_rate", 0.04)
     be_prob = breakeven_probability(market_price, fee_rate)
-    if certainty < be_prob:
-        log.info(f"SNIPE [{asset} {market['timeframe']}] REJECTED — certainty {certainty:.2%} < breakeven {be_prob:.2%}")
+    est_prob = certainty_to_prob(certainty)
+    if est_prob < be_prob:
+        log.info(f"SNIPE [{asset} {market['timeframe']}] REJECTED — est_prob {est_prob:.2%} < breakeven {be_prob:.2%}")
         return None
 
     # Size: 3% of bankroll for high certainty, scale down for lower
@@ -193,7 +199,7 @@ def correlate_signal(market: dict) -> Optional[TradeSignal]:
 
     certainty = 0.60 * freshness  # lower confidence than snipe
     fee_rate = market.get("fee_rate", 0.04)
-    if certainty < breakeven_probability(market_price, fee_rate):
+    if certainty_to_prob(certainty) < breakeven_probability(market_price, fee_rate):
         return None
 
     size_pct = 0.015 * freshness  # smaller size for correlation trades
@@ -238,7 +244,7 @@ def arb_signal(market: dict) -> Optional[TradeSignal]:
     fee_no = effective_fee(market.get("fee_rate", 0.04), no_p)
     net_profit = profit_per_unit - fee_yes - fee_no
 
-    if net_profit <= 0:
+    if net_profit < 0.005:  # require 0.5% minimum buffer above fees
         return None
 
     return TradeSignal(
@@ -292,7 +298,7 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[Tra
         outcome, outcome_id, market_price = "NO", market["no_id"], no_p
 
     fee_rate = market.get("fee_rate", 0.04)
-    if strength < breakeven_probability(market_price, fee_rate):
+    if certainty_to_prob(strength) < breakeven_probability(market_price, fee_rate):
         return None
 
     size_pct = 0.02 * strength  # news trades are smaller — more uncertainty
@@ -366,7 +372,8 @@ def evaluate(market: dict, strategies: list | None = None, learned: dict | None 
         strategies = ["SNIPE", "CORRELATE", "ARB", "NEWS"]
     learned = learned or {}
 
-    min_cert    = learned.get("snipe_min_certainty", SNIPE_MIN_CERTAINTY)
+    # Config is the floor — learned can raise it but never override a deliberate lowering
+    min_cert    = min(learned.get("snipe_min_certainty", SNIPE_MIN_CERTAINTY), SNIPE_MIN_CERTAINTY)
     news_thresh = learned.get("news_sentiment_threshold", 0.35)
 
     dispatch = {
@@ -380,9 +387,12 @@ def evaluate(market: dict, strategies: list | None = None, learned: dict | None 
     for name in strategies:
         fn = dispatch.get(name)
         if fn:
-            sig = fn(market)
-            if sig:
-                signals.append(sig)
+            try:
+                sig = fn(market)
+                if sig:
+                    signals.append(sig)
+            except Exception as e:
+                log.error(f"Strategy {name} error on {market.get('market_id')}: {e}", exc_info=True)
 
     if not signals:
         return []

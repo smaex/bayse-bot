@@ -73,9 +73,6 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
 
     market = markets[0]
     threshold = full.get("eventThreshold") or market.get("marketThreshold")
-    # Live API uses outcome1=Up/Yes, outcome2=Down/No
-    yes_price = float(market.get("outcome1Price", 0.5))
-    no_price = float(market.get("outcome2Price", 0.5))
     yes_id = market.get("outcome1Id")    # "Up" or "Yes" outcome
     no_id = market.get("outcome2Id")     # "Down" or "No" outcome
     yes_label = market.get("outcome1Label", "Up")   # "Up" or "Yes"
@@ -85,6 +82,14 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
 
     if not market_id or not yes_id or not no_id:
         return None
+
+    # Reject markets with missing prices — 0.5/0.5 default would cause false ARB signals
+    raw_yes = market.get("outcome1Price")
+    raw_no  = market.get("outcome2Price")
+    if raw_yes is None or raw_no is None:
+        return None
+    yes_price = float(raw_yes)
+    no_price  = float(raw_no)
 
     return {
         "event_id": event_id,

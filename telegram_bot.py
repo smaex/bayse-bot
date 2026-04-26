@@ -54,7 +54,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("set",        cmd_set))
     app.add_handler(CommandHandler("pause",      cmd_pause))
     app.add_handler(CommandHandler("resume",     cmd_resume))
-    app.add_handler(CommandHandler("learning",   cmd_learning))
+    app.add_handler(CommandHandler("learning",      cmd_learning))
+    app.add_handler(CommandHandler("resetlearning", cmd_resetlearning))
     app.add_handler(CommandHandler("learnstats", cmd_learnstats))
     app.add_handler(CommandHandler("mode",       cmd_mode))
     app.add_handler(CommandHandler("debug",      cmd_debug))
@@ -456,6 +457,23 @@ async def cmd_learning(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @_guard
+async def cmd_resetlearning(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    cid = str(update.effective_chat.id)
+    user = database.get_user(cid)
+    if not user:
+        return
+    s = user["settings"]
+    s["learned"] = {}
+    database.update_settings(cid, s)
+    await update.message.reply_text(
+        "🔄 *Learned settings cleared.*\n\n"
+        "The bot will now use the base config thresholds.\n"
+        "Intelligence will rebuild from scratch as new trades complete.",
+        parse_mode="Markdown",
+    )
+
+
+@_guard
 async def cmd_learnstats(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid  = str(update.effective_chat.id)
     rows = database.recent_stats(cid, days=7)
@@ -623,6 +641,7 @@ async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         "/markets — active markets you're watching\n"
         "/analysis — full performance report\n"
         "/learning — run intelligence cycle now\n"
+        "/resetlearning — clear learned overrides, reset to base config\n"
         "/learnstats — 7-day win rates by strategy\n"
         "/settings — current configuration\n"
         "/mode — switch risk mode (Safe / Balanced / Aggressive / Full Send)\n"

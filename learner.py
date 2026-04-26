@@ -160,6 +160,11 @@ async def resolution_monitor(user_clients: dict, tg_app=None):
                     if not resolved:
                         continue
 
+                    # Skip cancelled or invalid markets — not a real win or loss
+                    if resolved.upper() in ("CANCEL", "CANCELLED", "INVALID", "VOID"):
+                        log.info(f"[{chat_id}] Trade {trade['trade_id']} voided ({resolved}) — skipping")
+                        continue
+
                     won    = resolved.lower() in trade["outcome"].lower()
                     fr     = float(market.get("feePercentage", 4)) / 100
                     entry  = trade["entry_price"]
@@ -173,6 +178,14 @@ async def resolution_monitor(user_clients: dict, tg_app=None):
 
                     database.resolve_trade(trade["trade_id"], won, pnl)
 
+                    result = "WIN" if won else "LOSS"
+                    log.info(
+                        f"[{chat_id}] RESOLVED {result} | {trade['strategy']} "
+                        f"{trade['asset']} {trade['timeframe']} {trade['outcome']} | "
+                        f"entry={trade['entry_price']:.3f} amount=₦{trade['amount_ngn']:,.0f} "
+                        f"pnl=₦{pnl:+,.2f}"
+                    )
+
                     if tg_app:
                         fn = tgb.notify_win if won else tgb.notify_loss
                         await fn(
@@ -180,7 +193,7 @@ async def resolution_monitor(user_clients: dict, tg_app=None):
                             trade["asset"], trade["timeframe"], trade["strategy"], pnl,
                         )
                 except Exception as e:
-                    log.debug(f"Resolution check failed {trade['trade_id']}: {e}")
+                    log.warning(f"[{chat_id}] Resolution check failed {trade['trade_id']}: {e}")
 
 
 async def daily_learning_loop(tg_app=None):
