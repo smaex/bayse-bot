@@ -26,9 +26,15 @@ async def full_report(client: BayseClient, chat_id: str | None = None) -> str:
         return f"Error fetching data: {e}"
 
     balance = 0.0
-    for asset in wallet.get("assets", []):
-        if asset.get("currency") == "NGN":
-            balance = float(asset.get("available", 0))
+    assets = wallet if isinstance(wallet, list) else wallet.get("assets", [])
+    for asset in assets:
+        currency = (asset.get("currency") or asset.get("symbol") or "").upper()
+        if currency == "NGN":
+            for field in ("availableBalance", "available", "balance", "total"):
+                v = asset.get(field)
+                if v is not None and float(v) > 0:
+                    balance = float(v)
+                    break
 
     realized_pnl = float(pnl_data.get("realizedPnl", 0) or pnl_data.get("pnl", 0))
     orders = orders_data.get("orders", [])
@@ -146,9 +152,9 @@ def _empty_report(balance: float) -> str:
         f"3. SOL 5-min (high volatility)\n"
         f"4. BTC 1h (larger size per trade)\n\n"
         f"💡 *Edge Summary:*\n"
-        f"• Near-close snipe: 80–99% certainty in last 90s\n"
-        f"• Cross-asset correlation: ~60% edge when BTC leads\n"
-        f"• ARB (mint/burn): 100% certainty, risk-free\n"
+        f"• Near-close snipe: enters up to 5 min before close\n"
+        f"• Cross-asset correlation: ~60% edge when BTC leads ETH/SOL\n"
+        f"• ARB (mint/burn): 100% certainty, risk-free when available\n"
         f"• Effective fee drag: ~1–1.8% per trade (not flat 4%)\n"
         f"• Break-even accuracy needed: ~52–53%"
     )

@@ -10,7 +10,7 @@ All strategies return a TradeSignal or None.
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Literal
 from config import (
     SNIPE_ENTRY_SECONDS, SNIPE_MIN_CERTAINTY, SNIPE_MAX_PRICE,
@@ -39,6 +39,7 @@ class TradeSignal:
     reason: str
     title: str = ""
     arb_quantity: float = 0.0   # only for ARB strategy
+    converged_with: list = field(default_factory=list)  # other strategies that agreed
 
 
 # Track last BTC market move timestamp for correlation signals
@@ -302,6 +303,53 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[Tra
     )
 
 
+def _apply_convergence(signals: list[TradeSignal]) -> list[TradeSignal]:
+    """
+    Boost the best directional signal when multiple independent strategies agree.
+
+    Rules:
+    - ARB is excluded (risk-free, certainty already 1.0, different category)
+    - 2+ directional signals pointing the same way → certainty +7% each, size +25% each
+    - Conflicting signals (some YES, some NO) → flag it, no boost, highest certainty wins
+    """
+    arb = [s for s in signals if s.strategy == "ARB"]
+    directional = [s for s in signals if s.strategy != "ARB"]
+
+    if len(directional) < 2:
+        return signals  # nothing to converge
+
+    yes_sigs = [s for s in directional if s.outcome == "YES"]
+    no_sigs  = [s for s in directional if s.outcome == "NO"]
+
+    if yes_sigs and no_sigs:
+        # Conflicting strategies — flag it, let the strongest directional signal stand
+        best = max(directional, key=lambda s: s.certainty)
+        conflict_strats = " vs ".join(
+            f"{s.strategy}({'YES' if s.outcome=='YES' else 'NO'})" for s in directional
+        )
+        best.reason = f"[⚡ CONFLICT: {conflict_strats}] " + best.reason
+        return arb + sorted(directional, key=lambda s: s.certainty, reverse=True)
+
+    # All directional signals agree — boost the best one
+    dominant = yes_sigs or no_sigs
+    top = max(dominant, key=lambda s: s.certainty)
+    n_extra = len(dominant) - 1  # number of confirming signals beyond the primary
+
+    top.certainty      = min(0.99, top.certainty + 0.07 * n_extra)
+    top.size_pct       = top.size_pct * (1.0 + 0.25 * n_extra)
+    top.converged_with = [s.strategy for s in dominant if s is not top]
+
+    confirming = "+".join(s.strategy for s in dominant)
+    top.reason = f"[🎯 CONVERGED: {confirming}] " + top.reason
+
+    log.info(
+        f"Signal convergence: {confirming} → {top.outcome} "
+        f"certainty={top.certainty:.2%} size_pct={top.size_pct:.4f}"
+    )
+
+    return arb + [top]
+
+
 def evaluate(market: dict, strategies: list | None = None, learned: dict | None = None) -> list[TradeSignal]:
     """Run the given strategies on a market, return signals sorted by certainty."""
     if strategies is None:
@@ -325,4 +373,9 @@ def evaluate(market: dict, strategies: list | None = None, learned: dict | None 
             sig = fn(market)
             if sig:
                 signals.append(sig)
+
+    if not signals:
+        return []
+
+    signals = _apply_convergence(signals)
     return sorted(signals, key=lambda s: s.certainty, reverse=True)

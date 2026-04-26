@@ -767,9 +767,14 @@ async def send_message(app: Application, chat_id: str, text: str, **kwargs):
 
 async def notify_trade(app, cid: str, sig, amount: float):
     icon = "⬆️" if "YES" in sig.outcome.upper() or "UP" in sig.outcome.upper() else "⬇️"
+    converged = getattr(sig, "converged_with", [])
+    if converged:
+        header = f"🎯 *Converged Trade* ({sig.strategy} + {' + '.join(converged)})"
+    else:
+        header = f"🔔 *Trade* ({sig.strategy})"
     await send_message(
         app, cid,
-        f"🔔 *Trade*\n{sig.strategy} | {sig.asset} {sig.timeframe}\n"
+        f"{header}\n{sig.asset} {sig.timeframe}\n"
         f"{icon} {sig.outcome} | ₦{amount:,.0f} @ {sig.certainty:.0%}\n_{sig.reason}_",
         parse_mode="Markdown",
     )
