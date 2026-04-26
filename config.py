@@ -77,7 +77,7 @@ ALL_TIMEFRAMES = ["5min", "15min", "1h", "6h", "1d"]
 # 90s was too late — by then other traders have pushed YES/NO to 0.97-0.98 (no edge).
 # 300s (5 min) lets the bot enter while prices are still in the 0.60-0.85 range.
 SNIPE_ENTRY_SECONDS = 300    # enter when 5 min remain
-SNIPE_MIN_CERTAINTY = 0.65   # certainty threshold (was 0.80 — too strict, trades never fired)
+SNIPE_MIN_CERTAINTY = 0.35   # certainty threshold — lower = more trades, ~57% win rate floor
 SNIPE_MAX_PRICE = 0.92       # never pay more than 0.92 for a "sure thing" (fee protection)
 
 # ── Correlation Signal ─────────────────────────────────────────────────────────
