@@ -89,6 +89,13 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
     raw_certainty = abs(distance_pct) / max(0.005 - time_weight * 0.004, 0.001)
     certainty = min(raw_certainty, 0.99)
 
+    log.info(
+        f"SNIPE [{asset} {market['timeframe']}] {secs:.0f}s left | "
+        f"spot={live_price:,.2f} threshold={threshold:,.2f} ({distance_pct:+.3%}) | "
+        f"certainty={certainty:.2%} min={min_certainty:.0%} "
+        f"{'✓' if certainty >= min_certainty else '✗ LOW'}"
+    )
+
     if certainty < min_certainty:
         return None
 
@@ -102,12 +109,14 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
         market_price = market["no_price"]
 
     if market_price > SNIPE_MAX_PRICE:
+        log.info(f"SNIPE [{asset} {market['timeframe']}] REJECTED — price {market_price:.3f} > max {SNIPE_MAX_PRICE}")
         return None  # already priced in, not worth it
 
     # Check fee-adjusted profitability
     fee_rate = market.get("fee_rate", 0.04)
     be_prob = breakeven_probability(market_price, fee_rate)
     if certainty < be_prob:
+        log.info(f"SNIPE [{asset} {market['timeframe']}] REJECTED — certainty {certainty:.2%} < breakeven {be_prob:.2%}")
         return None
 
     # Size: 3% of bankroll for high certainty, scale down for lower
