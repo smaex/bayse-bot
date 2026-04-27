@@ -425,9 +425,7 @@ async def main():
         active_markets = await scanner.scan_all(_scan_client)
         telegram_bot._active_markets = active_markets
         log.info(f"Initial scan: {len(active_markets)} markets")
-        feeds.restart_bayse_feed(
-            [m["market_id"] for m in active_markets], _on_market_update
-        )
+        feeds.restart_bayse_feed(active_markets, _on_market_update)
 
     # Wait for first spot prices
     for _ in range(20):
