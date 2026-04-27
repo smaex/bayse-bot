@@ -6,6 +6,7 @@ Existing users: all commands work immediately.
 """
 
 import logging
+from datetime import date
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -665,9 +666,15 @@ async def _status_text(cid: str) -> str:
         return "Could not fetch balance right now."
 
     risk  = _user_risks.get(cid)
-    day   = _user_daily.get(cid, {})
     user  = database.get_user(cid)
     s     = user["settings"] if user else {}
+
+    # Prefer in-memory cache; fall back to DB-persisted daily_state on cold restart
+    day = _user_daily.get(cid) or {}
+    if not day and user:
+        saved = s.get("daily_state", {})
+        if saved.get("date") == date.today().isoformat():
+            day = saved
 
     profit_today = balance - day.get("start_balance", balance)
     target       = _calc_target(s, day.get("start_balance", balance))
