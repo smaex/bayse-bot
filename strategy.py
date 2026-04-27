@@ -42,9 +42,10 @@ class TradeSignal:
     converged_with: list = field(default_factory=list)  # other strategies that agreed
 
 
-# Track last BTC market move timestamp for correlation signals
-_btc_signal_time: dict[str, float] = {}   # timeframe → unix timestamp
-_btc_signal_direction: dict[str, str] = {}  # timeframe → "UP" or "DOWN"
+# Track last BTC market move for correlation signals
+_btc_signal_time: dict[str, float] = {}      # timeframe → unix timestamp
+_btc_signal_direction: dict[str, str] = {}   # timeframe → "UP" or "DOWN"
+_btc_signal_move: dict[str, float] = {}      # timeframe → actual move magnitude (stored so per-user threshold can be applied later)
 
 
 def effective_fee(fee_rate: float, price: float) -> float:
@@ -153,21 +154,24 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
 # ── Strategy 2: Cross-asset correlation ──────────────────────────────────────
 
 def record_btc_move(market: dict, yes_price_new: float):
-    """Call this when BTC market YES price moves significantly."""
+    """Record any BTC market move ≥1%. The per-user learned threshold is applied
+    later in correlate_signal() so individual users can have different sensitivity."""
     if market["asset"] != "BTC":
         return
     tf = market["timeframe"]
     old = feeds.prev_yes.get(market["market_id"], yes_price_new)
     move = yes_price_new - old
-    if abs(move) >= CORRELATION_THRESHOLD:
+    if abs(move) >= 0.01:  # record anything ≥1% — per-user filter applied at signal time
         _btc_signal_time[tf] = time.time()
         _btc_signal_direction[tf] = "UP" if move > 0 else "DOWN"
-        log.info(f"BTC {tf} market moved {move:+.3f} — correlation signal {_btc_signal_direction[tf]}")
+        _btc_signal_move[tf] = abs(move)
+        log.info(f"BTC {tf} market moved {move:+.3f} — stored for correlation filter")
 
 
-def correlate_signal(market: dict) -> Optional[TradeSignal]:
+def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> Optional[TradeSignal]:
     """
     If BTC market recently repriced significantly, trade same direction on ETH/SOL.
+    threshold: minimum BTC market move required — can be tuned per-user by the learner.
     """
     if market["asset"] == "BTC":
         return None  # only ETH and SOL benefit from this
@@ -179,6 +183,11 @@ def correlate_signal(market: dict) -> Optional[TradeSignal]:
 
     age = time.time() - signal_time
     if age > CORRELATION_WINDOW_SEC:
+        return None
+
+    # Apply the per-user learned (or default) threshold to the stored move magnitude
+    actual_move = _btc_signal_move.get(tf, 0.0)
+    if actual_move < threshold:
         return None
 
     # Signal fades with age
@@ -372,13 +381,16 @@ def evaluate(market: dict, strategies: list | None = None, learned: dict | None 
         strategies = ["SNIPE", "CORRELATE", "ARB", "NEWS"]
     learned = learned or {}
 
-    # Config is the floor — learned can raise it but never override a deliberate lowering
-    min_cert    = min(learned.get("snipe_min_certainty", SNIPE_MIN_CERTAINTY), SNIPE_MIN_CERTAINTY)
+    # Config is the floor (can never go below it), ceiling prevents bad learned values blocking all trades
+    raw_cert    = learned.get("snipe_min_certainty", SNIPE_MIN_CERTAINTY)
+    min_cert    = max(SNIPE_MIN_CERTAINTY, min(raw_cert, 0.75))
+    raw_corr    = learned.get("correlation_threshold", CORRELATION_THRESHOLD)
+    corr_thresh = max(CORRELATION_THRESHOLD, min(raw_corr, 0.20))
     news_thresh = learned.get("news_sentiment_threshold", 0.35)
 
     dispatch = {
         "SNIPE":     lambda m: snipe_signal(m, min_certainty=min_cert),
-        "CORRELATE": correlate_signal,
+        "CORRELATE": lambda m: correlate_signal(m, threshold=corr_thresh),
         "ARB":       arb_signal,
         "NEWS":      lambda m: news_signal(m, sentiment_threshold=news_thresh),
     }

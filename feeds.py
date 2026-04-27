@@ -26,6 +26,10 @@ prev_yes: dict[str, float] = {}
 # Current Bayse market prices — {market_id: {"yes": float, "no": float}}
 market_prices: dict[str, dict] = {}
 
+# Bayse WebSocket task (restarted after each market scan)
+_bayse_task: asyncio.Task | None = None
+_subscribed_ids: set[str] = set()
+
 def _parse_frames(raw: str):
     for line in raw.strip().split("\n"):
         line = line.strip()
@@ -93,18 +97,18 @@ async def kraken_feed(on_price=None):
 
 # ── Bayse market feed ────────────────────────────────────────────────────────
 
-async def bayse_feed(market_ids: list[str], on_update=None):
-    if not market_ids:
+async def bayse_feed(event_ids: list[str], on_update=None):
+    if not event_ids:
         return
     backoff = 1
     while True:
         try:
             async with websockets.connect(WS_MARKETS_URL, ping_interval=20) as ws:
-                log.info(f"Bayse market feed connected ({len(market_ids)} markets)")
+                log.info(f"Bayse market feed connected ({len(event_ids)} events)")
                 backoff = 1
-                for mid in market_ids:
+                for eid in event_ids:
                     await ws.send(json.dumps({
-                        "type": "subscribe", "channel": "prices", "eventId": mid
+                        "type": "subscribe", "channel": "prices", "eventId": eid
                     }))
                 async for raw in ws:
                     for msg in _parse_frames(raw):
@@ -137,8 +141,25 @@ def _handle_market(msg: dict, on_update=None):
             on_update(mid, market_prices[mid])
 
 
-async def start_feeds(market_ids: list[str], on_price=None, on_update=None):
-    await asyncio.gather(
-        kraken_feed(on_price),
-        bayse_feed(market_ids, on_update),
-    )
+def restart_bayse_feed(markets: list[dict], on_update=None):
+    """Call after each market scan to keep the WS subscriptions current.
+    markets: full market dicts from the scanner (need both event_id and market_id).
+    Subscribes by event_id (what the Bayse WS endpoint expects).
+    """
+    global _bayse_task, _subscribed_ids
+    new_market_ids = {m["market_id"] for m in markets}
+    if new_market_ids == _subscribed_ids and _bayse_task and not _bayse_task.done():
+        return  # no change — avoid unnecessary reconnects
+    _subscribed_ids = new_market_ids
+    if _bayse_task and not _bayse_task.done():
+        _bayse_task.cancel()
+    if markets:
+        # Deduplicate event_ids — each event has one market but avoid duplicate subscribes
+        event_ids = list({m["event_id"] for m in markets})
+        _bayse_task = asyncio.create_task(bayse_feed(event_ids, on_update))
+        log.info(f"Bayse WS (re)started — {len(event_ids)} events / {len(markets)} markets")
+
+
+async def start_feeds(on_price=None):
+    """Start only the Kraken spot feed. Bayse WS is managed via restart_bayse_feed()."""
+    await kraken_feed(on_price)

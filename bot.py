@@ -201,13 +201,16 @@ async def _user_loop(chat_id: str):
 
 
 async def _execute_trade(chat_id, sig, client, risk, balance, settings, learned, max_exp):
-    mult    = learned.get("size_multipliers", {}).get(sig.strategy, 1.0)
-    raw_pct = settings.get("risk_pct", 3.0) * mult / 100.0
-    min_t   = settings.get("mintrade",  100)
-    max_t   = settings.get("maxtrade",  500_000)
+    mult     = learned.get("size_multipliers", {}).get(sig.strategy, 1.0)
+    base_pct = settings.get("risk_pct", 3.0) / 100.0
+    min_t    = settings.get("mintrade",  100)
+    max_t    = settings.get("maxtrade",  500_000)
 
-    amount = balance * min(raw_pct, 0.05)
-    amount = max(min_t, min(max_t, amount))
+    # Scale position size by signal certainty: a 35%-certain trade uses 35% of base risk,
+    # a 99%-certain trade uses 99%. High-conviction signals earn larger positions automatically.
+    raw_pct = base_pct * mult * sig.certainty
+    amount  = balance * min(raw_pct, 0.05)   # hard cap at 5% regardless
+    amount  = max(min_t, min(max_t, amount))
 
     if not risk.can_trade(balance, amount, max_exp):
         return
@@ -309,6 +312,7 @@ async def _scan_loop():
             active_markets = await scanner.scan_all(_scan_client)
             telegram_bot._active_markets = active_markets
             log.info(f"Rescanned: {len(active_markets)} markets")
+            feeds.restart_bayse_feed(active_markets, _on_market_update)
         except Exception as e:
             log.warning(f"Scan failed: {e}")
 
@@ -393,11 +397,9 @@ async def main():
     asyncio.create_task(_keep_alive_server())
     asyncio.create_task(_self_ping_loop())
 
-    asyncio.create_task(feeds.start_feeds(
-        [], on_price=_on_spot_price, on_update=_on_market_update
-    ))
+    asyncio.create_task(feeds.start_feeds(on_price=_on_spot_price))
     asyncio.create_task(news_mod.start_news_feeds())
-    asyncio.create_task(learner.resolution_monitor(_user_clients, _tg_app))
+    asyncio.create_task(learner.resolution_monitor(_user_clients, _user_risks, _tg_app))
     asyncio.create_task(learner.daily_learning_loop(_tg_app))
     asyncio.create_task(_scan_loop())
 
@@ -418,11 +420,14 @@ async def main():
         except Exception:
             pass
 
-    # Initial market scan
+    # Initial market scan + start Bayse WebSocket for real-time prices
     if _scan_client:
         active_markets = await scanner.scan_all(_scan_client)
         telegram_bot._active_markets = active_markets
         log.info(f"Initial scan: {len(active_markets)} markets")
+        feeds.restart_bayse_feed(
+            [m["market_id"] for m in active_markets], _on_market_update
+        )
 
     # Wait for first spot prices
     for _ in range(20):

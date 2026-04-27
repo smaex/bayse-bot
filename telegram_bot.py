@@ -737,7 +737,7 @@ def _settings_text(cid: str) -> str:
     if not user:
         return "Not connected."
     s    = user["settings"]
-    mult = s.get("daily_multiplier", 50)
+    mult = s.get("daily_multiplier", 10)
     abs_ = s.get("daily_target_ngn", 0)
     tgt  = f"₦{abs_:,.0f} (fixed)" if abs_ > 0 else f"{mult}% of starting balance"
     return (
@@ -758,7 +758,7 @@ def _calc_target(settings: dict, start_balance: float) -> float:
     abs_ = settings.get("daily_target_ngn", 0)
     if abs_ > 0:
         return float(abs_)
-    return start_balance * settings.get("daily_multiplier", 50)
+    return start_balance * settings.get("daily_multiplier", 10) / 100
 
 
 def _set_paused(cid: str, paused: bool):

@@ -144,7 +144,26 @@ def run_learning(chat_id: str) -> tuple[dict, str]:
     return learned, "\n".join(lines)
 
 
-async def resolution_monitor(user_clients: dict, tg_app=None):
+_YES_OUTCOMES = {"yes", "up", "outcome1", "1"}
+_NO_OUTCOMES  = {"no", "down", "outcome2", "2"}
+
+
+def _resolved_won(resolved: str, trade: dict, market: dict) -> bool:
+    """Determine if we won, handling Yes/Up/No/Down label variants from the API."""
+    yes_label = (market.get("outcome1Label") or "Up").lower()
+    no_label  = (market.get("outcome2Label") or "Down").lower()
+    r = resolved.lower()
+    yes_signals = _YES_OUTCOMES | {yes_label}
+    no_signals  = _NO_OUTCOMES  | {no_label}
+    if r in yes_signals:
+        return trade["outcome"].upper() == "YES"
+    if r in no_signals:
+        return trade["outcome"].upper() == "NO"
+    # Fallback: maybe resolvedOutcome is the outcome ID itself
+    return resolved == trade.get("outcome_id", "")
+
+
+async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app=None):
     """Check all users' unresolved trades against the Bayse API every 2 minutes."""
     import telegram_bot as tgb
 
@@ -163,9 +182,12 @@ async def resolution_monitor(user_clients: dict, tg_app=None):
                     # Skip cancelled or invalid markets — not a real win or loss
                     if resolved.upper() in ("CANCEL", "CANCELLED", "INVALID", "VOID"):
                         log.info(f"[{chat_id}] Trade {trade['trade_id']} voided ({resolved}) — skipping")
+                        # Still free up the position so exposure cap doesn't stall trading
+                        if user_risks and chat_id in user_risks:
+                            user_risks[chat_id].remove_position(trade["market_id"])
                         continue
 
-                    won    = resolved.lower() in trade["outcome"].lower()
+                    won    = _resolved_won(resolved, trade, market)
                     fr     = float(market.get("feePercentage", 4)) / 100
                     entry  = trade["entry_price"]
                     amount = trade["amount_ngn"]
@@ -177,6 +199,10 @@ async def resolution_monitor(user_clients: dict, tg_app=None):
                         pnl = -amount
 
                     database.resolve_trade(trade["trade_id"], won, pnl)
+
+                    # Free up position in risk manager so exposure cap doesn't block new trades
+                    if user_risks and chat_id in user_risks:
+                        user_risks[chat_id].remove_position(trade["market_id"])
 
                     result = "WIN" if won else "LOSS"
                     log.info(

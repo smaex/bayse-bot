@@ -61,30 +61,40 @@ def _cx() -> psycopg2.extensions.connection:
     return psycopg2.connect(url)
 
 def _execute(query: str, params: tuple = ()):
-    with _cx() as conn:
+    conn = _cx()
+    try:
         with conn.cursor() as cur:
             cur.execute(query, params)
         conn.commit()
+    finally:
+        conn.close()
 
 def _fetch_one(query: str, params: tuple = ()) -> dict | None:
-    with _cx() as conn:
+    conn = _cx()
+    try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(query, params)
             row = cur.fetchone()
-    return dict(row) if row else None
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
 def _fetch_all(query: str, params: tuple = ()) -> list[dict]:
-    with _cx() as conn:
+    conn = _cx()
+    try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(query, params)
             rows = cur.fetchall()
-    return [dict(r) for r in rows]
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 # ── DB setup ──────────────────────────────────────────────────────────────────
 
 def init_db():
-    with _cx() as conn:
+    conn = _cx()
+    try:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -127,6 +137,8 @@ def init_db():
                 ON trades(chat_id, won) WHERE won IS NULL
             """)
         conn.commit()
+    finally:
+        conn.close()
     log.info("Database ready (PostgreSQL)")
 
 

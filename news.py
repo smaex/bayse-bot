@@ -139,6 +139,8 @@ async def newsapi_feed():
                 ) as r:
                     if r.status == 200:
                         data = await r.json()
+                        if data.get("status") != "ok":
+                            log.warning(f"NewsAPI error response: {data.get('code')} {data.get('message')}")
                         for article in data.get("articles", []):
                             article_url = article.get("url", "")
                             if article_url in seen_urls:
