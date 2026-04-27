@@ -95,7 +95,7 @@ def start_user(chat_id: str):
 
 async def _user_loop(chat_id: str):
     """Per-user async trading loop — runs every 10 seconds."""
-    last_news = ""
+    sent_news: set[str] = set()
     iter_count = 0
 
     while True:
@@ -156,8 +156,8 @@ async def _user_loop(chat_id: str):
         # ── News notifications ─────────────────────────────────────────────────
         for sig in news_mod.active_signals:
             key = f"{sig.source}:{sig.headline[:40]}"
-            if key != last_news and sig.strength() > 0.4:
-                last_news = key
+            if key not in sent_news and sig.strength() > 0.4:
+                sent_news.add(key)
                 if _tg_app:
                     await telegram_bot.notify_news(
                         _tg_app, chat_id,
