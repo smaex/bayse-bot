@@ -187,16 +187,32 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                             user_risks[chat_id].remove_position(trade["market_id"])
                         continue
 
-                    won    = _resolved_won(resolved, trade, market)
-                    fr     = float(market.get("feePercentage", 4)) / 100
-                    entry  = trade["entry_price"]
-                    amount = trade["amount_ngn"]
-                    if won:
-                        shares  = amount / entry
-                        fee_amt = fr * shares * entry * max(1 - entry, 0.5)
-                        pnl     = shares * (1.0 - entry) - fee_amt
-                    else:
-                        pnl = -amount
+                    won = _resolved_won(resolved, trade, market)
+
+                    # Try to get the real PnL from Bayse — avoids fee estimation errors
+                    pnl = None
+                    order_id = trade.get("order_id")
+                    if order_id:
+                        try:
+                            order_data = await client.get_order(order_id)
+                            raw = (order_data.get("profit") or order_data.get("pnl")
+                                   or order_data.get("realizedPnl"))
+                            if raw is not None:
+                                pnl = float(raw)
+                        except Exception as oe:
+                            log.debug(f"get_order fallback: {oe}")
+
+                    # Fallback: estimate PnL from our own formula
+                    if pnl is None:
+                        fr     = float(market.get("feePercentage", 4)) / 100
+                        entry  = trade["entry_price"]
+                        amount = trade["amount_ngn"]
+                        if won:
+                            shares  = amount / entry
+                            fee_amt = fr * shares * entry * max(1 - entry, 0.5)
+                            pnl     = shares * (1.0 - entry) - fee_amt
+                        else:
+                            pnl = -amount
 
                     database.resolve_trade(trade["trade_id"], won, pnl)
 
@@ -211,15 +227,20 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                         f"entry={trade['entry_price']:.3f} amount=₦{trade['amount_ngn']:,.0f} "
                         f"pnl=₦{pnl:+,.2f}"
                     )
+                except Exception as e:
+                    log.warning(f"[{chat_id}] Resolution check failed {trade['trade_id']}: {e}")
+                    continue
 
-                    if tg_app:
+                # Notify outside the main try/except so a Telegram error never silences the resolution
+                if tg_app:
+                    try:
                         fn = tgb.notify_win if won else tgb.notify_loss
                         await fn(
                             tg_app, chat_id, trade["market_id"],
                             trade["asset"], trade["timeframe"], trade["strategy"], pnl,
                         )
-                except Exception as e:
-                    log.warning(f"[{chat_id}] Resolution check failed {trade['trade_id']}: {e}")
+                    except Exception as ne:
+                        log.warning(f"[{chat_id}] Notify failed {trade['trade_id']}: {ne}")
 
 
 async def daily_learning_loop(tg_app=None):

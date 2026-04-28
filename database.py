@@ -117,6 +117,7 @@ def init_db():
                     outcome_id            TEXT,
                     market_id             TEXT,
                     event_id              TEXT,
+                    order_id              TEXT,
                     entry_price           REAL,
                     amount_ngn            REAL,
                     certainty             REAL,
@@ -127,6 +128,9 @@ def init_db():
                     created_at            TEXT,
                     resolved_at           TEXT
                 )
+            """)
+            cur.execute("""
+                ALTER TABLE trades ADD COLUMN IF NOT EXISTS order_id TEXT
             """)
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_trades_user
@@ -186,14 +190,14 @@ def record_trade(chat_id: str, **kw) -> str:
     _execute("""
         INSERT INTO trades
           (trade_id, chat_id, strategy, asset, timeframe, outcome, outcome_id,
-           market_id, event_id, entry_price, amount_ngn, certainty,
+           market_id, event_id, order_id, entry_price, amount_ngn, certainty,
            secs_to_close, spot_vs_threshold_pct, created_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
         trade_id, chat_id,
         kw.get("strategy"), kw.get("asset"), kw.get("timeframe"),
         kw.get("outcome"), kw.get("outcome_id"),
-        kw.get("market_id"), kw.get("event_id"),
+        kw.get("market_id"), kw.get("event_id"), kw.get("order_id"),
         kw.get("entry_price"), kw.get("amount_ngn"),
         kw.get("certainty"), kw.get("secs_to_close"),
         kw.get("spot_vs_threshold_pct", 0.0), now,

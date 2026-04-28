@@ -228,6 +228,7 @@ async def _execute_trade(chat_id, sig, client, risk, balance, settings, learned,
         )
         order        = resp.get("order", resp)
         filled_price = float(order.get("price", sig.market_price) or sig.market_price)
+        bayse_order_id = order.get("id") or order.get("orderId") or order.get("order_id")
 
         log.info(
             f"[{chat_id}] PLACED {sig.strategy} | {sig.asset} {sig.timeframe} {sig.outcome} "
@@ -242,7 +243,7 @@ async def _execute_trade(chat_id, sig, client, risk, balance, settings, learned,
         trade_id = database.record_trade(
             chat_id=chat_id, strategy=sig.strategy, asset=sig.asset,
             timeframe=sig.timeframe, outcome=sig.outcome, outcome_id=sig.outcome_id,
-            market_id=sig.market_id, event_id=sig.event_id,
+            market_id=sig.market_id, event_id=sig.event_id, order_id=bayse_order_id,
             entry_price=filled_price, amount_ngn=amount, certainty=sig.certainty,
             secs_to_close=market["secs_to_close"] if market else 0,
             spot_vs_threshold_pct=spot_vs_thresh,
@@ -271,13 +272,24 @@ async def _execute_arb(chat_id, sig, client, balance, settings):
     ws = feeds.market_prices.get(sig.market_id)
     yes_p = ws["yes"] if ws else market["yes_price"]
     no_p  = ws["no"]  if ws else market["no_price"]
+    if yes_p <= 0 or no_p <= 0:  # prices not yet received from WS — skip
+        return
     if yes_p + no_p >= 0.99:  # tight buffer — any sum ≥0.99 is not worth the slippage
         return
 
+    min_t     = settings.get("mintrade", 100)
     max_t     = settings.get("maxtrade", 500_000)
-    max_pairs = min(ARB_MAX_SIZE_NGN, max_t, balance * 0.05) / (yes_p + no_p)
-    if max_pairs < 10:
-        return
+
+    # Each leg must meet Bayse's minimum order size independently
+    # Budget = smaller of the two leg costs × pairs, so both legs clear the minimum
+    budget     = min(ARB_MAX_SIZE_NGN, max_t, balance * 0.05)
+    min_budget = min_t / min(yes_p, no_p)        # pairs needed so smaller leg = mintrade
+    if budget / (yes_p + no_p) < min_budget:
+        budget = min_budget * (yes_p + no_p)     # scale up to meet minimum
+
+    max_pairs = budget / (yes_p + no_p)
+    if max_pairs * yes_p < min_t or max_pairs * no_p < min_t:
+        return  # can't meet platform minimum on both legs — skip
 
     profit_est = max_pairs * (1.00 - yes_p - no_p)
     log.info(f"[{chat_id}] ARB {sig.asset}: {max_pairs:.0f} pairs → est ₦{profit_est:,.2f}")

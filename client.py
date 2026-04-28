@@ -174,6 +174,9 @@ class BayseClient:
     async def list_orders(self, page: int = 1, limit: int = 50) -> dict:
         return await self._get("/v1/pm/orders", params={"page": page, "limit": limit})
 
+    async def get_order(self, order_id: str) -> dict:
+        return await self._get(f"/v1/pm/orders/{order_id}")
+
     # ── Portfolio ─────────────────────────────────────────────────────────────
 
     async def get_portfolio(self) -> dict:

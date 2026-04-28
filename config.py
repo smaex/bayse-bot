@@ -73,12 +73,26 @@ ALL_ASSETS     = ["BTC", "ETH", "SOL"]
 ALL_TIMEFRAMES = ["5min", "15min", "1h", "6h", "1d"]
 
 # ── Sniping ───────────────────────────────────────────────────────────────────
-# Enter a snipe trade when this many seconds remain before market close.
-# 90s was too late — by then other traders have pushed YES/NO to 0.97-0.98 (no edge).
-# 300s (5 min) lets the bot enter while prices are still in the 0.60-0.85 range.
-SNIPE_ENTRY_SECONDS = 600    # enter when 10 min remain — 5 min window misses early pricing
-SNIPE_MIN_CERTAINTY = 0.35   # certainty threshold — lower = more trades, ~57% win rate floor
-SNIPE_MAX_PRICE = 0.92       # never pay more than 0.92 for a "sure thing" (fee protection)
+# Per-timeframe entry windows: each timeframe has its own optimal entry point.
+# Short timeframes move fast — enter late when signal is strong.
+# Long timeframes need early entry to catch markets before they fully price in.
+SNIPE_ENTRY_WINDOWS = {
+    "5min":  240,    # last 4 min — BTC 1% above threshold gives ~98% win prob here
+    "15min": 600,    # last 10 min — good balance of certainty vs market price
+    "1h":    1800,   # last 30 min — catches 1h markets while still at 0.60-0.75
+    "6h":    7200,   # last 2 hours
+    "1d":    21600,  # last 6 hours
+}
+
+# Asset hourly volatility (1σ, fractional) — used in diffusion model for win probability.
+# P(win) = Φ( |spot_distance| / (σ_h × √T_hours) )  ← same math as options pricing
+ASSET_HOURLY_VOL = {
+    "BTC": 0.018,   # ~1.8% per hour (annualised ~28%)
+    "ETH": 0.022,   # ~2.2% per hour (annualised ~34%)
+    "SOL": 0.028,   # ~2.8% per hour (annualised ~43%)
+}
+
+SNIPE_MIN_CERTAINTY = 0.40   # min certainty = min win_prob of 68% (0.50 + 0.45×0.40)
 
 # ── Correlation Signal ─────────────────────────────────────────────────────────
 CORRELATION_THRESHOLD = 0.04  # BTC market must move ≥4% for cross-asset signal (was 8% — never fired)
