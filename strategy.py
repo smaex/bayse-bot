@@ -1,44 +1,61 @@
 """
 Strategy engine — four independent signal generators.
 
-Quantitative framework (applied throughout):
+Quantitative framework (5-model composite for SNIPE):
 
-  Win probability via diffusion model
+  1. Diffusion model (Brownian motion) — primary signal
+  ──────────────────────────────────────────────────────
+  P(win) = Φ( |d| / (σ_h × √T_h) )   ← same math as Black-Scholes d2
+  σ_h is computed from LIVE realized volatility, not a fixed constant.
+
+  2. Realized volatility (dynamic σ)
   ────────────────────────────────────
-  Treats the underlying asset price as a Brownian motion process.
-  P(win) = Φ( |d| / (σ_h × √T_h) )
-  where d   = fractional distance of spot from threshold
-        σ_h = asset hourly volatility
-        T_h = hours remaining until market close
-        Φ   = standard normal CDF
+  Instead of a fixed hourly-vol config, the bot measures actual price
+  movement from the last 10 minutes of ticks and blends that with the
+  long-run config value. A calmer-than-usual market → lower σ → higher
+  win probability for the same distance.
 
-  This is the same integral that Black-Scholes uses for d2 — the probability
-  that the asset ends above/below the strike given current distance and time.
+  3. Momentum confirmation
+  ─────────────────────────
+  Compares the early vs late thirds of the last 90-second price window.
+  +1 = price strongly moving away from threshold (confirms our bet).
+  −1 = price moving toward threshold (undermines our bet).
+  Adds ±0.12 to composite certainty.
 
-  Dynamic max entry price (Kelly-derived)
-  ────────────────────────────────────────
-  From first principles:
-    EV = W × (1/P × (1-fee) - 1) - (1-W) > 0
-    → P < W × (1 - fee)
-  So we only enter when: market_price < win_prob × (1 - fee_rate)
-  This guarantees every trade has positive expected value before sizing.
+  4. Regime detection (efficiency ratio)
+  ───────────────────────────────────────
+  Net displacement ÷ total path length over the last 5 minutes.
+  Clean trend → ratio near 1 → regime_factor up to 1.25× certainty.
+  Random chop → ratio near 0 → regime_factor as low as 0.75×.
+
+  5. Market mispricing / edge score
+  ───────────────────────────────────
+  Edge = our_model_win_prob − market_price.
+  Positive edge (market underpricing our side) → up to +0.12 bonus.
+  Negative edge (market already priced our move) → up to −0.08 penalty.
+
+  Composite certainty
+  ────────────────────
+  composite = (base + mom_bonus + edge_bonus) × regime_factor
+  Trade fires only when composite ≥ SNIPE_MIN_CERTAINTY (0.40).
+  Hard veto: adverse momentum (< −0.7) on a weak base (< 0.55).
+
+  Dynamic EV ceiling (Kelly-derived)
+  ────────────────────────────────────
+  Only enter when market_price < win_prob × (1 − fee).  Guarantees
+  every accepted trade has positive expected value.
 
   Quarter-Kelly position sizing
   ──────────────────────────────
-  b  = net payoff ratio = (1-fee)/market_price - 1
-  f* = (W×b - (1-W)) / b    ← full Kelly fraction
-  We use f*/4 capped at 5% of bankroll for robustness against model error.
-
-  Per-timeframe entry windows
-  ────────────────────────────
-  Each timeframe has its own optimal entry window. Short markets (5min) move
-  fast — enter 4 minutes out when the signal is already strong. Long markets
-  (1h, 6h) need earlier entry to catch prices before they fully converge.
+  f* = (W×b − (1−W)) / b   capped at 5% of bankroll.
+  Position size is then scaled by composite certainty so high-conviction
+  signals earn proportionally larger positions.
 """
 
 import logging
 import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Literal
 from config import (
@@ -62,7 +79,7 @@ class TradeSignal:
     timeframe: str
     outcome: str          # "YES" or "NO"
     outcome_id: str
-    certainty: float      # 0–1 derived from win_probability
+    certainty: float      # composite 0–1
     market_price: float   # current AMM price of chosen outcome
     size_pct: float       # fraction of bankroll (quarter-Kelly)
     reason: str
@@ -77,48 +94,51 @@ _btc_signal_direction: dict[str, str]   = {}
 _btc_signal_move:      dict[str, float] = {}
 
 
+# ── Price history (feeds all 5 quant signals) ─────────────────────────────────
+_price_history:        dict[str, deque] = {}   # asset → deque[(timestamp, price)]
+_last_history_update:  dict[str, float] = {}   # throttle to 1 sample per 5s
+
+def update_price_history(asset: str, price: float) -> None:
+    """Record spot tick for quant signals (throttled to 1 sample per 5 s)."""
+    now = time.time()
+    if now - _last_history_update.get(asset, 0) < 5:
+        return
+    _last_history_update[asset] = now
+    if asset not in _price_history:
+        _price_history[asset] = deque(maxlen=120)  # 10 min at 5s cadence
+    _price_history[asset].append((now, price))
+
+
 # ── Quantitative helpers ──────────────────────────────────────────────────────
 
 def _norm_cdf(z: float) -> float:
-    """Standard normal CDF — uses math.erf (stdlib, no scipy needed)."""
+    """Standard normal CDF via math.erf (stdlib — no scipy needed)."""
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
 
 
-def win_probability(distance_pct: float, secs_remaining: float, asset: str) -> float:
+def win_probability(distance_pct: float, secs_remaining: float, asset: str,
+                    sigma_override: float = None) -> float:
     """
-    P(our direction wins) via diffusion model (Brownian motion assumption).
+    P(our direction wins) via diffusion model.
 
-    If spot is d% above threshold with T hours left and the asset has hourly
-    volatility σ_h, the probability it stays above the threshold is:
-        P = Φ( d / (σ_h × √T) )
+    P = Φ( |d| / (σ_h × √T_h) )
 
-    More time remaining → more chance of reversal → lower P for the same distance.
-    Larger distance → less likely to reverse → higher P.
+    sigma_override lets callers pass realized vol instead of config vol.
     """
-    sigma_h = ASSET_HOURLY_VOL.get(asset, 0.022)
-    t_hours = max(secs_remaining / 3600.0, 1.0 / 3600.0)  # floor at 1 second
+    sigma_h = sigma_override if sigma_override is not None else ASSET_HOURLY_VOL.get(asset, 0.022)
+    t_hours = max(secs_remaining / 3600.0, 1.0 / 3600.0)
     z = abs(distance_pct) / (sigma_h * math.sqrt(t_hours))
     return _norm_cdf(z)
 
 
 def max_ev_price(win_prob: float, fee_rate: float = 0.04) -> float:
-    """
-    Max entry price where EV > 0.
-    Derived from EV = W×(payout - 1) - (1-W) > 0, where payout = (1-fee)/price.
-    Rearranges to: price < W × (1 - fee_rate)
-    """
+    """Max entry price guaranteeing EV > 0.  price < W × (1 − fee)."""
     return win_prob * (1.0 - fee_rate)
 
 
 def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.04,
                fraction: float = 0.25, cap: float = 0.05) -> float:
-    """
-    Quarter-Kelly position size fraction, capped at `cap`.
-
-    Full Kelly: f* = (W×b - (1-W)) / b  where b = net payoff if win = (1-fee)/price - 1
-    We use fraction=0.25 (quarter-Kelly) to account for model error and
-    the fat-tailed reality of crypto price distributions.
-    """
+    """Quarter-Kelly position size, capped at `cap`."""
     b = (1.0 - fee_rate) / market_price - 1.0
     if b <= 0:
         return 0.0
@@ -127,30 +147,97 @@ def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.04,
 
 
 def _certainty_from_prob(win_prob: float) -> float:
-    """Map win_prob [0.50–0.999] → certainty [0–1] for display and thresholds."""
+    """Map win_prob [0.50–0.999] → certainty [0–1]."""
     return max(0.0, min((win_prob - 0.50) / 0.45, 0.99))
 
 
 def certainty_to_prob(certainty: float) -> float:
-    """Legacy helper used by CORRELATE / NEWS — maps certainty [0–1] → prob [0.50–0.95]."""
+    """Legacy helper for CORRELATE/NEWS: certainty [0–1] → prob [0.50–0.95]."""
     return 0.50 + 0.45 * min(certainty, 1.0)
 
 
-# ── Strategy 1: SNIPE — per-timeframe diffusion model ────────────────────────
+# ── Quant signal 2: realized volatility ──────────────────────────────────────
+
+def realized_vol_hourly(asset: str) -> float:
+    """
+    Actual hourly vol computed from recent price ticks.
+    Blends with config value — full weight after ~5 minutes of data.
+    """
+    hist = list(_price_history.get(asset, []))
+    config_vol = ASSET_HOURLY_VOL.get(asset, 0.022)
+    if len(hist) < 10:
+        return config_vol
+    prices = [p for _, p in hist]
+    log_returns = [math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices))]
+    if len(log_returns) < 5:
+        return config_vol
+    mean_r   = sum(log_returns) / len(log_returns)
+    variance = sum((r - mean_r) ** 2 for r in log_returns) / len(log_returns)
+    # 5-second samples → 720 ticks per hour
+    hourly_rv = math.sqrt(variance) * math.sqrt(720)
+    # Ramp blend weight from 0 → 1 over first 60 samples (~5 minutes)
+    weight = min(len(log_returns) / 60.0, 1.0)
+    return config_vol * (1.0 - weight) + hourly_rv * weight
+
+
+# ── Quant signal 3: momentum ──────────────────────────────────────────────────
+
+def _momentum_score(asset: str, direction: str) -> float:
+    """
+    +1 = price moving strongly in our favour (away from threshold).
+    −1 = price moving strongly against us (toward threshold).
+    direction: 'YES' (we want higher price) or 'NO' (we want lower price).
+    Measured over last 90 seconds of ticks.
+    """
+    hist = list(_price_history.get(asset, []))
+    n = min(len(hist), 18)   # 18 × 5s = 90s window
+    if n < 6:
+        return 0.0
+    prices = [p for _, p in hist[-n:]]
+    third = max(1, n // 3)
+    early = sum(prices[:third]) / third
+    late  = sum(prices[-third:]) / third
+    change = (late - early) / early          # fractional price change
+    signed = change if direction == "YES" else -change
+    # ±0.1% over the window maps to ±1.0
+    return min(max(signed / 0.001, -1.0), 1.0)
+
+
+# ── Quant signal 4: regime (efficiency ratio) ─────────────────────────────────
+
+def _regime_score(asset: str) -> float:
+    """
+    0 = pure choppy noise, 1 = clean directional trend.
+    Uses efficiency ratio: net displacement / total path length over 5 min.
+    Efficiency ≥ 0.50 scores 1.0 (already a decent trend).
+    """
+    hist = list(_price_history.get(asset, []))
+    n = min(len(hist), 60)   # 60 × 5s = 5-minute window
+    if n < 10:
+        return 0.5            # neutral when insufficient data
+    prices = [p for _, p in hist[-n:]]
+    net  = abs(prices[-1] - prices[0])
+    path = sum(abs(prices[i] - prices[i - 1]) for i in range(1, len(prices)))
+    if path < 1e-10:
+        return 0.5
+    return min(net / path / 0.5, 1.0)
+
+
+# ── Strategy 1: SNIPE — 5-model composite ────────────────────────────────────
 
 def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Optional[TradeSignal]:
     """
-    Enter when the live spot price has moved convincingly past the threshold,
-    using a diffusion model to estimate true win probability.
+    Enter when the diffusion model AND supporting signals agree.
 
-    Each timeframe gets its own entry window:
-      5min  → last 4 min  (market price still exploitable when certainty is high)
-      15min → last 10 min
-      1h    → last 30 min (catch before price fully converges)
-      6h/1d → even earlier
+    Five-model composite certainty:
+      base     = _certainty_from_prob(win_prob using realized vol)
+      mom      = ±0.12 from 90-second momentum
+      edge     = ±0.08–0.12 from model vs market-implied price
+      regime   = ×0.75 (choppy) to ×1.25 (trending)
+      composite = (base + mom_bonus + edge_bonus) × regime_factor
 
-    Max entry price is dynamic: only enter if market_price < win_prob × (1-fee),
-    guaranteeing positive EV on every trade we accept.
+    Hard veto: composite below threshold, or strong adverse momentum
+    on a weak base signal.  EV ceiling still applied after all filters.
     """
     tf   = market["timeframe"]
     secs = market["secs_to_close"]
@@ -167,29 +254,55 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
             log.warning(f"SNIPE [{asset} {tf}] no spot price in feeds.spot")
         return None
 
-    distance_pct = (live_spot - threshold) / threshold  # +ve = YES wins
+    distance_pct = (live_spot - threshold) / threshold   # +ve → YES wins
 
-    # ── Diffusion-model win probability ──────────────────────────────────────
-    w_est     = win_probability(distance_pct, secs, asset)
-    certainty = _certainty_from_prob(w_est)
+    # ── Signal 1: diffusion win probability (realized vol) ────────────────────
+    rv    = realized_vol_hourly(asset)
+    w_est = win_probability(distance_pct, secs, asset, sigma_override=rv)
+    base  = _certainty_from_prob(w_est)
 
-    log.info(
-        f"SNIPE [{asset} {tf}] {secs:.0f}s | "
-        f"spot={live_spot:,.2f} threshold={threshold:,.2f} ({distance_pct:+.3%}) | "
-        f"w_est={w_est:.1%} certainty={certainty:.2%} "
-        f"{'✓' if certainty >= min_certainty else '✗ LOW'}"
-    )
-
-    if certainty < min_certainty:
-        return None
-
-    # ── Direction ─────────────────────────────────────────────────────────────
-    if distance_pct > 0:
+    # ── Direction + market price ───────────────────────────────────────────────
+    direction = "YES" if distance_pct > 0 else "NO"
+    if direction == "YES":
         outcome, outcome_id, market_price = "YES", market["yes_id"], market["yes_price"]
     else:
         outcome, outcome_id, market_price = "NO",  market["no_id"],  market["no_price"]
 
-    # ── Dynamic EV gate: only enter if market hasn't priced out our edge ──────
+    # ── Signal 3: momentum ────────────────────────────────────────────────────
+    mom       = _momentum_score(asset, direction)
+    mom_bonus = 0.12 * mom                     # ±0.12 range
+
+    # ── Signal 4: regime ──────────────────────────────────────────────────────
+    regime        = _regime_score(asset)
+    regime_factor = 0.75 + 0.50 * regime       # 0.75 (choppy) → 1.25 (trending)
+
+    # ── Signal 5: edge vs market-implied probability ───────────────────────────
+    raw_edge   = w_est - market_price           # +ve = market underpricing our side
+    edge_bonus = min(max(raw_edge * 0.40, -0.08), 0.12)
+
+    # ── Composite certainty ───────────────────────────────────────────────────
+    composite = min((base + mom_bonus + edge_bonus) * regime_factor, 0.99)
+
+    log.info(
+        f"SNIPE [{asset} {tf}] {secs:.0f}s | "
+        f"spot={live_spot:,.2f} threshold={threshold:,.2f} ({distance_pct:+.3%}) | "
+        f"w={w_est:.1%} rv={rv:.3f} base={base:.2f} mom={mom:+.2f} "
+        f"regime={regime:.2f} edge={raw_edge:+.3f} ➜ composite={composite:.2f} "
+        f"{'✓' if composite >= min_certainty else '✗ LOW'}"
+    )
+
+    # Hard veto: price racing toward threshold on an already-weak signal
+    if mom < -0.7 and base < 0.55:
+        log.info(
+            f"SNIPE [{asset} {tf}] VETOED — adverse momentum ({mom:+.2f}) "
+            f"with weak base ({base:.2f})"
+        )
+        return None
+
+    if composite < min_certainty:
+        return None
+
+    # ── Dynamic EV gate ───────────────────────────────────────────────────────
     fee_rate  = market.get("fee_rate", 0.04)
     ev_ceiling = max_ev_price(w_est, fee_rate)
 
@@ -206,7 +319,7 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
     log.info(
         f"SNIPE [{asset} {tf}] ✅ SIGNAL | "
         f"market={market_price:.3f} < ceiling={ev_ceiling:.3f} | "
-        f"size={size:.2%}"
+        f"composite={composite:.2f} size={size:.2%}"
     )
 
     return TradeSignal(
@@ -217,13 +330,14 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
         timeframe=tf,
         outcome=outcome,
         outcome_id=outcome_id,
-        certainty=certainty,
+        certainty=composite,
         market_price=market_price,
         size_pct=size,
         reason=(
-            f"Spot {asset}={live_spot:,.2f} vs threshold={threshold:,.2f} "
-            f"({distance_pct:+.3%}), {secs:.0f}s to close | "
-            f"w_est={w_est:.1%} market={market_price:.3f} ceiling={ev_ceiling:.3f} [{tf}]"
+            f"Spot {asset}={live_spot:,.2f} threshold={threshold:,.2f} "
+            f"({distance_pct:+.3%}), {secs:.0f}s | "
+            f"w={w_est:.1%} rv={rv:.3f} mom={mom:+.2f} "
+            f"regime={regime:.2f} edge={raw_edge:+.3f} composite={composite:.2f} [{tf}]"
         ),
         title=market["title"],
     )
@@ -232,7 +346,7 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
 # ── Strategy 2: CORRELATE — BTC → ETH/SOL lead-lag ───────────────────────────
 
 def record_btc_move(market: dict, yes_price_new: float):
-    """Record any BTC market move ≥1%. Per-user threshold applied later in correlate_signal."""
+    """Record any BTC market move ≥1%. Per-user threshold applied later."""
     if market["asset"] != "BTC":
         return
     tf  = market["timeframe"]
@@ -248,7 +362,7 @@ def record_btc_move(market: dict, yes_price_new: float):
 def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> Optional[TradeSignal]:
     """
     BTC market reprices → trade same direction on ETH/SOL before it catches up.
-    Uses dynamic EV ceiling (same framework as SNIPE) instead of hardcoded price cap.
+    Momentum of the target asset boosts/reduces certainty by ±20%.
     """
     if market["asset"] == "BTC":
         return None
@@ -274,7 +388,10 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> 
     else:
         outcome, outcome_id, market_price = "NO",  market["no_id"],  market["no_price"]
 
-    certainty = 0.60 * freshness
+    # Momentum of target asset confirms or weakens the correlation signal
+    mom       = _momentum_score(market["asset"], direction == "UP" and "YES" or "NO")
+    certainty = min(0.60 * freshness * (1.0 + 0.20 * mom), 0.99)
+
     w_est     = certainty_to_prob(certainty)
     fee_rate  = market.get("fee_rate", 0.04)
     ev_ceiling = max_ev_price(w_est, fee_rate)
@@ -297,7 +414,7 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> 
         size_pct=size,
         reason=(
             f"BTC→{market['asset']} {direction} correlation, "
-            f"age={age:.0f}s freshness={freshness:.2f} "
+            f"age={age:.0f}s freshness={freshness:.2f} mom={mom:+.2f} "
             f"market={market_price:.3f} ceiling={ev_ceiling:.3f}"
         ),
         title=market["title"],
@@ -356,7 +473,7 @@ def arb_signal(market: dict) -> Optional[TradeSignal]:
 def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[TradeSignal]:
     """
     Trade in the direction of a live high-confidence news signal.
-    Uses dynamic EV ceiling — avoids entering markets already priced for the news.
+    Momentum of the target asset provides a ±15% certainty adjustment.
     """
     asset = market["asset"]
     sig   = news_mod.best_signal_for(asset)
@@ -372,17 +489,23 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[Tra
 
     if sig.direction == "BULLISH":
         outcome, outcome_id, market_price = "YES", market["yes_id"], yes_p
+        direction = "YES"
     else:
         outcome, outcome_id, market_price = "NO",  market["no_id"],  no_p
+        direction = "NO"
 
-    w_est      = certainty_to_prob(strength)
+    # Momentum adjustment: confirming price move boosts confidence
+    mom          = _momentum_score(asset, direction)
+    strength_adj = min(strength * (1.0 + 0.15 * mom), 0.99)
+
+    w_est      = certainty_to_prob(strength_adj)
     fee_rate   = market.get("fee_rate", 0.04)
     ev_ceiling = max_ev_price(w_est, fee_rate)
 
     if market_price >= ev_ceiling:
         return None
 
-    size = kelly_size(w_est, market_price, fee_rate, fraction=0.20)  # smaller fraction for news
+    size = kelly_size(w_est, market_price, fee_rate, fraction=0.20)
 
     return TradeSignal(
         strategy="NEWS",
@@ -392,11 +515,12 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[Tra
         timeframe=market["timeframe"],
         outcome=outcome,
         outcome_id=outcome_id,
-        certainty=strength,
+        certainty=strength_adj,
         market_price=market_price,
         size_pct=size,
         reason=(
             f"News [{sig.direction}] src={sig.source} score={strength:.2f} "
+            f"mom={mom:+.2f} adj={strength_adj:.2f} "
             f"market={market_price:.3f} ceiling={ev_ceiling:.3f}: {sig.headline[:60]}"
         ),
         title=market["title"],

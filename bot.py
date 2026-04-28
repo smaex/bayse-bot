@@ -335,6 +335,7 @@ def _refresh_timers():
 
 
 def _on_spot_price(asset: str, price: float):
+    strategy.update_price_history(asset, price)
     log.debug(f"Spot {asset}: {price:,.4f}")
 
 
