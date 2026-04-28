@@ -352,14 +352,14 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     s    = user["settings"]
     key, vals = args[0].lower(), args[1:]
 
-    ASSETS     = {"BTC", "ETH", "SOL"}
+    ASSETS     = {"BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "EURGBP", "XAUUSD"}
     TIMEFRAMES = {"5min", "15min", "1h", "6h", "1d"}
     STRATEGIES = {"SNIPE", "CORRELATE", "ARB", "NEWS"}
 
     if key == "assets":
         bad = [v for v in vals if v.upper() not in ASSETS]
         if bad:
-            await update.message.reply_text(f"Unknown: {bad}. Valid: BTC ETH SOL"); return
+            await update.message.reply_text(f"Unknown: {bad}. Valid: BTC ETH SOL EURUSD GBPUSD EURGBP XAUUSD"); return
         s["assets"] = [v.upper() for v in vals]
         msg = f"Assets: {s['assets']}"
 
@@ -596,6 +596,32 @@ _MODES = {
             "daily_target_ngn": 0,
         },
     },
+    "mode_fx": {
+        "label": "💱 FX + Crypto",
+        "description": (
+            "*💱 FX + Crypto Mode*\n\n"
+            "Trades both crypto and FX/Gold markets.\n"
+            "FX markets are calmer — high win probability at small distances.\n"
+            "More markets open = more opportunities per day.\n\n"
+            "• Assets: BTC, ETH, SOL + EUR/USD, GBP/USD, EUR/GBP, Gold\n"
+            "• Timeframes: 15min, 1h\n"
+            "• Strategies: SNIPE, ARB\n"
+            "• Risk per trade: 3%\n"
+            "• Min trade: ₦100\n"
+            "• Max exposure: 25%\n"
+            "• Daily target: 10% of starting balance"
+        ),
+        "settings": {
+            "assets":           ["BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "EURGBP", "XAUUSD"],
+            "timeframes":       ["15min", "1h"],
+            "strategies":       ["SNIPE", "ARB"],
+            "risk_pct":         3.0,
+            "mintrade":         100,
+            "maxexposure":      25.0,
+            "daily_multiplier": 10,
+            "daily_target_ngn": 0,
+        },
+    },
 }
 
 
@@ -609,6 +635,9 @@ async def cmd_mode(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("🟠 Aggressive", callback_data="mode_aggressive"),
             InlineKeyboardButton("🔴 Full Send",  callback_data="mode_degen"),
+        ],
+        [
+            InlineKeyboardButton("💱 FX + Crypto", callback_data="mode_fx"),
         ],
     ]
     await update.message.reply_text(
@@ -645,7 +674,7 @@ async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         "/resetlearning — clear learned overrides, reset to base config\n"
         "/learnstats — 7-day win rates by strategy\n"
         "/settings — current configuration\n"
-        "/mode — switch risk mode (Safe / Balanced / Aggressive / Full Send)\n"
+        "/mode — switch risk mode (Safe / Balanced / Aggressive / FX+Crypto / Full Send)\n"
         "/set — change a single setting (type /set for options)\n"
         "/pause — stop all trading\n"
         "/resume — restart trading\n"

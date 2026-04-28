@@ -368,12 +368,15 @@ def record_btc_move(market: dict, yes_price_new: float):
         log.info(f"BTC {tf} market moved {move:+.3f} — stored for CORRELATE")
 
 
+_CRYPTO_ASSETS = {"BTC", "ETH", "SOL"}
+
 def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> Optional[TradeSignal]:
     """
     BTC market reprices → trade same direction on ETH/SOL before it catches up.
+    FX and commodity markets are excluded — they don't correlate with BTC.
     Momentum of the target asset boosts/reduces certainty by ±20%.
     """
-    if market["asset"] == "BTC":
+    if market["asset"] not in _CRYPTO_ASSETS or market["asset"] == "BTC":
         return None
 
     tf          = market["timeframe"]

@@ -32,15 +32,16 @@ market_prices: dict[str, dict] = {}
 _bayse_task: asyncio.Task | None = None
 _subscribed_ids: set[str] = set()
 
-# All symbols available on the Bayse realtime feed → internal asset name
+# Bayse realtime symbols → internal asset name (matches SERIES keys in config.py)
 _REALTIME_SYMBOLS = {
     "BTCUSDT": "BTC",
     "ETHUSDT": "ETH",
     "SOLUSDT": "SOL",
-    "EURUSD":  "EUR",
-    "GBPUSD":  "GBP",
-    "USDNGN":  "NGN",
-    "XAUUSD":  "XAU",
+    "EURUSD":  "EURUSD",
+    "GBPUSD":  "GBPUSD",
+    "XAUUSD":  "XAUUSD",
+    # USDNGN subscribed for future markets but no active series yet
+    "USDNGN":  "USDNGN",
 }
 
 
@@ -85,6 +86,12 @@ async def realtime_feed(on_price=None):
                         asset  = _REALTIME_SYMBOLS.get(symbol)
                         if asset and price is not None:
                             spot[asset] = float(price)
+                            # Derive EURGBP from EURUSD / GBPUSD whenever either updates
+                            if asset in ("EURUSD", "GBPUSD"):
+                                eur = spot.get("EURUSD")
+                                gbp = spot.get("GBPUSD")
+                                if eur and gbp:
+                                    spot["EURGBP"] = round(eur / gbp, 6)
                             log.debug(f"Spot {asset} ({symbol}): {float(price):,.4f}")
                             if on_price:
                                 on_price(asset, float(price))

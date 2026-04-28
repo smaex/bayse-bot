@@ -15,15 +15,13 @@ BASE_URL = "https://relay.bayse.markets"
 WS_MARKETS_URL = "wss://socket.bayse.markets/ws/v1/markets"
 WS_REALTIME_URL = "wss://socket.bayse.markets/ws/v1/realtime"
 
-# ── Oracle Price Feeds (each asset resolves on a DIFFERENT oracle) ─────────────
-# BTC/ETH → Binance   |   SOL → Chainlink
-BINANCE_WS_URL = "wss://stream.binance.com:9443/stream"
-BINANCE_SYMBOLS = ["btcusdt", "ethusdt"]  # BTC and ETH only on Binance
-CHAINLINK_SOL_URL = "https://data.chain.link/feeds/sol-usd"  # polled every 10s
-CHAINLINK_POLL_SEC = 10  # Chainlink updates every 10–30s or on 0.5% deviation
+# ── Oracle Price Feeds ────────────────────────────────────────────────────────
+# All spot prices come from the Bayse realtime WebSocket (wss://socket.bayse.markets/ws/v1/realtime)
+# Crypto: sourced from Binance  |  FX + Gold: sourced from TwelveData
 
 # ── Market Series Slugs ────────────────────────────────────────────────────────
 SERIES = {
+    # ── Crypto ────────────────────────────────────────────────────────────────
     "BTC": {
         "5min":  "crypto-btc-5min",
         "15min": "crypto-btc-15min",
@@ -45,10 +43,20 @@ SERIES = {
         "6h":    "crypto-sol-6h",
         "1d":    "crypto-sol-1d",
     },
+    # ── FX (confirmed slugs from live API — 1h only as of 2026-04-28) ─────────
+    "EURUSD": {"1h": "fx-eurusd-1h"},
+    "GBPUSD": {"1h": "fx-gbpusd-1h"},
+    "EURGBP": {"1h": "fx-eurgbp-1h"},   # derived price: EURUSD / GBPUSD
+    # ── Commodities ────────────────────────────────────────────────────────────
+    "XAUUSD": {"1h": "commodity-xauusd-1h"},
 }
 
-# Which oracle each asset uses for resolution (discovered from live API)
-ASSET_ORACLE = {"BTC": "BINANCE", "ETH": "BINANCE", "SOL": "CHAINLINK"}
+# Which oracle each asset uses for resolution
+ASSET_ORACLE = {
+    "BTC": "BINANCE", "ETH": "BINANCE", "SOL": "BINANCE",
+    "EURUSD": "TWELVEDATA", "GBPUSD": "TWELVEDATA",
+    "EURGBP": "TWELVEDATA", "XAUUSD": "TWELVEDATA",
+}
 
 # News & sentiment
 NEWSAPI_KEY   = os.getenv("NEWSAPI_KEY", "")  # free at newsapi.org
@@ -69,7 +77,7 @@ CPI_ADVANCE_MINUTES = 2  # enter position 2 min before scheduled release
 CURRENCY = "NGN"
 
 # ── All possible assets / timeframes (superset — per-user settings stored in DB) ─
-ALL_ASSETS     = ["BTC", "ETH", "SOL"]
+ALL_ASSETS     = ["BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "EURGBP", "XAUUSD"]
 ALL_TIMEFRAMES = ["5min", "15min", "1h", "6h", "1d"]
 
 # ── Sniping ───────────────────────────────────────────────────────────────────
@@ -87,9 +95,16 @@ SNIPE_ENTRY_WINDOWS = {
 # Asset hourly volatility (1σ, fractional) — used in diffusion model for win probability.
 # P(win) = Φ( |spot_distance| / (σ_h × √T_hours) )  ← same math as options pricing
 ASSET_HOURLY_VOL = {
-    "BTC": 0.018,   # ~1.8% per hour (annualised ~28%)
-    "ETH": 0.022,   # ~2.2% per hour (annualised ~34%)
-    "SOL": 0.028,   # ~2.8% per hour (annualised ~43%)
+    # Crypto
+    "BTC":    0.018,   # ~1.8% per hour (annualised ~28%)
+    "ETH":    0.022,   # ~2.2% per hour (annualised ~34%)
+    "SOL":    0.028,   # ~2.8% per hour (annualised ~43%)
+    # FX — much lower vol; realized vol will refine these quickly
+    "EURUSD": 0.0006,  # ~0.06% per hour (major pair, very stable)
+    "GBPUSD": 0.0007,  # ~0.07% per hour
+    "EURGBP": 0.0004,  # ~0.04% per hour (cross rate, tightest range)
+    # Commodities
+    "XAUUSD": 0.0015,  # ~0.15% per hour (Gold)
 }
 
 SNIPE_MIN_CERTAINTY = 0.40   # min certainty = min win_prob of 68% (0.50 + 0.45×0.40)
