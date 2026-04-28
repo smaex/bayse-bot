@@ -1,23 +1,25 @@
 """
 Real-time price feeds.
 
-BTC, ETH, SOL spot prices are polled from Kraken REST every CHAINLINK_POLL_SEC seconds.
-- Binance (WS + REST): HTTP 451 geo-blocked from Render Oregon (US IPs)
-- CoinCap: DNS resolution failure on Render
-- Kraken: US-based, no geo-block, no API key, 1 req/sec public limit
-Bayse market YES/NO prices come from the Bayse WebSocket.
+All spot prices come from the Bayse realtime WebSocket:
+  wss://socket.bayse.markets/ws/v1/realtime
+
+Bayse proxies Binance (crypto) and TwelveData (FX/Gold) — no geo-block,
+no extra API keys, prices update ~every second per symbol.
+
+This replaces the previous Kraken REST polling (10-second delay).
+Bayse market YES/NO prices come from a separate Bayse markets WebSocket.
 """
 
 import asyncio
 import json
 import logging
-import aiohttp
 import websockets
-from config import WS_MARKETS_URL, CHAINLINK_POLL_SEC
+from config import WS_MARKETS_URL, WS_REALTIME_URL
 
 log = logging.getLogger(__name__)
 
-# Live spot prices — {"BTC": 77800.12, "ETH": 1520.50, "SOL": 86.72}
+# Live spot prices — {"BTC": 77800.12, "ETH": 1520.50, "EUR": 1.085, ...}
 spot: dict[str, float] = {}
 
 # Previous Bayse YES prices — used to detect BTC moves for correlation signals
@@ -26,9 +28,21 @@ prev_yes: dict[str, float] = {}
 # Current Bayse market prices — {market_id: {"yes": float, "no": float}}
 market_prices: dict[str, dict] = {}
 
-# Bayse WebSocket task (restarted after each market scan)
+# Bayse markets WS task (restarted after each market scan)
 _bayse_task: asyncio.Task | None = None
 _subscribed_ids: set[str] = set()
+
+# All symbols available on the Bayse realtime feed → internal asset name
+_REALTIME_SYMBOLS = {
+    "BTCUSDT": "BTC",
+    "ETHUSDT": "ETH",
+    "SOLUSDT": "SOL",
+    "EURUSD":  "EUR",
+    "GBPUSD":  "GBP",
+    "USDNGN":  "NGN",
+    "XAUUSD":  "XAU",
+}
+
 
 def _parse_frames(raw: str):
     for line in raw.strip().split("\n"):
@@ -40,62 +54,48 @@ def _parse_frames(raw: str):
                 pass
 
 
-# ── Kraken REST feed (BTC + ETH + SOL) ───────────────────────────────────────
-# Kraken is a US-based exchange — no geo-block from Render Oregon, no API key needed.
-# Binance (WS + REST) returns HTTP 451 from US IPs; CoinCap has DNS failures on Render.
+# ── Bayse realtime spot feed ──────────────────────────────────────────────────
 
-_KRAKEN_PAIRS = {
-    "XXBTZUSD": "BTC",
-    "XETHZUSD": "ETH",
-    "SOLUSD":   "SOL",
-}
-
-async def kraken_feed(on_price=None):
-    url = "https://api.kraken.com/0/public/Ticker"
-    params = {"pair": "XBTUSD,ETHUSD,SOLUSD"}
+async def realtime_feed(on_price=None):
+    """
+    Stream live asset prices from Bayse realtime WS.
+    Covers BTC/ETH/SOL (Binance source) + EUR/GBP/NGN/XAU (TwelveData source).
+    Auto-reconnects with exponential backoff.
+    """
+    symbols = list(_REALTIME_SYMBOLS.keys())
     backoff = 1
 
     while True:
         try:
-            async with aiohttp.ClientSession() as session:
-                log.info("Kraken price feed started (BTC, ETH, SOL)")
+            async with websockets.connect(WS_REALTIME_URL, ping_interval=20) as ws:
+                log.info(f"Bayse realtime feed connected — {len(symbols)} symbols")
                 backoff = 1
-                while True:
-                    try:
-                        async with session.get(
-                            url, params=params,
-                            timeout=aiohttp.ClientTimeout(total=8),
-                        ) as r:
-                            if r.status == 200:
-                                data = await r.json()
-                                errors = data.get("error", [])
-                                if errors:
-                                    log.warning(f"Kraken API error: {errors}")
-                                else:
-                                    for pair, asset in _KRAKEN_PAIRS.items():
-                                        info = data.get("result", {}).get(pair)
-                                        if info:
-                                            price = float(info["c"][0])
-                                            spot[asset] = price
-                                            log.debug(f"Kraken {asset}: {price:,.4f}")
-                                            if on_price:
-                                                on_price(asset, price)
-                            elif r.status == 429:
-                                log.warning("Kraken rate limited — waiting 60s")
-                                await asyncio.sleep(60)
-                            else:
-                                log.warning(f"Kraken HTTP {r.status}")
-                    except Exception as e:
-                        log.warning(f"Kraken fetch error: {e}")
-                    await asyncio.sleep(CHAINLINK_POLL_SEC)
+                await ws.send(json.dumps({
+                    "type": "subscribe",
+                    "channel": "asset_prices",
+                    "symbols": symbols,
+                }))
+                async for raw in ws:
+                    for msg in _parse_frames(raw):
+                        if msg.get("type") != "asset_price":
+                            continue
+                        data   = msg.get("data", {})
+                        symbol = data.get("symbol", "")
+                        price  = data.get("price")
+                        asset  = _REALTIME_SYMBOLS.get(symbol)
+                        if asset and price is not None:
+                            spot[asset] = float(price)
+                            log.debug(f"Spot {asset} ({symbol}): {float(price):,.4f}")
+                            if on_price:
+                                on_price(asset, float(price))
         except Exception as e:
-            log.warning(f"Kraken feed crashed: {e}. Restarting in {backoff}s")
-            spot.clear()  # don't trade on stale prices while feed is down
+            log.warning(f"Bayse realtime feed error: {e}. Reconnecting in {backoff}s")
+            spot.clear()   # don't trade on stale prices while feed is down
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
 
-# ── Bayse market feed ────────────────────────────────────────────────────────
+# ── Bayse market YES/NO price feed ────────────────────────────────────────────
 
 async def bayse_feed(event_ids: list[str], on_update=None):
     if not event_ids:
@@ -125,11 +125,10 @@ def _handle_market(msg: dict, on_update=None):
     if not mid:
         return
 
-    # outcome1 = UP/YES, outcome2 = DOWN/NO
     yes_p = (data.get("yesPrice") or data.get("yes")
              or data.get("outcome1Price") or data.get("upPrice"))
-    no_p = (data.get("noPrice") or data.get("no")
-            or data.get("outcome2Price") or data.get("downPrice"))
+    no_p  = (data.get("noPrice") or data.get("no")
+             or data.get("outcome2Price") or data.get("downPrice"))
 
     if yes_p is not None:
         prev_yes[mid] = market_prices.get(mid, {}).get("yes", float(yes_p))
@@ -142,24 +141,20 @@ def _handle_market(msg: dict, on_update=None):
 
 
 def restart_bayse_feed(markets: list[dict], on_update=None):
-    """Call after each market scan to keep the WS subscriptions current.
-    markets: full market dicts from the scanner (need both event_id and market_id).
-    Subscribes by event_id (what the Bayse WS endpoint expects).
-    """
+    """Call after each market scan to keep WS subscriptions current."""
     global _bayse_task, _subscribed_ids
     new_market_ids = {m["market_id"] for m in markets}
     if new_market_ids == _subscribed_ids and _bayse_task and not _bayse_task.done():
-        return  # no change — avoid unnecessary reconnects
+        return
     _subscribed_ids = new_market_ids
     if _bayse_task and not _bayse_task.done():
         _bayse_task.cancel()
     if markets:
-        # Deduplicate event_ids — each event has one market but avoid duplicate subscribes
         event_ids = list({m["event_id"] for m in markets})
         _bayse_task = asyncio.create_task(bayse_feed(event_ids, on_update))
         log.info(f"Bayse WS (re)started — {len(event_ids)} events / {len(markets)} markets")
 
 
 async def start_feeds(on_price=None):
-    """Start only the Kraken spot feed. Bayse WS is managed via restart_bayse_feed()."""
-    await kraken_feed(on_price)
+    """Start the Bayse realtime spot feed. Bayse WS is managed via restart_bayse_feed()."""
+    await realtime_feed(on_price)

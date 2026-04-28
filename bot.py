@@ -247,6 +247,10 @@ async def _execute_trade(chat_id, sig, client, risk, balance, settings, learned,
             entry_price=filled_price, amount_ngn=amount, certainty=sig.certainty,
             secs_to_close=market["secs_to_close"] if market else 0,
             spot_vs_threshold_pct=spot_vs_thresh,
+            momentum_at_entry=sig.momentum_at_entry,
+            regime_at_entry=sig.regime_at_entry,
+            edge_at_entry=sig.edge_at_entry,
+            realized_vol_at_entry=sig.realized_vol_at_entry,
         )
 
         risk.add_position(sig.market_id, {
@@ -439,6 +443,7 @@ async def main():
         telegram_bot._active_markets = active_markets
         log.info(f"Initial scan: {len(active_markets)} markets")
         feeds.restart_bayse_feed(active_markets, _on_market_update)
+        asyncio.create_task(scanner.discover_series(_scan_client))
 
     # Wait for first spot prices
     for _ in range(20):

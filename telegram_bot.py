@@ -256,11 +256,11 @@ async def cmd_debug(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
     # Spot prices
     if feeds.spot:
-        lines.append("*Spot prices (Kraken):*")
+        lines.append("*Spot prices (Bayse Realtime):*")
         for asset, price in feeds.spot.items():
             lines.append(f"  {asset}: ${price:,.2f}")
     else:
-        lines.append("⚠️ *Spot prices: EMPTY* — Kraken feed not loaded yet. SNIPE is disabled.")
+        lines.append("⚠️ *Spot prices: EMPTY* — Realtime feed not loaded yet. SNIPE is disabled.")
 
     # Active markets
     lines.append(f"\n*Active markets: {len(_active_markets)}*")

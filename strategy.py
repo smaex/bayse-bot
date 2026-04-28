@@ -86,6 +86,11 @@ class TradeSignal:
     title: str = ""
     arb_quantity: float = 0.0
     converged_with: list = field(default_factory=list)
+    # ML feature snapshot at entry time — stored in DB for future model training
+    momentum_at_entry:     float = 0.0
+    regime_at_entry:       float = 0.0
+    edge_at_entry:         float = 0.0
+    realized_vol_at_entry: float = 0.0
 
 
 # ── BTC tracking for CORRELATE ────────────────────────────────────────────────
@@ -340,6 +345,10 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
             f"regime={regime:.2f} edge={raw_edge:+.3f} composite={composite:.2f} [{tf}]"
         ),
         title=market["title"],
+        momentum_at_entry=round(mom, 4),
+        regime_at_entry=round(regime, 4),
+        edge_at_entry=round(raw_edge, 4),
+        realized_vol_at_entry=round(rv, 6),
     )
 
 
@@ -418,6 +427,10 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> 
             f"market={market_price:.3f} ceiling={ev_ceiling:.3f}"
         ),
         title=market["title"],
+        momentum_at_entry=round(mom, 4),
+        regime_at_entry=round(_regime_score(market["asset"]), 4),
+        edge_at_entry=round(w_est - market_price, 4),
+        realized_vol_at_entry=round(realized_vol_hourly(market["asset"]), 6),
     )
 
 
@@ -524,6 +537,10 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[Tra
             f"market={market_price:.3f} ceiling={ev_ceiling:.3f}: {sig.headline[:60]}"
         ),
         title=market["title"],
+        momentum_at_entry=round(mom, 4),
+        regime_at_entry=round(_regime_score(asset), 4),
+        edge_at_entry=round(w_est - market_price, 4),
+        realized_vol_at_entry=round(realized_vol_hourly(asset), 6),
     )
 
 

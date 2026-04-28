@@ -116,6 +116,40 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
     }
 
 
+async def discover_series(client: BayseClient) -> None:
+    """
+    Fetch all open events from the Bayse API and log every unique series slug found.
+    Run once on startup to discover FX/commodity slugs for config.py.
+    """
+    slugs: dict[str, int] = {}  # slug → count of open events
+    page = 1
+    while True:
+        try:
+            data    = await client.list_events(page=page, limit=50)
+            events  = data if isinstance(data, list) else data.get("events", data.get("data", []))
+            if not events:
+                break
+            for ev in events:
+                slug = ev.get("seriesSlug") or ev.get("series") or ""
+                if slug:
+                    slugs[slug] = slugs.get(slug, 0) + 1
+            pagination = data.get("pagination", {}) if isinstance(data, dict) else {}
+            if page >= pagination.get("lastPage", 1):
+                break
+            page += 1
+        except Exception as e:
+            log.warning(f"discover_series page {page}: {e}")
+            break
+
+    if slugs:
+        log.info("═══ Available series slugs on Bayse ══════════════════════")
+        for slug, count in sorted(slugs.items()):
+            log.info(f"  {slug}  ({count} open events)")
+        log.info("══════════════════════════════════════════════════════════")
+    else:
+        log.warning("discover_series: no slugs found — check API connectivity")
+
+
 async def scan_all(client: BayseClient) -> list[dict]:
     """Fetch all currently open markets across all assets and timeframes."""
     tasks = []
