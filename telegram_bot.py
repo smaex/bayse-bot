@@ -79,7 +79,7 @@ async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     _setup_state[cid] = _NEED_PUBLIC
     await update.message.reply_text(
         "👋 *Welcome to Bayse Bot!*\n\n"
-        "I trade BTC, ETH, and SOL prediction markets automatically.\n\n"
+        "I trade BTC, ETH, SOL, FX, and Gold prediction markets automatically on your behalf.\n\n"
         "To connect your account:\n\n"
         "1. Open *app.bayse.markets*\n"
         "2. Go to *More → Account Settings → API Keys → Create*\n"
