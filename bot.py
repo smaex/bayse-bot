@@ -41,8 +41,13 @@ _user_clients:  dict[str, BayseClient]  = {}
 _user_risks:    dict[str, RiskManager]  = {}
 _user_daily:    dict[str, dict]         = {}  # {chat_id: {date, start_balance, target_hit}}
 _user_tasks:    dict[str, asyncio.Task] = {}
+_last_balance:  dict[str, float]        = {}  # for deposit/withdrawal detection
 _scan_client:   BayseClient | None = None
 _tg_app        = None
+
+# Minimum change to be considered a deposit/withdrawal (not just trade P&L noise)
+_BALANCE_EVENT_MIN_NGN = 500
+_BALANCE_EVENT_MIN_PCT = 0.08   # 8% of balance
 
 
 def _get_client(user: dict) -> BayseClient:
@@ -95,6 +100,7 @@ def start_user(chat_id: str):
 
 async def _user_loop(chat_id: str):
     """Per-user async trading loop — runs every 10 seconds."""
+    strategy.set_user_context(chat_id)   # tags every strategy log line with this user
     sent_news: set[str] = set()
     iter_count = 0
 
@@ -123,6 +129,43 @@ async def _user_loop(chat_id: str):
             continue
 
         risk.update_peak(balance)
+
+        # ── Deposit / withdrawal detection ─────────────────────────────────────
+        last_bal = _last_balance.get(chat_id)
+        if last_bal is not None:
+            delta     = balance - last_bal
+            threshold = max(_BALANCE_EVENT_MIN_NGN, last_bal * _BALANCE_EVENT_MIN_PCT)
+            if delta > threshold:
+                # Deposit detected — re-anchor so it doesn't look like profit
+                log.info(f"[{chat_id}] Deposit detected: ₦{delta:+,.0f} (₦{last_bal:,.0f} → ₦{balance:,.0f})")
+                day_now = _user_daily.get(chat_id, {})
+                day_now["start_balance"] = balance
+                settings["daily_state"]  = day_now
+                database.update_settings(chat_id, settings)
+                risk.peak_balance = balance
+                _user_daily[chat_id] = day_now
+                if _tg_app:
+                    await telegram_bot.notify_deposit_detected(
+                        _tg_app, chat_id, delta, "NGN"
+                    )
+            elif delta < -threshold and len(risk.open_positions) <= 1:
+                # Withdrawal detected — re-anchor peak so drawdown isn't triggered
+                log.info(f"[{chat_id}] Withdrawal detected: ₦{delta:,.0f} (₦{last_bal:,.0f} → ₦{balance:,.0f})")
+                day_now = _user_daily.get(chat_id, {})
+                day_now["start_balance"] = balance
+                settings["daily_state"]  = day_now
+                database.update_settings(chat_id, settings)
+                risk.peak_balance = balance
+                _user_daily[chat_id] = day_now
+                if _tg_app:
+                    await telegram_bot.send_message(
+                        _tg_app, chat_id,
+                        f"💸 *Withdrawal detected* — ₦{abs(delta):,.0f} removed\n\n"
+                        f"New balance: ₦{balance:,.2f}\n"
+                        f"Drawdown baseline reset. Trading continues from here.",
+                        parse_mode="Markdown",
+                    )
+        _last_balance[chat_id] = balance
 
         # ── Daily target ───────────────────────────────────────────────────────
         day          = _daily(chat_id, balance, settings)
@@ -200,15 +243,23 @@ async def _user_loop(chat_id: str):
             log.error(f"[{chat_id}] market eval error (iter={iter_count}): {e}", exc_info=True)
 
 
+_FX_ASSETS = {"EURUSD", "GBPUSD", "EURGBP", "XAUUSD"}
+
+
 async def _execute_trade(chat_id, sig, client, risk, balance, settings, learned, max_exp):
     mult     = learned.get("size_multipliers", {}).get(sig.strategy, 1.0)
     base_pct = settings.get("risk_pct", 3.0) / 100.0
     min_t    = settings.get("mintrade",  100)
     max_t    = settings.get("maxtrade",  500_000)
 
+    # FX trades are sized at 50% of normal — the diffusion edge is thinner on FX
+    # (lower vol = smaller absolute move advantage), so smaller positions reduce
+    # loss impact while wins still compound at full certainty-scaled rate.
+    fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
+
     # Scale position size by signal certainty: a 35%-certain trade uses 35% of base risk,
     # a 99%-certain trade uses 99%. High-conviction signals earn larger positions automatically.
-    raw_pct = base_pct * mult * sig.certainty
+    raw_pct = base_pct * mult * sig.certainty * fx_factor
     amount  = balance * min(raw_pct, 0.05)   # hard cap at 5% regardless
     amount  = max(min_t, min(max_t, amount))
 
@@ -367,8 +418,12 @@ async def _keep_alive_server():
 
 
 async def _self_ping_loop():
-    """Hit our own /ping every 13 minutes so Render never idles us out."""
-    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    """Hit our own /ping every 13 minutes to prevent idle shutdown."""
+    url = (
+        os.environ.get("APP_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or ""
+    ).rstrip("/")
     if not url:
         return
     log.info(f"Self-ping active → {url}/ping every 13 min")

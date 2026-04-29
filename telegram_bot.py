@@ -446,6 +446,13 @@ async def cmd_resume(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
     _set_paused(cid, False)
     _clear_target_hit(cid)
+    # Reset in-memory drawdown state so the risk manager doesn't immediately
+    # re-pause on the next loop tick.  peak_balance=0 causes update_peak() to
+    # re-anchor to the current live balance on the next balance fetch.
+    risk = _user_risks.get(cid)
+    if risk:
+        risk.paused = False
+        risk.peak_balance = 0
     await update.message.reply_text("▶️ Trading resumed.")
 
 

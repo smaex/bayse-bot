@@ -56,16 +56,31 @@ import logging
 import math
 import time
 from collections import deque
+from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional, Literal
 from config import (
     SNIPE_MIN_CERTAINTY, SNIPE_ENTRY_WINDOWS, ASSET_HOURLY_VOL,
     CORRELATION_THRESHOLD, CORRELATION_WINDOW_SEC, ARB_TRIGGER,
+    FX_SESSION_UTC, FX_MIN_DISTANCE, FX_MIN_REGIME,
+    FX_ENTRY_WINDOW_1H, FX_TREND_VETO_MULT,
 )
 import feeds
 import news as news_mod
 
 log = logging.getLogger(__name__)
+
+# Per-user logging context — set once per asyncio task in _user_loop.
+# Every signal log line is automatically prefixed with [chat_id].
+_user_ctx: ContextVar[str] = ContextVar("user_ctx", default="")
+
+def set_user_context(chat_id: str) -> None:
+    _user_ctx.set(chat_id)
+
+def _u() -> str:
+    uid = _user_ctx.get()
+    return f"[{uid}] " if uid else ""
 
 StrategyType = Literal["SNIPE", "CORRELATE", "ARB", "NEWS"]
 
@@ -228,6 +243,26 @@ def _regime_score(asset: str) -> float:
     return min(net / path / 0.5, 1.0)
 
 
+# ── Quant signal 5b: FX distance trend ───────────────────────────────────────
+
+def _fx_distance_trend(asset: str, threshold: float, direction: str) -> float:
+    """
+    How the price-to-threshold distance has changed over the last 10 minutes.
+      Positive = distance growing in our direction (move has conviction).
+      Negative = distance shrinking (price converging back — reversal risk).
+    Returns 0.0 when insufficient history (treated as neutral).
+    """
+    hist = list(_price_history.get(asset, []))
+    if len(hist) < 12:       # need at least ~60 s of ticks
+        return 0.0
+    now_price  = hist[-1][1]
+    past_price = hist[max(0, len(hist) - 120)][1]   # ~10 min ago (120 × 5 s)
+    if direction == "YES":
+        return (now_price - past_price) / threshold  # +ve = moved further above threshold
+    else:
+        return (past_price - now_price) / threshold  # +ve = moved further below threshold
+
+
 # ── Strategy 1: SNIPE — 5-model composite ────────────────────────────────────
 
 def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Optional[TradeSignal]:
@@ -244,22 +279,59 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
     Hard veto: composite below threshold, or strong adverse momentum
     on a weak base signal.  EV ceiling still applied after all filters.
     """
-    tf   = market["timeframe"]
-    secs = market["secs_to_close"]
+    tf    = market["timeframe"]
+    secs  = market["secs_to_close"]
+    asset = market["asset"]
 
     entry_window = SNIPE_ENTRY_WINDOWS.get(tf)
+    # Gate 1 (FX): tighter entry window — 20 min instead of 30 min for crypto.
+    # More time elapsed = move is more confirmed before we commit.
+    if asset in FX_SESSION_UTC and tf == "1h":
+        entry_window = FX_ENTRY_WINDOW_1H
     if entry_window is None or secs > entry_window or secs < 0:
         return None
 
-    asset     = market["asset"]
     threshold = market.get("threshold")
     live_spot = feeds.spot.get(asset)
     if not threshold or not live_spot:
         if not live_spot:
-            log.warning(f"SNIPE [{asset} {tf}] no spot price in feeds.spot")
+            log.warning(f"{_u()}SNIPE [{asset} {tf}] no spot price in feeds.spot")
         return None
 
     distance_pct = (live_spot - threshold) / threshold   # +ve → YES wins
+
+    # ── FX gate cascade (gates 1–3) ───────────────────────────────────────────
+    if asset in FX_SESSION_UTC:
+        # Gate 1: active session only
+        hour_utc = datetime.now(timezone.utc).hour
+        session_start, session_end = FX_SESSION_UTC[asset]
+        if not (session_start <= hour_utc < session_end):
+            log.debug(f"{_u()}SNIPE [{asset} {tf}] outside active session (UTC {hour_utc:02d}h)")
+            return None
+
+        # Gate 2: minimum distance — need a genuine move, not noise
+        min_dist = FX_MIN_DISTANCE[asset]
+        if abs(distance_pct) < min_dist:
+            log.info(
+                f"{_u()}SNIPE [{asset} {tf}] FX G2 DIST — {distance_pct:+.4%} < "
+                f"min {min_dist:.4%} (too close to threshold)"
+            )
+            return None
+
+        # Gate 3: distance trend — move must be holding or growing, not reversing
+        direction_early = "YES" if distance_pct > 0 else "NO"
+        trend = _fx_distance_trend(asset, threshold, direction_early)
+        veto_level = -min_dist * FX_TREND_VETO_MULT
+        if trend < veto_level:
+            log.info(
+                f"{_u()}SNIPE [{asset} {tf}] FX G3 TREND — converging {trend:+.4%}/10min "
+                f"(veto < {veto_level:.4%})"
+            )
+            return None
+        log.debug(
+            f"{_u()}SNIPE [{asset} {tf}] FX gates 1-3 passed | "
+            f"dist={distance_pct:+.4%} trend={trend:+.4%}/10min session=UTC{hour_utc:02d}h"
+        )
 
     # ── Signal 1: diffusion win probability (realized vol) ────────────────────
     rv    = realized_vol_hourly(asset)
@@ -281,6 +353,14 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
     regime        = _regime_score(asset)
     regime_factor = 0.75 + 0.50 * regime       # 0.75 (choppy) → 1.25 (trending)
 
+    # Gate 4 (FX): regime veto — choppy FX markets mean-revert and kill the edge
+    if asset in FX_SESSION_UTC and regime < FX_MIN_REGIME:
+        log.info(
+            f"{_u()}SNIPE [{asset} {tf}] FX G4 REGIME — regime={regime:.2f} < {FX_MIN_REGIME} "
+            f"(choppy, likely to revert)"
+        )
+        return None
+
     # ── Signal 5: edge vs market-implied probability ───────────────────────────
     raw_edge   = w_est - market_price           # +ve = market underpricing our side
     edge_bonus = min(max(raw_edge * 0.40, -0.08), 0.12)
@@ -289,7 +369,7 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
     composite = min((base + mom_bonus + edge_bonus) * regime_factor, 0.99)
 
     log.info(
-        f"SNIPE [{asset} {tf}] {secs:.0f}s | "
+        f"{_u()}SNIPE [{asset} {tf}] {secs:.0f}s | "
         f"spot={live_spot:,.2f} threshold={threshold:,.2f} ({distance_pct:+.3%}) | "
         f"w={w_est:.1%} rv={rv:.3f} base={base:.2f} mom={mom:+.2f} "
         f"regime={regime:.2f} edge={raw_edge:+.3f} ➜ composite={composite:.2f} "
@@ -299,7 +379,7 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
     # Hard veto: price racing toward threshold on an already-weak signal
     if mom < -0.7 and base < 0.55:
         log.info(
-            f"SNIPE [{asset} {tf}] VETOED — adverse momentum ({mom:+.2f}) "
+            f"{_u()}SNIPE [{asset} {tf}] VETOED — adverse momentum ({mom:+.2f}) "
             f"with weak base ({base:.2f})"
         )
         return None
@@ -313,7 +393,7 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
 
     if market_price >= ev_ceiling:
         log.info(
-            f"SNIPE [{asset} {tf}] REJECTED — market {market_price:.3f} >= "
+            f"{_u()}SNIPE [{asset} {tf}] REJECTED — market {market_price:.3f} >= "
             f"EV ceiling {ev_ceiling:.3f} (w_est={w_est:.1%})"
         )
         return None
@@ -322,7 +402,7 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
     size = kelly_size(w_est, market_price, fee_rate)
 
     log.info(
-        f"SNIPE [{asset} {tf}] ✅ SIGNAL | "
+        f"{_u()}SNIPE [{asset} {tf}] ✅ SIGNAL | "
         f"market={market_price:.3f} < ceiling={ev_ceiling:.3f} | "
         f"composite={composite:.2f} size={size:.2%}"
     )
@@ -365,7 +445,7 @@ def record_btc_move(market: dict, yes_price_new: float):
         _btc_signal_time[tf]      = time.time()
         _btc_signal_direction[tf] = "UP" if move > 0 else "DOWN"
         _btc_signal_move[tf]      = abs(move)
-        log.info(f"BTC {tf} market moved {move:+.3f} — stored for CORRELATE")
+        log.info(f"{_u()}BTC {tf} market moved {move:+.3f} — stored for CORRELATE")
 
 
 _CRYPTO_ASSETS = {"BTC", "ETH", "SOL"}
@@ -583,7 +663,7 @@ def _apply_convergence(signals: list[TradeSignal]) -> list[TradeSignal]:
     top.reason         = f"[🎯 CONVERGED: {'+'.join(s.strategy for s in dominant)}] " + top.reason
 
     log.info(
-        f"Convergence: {top.converged_with} → {top.outcome} "
+        f"{_u()}Convergence: {top.converged_with} → {top.outcome} "
         f"certainty={top.certainty:.2%} size={top.size_pct:.2%}"
     )
 

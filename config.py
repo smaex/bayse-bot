@@ -109,6 +109,37 @@ ASSET_HOURLY_VOL = {
 
 SNIPE_MIN_CERTAINTY = 0.40   # min certainty = min win_prob of 68% (0.50 + 0.45×0.40)
 
+# ── FX-specific trading rules ─────────────────────────────────────────────────
+# Only trade FX/Gold during their active market sessions (UTC).
+# Outside these windows, vol is dominated by noise — false breakouts are common.
+FX_SESSION_UTC = {
+    "EURUSD": (6, 17),   # London open → NY close
+    "GBPUSD": (6, 17),
+    "EURGBP": (6, 17),
+    "XAUUSD": (8, 20),   # London overlap → NY afternoon
+}
+
+# Minimum distance from threshold before entering an FX trade.
+# Set to 1× hourly σ per asset — ensures we have a genuine move, not noise.
+FX_MIN_DISTANCE = {
+    "EURUSD": 0.0006,  # 0.06% — 1σ/hr
+    "GBPUSD": 0.0007,  # 0.07%
+    "EURGBP": 0.0004,  # 0.04%
+    "XAUUSD": 0.0015,  # 0.15%
+}
+
+# FX requires a cleaner trend than crypto — minimum efficiency ratio.
+FX_MIN_REGIME = 0.30   # below this = too choppy to trade FX reliably
+
+# FX entry window: last 20 min of the hour (crypto 1h uses 30 min).
+# More elapsed time = more confirmation the move is real.
+FX_ENTRY_WINDOW_1H = 1200  # seconds (20 min)
+
+# FX distance trend: reject if price has converged back toward the threshold
+# by more than 1× the minimum distance over the last 10 minutes.
+# Positive trend = move is holding. Negative = price reversing.
+FX_TREND_VETO_MULT = 1.0   # reject if 10-min convergence > FX_MIN_DISTANCE × this
+
 # ── Correlation Signal ─────────────────────────────────────────────────────────
 CORRELATION_THRESHOLD = 0.04  # BTC market must move ≥4% for cross-asset signal (was 8% — never fired)
 CORRELATION_WINDOW_SEC = 180  # signal valid for 3 minutes after BTC move (was 2 min — too short)
