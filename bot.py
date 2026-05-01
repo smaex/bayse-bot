@@ -369,12 +369,15 @@ async def _execute_arb(chat_id, sig, client, balance, settings):
     if budget / (yes_p + no_p) < min_budget:
         budget = min_budget * (yes_p + no_p)
 
-    max_pairs = budget / (yes_p + no_p)
+    max_pairs = int(budget / (yes_p + no_p))
     if max_pairs * yes_p < min_t or max_pairs * no_p < min_t:
         return  # can't meet platform minimum on both legs — skip
 
     profit_est = max_pairs * (1.00 - yes_p - no_p)
-    log.info(f"[{chat_id}] ARB {sig.asset}: {max_pairs:.0f} pairs → est ₦{profit_est:,.2f}")
+    log.info(f"[{chat_id}] ARB {sig.asset}: {max_pairs} pairs → est ₦{profit_est:,.2f}")
+
+    amount_yes = round(max_pairs * yes_p, 2)
+    amount_no  = round(max_pairs * no_p, 2)
 
     yes_ok = False
     try:
@@ -382,7 +385,7 @@ async def _execute_arb(chat_id, sig, client, balance, settings):
         await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["yes_id"], side="BUY",
-            amount=max_pairs * yes_p, order_type="MARKET", currency=CURRENCY,
+            amount=amount_yes, order_type="MARKET", currency=CURRENCY,
         )
         yes_ok = True
 
@@ -399,7 +402,7 @@ async def _execute_arb(chat_id, sig, client, balance, settings):
                     await client.place_order(
                         event_id=sig.event_id, market_id=sig.market_id,
                         outcome_id=market["yes_id"], side="SELL",
-                        amount=max_pairs * yes_p, order_type="MARKET", currency=CURRENCY,
+                        amount=amount_yes, order_type="MARKET", currency=CURRENCY,
                     )
                 except Exception as re:
                     log.error(f"[{chat_id}] ARB rollback sell failed: {re}")
@@ -409,7 +412,7 @@ async def _execute_arb(chat_id, sig, client, balance, settings):
         await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["no_id"], side="BUY",
-            amount=max_pairs * no_p, order_type="MARKET", currency=CURRENCY,
+            amount=amount_no, order_type="MARKET", currency=CURRENCY,
         )
 
         # ── Leg 3: burn for ₦1.00 per pair ─────────────────────────────────────
@@ -426,7 +429,7 @@ async def _execute_arb(chat_id, sig, client, balance, settings):
                 await client.place_order(
                     event_id=sig.event_id, market_id=sig.market_id,
                     outcome_id=market["yes_id"], side="SELL",
-                    amount=max_pairs * yes_p, order_type="MARKET", currency=CURRENCY,
+                    amount=amount_yes, order_type="MARKET", currency=CURRENCY,
                 )
                 log.info(f"[{chat_id}] ARB YES leg rolled back successfully")
             except Exception as re:
