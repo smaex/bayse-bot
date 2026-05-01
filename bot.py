@@ -33,6 +33,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)  # Hide Telegram API tokens from logs
 log = logging.getLogger("bot")
 
 # ── Shared state ───────────────────────────────────────────────────────────────
