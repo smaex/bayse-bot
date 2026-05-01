@@ -189,6 +189,8 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         user   = database.get_user(cid)
         s      = user["settings"]
         s.update(mode["settings"])
+        # Store the mode name so /settings and /status can show it
+        s["mode"] = data.replace("mode_", "")   # e.g. "mode_safe" → "safe"
         database.update_settings(cid, s)
         await query.message.reply_text(
             f"{mode['description']}\n\n✅ *Mode applied. Trading resumes now.*\n"
@@ -430,8 +432,9 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"Unknown setting `{key}`.", parse_mode="Markdown"); return
 
+    s["mode"] = "custom"   # individual /set changes override the preset mode
     database.update_settings(cid, s)
-    await update.message.reply_text(f"✅ {msg}")
+    await update.message.reply_text(f"✅ {msg}\n_(Mode → Custom)_", parse_mode="Markdown")
 
 
 @_guard
@@ -739,6 +742,7 @@ async def _status_text(cid: str) -> str:
         f"All-time: {stats['wins']}/{stats['total']} wins "
         f"({stats['win_rate']:.0%} WR) ₦{stats['total_pnl']:+,.0f}",
         f"\nStatus: {'⏸ Paused' if s.get('paused') else '🟢 Active'}",
+        f"Mode: *{_mode_label(s.get('mode', 'balanced'))}*",
     ]
     return "\n".join(lines)
 
@@ -783,8 +787,10 @@ def _settings_text(cid: str) -> str:
     mult = s.get("daily_multiplier", 10)
     abs_ = s.get("daily_target_ngn", 0)
     tgt  = f"₦{abs_:,.0f} (fixed)" if abs_ > 0 else f"{mult}% of starting balance"
+    mode_name = _mode_label(s.get("mode", "balanced"))
     return (
         "⚙️ *Settings*\n\n"
+        f"Mode:         {mode_name}\n"
         f"Assets:       {s.get('assets')}\n"
         f"Timeframes:   {s.get('timeframes')}\n"
         f"Strategies:   {s.get('strategies')}\n"
@@ -796,6 +802,18 @@ def _settings_text(cid: str) -> str:
         f"Status:       {'⏸ Paused' if s.get('paused') else '🟢 Active'}"
     )
 
+
+_MODE_LABELS = {
+    "safe":       "🟢 Safe",
+    "balanced":   "🔵 Balanced",
+    "aggressive": "🟠 Aggressive",
+    "degen":      "🔴 Full Send",
+    "fx":         "💱 FX + Crypto",
+    "custom":     "🔧 Custom",
+}
+
+def _mode_label(mode_key: str) -> str:
+    return _MODE_LABELS.get(mode_key, f"🔧 {mode_key.title()}")
 
 def _calc_target(settings: dict, start_balance: float) -> float:
     abs_ = settings.get("daily_target_ngn", 0)

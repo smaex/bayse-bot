@@ -93,6 +93,33 @@ def start_user(chat_id: str):
     client = _get_client(user)
     if _scan_client is None:
         _scan_client = client
+
+    # ── Reconstruct open positions from DB ─────────────────────────────────────
+    # After a restart, risk.open_positions is empty.  Without this, the exposure
+    # cap is bypassed until trades resolve — the bot could over-deploy capital.
+    risk = _get_risk(chat_id)
+    if not risk.open_positions:
+        unresolved = database.get_all_unresolved(chat_id)
+        for trade in unresolved:
+            mid = trade.get("market_id")
+            if mid and mid not in risk.open_positions:
+                risk.add_position(mid, {
+                    "trade_id":    trade["trade_id"],
+                    "event_id":    trade["event_id"],
+                    "outcome":     trade["outcome"],
+                    "outcome_id":  trade["outcome_id"],
+                    "entry_price": trade["entry_price"],
+                    "amount_ngn":  trade["amount_ngn"],
+                    "strategy":    trade["strategy"],
+                    "asset":       trade["asset"],
+                    "timeframe":   trade["timeframe"],
+                })
+        if unresolved:
+            log.info(
+                f"[{chat_id}] Reconstructed {len(unresolved)} open positions from DB "
+                f"(deployed ₦{risk.deployed():,.0f})"
+            )
+
     if chat_id not in _user_tasks or _user_tasks[chat_id].done():
         _user_tasks[chat_id] = asyncio.create_task(_user_loop(chat_id))
         log.info(f"Trading loop started for {chat_id}")
@@ -336,11 +363,10 @@ async def _execute_arb(chat_id, sig, client, balance, settings):
     max_t     = settings.get("maxtrade", 500_000)
 
     # Each leg must meet Bayse's minimum order size independently
-    # Budget = smaller of the two leg costs × pairs, so both legs clear the minimum
     budget     = min(ARB_MAX_SIZE_NGN, max_t, balance * 0.05)
-    min_budget = min_t / min(yes_p, no_p)        # pairs needed so smaller leg = mintrade
+    min_budget = min_t / min(yes_p, no_p)
     if budget / (yes_p + no_p) < min_budget:
-        budget = min_budget * (yes_p + no_p)     # scale up to meet minimum
+        budget = min_budget * (yes_p + no_p)
 
     max_pairs = budget / (yes_p + no_p)
     if max_pairs * yes_p < min_t or max_pairs * no_p < min_t:
@@ -349,22 +375,61 @@ async def _execute_arb(chat_id, sig, client, balance, settings):
     profit_est = max_pairs * (1.00 - yes_p - no_p)
     log.info(f"[{chat_id}] ARB {sig.asset}: {max_pairs:.0f} pairs → est ₦{profit_est:,.2f}")
 
+    yes_ok = False
     try:
+        # ── Leg 1: buy YES ─────────────────────────────────────────────────────
         await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["yes_id"], side="BUY",
             amount=max_pairs * yes_p, order_type="MARKET", currency=CURRENCY,
         )
+        yes_ok = True
+
+        # Re-check prices between legs — someone may have front-run us
+        ws2 = feeds.market_prices.get(sig.market_id)
+        if ws2:
+            live_sum = ws2["yes"] + ws2["no"]
+            if live_sum >= 0.99:
+                log.warning(
+                    f"[{chat_id}] ARB {sig.asset}: price moved between legs "
+                    f"(sum now {live_sum:.3f}). Rolling back YES leg."
+                )
+                try:
+                    await client.place_order(
+                        event_id=sig.event_id, market_id=sig.market_id,
+                        outcome_id=market["yes_id"], side="SELL",
+                        amount=max_pairs * yes_p, order_type="MARKET", currency=CURRENCY,
+                    )
+                except Exception as re:
+                    log.error(f"[{chat_id}] ARB rollback sell failed: {re}")
+                return
+
+        # ── Leg 2: buy NO ──────────────────────────────────────────────────────
         await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["no_id"], side="BUY",
             amount=max_pairs * no_p, order_type="MARKET", currency=CURRENCY,
         )
+
+        # ── Leg 3: burn for ₦1.00 per pair ─────────────────────────────────────
         await client.burn_shares(sig.market_id, max_pairs, CURRENCY)
         if _tg_app:
             await telegram_bot.notify_arb(_tg_app, chat_id, sig, max_pairs, profit_est)
+
     except Exception as e:
         log.error(f"[{chat_id}] ARB failed {sig.market_id}: {e}")
+        # If YES leg succeeded but NO or burn failed → sell YES back
+        if yes_ok:
+            log.warning(f"[{chat_id}] ARB rolling back YES leg after failure")
+            try:
+                await client.place_order(
+                    event_id=sig.event_id, market_id=sig.market_id,
+                    outcome_id=market["yes_id"], side="SELL",
+                    amount=max_pairs * yes_p, order_type="MARKET", currency=CURRENCY,
+                )
+                log.info(f"[{chat_id}] ARB YES leg rolled back successfully")
+            except Exception as re:
+                log.error(f"[{chat_id}] ARB rollback sell ALSO failed: {re}")
 
 
 # ── Shared scan loop ───────────────────────────────────────────────────────────

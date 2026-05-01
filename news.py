@@ -98,6 +98,11 @@ def best_signal_for(asset: str) -> Optional[NewsSignal]:
     return max(live, key=lambda s: s.strength(), default=None)
 
 
+def active_signals_for(asset: str) -> list[NewsSignal]:
+    """Return all live signals relevant to this asset."""
+    return [s for s in active_signals if s.is_alive() and asset in s.assets]
+
+
 # ── NewsAPI.org feed ──────────────────────────────────────────────────────────
 
 async def newsapi_feed():

@@ -65,6 +65,10 @@ from config import (
     CORRELATION_THRESHOLD, CORRELATION_WINDOW_SEC, ARB_TRIGGER,
     FX_SESSION_UTC, FX_MIN_DISTANCE, FX_MIN_REGIME,
     FX_ENTRY_WINDOW_1H, FX_TREND_VETO_MULT,
+    CORRELATE_BASE_CERTAINTY, CORRELATE_ALREADY_MOVED,
+    CORRELATE_MAX_MARKET_PRICE, CORRELATE_MIN_REGIME,
+    NEWS_CERTAINTY_DAMPEN, NEWS_MAX_MARKET_PRICE, NEWS_MIN_REGIME,
+    NEWS_MIN_SECS_LEFT, NEWS_KELLY_FRACTION,
 )
 import feeds
 import news as news_mod
@@ -115,6 +119,8 @@ _btc_signal_move:      dict[str, float] = {}
 
 
 # ── Price history (feeds all 5 quant signals) ─────────────────────────────────
+_HISTORY_MAXLEN         = 180          # 15 min at 5s cadence (extra headroom for FX lookback)
+_FX_TREND_LOOKBACK      = 120          # samples to look back for FX distance trend (~10 min)
 _price_history:        dict[str, deque] = {}   # asset → deque[(timestamp, price)]
 _last_history_update:  dict[str, float] = {}   # throttle to 1 sample per 5s
 
@@ -125,7 +131,7 @@ def update_price_history(asset: str, price: float) -> None:
         return
     _last_history_update[asset] = now
     if asset not in _price_history:
-        _price_history[asset] = deque(maxlen=120)  # 10 min at 5s cadence
+        _price_history[asset] = deque(maxlen=_HISTORY_MAXLEN)
     _price_history[asset].append((now, price))
 
 
@@ -256,7 +262,7 @@ def _fx_distance_trend(asset: str, threshold: float, direction: str) -> float:
     if len(hist) < 12:       # need at least ~60 s of ticks
         return 0.0
     now_price  = hist[-1][1]
-    past_price = hist[max(0, len(hist) - 120)][1]   # ~10 min ago (120 × 5 s)
+    past_price = hist[max(0, len(hist) - _FX_TREND_LOOKBACK)][1]   # ~10 min ago
     if direction == "YES":
         return (now_price - past_price) / threshold  # +ve = moved further above threshold
     else:
@@ -432,6 +438,25 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
     )
 
 
+# ── BTC spot move detector (feeds CORRELATE) ─────────────────────────────────
+
+def _btc_spot_move_pct(window_sec: float = CORRELATION_WINDOW_SEC) -> tuple[float, str]:
+    """
+    Returns (move_pct, direction) of BTC spot price over the last window_sec.
+    Uses price history — no market scan needed, fires as soon as spot moves.
+    """
+    hist = list(_price_history.get("BTC", []))
+    if len(hist) < 6:
+        return 0.0, ""
+    now     = time.time()
+    cutoff  = now - window_sec
+    past    = next(((t, p) for t, p in hist if t >= cutoff), None)
+    if past is None:
+        return 0.0, ""
+    move = (hist[-1][1] - past[1]) / past[1]
+    return abs(move), ("UP" if move > 0 else "DOWN")
+
+
 # ── Strategy 2: CORRELATE — BTC → ETH/SOL lead-lag ───────────────────────────
 
 def record_btc_move(market: dict, yes_price_new: float):
@@ -452,52 +477,124 @@ _CRYPTO_ASSETS = {"BTC", "ETH", "SOL"}
 
 def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> Optional[TradeSignal]:
     """
-    BTC market reprices → trade same direction on ETH/SOL before it catches up.
-    FX and commodity markets are excluded — they don't correlate with BTC.
-    Momentum of the target asset boosts/reduces certainty by ±20%.
+    BTC spot price moves ≥threshold % → trade same direction on ETH/SOL.
+
+    Guards (v2 — fixed loss-making issues):
+      1. Target asset already-moved check — if ETH/SOL already followed BTC, edge is gone
+      2. Target distance from threshold — target spot must be on the correct side
+      3. Regime filter — choppy target assets mean-revert, killing the correlation edge
+      4. Market repricing gate — if market price > 0.65, the move is already priced in
+      5. Lower base certainty (0.40 vs old 0.60) — more realistic win probability
     """
     if market["asset"] not in _CRYPTO_ASSETS or market["asset"] == "BTC":
         return None
 
-    tf          = market["timeframe"]
-    signal_time = _btc_signal_time.get(tf)
-    if not signal_time:
-        return None
+    tf    = market["timeframe"]
+    asset = market["asset"]
 
-    age = time.time() - signal_time
-    if age > CORRELATION_WINDOW_SEC:
-        return None
+    # Primary: BTC spot move (fast, fires before markets reprice)
+    spot_move, spot_dir = _btc_spot_move_pct(CORRELATION_WINDOW_SEC)
+    if spot_move >= threshold:
+        direction = spot_dir
+        freshness = 1.0
+        log.info(
+            f"{_u()}CORRELATE [{asset} {tf}] BTC spot {spot_dir} "
+            f"{spot_move:.2%} ≥ {threshold:.2%} — checking {asset}"
+        )
+    else:
+        # Fallback: BTC market-price signal from record_btc_move
+        signal_time = _btc_signal_time.get(tf)
+        if not signal_time:
+            return None
+        age = time.time() - signal_time
+        if age > CORRELATION_WINDOW_SEC or _btc_signal_move.get(tf, 0.0) < threshold:
+            return None
+        direction = _btc_signal_direction.get(tf)
+        freshness = 1.0 - (age / CORRELATION_WINDOW_SEC)
 
-    actual_move = _btc_signal_move.get(tf, 0.0)
-    if actual_move < threshold:
-        return None
+    # ── Guard 1: has the target asset already moved in the same direction? ─────
+    target_move, target_dir = _btc_spot_move_pct(CORRELATION_WINDOW_SEC)  # reuse helper
+    # Actually measure target asset's own move
+    target_hist = list(_price_history.get(asset, []))
+    if len(target_hist) >= 6:
+        cutoff_time = time.time() - CORRELATION_WINDOW_SEC
+        past_entry = next(((t, p) for t, p in target_hist if t >= cutoff_time), None)
+        if past_entry:
+            target_asset_move = abs(target_hist[-1][1] - past_entry[1]) / past_entry[1]
+            if target_asset_move > spot_move * CORRELATE_ALREADY_MOVED:
+                log.info(
+                    f"{_u()}CORRELATE [{asset} {tf}] REJECTED — {asset} already moved "
+                    f"{target_asset_move:.2%} (>{CORRELATE_ALREADY_MOVED:.0%} of BTC's {spot_move:.2%})"
+                )
+                return None
 
-    freshness = 1.0 - (age / CORRELATION_WINDOW_SEC)
-    direction = _btc_signal_direction.get(tf)
+    # ── Guard 2: target spot must be on the correct side of threshold ──────────
+    target_threshold = market.get("threshold")
+    target_spot = feeds.spot.get(asset)
+    if target_threshold and target_spot:
+        if direction == "UP" and target_spot < target_threshold:
+            log.info(
+                f"{_u()}CORRELATE [{asset} {tf}] REJECTED — BTC says UP but "
+                f"{asset} spot {target_spot:,.2f} < threshold {target_threshold:,.2f}"
+            )
+            return None
+        if direction == "DOWN" and target_spot > target_threshold:
+            log.info(
+                f"{_u()}CORRELATE [{asset} {tf}] REJECTED — BTC says DOWN but "
+                f"{asset} spot {target_spot:,.2f} > threshold {target_threshold:,.2f}"
+            )
+            return None
 
     if direction == "UP":
         outcome, outcome_id, market_price = "YES", market["yes_id"], market["yes_price"]
     else:
         outcome, outcome_id, market_price = "NO",  market["no_id"],  market["no_price"]
 
-    # Momentum of target asset confirms or weakens the correlation signal
-    mom       = _momentum_score(market["asset"], direction == "UP" and "YES" or "NO")
-    certainty = min(0.60 * freshness * (1.0 + 0.20 * mom), 0.99)
+    # ── Guard 3: market already repriced ───────────────────────────────────────
+    if market_price > CORRELATE_MAX_MARKET_PRICE:
+        log.info(
+            f"{_u()}CORRELATE [{asset} {tf}] REJECTED — market already at "
+            f"{market_price:.3f} > {CORRELATE_MAX_MARKET_PRICE} (move priced in)"
+        )
+        return None
 
-    w_est     = certainty_to_prob(certainty)
-    fee_rate  = market.get("fee_rate", 0.04)
+    # ── Guard 4: regime filter on target asset ─────────────────────────────────
+    regime = _regime_score(asset)
+    if regime < CORRELATE_MIN_REGIME:
+        log.info(
+            f"{_u()}CORRELATE [{asset} {tf}] REJECTED — target regime "
+            f"{regime:.2f} < {CORRELATE_MIN_REGIME} (choppy, will revert)"
+        )
+        return None
+
+    mom_dir   = "YES" if direction == "UP" else "NO"
+    mom       = _momentum_score(asset, mom_dir)
+    certainty = min(CORRELATE_BASE_CERTAINTY * freshness * (1.0 + 0.20 * mom), 0.99)
+
+    w_est      = certainty_to_prob(certainty)
+    fee_rate   = market.get("fee_rate", 0.04)
     ev_ceiling = max_ev_price(w_est, fee_rate)
 
     if market_price >= ev_ceiling:
+        log.info(
+            f"{_u()}CORRELATE [{asset} {tf}] REJECTED — market {market_price:.3f} "
+            f">= EV ceiling {ev_ceiling:.3f}"
+        )
         return None
 
     size = kelly_size(w_est, market_price, fee_rate)
+
+    log.info(
+        f"{_u()}CORRELATE [{asset} {tf}] ✅ SIGNAL | "
+        f"BTC {direction} {spot_move:.2%} | mom={mom:+.2f} regime={regime:.2f} "
+        f"certainty={certainty:.2f} market={market_price:.3f}"
+    )
 
     return TradeSignal(
         strategy="CORRELATE",
         event_id=market["event_id"],
         market_id=market["market_id"],
-        asset=market["asset"],
+        asset=asset,
         timeframe=tf,
         outcome=outcome,
         outcome_id=outcome_id,
@@ -505,15 +602,15 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> 
         market_price=market_price,
         size_pct=size,
         reason=(
-            f"BTC→{market['asset']} {direction} correlation, "
-            f"age={age:.0f}s freshness={freshness:.2f} mom={mom:+.2f} "
+            f"BTC spot {direction} {spot_move:.2%} → {asset} | "
+            f"freshness={freshness:.2f} mom={mom:+.2f} regime={regime:.2f} "
             f"market={market_price:.3f} ceiling={ev_ceiling:.3f}"
         ),
         title=market["title"],
         momentum_at_entry=round(mom, 4),
-        regime_at_entry=round(_regime_score(market["asset"]), 4),
+        regime_at_entry=round(regime, 4),
         edge_at_entry=round(w_est - market_price, 4),
-        realized_vol_at_entry=round(realized_vol_hourly(market["asset"]), 6),
+        realized_vol_at_entry=round(realized_vol_hourly(asset), 6),
     )
 
 
@@ -569,15 +666,31 @@ def arb_signal(market: dict) -> Optional[TradeSignal]:
 def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[TradeSignal]:
     """
     Trade in the direction of a live high-confidence news signal.
-    Momentum of the target asset provides a ±15% certainty adjustment.
+
+    v2 fixes (was losing money):
+      1. Dampened certainty — VADER score × 0.55, not raw score as certainty
+      2. Market repricing gate — reject if market already moved past 0.62
+      3. Regime filter — only trade news in trending markets (regime ≥ 0.25)
+      4. Adverse momentum veto — reject if price moving opposite to news
+      5. Minimum time remaining — need ≥ 2 min for news to play out
+      6. Conservative Kelly (12% vs old 20%)
     """
     asset = market["asset"]
+    secs  = market.get("secs_to_close", 0)
     sig   = news_mod.best_signal_for(asset)
     if not sig:
         return None
 
     strength = sig.strength()
     if strength < sentiment_threshold:
+        return None
+
+    # ── Guard 1: minimum time remaining ────────────────────────────────────────
+    if secs < NEWS_MIN_SECS_LEFT:
+        log.info(
+            f"{_u()}NEWS [{asset}] REJECTED — only {secs:.0f}s left "
+            f"(need ≥{NEWS_MIN_SECS_LEFT}s for news to play out)"
+        )
         return None
 
     yes_p = market["yes_price"]
@@ -590,18 +703,58 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[Tra
         outcome, outcome_id, market_price = "NO",  market["no_id"],  no_p
         direction = "NO"
 
-    # Momentum adjustment: confirming price move boosts confidence
-    mom          = _momentum_score(asset, direction)
-    strength_adj = min(strength * (1.0 + 0.15 * mom), 0.99)
+    # ── Guard 2: market already repriced ───────────────────────────────────────
+    if market_price > NEWS_MAX_MARKET_PRICE:
+        log.info(
+            f"{_u()}NEWS [{asset}] REJECTED — market at {market_price:.3f} "
+            f"> {NEWS_MAX_MARKET_PRICE} (move already priced in)"
+        )
+        return None
+
+    # ── Guard 3: regime filter ─────────────────────────────────────────────────
+    regime = _regime_score(asset)
+    if regime < NEWS_MIN_REGIME:
+        log.info(
+            f"{_u()}NEWS [{asset}] REJECTED — regime {regime:.2f} "
+            f"< {NEWS_MIN_REGIME} (choppy market absorbs news shocks)"
+        )
+        return None
+
+    # Momentum: confirming price move boosts confidence
+    mom = _momentum_score(asset, direction)
+
+    # ── Guard 4: adverse momentum veto ─────────────────────────────────────────
+    if mom < -0.5:
+        log.info(
+            f"{_u()}NEWS [{asset}] REJECTED — adverse momentum {mom:+.2f} "
+            f"(price moving opposite to {sig.direction} news)"
+        )
+        return None
+
+    # ── Dampened certainty (v2) ────────────────────────────────────────────────
+    # VADER compound 0.80 × dampen 0.55 = effective 0.44 → win_prob ≈ 70%
+    # Old: 0.80 raw → certainty 0.80 → win_prob 86% (wildly overconfident)
+    dampened     = strength * NEWS_CERTAINTY_DAMPEN
+    strength_adj = min(dampened * (1.0 + 0.15 * mom), 0.99)
 
     w_est      = certainty_to_prob(strength_adj)
     fee_rate   = market.get("fee_rate", 0.04)
     ev_ceiling = max_ev_price(w_est, fee_rate)
 
     if market_price >= ev_ceiling:
+        log.info(
+            f"{_u()}NEWS [{asset}] REJECTED — market {market_price:.3f} "
+            f">= EV ceiling {ev_ceiling:.3f} (strength_adj={strength_adj:.2f})"
+        )
         return None
 
-    size = kelly_size(w_est, market_price, fee_rate, fraction=0.20)
+    size = kelly_size(w_est, market_price, fee_rate, fraction=NEWS_KELLY_FRACTION)
+
+    log.info(
+        f"{_u()}NEWS [{asset}] ✅ SIGNAL | {sig.direction} "
+        f"raw={strength:.2f} dampened={dampened:.2f} adj={strength_adj:.2f} "
+        f"mom={mom:+.2f} regime={regime:.2f} market={market_price:.3f}"
+    )
 
     return TradeSignal(
         strategy="NEWS",
@@ -615,13 +768,13 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[Tra
         market_price=market_price,
         size_pct=size,
         reason=(
-            f"News [{sig.direction}] src={sig.source} score={strength:.2f} "
-            f"mom={mom:+.2f} adj={strength_adj:.2f} "
+            f"News [{sig.direction}] src={sig.source} raw={strength:.2f} "
+            f"dampened={dampened:.2f} mom={mom:+.2f} regime={regime:.2f} "
             f"market={market_price:.3f} ceiling={ev_ceiling:.3f}: {sig.headline[:60]}"
         ),
         title=market["title"],
         momentum_at_entry=round(mom, 4),
-        regime_at_entry=round(_regime_score(asset), 4),
+        regime_at_entry=round(regime, 4),
         edge_at_entry=round(w_est - market_price, 4),
         realized_vol_at_entry=round(realized_vol_hourly(asset), 6),
     )

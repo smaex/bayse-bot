@@ -1,17 +1,22 @@
 """
-Multi-user PostgreSQL store (Supabase free tier).
+Multi-user PostgreSQL store (CockroachDB free tier).
 Per-user: API keys (AES-encrypted), settings, trade history.
-Survives every Render redeploy — no persistent disk needed.
+Survives every Replit/Render redeploy — no persistent disk needed.
+
+v2: Connection pooling (ThreadedConnectionPool) — avoids per-call connection
+churn that was burning through CockroachDB's 5-connection free-tier limit.
 """
 
 import json
 import logging
 import os
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from cryptography.fernet import Fernet
 
 log = logging.getLogger(__name__)
@@ -30,6 +35,7 @@ DEFAULT_SETTINGS: dict = {
     "daily_target_ngn": 0,
     "paused":           False,
     "learned":          {},
+    "mode":             "balanced",
 }
 
 
@@ -40,7 +46,7 @@ def _fernet() -> Fernet:
     if not key:
         raise RuntimeError(
             "ENCRYPTION_KEY not set. Generate one with:\n"
-            "python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+            'python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
         )
     return Fernet(key.encode())
 
@@ -51,50 +57,80 @@ def _dec(text: str) -> str:
     return _fernet().decrypt(text.encode()).decode()
 
 
-# ── Connection ────────────────────────────────────────────────────────────────
+# ── Connection Pool ───────────────────────────────────────────────────────────
+# CockroachDB free tier: 5 max connections.  Pool avoids per-call connection
+# churn (old: open → query → close on every DB call = connection storm).
 
-def _cx() -> psycopg2.extensions.connection:
+_pool: psycopg2.pool.ThreadedConnectionPool | None = None
+
+
+def _init_pool():
+    """Create the connection pool. Called once from init_db()."""
+    global _pool
+    if _pool is not None:
+        return
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL not set. Add your CockroachDB connection string.")
-    # verify-full requires a root cert that doesn't exist on Render — require still encrypts
     url = DATABASE_URL.replace("sslmode=verify-full", "sslmode=require")
-    return psycopg2.connect(url)
+    _pool = psycopg2.pool.ThreadedConnectionPool(
+        minconn=2,
+        maxconn=5,   # CockroachDB free tier limit
+        dsn=url,
+    )
+    log.info("Connection pool created (min=2, max=5)")
+
+
+@contextmanager
+def _cx():
+    """
+    Context manager that checks out a connection from the pool and
+    guarantees it's returned — even on error.  Validates the connection
+    with a lightweight query to handle CockroachDB dropping idle conns.
+    """
+    if _pool is None:
+        _init_pool()
+    conn = _pool.getconn()
+    try:
+        # Validate connection — CockroachDB may have dropped it while idle
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            conn.close()
+            conn = _pool.getconn()
+        yield conn
+    finally:
+        _pool.putconn(conn)
+
 
 def _execute(query: str, params: tuple = ()):
-    conn = _cx()
-    try:
+    with _cx() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
         conn.commit()
-    finally:
-        conn.close()
+
 
 def _fetch_one(query: str, params: tuple = ()) -> dict | None:
-    conn = _cx()
-    try:
+    with _cx() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(query, params)
             row = cur.fetchone()
         return dict(row) if row else None
-    finally:
-        conn.close()
+
 
 def _fetch_all(query: str, params: tuple = ()) -> list[dict]:
-    conn = _cx()
-    try:
+    with _cx() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(query, params)
             rows = cur.fetchall()
         return [dict(r) for r in rows]
-    finally:
-        conn.close()
 
 
 # ── DB setup ──────────────────────────────────────────────────────────────────
 
 def init_db():
-    conn = _cx()
-    try:
+    _init_pool()
+    with _cx() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -147,9 +183,7 @@ def init_db():
                 ON trades(chat_id, won) WHERE won IS NULL
             """)
         conn.commit()
-    finally:
-        conn.close()
-    log.info("Database ready (PostgreSQL)")
+    log.info("Database ready (PostgreSQL, pooled connections)")
 
 
 # ── Users ─────────────────────────────────────────────────────────────────────
@@ -228,6 +262,14 @@ def get_unresolved(chat_id: str, older_than_minutes: int = 6) -> list[dict]:
         SELECT * FROM trades
         WHERE chat_id=%s AND won IS NULL AND created_at < %s
     """, (chat_id, cutoff))
+
+def get_all_unresolved(chat_id: str) -> list[dict]:
+    """Return ALL unresolved trades for a user — used to reconstruct positions on restart."""
+    return _fetch_all("""
+        SELECT * FROM trades
+        WHERE chat_id=%s AND won IS NULL
+        ORDER BY created_at DESC
+    """, (chat_id,))
 
 def recent_stats(chat_id: str, days: int = 30) -> list[dict]:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
