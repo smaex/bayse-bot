@@ -151,53 +151,54 @@ async def _user_loop(chat_id: str):
         risk   = _get_risk(chat_id)
 
         try:
-            balance = await client.get_balance_ngn()
+            free_cash = await client.get_balance_ngn()
         except Exception as e:
             log.warning(f"[{chat_id}] balance fetch failed: {e}")
             continue
 
-        risk.update_peak(balance)
+        equity = free_cash + risk.deployed()
+        risk.update_peak(equity)
 
         # ── Deposit / withdrawal detection ─────────────────────────────────────
         last_bal = _last_balance.get(chat_id)
         if last_bal is not None:
-            delta     = balance - last_bal
+            delta     = equity - last_bal
             threshold = max(_BALANCE_EVENT_MIN_NGN, last_bal * _BALANCE_EVENT_MIN_PCT)
             if delta > threshold:
                 # Deposit detected — re-anchor so it doesn't look like profit
-                log.info(f"[{chat_id}] Deposit detected: ₦{delta:+,.0f} (₦{last_bal:,.0f} → ₦{balance:,.0f})")
+                log.info(f"[{chat_id}] Deposit detected: ₦{delta:+,.0f} (₦{last_bal:,.0f} → ₦{equity:,.0f})")
                 day_now = _user_daily.get(chat_id, {})
-                day_now["start_balance"] = balance
+                day_now["start_balance"] = equity
                 settings["daily_state"]  = day_now
                 database.update_settings(chat_id, settings)
-                risk.peak_balance = balance
+                risk.peak_balance = equity
                 _user_daily[chat_id] = day_now
                 if _tg_app:
                     await telegram_bot.notify_deposit_detected(
                         _tg_app, chat_id, delta, "NGN"
                     )
-            elif delta < -threshold and len(risk.open_positions) <= 1:
+            elif delta < -threshold:
                 # Withdrawal detected — re-anchor peak so drawdown isn't triggered
-                log.info(f"[{chat_id}] Withdrawal detected: ₦{delta:,.0f} (₦{last_bal:,.0f} → ₦{balance:,.0f})")
+                log.info(f"[{chat_id}] Withdrawal detected: ₦{delta:,.0f} (₦{last_bal:,.0f} → ₦{equity:,.0f})")
                 day_now = _user_daily.get(chat_id, {})
-                day_now["start_balance"] = balance
+                day_now["start_balance"] = equity
                 settings["daily_state"]  = day_now
                 database.update_settings(chat_id, settings)
-                risk.peak_balance = balance
+                risk.peak_balance = equity
                 _user_daily[chat_id] = day_now
                 if _tg_app:
                     await telegram_bot.send_message(
                         _tg_app, chat_id,
                         f"💸 *Withdrawal detected* — ₦{abs(delta):,.0f} removed\n\n"
-                        f"New balance: ₦{balance:,.2f}\n"
+                        f"New balance: ₦{equity:,.2f}\n"
                         f"Drawdown baseline reset. Trading continues from here.",
                         parse_mode="Markdown",
                     )
-        _last_balance[chat_id] = balance
+        _last_balance[chat_id] = equity
 
         # ── Daily target ───────────────────────────────────────────────────────
-        day          = _daily(chat_id, balance, settings)
-        profit_today = balance - day["start_balance"]
+        day          = _daily(chat_id, equity, settings)
+        profit_today = equity - day["start_balance"]
         target       = _daily_target(settings, day["start_balance"])
         if target > 0 and profit_today >= target and not day["target_hit"]:
             day["target_hit"] = True
@@ -216,12 +217,12 @@ async def _user_loop(chat_id: str):
             continue
 
         # ── Drawdown check ─────────────────────────────────────────────────────
-        if not risk.check_drawdown(balance):
-            dd = (risk.peak_balance - balance) / risk.peak_balance
+        if not risk.check_drawdown(equity):
+            dd = (risk.peak_balance - equity) / risk.peak_balance
             settings["paused"] = True
             database.update_settings(chat_id, settings)
             if _tg_app:
-                await telegram_bot.notify_drawdown(_tg_app, chat_id, balance, risk.peak_balance, dd)
+                await telegram_bot.notify_drawdown(_tg_app, chat_id, equity, risk.peak_balance, dd)
             continue
 
         # ── News notifications ─────────────────────────────────────────────────
@@ -261,10 +262,10 @@ async def _user_loop(chat_id: str):
                 signals = strategy.evaluate(market, strategies=active_strats, learned=learned)
                 for sig in signals:
                     if sig.strategy == "ARB":
-                        await _execute_arb(chat_id, sig, client, balance, settings)
+                        await _execute_arb(chat_id, sig, client, equity, free_cash, settings)
                     elif not risk.already_in(sig.market_id):
                         await _execute_trade(
-                            chat_id, sig, client, risk, balance, settings, learned, max_exp
+                            chat_id, sig, client, risk, equity, free_cash, settings, learned, max_exp
                         )
                     break  # best signal per market per tick
         except Exception as e:
@@ -274,7 +275,7 @@ async def _user_loop(chat_id: str):
 _FX_ASSETS = {"EURUSD", "GBPUSD", "EURGBP", "XAUUSD"}
 
 
-async def _execute_trade(chat_id, sig, client, risk, balance, settings, learned, max_exp):
+async def _execute_trade(chat_id, sig, client, risk, equity, free_cash, settings, learned, max_exp):
     mult     = learned.get("size_multipliers", {}).get(sig.strategy, 1.0)
     base_pct = settings.get("risk_pct", 3.0) / 100.0
     min_t    = settings.get("mintrade",  100)
@@ -288,10 +289,13 @@ async def _execute_trade(chat_id, sig, client, risk, balance, settings, learned,
     # Scale position size by signal certainty: a 35%-certain trade uses 35% of base risk,
     # a 99%-certain trade uses 99%. High-conviction signals earn larger positions automatically.
     raw_pct = base_pct * mult * sig.certainty * fx_factor
-    amount  = balance * min(raw_pct, 0.05)   # hard cap at 5% regardless
+    amount  = equity * min(raw_pct, 0.05)   # hard cap at 5% regardless
     amount  = max(min_t, min(max_t, amount))
 
-    if not risk.can_trade(balance, amount, max_exp):
+    if amount > free_cash:
+        return
+
+    if not risk.can_trade(equity, amount, max_exp):
         return
 
     log.info(
@@ -346,7 +350,7 @@ async def _execute_trade(chat_id, sig, client, risk, balance, settings, learned,
         log.error(f"[{chat_id}] order failed {sig.market_id}: {e}")
 
 
-async def _execute_arb(chat_id, sig, client, balance, settings):
+async def _execute_arb(chat_id, sig, client, equity, free_cash, settings):
     market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
     if not market:
         return
@@ -364,7 +368,11 @@ async def _execute_arb(chat_id, sig, client, balance, settings):
     max_t     = settings.get("maxtrade", 500_000)
 
     # Each leg must meet Bayse's minimum order size independently
-    budget     = min(ARB_MAX_SIZE_NGN, max_t, balance * 0.05)
+    budget     = min(ARB_MAX_SIZE_NGN, max_t, equity * 0.05)
+    
+    if budget > free_cash:
+        budget = free_cash
+        
     min_budget = min_t / min(yes_p, no_p)
     if budget / (yes_p + no_p) < min_budget:
         budget = min_budget * (yes_p + no_p)
