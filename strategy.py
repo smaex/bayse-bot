@@ -68,7 +68,7 @@ from config import (
     CORRELATE_BASE_CERTAINTY, CORRELATE_ALREADY_MOVED,
     CORRELATE_MAX_MARKET_PRICE, CORRELATE_MIN_REGIME,
     NEWS_CERTAINTY_DAMPEN, NEWS_MAX_MARKET_PRICE, NEWS_MIN_REGIME,
-    NEWS_MIN_SECS_LEFT, NEWS_KELLY_FRACTION,
+    NEWS_MIN_SECS_LEFT, NEWS_KELLY_FRACTION, CRYPTO_MIN_DISTANCE,
 )
 import feeds
 import news as news_mod
@@ -297,6 +297,11 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
     if entry_window is None or secs > entry_window or secs < 0:
         return None
 
+    # Time Decay Guard (Gamma Guard): Reject if too close to expiration
+    if secs < 90:
+        log.debug(f"{_u()}SNIPE [{asset} {tf}] REJECTED — {secs:.0f}s left (Gamma Guard)")
+        return None
+
     threshold = market.get("threshold")
     live_spot = feeds.spot.get(asset)
     if not threshold or not live_spot:
@@ -305,6 +310,16 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
         return None
 
     distance_pct = (live_spot - threshold) / threshold   # +ve → YES wins
+
+    # Crypto Minimum Distance Guard (Pin Risk)
+    if asset not in FX_SESSION_UTC:
+        min_dist = CRYPTO_MIN_DISTANCE.get(asset, 0.0010)
+        if abs(distance_pct) < min_dist:
+            log.debug(
+                f"{_u()}SNIPE [{asset} {tf}] REJECTED — distance {distance_pct:+.4%} "
+                f"< min {min_dist:.4%} (Pin Risk Guard)"
+            )
+            return None
 
     # ── FX gate cascade (gates 1–3) ───────────────────────────────────────────
     if asset in FX_SESSION_UTC:
@@ -341,6 +356,13 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
 
     # ── Signal 1: diffusion win probability (realized vol) ────────────────────
     rv    = realized_vol_hourly(asset)
+
+    # Fat-tail penalty: inflate realized volatility artificially in the final minutes
+    # to force the model to demand a larger price gap for high certainty.
+    if secs < 300:
+        penalty_multiplier = 1.0 + 0.5 * ((300 - secs) / 210.0)  # scales from 1.0 to 1.5
+        rv = rv * penalty_multiplier
+
     w_est = win_probability(distance_pct, secs, asset, sigma_override=rv)
     base  = _certainty_from_prob(w_est)
 

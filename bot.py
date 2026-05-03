@@ -292,6 +292,16 @@ async def _execute_trade(chat_id, sig, client, risk, equity, free_cash, settings
     amount  = equity * min(raw_pct, 0.05)   # hard cap at 5% regardless
     amount  = max(min_t, min(max_t, amount))
 
+    # Safety Guard: Ensure mintrade does not force a massively oversized trade
+    hard_cap = equity * 0.15
+    if amount > hard_cap:
+        log.warning(
+            f"[{chat_id}] REJECTED {sig.strategy} | {sig.asset} — "
+            f"Trade amount ₦{amount:,.0f} exceeds 15% bankroll hard cap (₦{hard_cap:,.0f}). "
+            f"Consider lowering mintrade."
+        )
+        return
+
     if amount > free_cash:
         return
 

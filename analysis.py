@@ -151,7 +151,7 @@ async def full_report(client: BayseClient, chat_id: str | None = None) -> str:
         lines.append("")
 
     # ── Recommendations ───────────────────────────────────────────────────────
-    lines += _recommendations(win_rate, total, by_strategy if stats_rows else {})
+    lines += _recommendations(win_rate, total, total_pnl, by_strategy if stats_rows else {}, by_asset if stats_rows else {})
 
     return "\n".join(lines)
 
@@ -163,25 +163,31 @@ def _estimate_fee_drag(stats_rows: list) -> float:
     return 0.04 * 0.50 * 0.50  # = 1%
 
 
-def _recommendations(win_rate: float, total: int, by_strategy: dict) -> list[str]:
+def _recommendations(win_rate: float, total: int, total_pnl: float, by_strategy: dict, by_asset: dict) -> list[str]:
     lines = ["💡 *Recommendations*"]
 
     if total < 10:
         lines.append("   - Need 30+ trades for statistical significance (keep running)")
-    elif win_rate >= 0.62:
+    elif win_rate >= 0.62 and total_pnl > 0:
         lines.append("   - Strong edge. Consider raising risk % gradually (/set risk 4)")
         lines.append("   - Scale up position sizes to compound gains faster")
-    elif win_rate >= 0.52:
+    elif win_rate >= 0.52 and total_pnl > 0:
         lines.append("   - Positive edge. Maintain current settings.")
         lines.append("   - Focus on 5min and 15min for highest frequency")
     else:
-        lines.append("   - Win rate below break-even. Run /resetlearning to reset thresholds")
+        lines.append("   - Win rate below break-even or in drawdown. Run /resetlearning to reset thresholds")
         lines.append("   - Disable low-confidence strategies: /set strategies SNIPE ARB")
 
     # Flag any strategy with a losing record
     for strat, d in by_strategy.items():
         if d["total"] >= 5 and d["pnl"] < 0:
             wr = d["wins"] / d["total"]
-            lines.append(f"   ⚠️ {strat} losing (₦{d['pnl']:+,.0f}, {wr:.0%} WR) — consider disabling")
+            lines.append(f"   ⚠️ {strat} strategy losing (₦{d['pnl']:+,.0f}, {wr:.0%} WR) — consider disabling")
+
+    # Flag any asset with a losing record
+    for asset, d in by_asset.items():
+        if d["total"] >= 5 and d["pnl"] < 0:
+            wr = d["wins"] / d["total"]
+            lines.append(f"   ⚠️ {asset} asset losing (₦{d['pnl']:+,.0f}, {wr:.0%} WR) — consider disabling: /set assets BTC SOL")
 
     return lines

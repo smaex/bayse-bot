@@ -137,6 +137,13 @@ FX_MIN_DISTANCE = {
     "XAUUSD": 0.0015,  # 0.15%
 }
 
+# Minimum distance for Crypto SNIPE entries to protect against Pin Risk (jumps near expiration).
+CRYPTO_MIN_DISTANCE = {
+    "BTC": 0.0010,  # 0.10%
+    "ETH": 0.0015,  # 0.15%
+    "SOL": 0.0020,  # 0.20%
+}
+
 # FX requires a cleaner trend than crypto — minimum efficiency ratio.
 FX_MIN_REGIME = 0.30   # below this = too choppy to trade FX reliably
 
