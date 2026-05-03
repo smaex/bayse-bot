@@ -534,6 +534,15 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> 
         direction = _btc_signal_direction.get(tf)
         freshness = 1.0 - (age / CORRELATION_WINDOW_SEC)
 
+    # ── Guard 0: Time to play out ──────────────────────────────────────────────
+    secs = market.get("secs_to_close", 0)
+    if secs < 300:
+        log.info(
+            f"{_u()}CORRELATE [{asset} {tf}] REJECTED — only {secs:.0f}s left "
+            f"(need ≥300s for correlation to fully play out)"
+        )
+        return None
+
     # ── Guard 1: has the target asset already moved in the same direction? ─────
     target_move, target_dir = _btc_spot_move_pct(CORRELATION_WINDOW_SEC)  # reuse helper
     # Actually measure target asset's own move
@@ -712,6 +721,15 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[Tra
         log.info(
             f"{_u()}NEWS [{asset}] REJECTED — only {secs:.0f}s left "
             f"(need ≥{NEWS_MIN_SECS_LEFT}s for news to play out)"
+        )
+        return None
+
+    # ── Guard 1.5: timeframe restriction ───────────────────────────────────────
+    tf = market.get("timeframe", "")
+    if tf == "5min":
+        log.info(
+            f"{_u()}NEWS [{asset}] REJECTED — timeframe is 5min "
+            f"(too fast for news to reliably establish trend)"
         )
         return None
 
