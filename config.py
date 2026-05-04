@@ -120,7 +120,7 @@ ASSET_HOURLY_VOL = {
     "XAUUSD": 0.0015,  # ~0.15% per hour (Gold)
 }
 
-SNIPE_MIN_CERTAINTY = 0.40   # min certainty = min win_prob of 68% (0.50 + 0.45×0.40)
+SNIPE_MIN_CERTAINTY = 0.55   # min win_prob of ~75% (was 0.40/68% — too risky for small bankrolls)
 
 # ── FX-specific trading rules ─────────────────────────────────────────────────
 # Only trade FX/Gold during their active market sessions (UTC).
@@ -175,9 +175,9 @@ ARB_TRIGGER = 0.94           # enter burn arb when YES+NO sum ≤ this (demands 
 ARB_MAX_SIZE_NGN = 50_000    # max per arb trade
 
 # ── Risk Management ───────────────────────────────────────────────────────────
-BANKROLL_PCT_PER_TRADE = 0.03  # 3% of bankroll per trade (Kelly-conservative)
-MAX_PORTFOLIO_EXPOSURE = 0.30  # never have >30% of bankroll in open positions
-MAX_DRAWDOWN_STOP = 0.20       # pause all trading at 20% drawdown from peak
+BANKROLL_PCT_PER_TRADE = 0.02  # 2% of bankroll per trade (was 3% — too aggressive)
+MAX_PORTFOLIO_EXPOSURE = 0.20  # never have >20% of bankroll in open positions (was 30%)
+MAX_DRAWDOWN_STOP = 0.15       # pause all trading at 15% drawdown (was 20%)
 PROFIT_ALERT_NGN = 20_000      # Telegram alert when unrealized profit hits this
 
 # ── Rate Limiting (stay well under 20 write/sec, 30 read/sec) ─────────────────
