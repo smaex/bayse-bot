@@ -95,6 +95,21 @@ def start_user(chat_id: str):
     if _scan_client is None:
         _scan_client = client
 
+    # ── Force-Safety Migration ────────────────────────────────────────────────
+    # Ensure existing users are moved to the new safer defaults (2% risk, 20% exposure)
+    # This prevents the "20% wipeout" even if they haven't manually updated settings.
+    settings = user.get("settings", {})
+    updated = False
+    if settings.get("risk_pct", 3.0) > 2.0:
+        settings["risk_pct"] = 2.0
+        updated = True
+    if settings.get("maxexposure", 30.0) > 20.0:
+        settings["maxexposure"] = 20.0
+        updated = True
+    if updated:
+        database.update_settings(chat_id, settings)
+        log.info(f"[{chat_id}] Safety Migration applied: risk_pct=2%, maxexposure=20%")
+
     # ── Reconstruct open positions from DB ─────────────────────────────────────
     # After a restart, risk.open_positions is empty.  Without this, the exposure
     # cap is bypassed until trades resolve — the bot could over-deploy capital.
