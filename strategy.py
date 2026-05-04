@@ -69,6 +69,7 @@ from config import (
     CORRELATE_MAX_MARKET_PRICE, CORRELATE_MIN_REGIME,
     NEWS_CERTAINTY_DAMPEN, NEWS_MAX_MARKET_PRICE, NEWS_MIN_REGIME,
     NEWS_MIN_SECS_LEFT, NEWS_KELLY_FRACTION, CRYPTO_MIN_DISTANCE,
+    SNIPE_MAX_MARKET_PRICE,
 )
 import feeds
 import news as news_mod
@@ -157,9 +158,13 @@ def win_probability(distance_pct: float, secs_remaining: float, asset: str,
     return _norm_cdf(z)
 
 
-def max_ev_price(win_prob: float, fee_rate: float = 0.04) -> float:
-    """Max entry price guaranteeing EV > 0.  price < W × (1 − fee)."""
-    return win_prob * (1.0 - fee_rate)
+def max_ev_price(win_prob: float, fee_rate: float = 0.04, min_margin: float = 0.10) -> float:
+    """
+    Max entry price guaranteeing EV > 0 with a profit cushion.
+    formula: win_prob * (1.0 - fee_rate) - min_margin
+    Ensures we don't take trades that 'win' but pay out less than we spent.
+    """
+    return win_prob * (1.0 - fee_rate) - min_margin
 
 
 def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.04,
@@ -417,12 +422,21 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
 
     # ── Dynamic EV gate ───────────────────────────────────────────────────────
     fee_rate  = market.get("fee_rate", 0.04)
-    ev_ceiling = max_ev_price(w_est, fee_rate)
+    # Require at least a 10% margin above fees
+    ev_ceiling = max_ev_price(w_est, fee_rate, min_margin=0.10)
 
     if market_price >= ev_ceiling:
         log.info(
             f"{_u()}SNIPE [{asset} {tf}] REJECTED — market {market_price:.3f} >= "
-            f"EV ceiling {ev_ceiling:.3f} (w_est={w_est:.1%})"
+            f"EV ceiling {ev_ceiling:.3f} (w_est={w_est:.1%}, margin buffer=10%)"
+        )
+        return None
+
+    # ── Hard Price Ceiling ──────────────────────────────────────────────────
+    if market_price > SNIPE_MAX_MARKET_PRICE:
+        log.info(
+            f"{_u()}SNIPE [{asset} {tf}] REJECTED — market {market_price:.3f} > "
+            f"SNIPE_MAX_MARKET_PRICE {SNIPE_MAX_MARKET_PRICE:.3f}"
         )
         return None
 

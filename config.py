@@ -101,6 +101,10 @@ SNIPE_ENTRY_WINDOWS = {
     "1d":    21600,  # last 6 hours
 }
 
+# DO NOT buy if the price is already this high.
+# Prevents buying "certain wins" that actually lose money after fees (e.g. 0.98 price).
+SNIPE_MAX_MARKET_PRICE = 0.85
+
 # Asset hourly volatility (1σ, fractional) — used in diffusion model for win probability.
 # P(win) = Φ( |spot_distance| / (σ_h × √T_hours) )  ← same math as options pricing
 ASSET_HOURLY_VOL = {

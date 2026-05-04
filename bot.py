@@ -308,6 +308,15 @@ async def _execute_trade(chat_id, sig, client, risk, equity, free_cash, settings
     if not risk.can_trade(equity, amount, max_exp):
         return
 
+    # Final Sanity Guard: Never buy if the price is > 0.95.
+    # Even with 100% win probability, the platform's 4-5% fee would result in a net loss.
+    if sig.market_price > 0.95:
+        log.warning(
+            f"[{chat_id}] REJECTED {sig.strategy} | {sig.asset} — "
+            f"Market price {sig.market_price:.3f} too high (guaranteed loss after fees)."
+        )
+        return
+
     log.info(
         f"[{chat_id}] PLACING {sig.strategy} | {sig.asset} {sig.timeframe} {sig.outcome} "
         f"@ {sig.market_price:.3f} certainty={sig.certainty:.0%} ₦{amount:,.0f}"
