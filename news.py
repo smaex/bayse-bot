@@ -26,7 +26,7 @@ import aiohttp
 from config import (
     NEWSAPI_KEY, NEWS_POLL_SEC,
     NEWS_SENTIMENT_THRESHOLD, NEWS_SIGNAL_DECAY_MIN,
-    FOMC_DATES_2026,
+    FOMC_DATES_2026, NEWS_REQUIRE_CRYPTO_CATALYST,
 )
 
 log = logging.getLogger(__name__)
@@ -39,6 +39,32 @@ except ImportError:
     _vader_ok = False
     log.warning("vaderSentiment not installed — sentiment scoring disabled")
 
+# Direct crypto catalyst keywords — headlines must match at least one to trigger a trade.
+# Geopolitical noise (Iran, war, tariffs) scores high on VADER but has no reliable
+# crypto price correlation.  We still NOTIFY users about those headlines but don't trade.
+_CRYPTO_CATALYSTS = {
+    # Regulatory / legal
+    "etf", "sec", "cftc", "regulation", "regulatory", "ban", "lawsuit", "legal",
+    "approval", "approved", "reject", "rejected", "compliance", "enforcement",
+    # Market structure
+    "exchange", "binance", "coinbase", "kraken", "ftx", "hack", "hacked", "exploit",
+    "breach", "insolvent", "insolvency", "bankrupt", "bankruptcy", "delisted", "delist",
+    "liquidity", "liquidation", "liquidated", "whale", "dump", "dumped",
+    # Monetary policy (direct crypto impact)
+    "fed", "federal reserve", "fomc", "rate cut", "rate hike", "interest rate",
+    "inflation", "cpi", "monetary", "quantitative", "tightening", "easing",
+    "treasury", "yield", "bond",
+    # Crypto-specific events
+    "halving", "halvening", "fork", "upgrade", "merge", "staking", "unstaking",
+    "airdrop", "token", "defi", "nft", "layer 2", "l2", "rollup", "bridge",
+    "stablecoin", "tether", "usdt", "usdc", "depeg", "peg",
+    # Adoption / institutional
+    "adoption", "institutional", "microstrategy", "saylor", "tesla", "payment",
+    "custody", "etf approval", "spot etf", "blackrock", "fidelity", "grayscale",
+    # Direct asset mentions (redundant with _CRYPTO_KEYWORDS but explicit for catalyst check)
+    "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto", "cryptocurrency",
+}
+
 
 @dataclass
 class NewsSignal:
@@ -49,6 +75,7 @@ class NewsSignal:
     headline: str
     timestamp: float = field(default_factory=time.time)
     decay_minutes: int = NEWS_SIGNAL_DECAY_MIN
+    _notify_only: bool = False
 
     def is_alive(self) -> bool:
         return (time.time() - self.timestamp) < self.decay_minutes * 60
@@ -82,25 +109,43 @@ def _assets_from_text(text: str) -> list[str]:
     return found or ["BTC", "ETH", "SOL"]  # generic crypto news → all assets
 
 
+def _has_crypto_catalyst(text: str) -> bool:
+    """Check if headline contains a direct crypto catalyst keyword."""
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in _CRYPTO_CATALYSTS)
+
+
 def _push_signal(signal: NewsSignal):
-    active_signals.append(signal)
-    # Keep only live signals
-    active_signals[:] = [s for s in active_signals if s.is_alive()]
+    # Always log the signal for user notifications
     log.info(
         f"News signal [{signal.direction}] score={signal.score:.2f} "
         f"src={signal.source}: {signal.headline[:80]}"
     )
 
+    # Gate: only create a TRADING signal if it has a crypto catalyst
+    if NEWS_REQUIRE_CRYPTO_CATALYST and not _has_crypto_catalyst(signal.headline):
+        log.info(
+            f"News [{signal.direction}] NOTIFY-ONLY — no crypto catalyst: "
+            f"{signal.headline[:60]}"
+        )
+        # Still add to active_signals so users get Telegram notifications,
+        # but mark it as non-tradeable
+        signal._notify_only = True
+
+    active_signals.append(signal)
+    # Keep only live signals
+    active_signals[:] = [s for s in active_signals if s.is_alive()]
+
 
 def best_signal_for(asset: str) -> Optional[NewsSignal]:
     """Return strongest live signal relevant to this asset."""
-    live = [s for s in active_signals if s.is_alive() and asset in s.assets]
+    live = [s for s in active_signals if s.is_alive() and asset in s.assets and not getattr(s, "_notify_only", False)]
     return max(live, key=lambda s: s.strength(), default=None)
 
 
 def active_signals_for(asset: str) -> list[NewsSignal]:
     """Return all live signals relevant to this asset."""
-    return [s for s in active_signals if s.is_alive() and asset in s.assets]
+    return [s for s in active_signals if s.is_alive() and asset in s.assets and not getattr(s, "_notify_only", False)]
 
 
 # ── NewsAPI.org feed ──────────────────────────────────────────────────────────

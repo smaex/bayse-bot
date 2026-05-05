@@ -147,6 +147,13 @@ class BayseClient:
 
     # ── Orders (write) ───────────────────────────────────────────────────────
 
+    async def get_quote(self, event_id: str, market_id: str, outcome_id: str,
+                        side: str, amount: float, currency: str = "NGN") -> dict:
+        return await self._get(
+            f"/v1/pm/events/{event_id}/markets/{market_id}/quote",
+            params={"outcomeId": outcome_id, "side": side, "amount": amount, "currency": currency}
+        )
+
     async def place_order(self, event_id: str, market_id: str, outcome_id: str,
                           side: str, amount: float, order_type: str = "MARKET",
                           price: float = None, currency: str = "NGN",

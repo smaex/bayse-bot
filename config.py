@@ -72,6 +72,7 @@ NEWS_MAX_MARKET_PRICE  = 0.55    # reject if market already repriced past this (
 NEWS_MIN_REGIME        = 0.25    # reject in choppy markets (news shock gets absorbed)
 NEWS_MIN_SECS_LEFT     = 120     # need at least 2 min for news to play out
 NEWS_KELLY_FRACTION    = 0.12    # conservative sizing for sentiment-based signals
+NEWS_REQUIRE_CRYPTO_CATALYST = True  # only trade on headlines with direct crypto catalysts
 
 # Economic calendar events (UTC times — add to this list as needed)
 FOMC_DATES_2026 = [

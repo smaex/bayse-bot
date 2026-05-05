@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from datetime import date
 
 from aiohttp import web, ClientSession, ClientTimeout
@@ -43,12 +44,17 @@ _user_risks:    dict[str, RiskManager]  = {}
 _user_daily:    dict[str, dict]         = {}  # {chat_id: {date, start_balance, target_hit}}
 _user_tasks:    dict[str, asyncio.Task] = {}
 _last_balance:  dict[str, float]        = {}  # for deposit/withdrawal detection
+_low_bal_notified: dict[str, str]       = {}  # chat_id → date last notified (max once/day)
 _scan_client:   BayseClient | None = None
 _tg_app        = None
+
+_last_spot:        dict[str, float] = {}
+_last_market_eval: dict[str, float] = {}
 
 # Minimum change to be considered a deposit/withdrawal (not just trade P&L noise)
 _BALANCE_EVENT_MIN_NGN = 500
 _BALANCE_EVENT_MIN_PCT = 0.08   # 8% of balance
+_MIN_VIABLE_BALANCE    = 1_000  # Bayse minimum trade is ₦100; need ₦1k+ to trade safely
 
 
 def _get_client(user: dict) -> BayseClient:
@@ -142,13 +148,13 @@ def start_user(chat_id: str):
 
 
 async def _user_loop(chat_id: str):
-    """Per-user async trading loop — runs every 10 seconds."""
+    """Per-user async trading loop — runs every 30 seconds for housekeeping. Signal evaluation is event-driven."""
     strategy.set_user_context(chat_id)   # tags every strategy log line with this user
     sent_news: set[str] = set()
     iter_count = 0
 
     while True:
-        await asyncio.sleep(10)
+        await asyncio.sleep(30)
         iter_count += 1
         user = database.get_user(chat_id)
         if not user or not user.get("is_active"):
@@ -211,6 +217,30 @@ async def _user_loop(chat_id: str):
                     )
         _last_balance[chat_id] = equity
 
+        # ── Low balance guard ──────────────────────────────────────────────────
+        if equity < _MIN_VIABLE_BALANCE:
+            today = date.today().isoformat()
+            if _low_bal_notified.get(chat_id) != today:
+                _low_bal_notified[chat_id] = today
+                log.info(
+                    f"[{chat_id}] Balance ₦{equity:,.0f} below minimum "
+                    f"₦{_MIN_VIABLE_BALANCE:,} — notifying user to deposit"
+                )
+                if _tg_app:
+                    await telegram_bot.send_message(
+                        _tg_app, chat_id,
+                        f"⚠️ *Low Balance — Trading Paused*\n\n"
+                        f"Your balance is ₦{equity:,.0f}, which is below "
+                        f"the ₦{_MIN_VIABLE_BALANCE:,} minimum needed to trade safely.\n\n"
+                        f"Bayse requires at least ₦100 per trade, and the bot "
+                        f"needs ₦1,000+ to size positions properly.\n\n"
+                        f"💰 Please deposit funds to resume trading.\n"
+                        f"The bot will start trading automatically once your "
+                        f"balance is above ₦{_MIN_VIABLE_BALANCE:,}.",
+                        parse_mode="Markdown",
+                    )
+            continue
+
         # ── Daily target ───────────────────────────────────────────────────────
         day          = _daily(chat_id, equity, settings)
         profit_today = equity - day["start_balance"]
@@ -260,31 +290,36 @@ async def _user_loop(chat_id: str):
         active_strats = [s for s in user_strats if s not in suspended]
         max_exp      = settings.get("maxexposure", 30.0) / 100.0
 
-        try:
-            for market in active_markets:
-                if market.get("status") != "open":
-                    continue
-                if market["asset"] not in user_assets:
-                    continue
-                if market["timeframe"] not in user_tfs:
-                    continue
+        await _evaluate_markets(chat_id, settings, client, risk, equity, free_cash, active_strats, learned, max_exp, user_assets, user_tfs)
 
-                ws = feeds.market_prices.get(market["market_id"])
-                if ws:
-                    market["yes_price"] = ws["yes"]
-                    market["no_price"]  = ws["no"]
+async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash, active_strats, learned, max_exp, user_assets, user_tfs, trigger_asset=None):
+    try:
+        for market in active_markets:
+            if market.get("status") != "open":
+                continue
+            if market["asset"] not in user_assets:
+                continue
+            if trigger_asset and market["asset"] != trigger_asset:
+                continue
+            if market["timeframe"] not in user_tfs:
+                continue
 
-                signals = strategy.evaluate(market, strategies=active_strats, learned=learned)
-                for sig in signals:
-                    if sig.strategy == "ARB":
-                        await _execute_arb(chat_id, sig, client, equity, free_cash, settings)
-                    elif not risk.already_in(sig.market_id):
-                        await _execute_trade(
-                            chat_id, sig, client, risk, equity, free_cash, settings, learned, max_exp
-                        )
-                    break  # best signal per market per tick
-        except Exception as e:
-            log.error(f"[{chat_id}] market eval error (iter={iter_count}): {e}", exc_info=True)
+            ws = feeds.market_prices.get(market["market_id"])
+            if ws:
+                market["yes_price"] = ws["yes"]
+                market["no_price"]  = ws["no"]
+
+            signals = strategy.evaluate(market, strategies=active_strats, learned=learned)
+            for sig in signals:
+                if sig.strategy == "ARB":
+                    await _execute_arb(chat_id, sig, client, equity, free_cash, settings)
+                elif not risk.already_in(sig.market_id):
+                    await _execute_trade(
+                        chat_id, sig, client, risk, equity, free_cash, settings, learned, max_exp
+                    )
+                break  # best signal per market per tick
+    except Exception as e:
+        log.error(f"[{chat_id}] market eval error: {e}", exc_info=True)
 
 
 _FX_ASSETS = {"EURUSD", "GBPUSD", "EURGBP", "XAUUSD"}
@@ -308,13 +343,12 @@ async def _execute_trade(chat_id, sig, client, risk, equity, free_cash, settings
     amount  = max(min_t, min(max_t, amount))
 
     # Safety Guard: Ensure mintrade does not force a massively oversized trade.
-    # Hard cap at 8% of bankroll (was 15% — too high, 3 losses would wipe 45%).
+    # Hard cap at 8% of bankroll (3 losses would wipe 24% — manageable).
     hard_cap = equity * 0.08
     if amount > hard_cap:
-        log.warning(
-            f"[{chat_id}] REJECTED {sig.strategy} | {sig.asset} — "
-            f"Trade amount ₦{amount:,.0f} exceeds 15% bankroll hard cap (₦{hard_cap:,.0f}). "
-            f"Consider lowering mintrade."
+        log.info(
+            f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — "
+            f"Trade ₦{amount:,.0f} exceeds 8% hard cap (₦{hard_cap:,.0f})"
         )
         return
 
@@ -396,7 +430,7 @@ async def _execute_arb(chat_id, sig, client, equity, free_cash, settings):
     no_p  = ws["no"]  if ws else market["no_price"]
     if yes_p <= 0 or no_p <= 0:  # prices not yet received from WS — skip
         return
-    if yes_p + no_p >= 0.99:  # tight buffer — any sum ≥0.99 is not worth the slippage
+    if yes_p + no_p >= 0.97:  # tight buffer — any sum ≥0.97 is not worth the slippage
         return
 
     min_t     = settings.get("mintrade", 100)
@@ -422,15 +456,40 @@ async def _execute_arb(chat_id, sig, client, equity, free_cash, settings):
     amount_yes = round(max_pairs * yes_p, 2)
     amount_no  = round(max_pairs * no_p, 2)
 
+    try:
+        # ── Leg 0: Get quotes before committing ────────────────────────────────
+        quote_yes = await client.get_quote(sig.event_id, sig.market_id, market["yes_id"], "BUY", amount_yes, CURRENCY)
+        quote_no = await client.get_quote(sig.event_id, sig.market_id, market["no_id"], "BUY", amount_no, CURRENCY)
+        
+        q_yes_shares = float(quote_yes.get("shares", quote_yes.get("quantity", 0)))
+        q_no_shares = float(quote_no.get("shares", quote_no.get("quantity", 0)))
+        
+        # We need at least 95% of expected shares to proceed
+        if q_yes_shares < max_pairs * 0.95 or q_no_shares < max_pairs * 0.95:
+            log.warning(
+                f"[{chat_id}] ARB quote failed: slippage too high. "
+                f"Expected {max_pairs}, quoted YES:{q_yes_shares:.2f}, NO:{q_no_shares:.2f}"
+            )
+            return
+            
+        log.info(f"[{chat_id}] ARB quotes verified: expected ~{min(q_yes_shares, q_no_shares):.0f} shares")
+
+    except Exception as e:
+        log.warning(f"[{chat_id}] ARB quote fetch failed: {e}")
+        return
+
     yes_ok = False
     try:
         # ── Leg 1: buy YES ─────────────────────────────────────────────────────
-        await client.place_order(
+        resp_yes = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["yes_id"], side="BUY",
             amount=amount_yes, order_type="MARKET", currency=CURRENCY,
         )
         yes_ok = True
+        yes_order = resp_yes.get("order", resp_yes)
+        yes_shares = float(yes_order.get("shares", yes_order.get("quantity", max_pairs)) or max_pairs)
+        log.info(f"[{chat_id}] ARB {sig.asset} YES leg filled: {yes_shares} shares")
 
         # Re-check prices between legs — someone may have front-run us
         ws2 = feeds.market_prices.get(sig.market_id)
@@ -451,17 +510,48 @@ async def _execute_arb(chat_id, sig, client, equity, free_cash, settings):
                     log.error(f"[{chat_id}] ARB rollback sell failed: {re}")
                 return
 
+        # Recalculate NO amount using latest price to match share count
+        ws_no = feeds.market_prices.get(sig.market_id)
+        if ws_no:
+            live_no_p = ws_no["no"]
+            amount_no = round(yes_shares * live_no_p, 2)
+            log.info(f"[{chat_id}] ARB {sig.asset} NO leg adjusted: {amount_no} NGN at {live_no_p:.4f}")
+
         # ── Leg 2: buy NO ──────────────────────────────────────────────────────
-        await client.place_order(
+        resp_no = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["no_id"], side="BUY",
             amount=amount_no, order_type="MARKET", currency=CURRENCY,
         )
+        no_order = resp_no.get("order", resp_no)
+        no_shares = float(no_order.get("shares", no_order.get("quantity", max_pairs)) or max_pairs)
+        log.info(f"[{chat_id}] ARB {sig.asset} NO leg filled: {no_shares} shares")
 
-        # ── Leg 3: burn for ₦1.00 per pair ─────────────────────────────────────
-        await client.burn_shares(sig.market_id, max_pairs, CURRENCY)
+        # ── Leg 3: burn matched pairs ──────────────────────────────────────────
+        burn_pairs = int(min(yes_shares, no_shares))
+        if burn_pairs < 1:
+            log.warning(f"[{chat_id}] ARB {sig.asset}: not enough matched pairs to burn ({yes_shares}/{no_shares})")
+            return
+        if burn_pairs < max_pairs:
+            log.warning(
+                f"[{chat_id}] ARB {sig.asset}: share mismatch — "
+                f"YES={yes_shares}, NO={no_shares}, burning {burn_pairs} pairs"
+            )
+        await client.burn_shares(sig.market_id, burn_pairs, CURRENCY)
+        actual_profit = burn_pairs * (1.00 - yes_p - no_p)
+        
+        # Record trade to database so P&L is tracked
+        trade_id = database.record_trade(
+            chat_id=chat_id, strategy=sig.strategy, asset=sig.asset,
+            timeframe=sig.timeframe, outcome="ARB", outcome_id="burn",
+            market_id=sig.market_id, event_id=sig.event_id, order_id=str(burn_pairs),
+            entry_price=yes_p + no_p, amount_ngn=budget, certainty=sig.certainty,
+            secs_to_close=0, spot_vs_threshold_pct=0.0,
+        )
+        database.resolve_trade(trade_id, won=True, pnl_ngn=actual_profit)
+        
         if _tg_app:
-            await telegram_bot.notify_arb(_tg_app, chat_id, sig, max_pairs, profit_est)
+            await telegram_bot.notify_arb(_tg_app, chat_id, sig, burn_pairs, actual_profit)
 
     except Exception as e:
         log.error(f"[{chat_id}] ARB failed {sig.market_id}: {e}")
@@ -504,6 +594,60 @@ def _refresh_timers():
 def _on_spot_price(asset: str, price: float):
     strategy.update_price_history(asset, price)
     log.debug(f"Spot {asset}: {price:,.4f}")
+    
+    last = _last_spot.get(asset)
+    if last is not None:
+        change = abs(price - last) / last
+        threshold = 0.0005 if asset in _FX_ASSETS else 0.0010  # 0.05% FX, 0.1% Crypto
+        if change >= threshold:
+            _last_spot[asset] = price
+            asyncio.create_task(_evaluate_all_users_for_spot(asset))
+    else:
+        _last_spot[asset] = price
+
+
+async def _evaluate_all_users_for_spot(asset: str):
+    # Cooldown check: max 1 evaluation every 5 seconds per asset
+    now = time.time()
+    if now - _last_market_eval.get(asset, 0) < 5:
+        return
+    _last_market_eval[asset] = now
+    
+    log.info(f"⚡ SPOT TRIGGER: {asset} moved significantly, evaluating markets...")
+    
+    users = database.get_all_active()
+    for user in users:
+        chat_id = user["chat_id"]
+        client = _user_clients.get(chat_id)
+        risk = _user_risks.get(chat_id)
+        
+        if not client or not risk or risk.paused:
+            continue
+            
+        settings = user["settings"]
+        if settings.get("paused"):
+            continue
+            
+        # Use cached balance if possible to avoid API rate limits
+        equity = _last_balance.get(chat_id)
+        if not equity:
+            try:
+                free_cash = await client.get_balance_ngn()
+                equity = free_cash + risk.deployed()
+            except Exception:
+                continue
+        else:
+            free_cash = equity - risk.deployed()
+            
+        user_assets = settings.get("assets", ["BTC", "ETH", "SOL"])
+        user_tfs = settings.get("timeframes", ["5min", "15min", "1h"])
+        user_strats = settings.get("strategies", ["SNIPE", "CORRELATE", "ARB", "NEWS"])
+        learned = settings.get("learned", {})
+        suspended = learned.get("suspended_strategies", [])
+        active_strats = [s for s in user_strats if s not in suspended]
+        max_exp = settings.get("maxexposure", 30.0) / 100.0
+        
+        await _evaluate_markets(chat_id, settings, client, risk, equity, free_cash, active_strats, learned, max_exp, user_assets, user_tfs, trigger_asset=asset)
 
 
 def _on_market_update(market_id: str, prices: dict):
