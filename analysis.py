@@ -72,6 +72,22 @@ async def full_report(client: BayseClient, chat_id: str | None = None) -> str:
         "",
     ]
 
+    # ── Risk-Reward Analysis ──────────────────────────────────────────────────
+    recent_resolved = [t for t in recent if t.get("won") is not None and t.get("pnl_ngn") is not None]
+    if recent_resolved:
+        wins_only = [t["pnl_ngn"] for t in recent_resolved if t["won"] == 1]
+        loss_only = [abs(t["pnl_ngn"]) for t in recent_resolved if t["won"] == 0]
+        avg_win = sum(wins_only) / len(wins_only) if wins_only else 0
+        avg_loss = sum(loss_only) / len(loss_only) if loss_only else 0
+        rr_ratio = avg_win / avg_loss if avg_loss > 0 else 0
+        
+        lines += [
+            "⚖️ *Risk-Reward (last 5 resolved)*",
+            f"   Avg Win: ₦{avg_win:,.0f}  |  Avg Loss: ₦{avg_loss:,.0f}",
+            f"   RR Ratio: 1:{rr_ratio:.2f} {'(Healthy ✅)' if rr_ratio > 0.15 else '(Skewed ⚠️)'}",
+            "",
+        ]
+
     # ── Per-strategy breakdown ────────────────────────────────────────────────
     if stats_rows:
         by_strategy: dict[str, dict] = {}
@@ -166,17 +182,19 @@ def _estimate_fee_drag(stats_rows: list) -> float:
 def _recommendations(win_rate: float, total: int, total_pnl: float, by_strategy: dict, by_asset: dict) -> list[str]:
     lines = ["💡 *Recommendations*"]
 
+    # Strategy-specific recommendations
+    snipe = by_strategy.get("SNIPE", {})
+    if snipe.get("total", 0) >= 10:
+        wr = snipe["wins"] / snipe["total"]
+        if wr < 0.88:
+            lines.append(f"   ⚠️ SNIPE WR too low ({wr:.0%}). Needs >87% to be profitable. Selective mode active.")
+
     if total < 10:
         lines.append("   - Need 30+ trades for statistical significance (keep running)")
-    elif win_rate >= 0.62 and total_pnl > 0:
-        lines.append("   - Strong edge. Consider raising risk % gradually (/set risk 4)")
-        lines.append("   - Scale up position sizes to compound gains faster")
-    elif win_rate >= 0.52 and total_pnl > 0:
-        lines.append("   - Positive edge. Maintain current settings.")
-        lines.append("   - Focus on 5min and 15min for highest frequency")
-    else:
-        lines.append("   - Win rate below break-even or in drawdown. Run /resetlearning to reset thresholds")
-        lines.append("   - Disable low-confidence strategies: /set strategies SNIPE ARB")
+    elif win_rate >= 0.85 and total_pnl > 0:
+        lines.append("   - Strong performance. Risk-Reward is healthy.")
+    elif total_pnl < 0:
+        lines.append("   - In drawdown. The bot is now in 'Selective' mode to protect capital.")
 
     # Flag any strategy with a losing record
     for strat, d in by_strategy.items():

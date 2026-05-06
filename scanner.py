@@ -91,6 +91,10 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
     yes_price = float(raw_yes)
     no_price  = float(raw_no)
 
+    # Reject markets with zero prices or missing threshold — likely broken or closed
+    if yes_price <= 0 or no_price <= 0 or not threshold:
+        return None
+
     return {
         "event_id": event_id,
         "market_id": market_id,

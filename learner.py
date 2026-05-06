@@ -49,14 +49,19 @@ def run_learning(chat_id: str) -> tuple[dict, str]:
         if total < 5:
             continue
 
-        # Suspend / reactivate
-        if win_rate is not None and win_rate < 0.48 and total >= 20:
+        # Suspend / reactivate — strategy-specific thresholds
+        # SNIPE needs ~87% WR to break even with 15% profit floor.
+        # CORRELATE/NEWS need ~57% WR with their 0.55 price ceiling.
+        wr_suspend = 0.85 if strat == "SNIPE" else 0.55
+        wr_recover = 0.90 if strat == "SNIPE" else 0.65
+
+        if win_rate is not None and win_rate < wr_suspend and total >= 15:
             if strat not in suspended:
                 suspended.add(strat)
-                warnings.append(f"⚠️ {strat} suspended — WR {win_rate:.0%} over {total} trades")
-        elif strat in suspended and win_rate and win_rate >= 0.55:
+                warnings.append(f"⚠️ {strat} suspended — WR {win_rate:.0%} < {wr_suspend:.0%} threshold")
+        elif strat in suspended and win_rate and win_rate >= wr_recover:
             suspended.discard(strat)
-            changes.append(f"✅ {strat} reactivated — WR recovered to {win_rate:.0%}")
+            changes.append(f"✅ {strat} reactivated — WR {win_rate:.0%} recovered above {wr_recover:.0%}")
 
         # Size multiplier (range 0.25×–2.0×)
         m = mults.get(strat, 1.0)
@@ -69,12 +74,17 @@ def run_learning(chat_id: str) -> tuple[dict, str]:
         # Strategy-specific threshold tuning
         if strat == "SNIPE" and win_rate is not None:
             cur = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
-            if win_rate < 0.60:
-                new = min(round(cur + 0.02, 2), 0.95)
+            # Be much more aggressive in raising certainty if WR is below break-even (87%)
+            if win_rate < 0.88:
+                new = min(round(cur + 0.05, 2), 0.98)
+                learned["snipe_min_certainty"] = new
+                changes.append(f"🎯 SNIPE certainty raised AGGRESSIVELY {cur} → {new}")
+            elif win_rate < 0.92:
+                new = min(round(cur + 0.02, 2), 0.98)
                 learned["snipe_min_certainty"] = new
                 changes.append(f"🎯 SNIPE certainty raised {cur} → {new}")
-            elif win_rate > 0.80 and cur > 0.72:
-                new = max(round(cur - 0.01, 2), 0.72)
+            elif win_rate > 0.96 and cur > 0.75:
+                new = max(round(cur - 0.01, 2), 0.75)
                 learned["snipe_min_certainty"] = new
                 changes.append(f"🎯 SNIPE certainty lowered {cur} → {new}")
 

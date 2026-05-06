@@ -143,8 +143,29 @@ def start_user(chat_id: str):
                 f"(deployed ₦{risk.deployed():,.0f})"
             )
 
+    # ── One-time Startup Warning: Low Balance ──────────────────────────────────
+    # If the user has a tiny bankroll, notify them immediately that the bot 
+    # will be highly selective until they deposit more funds.
+    async def _warn_low_bal():
+        try:
+            client = _get_client(user)
+            bal = await client.get_balance_ngn()
+            if bal < _MIN_VIABLE_BALANCE * 2:
+                await telegram_bot.send_message(
+                    _tg_app, chat_id,
+                    f"⚠️ *Small Bankroll Detected (₦{bal:,.0f})*\n\n"
+                    f"The bot is active, but because your balance is low, "
+                    f"I have enabled **Selective Mode** and **Small Account Mode**.\n\n"
+                    f"I will only take the highest-quality trades to protect your "
+                    f"capital. Trades may be less frequent until your balance grows.",
+                    parse_mode="Markdown"
+                )
+        except Exception:
+            pass
+
     if chat_id not in _user_tasks or _user_tasks[chat_id].done():
         _user_tasks[chat_id] = asyncio.create_task(_user_loop(chat_id))
+        asyncio.create_task(_warn_low_bal())
         log.info(f"Trading loop started for {chat_id}")
 
 
