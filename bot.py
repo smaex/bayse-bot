@@ -415,6 +415,9 @@ async def _execute_trade(chat_id, sig, client, risk, equity, free_cash, settings
             f"[{chat_id}] REJECTED {sig.strategy} | {sig.asset} — "
             f"Low RR: Est payout {est_net_payout:.3f}x < {1.0 + MIN_PAYOUT_RATIO}x minimum. "
             f"(Market price {sig.market_price:.3f} too high)"
+        )
+        return
+
     # ── Strict Price Execution ──────────────────────────────────────────────────
     # A MARKET order allows the AMM to slip our price, causing "negative wins" and 
     # desyncing our database entry price from reality.
