@@ -27,6 +27,7 @@ from risk import RiskManager
 from client import BayseClient
 from config import (
     TELEGRAM_TOKEN, CURRENCY, SCAN_INTERVAL_SECONDS, ARB_MAX_SIZE_NGN,
+    MIN_PAYOUT_RATIO,
 )
 
 logging.basicConfig(
@@ -339,6 +340,13 @@ async def _execute_trade(chat_id, sig, client, risk, equity, free_cash, settings
     # Scale position size by signal certainty: a 35%-certain trade uses 35% of base risk,
     # a 99%-certain trade uses 99%. High-conviction signals earn larger positions automatically.
     raw_pct = base_pct * mult * sig.certainty * fx_factor
+
+    # Small Account "Stealth" Mode: If balance < ₦2,000, reduce size of directional 
+    # strategies (SNIPE, CORRELATE, NEWS) by 50% to prevent variance-wipes.
+    if equity < 2000 and sig.strategy != "ARB":
+        raw_pct *= 0.5
+        log.info(f"[{chat_id}] Small Account Mode: scaling {sig.strategy} size by 0.5x")
+
     amount  = equity * min(raw_pct, 0.05)   # hard cap at 5% regardless
     amount  = max(min_t, min(max_t, amount))
 
@@ -348,7 +356,8 @@ async def _execute_trade(chat_id, sig, client, risk, equity, free_cash, settings
     if amount > hard_cap:
         log.info(
             f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — "
-            f"Trade ₦{amount:,.0f} exceeds 8% hard cap (₦{hard_cap:,.0f})"
+            f"Trade ₦{amount:,.0f} exceeds 8% hard cap (₦{hard_cap:,.0f}). "
+            f"Current bankroll ₦{equity:,.0f} is too small for safe ₦{min_t} trades."
         )
         return
 
@@ -358,12 +367,14 @@ async def _execute_trade(chat_id, sig, client, risk, equity, free_cash, settings
     if not risk.can_trade(equity, amount, max_exp):
         return
 
-    # Final Sanity Guard: Never buy if the price is > 0.95.
-    # Even with 100% win probability, the platform's 4-5% fee would result in a net loss.
-    if sig.market_price > 0.95:
-        log.warning(
+    # Final Sanity Guard: Ensure RR is acceptable after fees.
+    fee_rate = settings.get("fee_rate", 0.04)
+    est_net_payout = (1.0 - fee_rate) / sig.market_price
+    if est_net_payout < 1.0 + MIN_PAYOUT_RATIO:
+        log.info(
             f"[{chat_id}] REJECTED {sig.strategy} | {sig.asset} — "
-            f"Market price {sig.market_price:.3f} too high (guaranteed loss after fees)."
+            f"Low RR: Est payout {est_net_payout:.3f}x < {1.0 + MIN_PAYOUT_RATIO}x minimum. "
+            f"(Market price {sig.market_price:.3f} too high)"
         )
         return
 

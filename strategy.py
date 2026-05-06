@@ -69,7 +69,8 @@ from config import (
     CORRELATE_MAX_MARKET_PRICE, CORRELATE_MIN_REGIME,
     NEWS_CERTAINTY_DAMPEN, NEWS_MAX_MARKET_PRICE, NEWS_MIN_REGIME,
     NEWS_MIN_SECS_LEFT, NEWS_KELLY_FRACTION, CRYPTO_MIN_DISTANCE,
-    SNIPE_MAX_MARKET_PRICE,
+    SNIPE_MAX_MARKET_PRICE, MIN_PAYOUT_RATIO,
+    SNIPE_VELOCITY_WINDOW, SNIPE_VELOCITY_VETO,
 )
 import feeds
 import news as news_mod
@@ -161,10 +162,17 @@ def win_probability(distance_pct: float, secs_remaining: float, asset: str,
 def max_ev_price(win_prob: float, fee_rate: float = 0.04, min_margin: float = 0.10) -> float:
     """
     Max entry price guaranteeing EV > 0 with a profit cushion.
-    formula: win_prob * (1.0 - fee_rate) - min_margin
-    Ensures we don't take trades that 'win' but pay out less than we spent.
+    
+    Formula v2: 
+    1. Primary: win_prob * (1.0 - fee_rate) - min_margin
+    2. Floor: Must allow at least MIN_PAYOUT_RATIO net profit.
+       payout = (1.0 - fee_rate) / price
+       (1.0 - fee_rate) / price >= 1.0 + MIN_PAYOUT_RATIO
+       price <= (1.0 - fee_rate) / (1.0 + MIN_PAYOUT_RATIO)
     """
-    return win_prob * (1.0 - fee_rate) - min_margin
+    ev_limit = win_prob * (1.0 - fee_rate) - min_margin
+    payout_limit = (1.0 - fee_rate) / (1.0 + MIN_PAYOUT_RATIO)
+    return min(ev_limit, payout_limit)
 
 
 def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.04,
@@ -232,6 +240,36 @@ def _momentum_score(asset: str, direction: str) -> float:
     signed = change if direction == "YES" else -change
     # ±0.1% over the window maps to ±1.0
     return min(max(signed / 0.001, -1.0), 1.0)
+
+
+def _velocity_score(asset: str, threshold: float, direction: str) -> float:
+    """
+    Measures the 'crash velocity' toward the threshold.
+    Returns the fraction of the safety gap that was closed in the last SNIPE_VELOCITY_WINDOW.
+    
+    Positive = price moving AWAY from threshold (safe).
+    Negative = price moving TOWARD threshold (dangerous).
+    -1.0 = price has closed the entire gap in the window.
+    """
+    hist = list(_price_history.get(asset, []))
+    n = min(len(hist), SNIPE_VELOCITY_WINDOW // 5)
+    if n < 4:
+        return 0.0
+    
+    now_price = hist[-1][1]
+    past_price = hist[-n][1]
+    
+    now_gap  = abs(now_price - threshold)
+    past_gap = abs(past_price - threshold)
+    
+    # If we are on the wrong side already, it's irrelevant (other guards catch this)
+    if (direction == "YES" and now_price < threshold) or (direction == "NO" and now_price > threshold):
+        return -1.0
+        
+    gap_change = now_gap - past_gap  # +ve = gap grew (safe), -ve = gap shrank (dangerous)
+    
+    # Normalize by the current gap to see how much of our remaining safety we lost
+    return gap_change / max(past_gap, 1e-9)
 
 
 # ── Quant signal 4: regime (efficiency ratio) ─────────────────────────────────
@@ -385,6 +423,15 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
     # ── Signal 4: regime ──────────────────────────────────────────────────────
     regime        = _regime_score(asset)
     regime_factor = 0.75 + 0.50 * regime       # 0.75 (choppy) → 1.25 (trending)
+
+    # ── Signal 5: Velocity (Falling Knife Guard) ──────────────────────────────
+    velocity = _velocity_score(asset, threshold, direction)
+    if velocity < -SNIPE_VELOCITY_VETO:
+        log.info(
+            f"{_u()}SNIPE [{asset} {tf}] VETOED — Velocity crash detected "
+            f"({velocity:+.1%} gap closed in {SNIPE_VELOCITY_WINDOW}s)"
+        )
+        return None
 
     # Gate 4 (FX): regime veto — choppy FX markets mean-revert and kill the edge
     if asset in FX_SESSION_UTC and regime < FX_MIN_REGIME:
@@ -612,7 +659,14 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> 
         )
         return None
 
-    mom_dir   = "YES" if direction == "UP" else "NO"
+    mom_dir    = "YES" if direction == "UP" else "NO"
+    target_mom = _momentum_score(asset, mom_dir)
+    if target_mom < -0.4:
+        log.info(
+            f"{_u()}CORRELATE [{asset} {tf}] REJECTED — target convergence "
+            f"detected ({target_mom:+.2f} momentum against BTC move)"
+        )
+        return None
     mom       = _momentum_score(asset, mom_dir)
     certainty = min(CORRELATE_BASE_CERTAINTY * freshness * (1.0 + 0.20 * mom), 0.99)
 
@@ -799,6 +853,14 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[Tra
         log.info(
             f"{_u()}NEWS [{asset}] REJECTED — market {market_price:.3f} "
             f">= EV ceiling {ev_ceiling:.3f} (strength_adj={strength_adj:.2f})"
+        )
+        return None
+
+    # ── Guard 5: slippage buffer — news causes volatility, need extra cushion ──
+    # If the market price is within 2% of the ceiling, skip it to allow for slippage.
+    if market_price > ev_ceiling * 0.98:
+        log.info(
+            f"{_u()}NEWS [{asset}] REJECTED — too close to EV ceiling ({market_price:.3f} vs {ev_ceiling:.3f})"
         )
         return None
 

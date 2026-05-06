@@ -104,7 +104,7 @@ SNIPE_ENTRY_WINDOWS = {
 
 # DO NOT buy if the price is already this high.
 # Prevents buying "certain wins" that actually lose money after fees (e.g. 0.98 price).
-SNIPE_MAX_MARKET_PRICE = 0.85
+SNIPE_MAX_MARKET_PRICE = 0.80
 
 # Asset hourly volatility (1σ, fractional) — used in diffusion model for win probability.
 # P(win) = Φ( |spot_distance| / (σ_h × √T_hours) )  ← same math as options pricing
@@ -149,6 +149,11 @@ CRYPTO_MIN_DISTANCE = {
     "SOL": 0.0020,  # 0.20%
 }
 
+# Velocity Guard: Reject if price is crashing toward the threshold too fast.
+# Measures distance change over the last 60 seconds.
+SNIPE_VELOCITY_WINDOW = 60
+SNIPE_VELOCITY_VETO   = 0.40  # reject if 40% of the safety gap is closed in 60s
+
 # FX requires a cleaner trend than crypto — minimum efficiency ratio.
 FX_MIN_REGIME = 0.30   # below this = too choppy to trade FX reliably
 
@@ -179,6 +184,10 @@ ARB_MAX_SIZE_NGN = 50_000    # max per arb trade
 BANKROLL_PCT_PER_TRADE = 0.02  # 2% of bankroll per trade (was 3% — too aggressive)
 MAX_PORTFOLIO_EXPOSURE = 0.20  # never have >20% of bankroll in open positions (was 30%)
 MAX_DRAWDOWN_STOP = 0.15       # pause all trading at 15% drawdown (was 20%)
+
+# Minimum Net Payout: Ensure for every 100 spent, we get at least 115 back (15% net profit).
+# This prevents the "risk 100 to win 5" trades that wipe out bankrolls.
+MIN_PAYOUT_RATIO = 0.15
 PROFIT_ALERT_NGN = 20_000      # Telegram alert when unrealized profit hits this
 
 # ── Rate Limiting (stay well under 20 write/sec, 30 read/sec) ─────────────────
