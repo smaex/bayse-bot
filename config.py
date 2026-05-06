@@ -185,6 +185,12 @@ BANKROLL_PCT_PER_TRADE = 0.02  # 2% of bankroll per trade (was 3% — too aggres
 MAX_PORTFOLIO_EXPOSURE = 0.20  # never have >20% of bankroll in open positions (was 30%)
 MAX_DRAWDOWN_STOP = 0.15       # pause all trading at 15% drawdown (was 20%)
 
+# Systemic Risk: If 3+ assets spike >50% above baseline vol, it's a global shock.
+# Halt all new entries for 60 minutes to let the market settle.
+SYSTEMIC_RISK_COUNT_THRESHOLD = 3
+SYSTEMIC_RISK_VOL_MULT        = 1.5
+SYSTEMIC_RISK_HALT_MINS       = 60
+
 # Minimum Net Payout: Ensure for every 100 spent, we get at least 115 back (15% net profit).
 # This prevents the "risk 100 to win 5" trades that wipe out bankrolls.
 MIN_PAYOUT_RATIO = 0.15

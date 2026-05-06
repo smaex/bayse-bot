@@ -71,6 +71,7 @@ from config import (
     NEWS_MIN_SECS_LEFT, NEWS_KELLY_FRACTION, CRYPTO_MIN_DISTANCE,
     SNIPE_MAX_MARKET_PRICE, MIN_PAYOUT_RATIO,
     SNIPE_VELOCITY_WINDOW, SNIPE_VELOCITY_VETO,
+    SYSTEMIC_RISK_VOL_MULT, SYSTEMIC_RISK_COUNT_THRESHOLD, SYSTEMIC_RISK_HALT_MINS
 )
 import feeds
 import news as news_mod
@@ -120,22 +121,132 @@ _btc_signal_direction: dict[str, str]   = {}
 _btc_signal_move:      dict[str, float] = {}
 
 
-# ── Price history (feeds all 5 quant signals) ─────────────────────────────────
-_HISTORY_MAXLEN         = 180          # 15 min at 5s cadence (extra headroom for FX lookback)
-_FX_TREND_LOOKBACK      = 120          # samples to look back for FX distance trend (~10 min)
-_price_history:        dict[str, deque] = {}   # asset → deque[(timestamp, price)]
-_last_history_update:  dict[str, float] = {}   # throttle to 1 sample per 5s
+# ── GARCH and Kalman State ────────────────────────────────────────────────────
+_kalman_state:         dict[str, dict]  = {}
+_garch_state:          dict[str, dict]  = {}
+_systemic_halt_until:  float            = 0.0
+
+def is_systemic_risk_active() -> bool:
+    """Returns True if the bot is currently in a systemic risk cooldown."""
+    return time.time() < _systemic_halt_until
+
+def check_systemic_risk() -> Optional[str]:
+    """
+    Scans all assets for volatility shocks. 
+    If enough assets spike simultaneously, triggers a global halt.
+    """
+    global _systemic_halt_until
+    if is_systemic_risk_active():
+        return f"Systemic halt active for {int(_systemic_halt_until - time.time())}s"
+
+    spike_assets = []
+    for asset, garch in _garch_state.items():
+        config_vol = ASSET_HOURLY_VOL.get(asset, 0.022)
+        current_vol = math.sqrt(garch["var"] * 720.0)
+        
+        if current_vol > config_vol * SYSTEMIC_RISK_VOL_MULT:
+            spike_assets.append(asset)
+            
+    if len(spike_assets) >= SYSTEMIC_RISK_COUNT_THRESHOLD:
+        _systemic_halt_until = time.time() + (SYSTEMIC_RISK_HALT_MINS * 60)
+        return f"GLOBAL VOLATILITY SHOCK: Spikes in {', '.join(spike_assets)}"
+        
+    return None
+
+def _init_kalman(price: float) -> dict:
+    # State: [price, velocity]
+    return {
+        "x": [price, 0.0],
+        # Covariance matrix P
+        "P": [[1.0, 0.0], [0.0, 1.0]]
+    }
+
+def _update_kalman(state: dict, z: float, dt: float) -> dict:
+    """1D Kalman filter for price and velocity estimation."""
+    x, P = state["x"], state["P"]
+    
+    # Process noise covariance Q (tuneable: assumes velocity changes are small but non-zero)
+    q = 1e-5
+    Q = [[q * (dt**3)/3, q * (dt**2)/2],
+         [q * (dt**2)/2, q * dt]]
+    # Measurement noise R (variance of price ticks)
+    R = 1e-4
+
+    # 1. Predict
+    # x_pred = F * x
+    x_pred = [x[0] + x[1] * dt, x[1]]
+    # P_pred = F * P * F^T + Q
+    P_pred = [
+        [P[0][0] + dt*(P[1][0] + P[0][1]) + P[1][1]*(dt**2) + Q[0][0], P[0][1] + P[1][1]*dt + Q[0][1]],
+        [P[1][0] + P[1][1]*dt + Q[1][0], P[1][1] + Q[1][1]]
+    ]
+
+    # 2. Update
+    # y = z - H * x_pred (H = [1, 0])
+    y = z - x_pred[0]
+    # S = H * P_pred * H^T + R
+    S = P_pred[0][0] + R
+    # K = P_pred * H^T / S
+    K = [P_pred[0][0] / S, P_pred[1][0] / S]
+
+    # x_new = x_pred + K * y
+    x_new = [x_pred[0] + K[0] * y, x_pred[1] + K[1] * y]
+    # P_new = (I - K * H) * P_pred
+    P_new = [
+        [(1 - K[0]) * P_pred[0][0], (1 - K[0]) * P_pred[0][1]],
+        [-K[1] * P_pred[0][0] + P_pred[1][0], -K[1] * P_pred[0][1] + P_pred[1][1]]
+    ]
+
+    return {"x": x_new, "P": P_new}
+
+def _update_garch(asset: str, price: float) -> None:
+    """Recursive pseudo-GARCH(1,1) update."""
+    from config import ASSET_HOURLY_VOL
+    omega_weight = 0.05
+    alpha = 0.15  # shock sensitivity
+    beta = 0.80   # persistence
+    
+    state = _garch_state.get(asset)
+    config_vol = ASSET_HOURLY_VOL.get(asset, 0.022)
+    # Convert hourly config vol to a rough 5s variance target
+    # hourly_vol = sqrt(var_5s * 720) -> var_5s = (hourly_vol^2) / 720
+    target_var = (config_vol ** 2) / 720.0
+    omega = target_var * omega_weight
+
+    if not state:
+        _garch_state[asset] = {"var": target_var, "last_price": price}
+        return
+        
+    last_price = state["last_price"]
+    if last_price <= 0:
+        _garch_state[asset]["last_price"] = price
+        return
+        
+    log_return = math.log(price / last_price)
+    shock_sq = log_return ** 2
+    
+    # GARCH update: var_t = omega + alpha * shock^2 + beta * var_{t-1}
+    new_var = omega + alpha * shock_sq + beta * state["var"]
+    _garch_state[asset] = {"var": new_var, "last_price": price}
 
 def update_price_history(asset: str, price: float) -> None:
     """Record spot tick for quant signals (throttled to 1 sample per 5 s)."""
     now = time.time()
-    if now - _last_history_update.get(asset, 0) < 5:
+    last_t = _last_history_update.get(asset, 0)
+    dt = now - last_t
+    if dt < 5:
         return
+        
     _last_history_update[asset] = now
     if asset not in _price_history:
         _price_history[asset] = deque(maxlen=_HISTORY_MAXLEN)
+        _kalman_state[asset] = _init_kalman(price)
+    
     _price_history[asset].append((now, price))
-
+    
+    if dt < 60: # only update filters if tick is continuous (avoid huge jumps)
+        _kalman_state[asset] = _update_kalman(_kalman_state[asset], price, dt)
+        _update_garch(asset, price)
 
 # ── Quantitative helpers ──────────────────────────────────────────────────────
 
@@ -199,24 +310,25 @@ def certainty_to_prob(certainty: float) -> float:
 
 def realized_vol_hourly(asset: str) -> float:
     """
-    Actual hourly vol computed from recent price ticks.
-    Blends with config value — full weight after ~5 minutes of data.
+    Actual hourly vol computed from recursive GARCH(1,1) estimates.
+    Blends with config value if insufficient data.
     """
-    hist = list(_price_history.get(asset, []))
+    from config import ASSET_HOURLY_VOL
     config_vol = ASSET_HOURLY_VOL.get(asset, 0.022)
-    if len(hist) < 10:
+    
+    garch = _garch_state.get(asset)
+    if not garch:
         return config_vol
-    prices = [p for _, p in hist]
-    log_returns = [math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices))]
-    if len(log_returns) < 5:
-        return config_vol
-    mean_r   = sum(log_returns) / len(log_returns)
-    variance = sum((r - mean_r) ** 2 for r in log_returns) / len(log_returns)
-    # 5-second samples → 720 ticks per hour
-    hourly_rv = math.sqrt(variance) * math.sqrt(720)
-    # Ramp blend weight from 0 → 1 over first 60 samples (~5 minutes)
-    weight = min(len(log_returns) / 60.0, 1.0)
-    return config_vol * (1.0 - weight) + hourly_rv * weight
+        
+    # GARCH variance is per 5s tick. Convert to annualized hourly std dev
+    # std_dev = sqrt(variance * 720)
+    hourly_garch_vol = math.sqrt(garch["var"] * 720.0)
+    
+    # Volatility Floor (The "Turkey Problem" Fix): 
+    # If the market is dead quiet for 15 minutes, blended vol approaches zero, causing the bot 
+    # to become wildly overconfident (e.g. 99% win prob) right before a breakout.
+    # We must NEVER use a volatility lower than the asset's baseline historical average.
+    return max(config_vol, hourly_garch_vol)
 
 
 # ── Quant signal 3: momentum ──────────────────────────────────────────────────
@@ -226,50 +338,57 @@ def _momentum_score(asset: str, direction: str) -> float:
     +1 = price moving strongly in our favour (away from threshold).
     −1 = price moving strongly against us (toward threshold).
     direction: 'YES' (we want higher price) or 'NO' (we want lower price).
-    Measured over last 90 seconds of ticks.
+    Uses Kalman Filter velocity to estimate 90s smoothed trajectory.
     """
-    hist = list(_price_history.get(asset, []))
-    n = min(len(hist), 18)   # 18 × 5s = 90s window
-    if n < 6:
+    kalman = _kalman_state.get(asset)
+    if not kalman:
         return 0.0
-    prices = [p for _, p in hist[-n:]]
-    third = max(1, n // 3)
-    early = sum(prices[:third]) / third
-    late  = sum(prices[-third:]) / third
-    change = (late - early) / early          # fractional price change
-    signed = change if direction == "YES" else -change
+        
+    price, velocity = kalman["x"]
+    if price <= 0: return 0.0
+    
+    # Project price change over a 90s window
+    projected_change = velocity * 90.0
+    fractional_change = projected_change / price
+    
+    signed = fractional_change if direction == "YES" else -fractional_change
     # ±0.1% over the window maps to ±1.0
     return min(max(signed / 0.001, -1.0), 1.0)
 
 
 def _velocity_score(asset: str, threshold: float, direction: str) -> float:
     """
-    Measures the 'crash velocity' toward the threshold.
-    Returns the fraction of the safety gap that was closed in the last SNIPE_VELOCITY_WINDOW.
+    Measures the 'crash velocity' toward the threshold using the Kalman filter.
+    Returns the fraction of the safety gap projected to be closed in the next SNIPE_VELOCITY_WINDOW.
     
     Positive = price moving AWAY from threshold (safe).
     Negative = price moving TOWARD threshold (dangerous).
-    -1.0 = price has closed the entire gap in the window.
+    -1.0 = price projected to close the entire gap.
     """
-    hist = list(_price_history.get(asset, []))
-    n = min(len(hist), SNIPE_VELOCITY_WINDOW // 5)
-    if n < 4:
+    kalman = _kalman_state.get(asset)
+    if not kalman:
         return 0.0
+        
+    price, velocity = kalman["x"]
+    if price <= 0: return 0.0
     
-    now_price = hist[-1][1]
-    past_price = hist[-n][1]
+    now_gap = abs(price - threshold)
     
-    now_gap  = abs(now_price - threshold)
-    past_gap = abs(past_price - threshold)
-    
-    # If we are on the wrong side already, it's irrelevant (other guards catch this)
-    if (direction == "YES" and now_price < threshold) or (direction == "NO" and now_price > threshold):
+    # If we are on the wrong side already, it's irrelevant
+    if (direction == "YES" and price < threshold) or (direction == "NO" and price > threshold):
         return -1.0
         
-    gap_change = now_gap - past_gap  # +ve = gap grew (safe), -ve = gap shrank (dangerous)
+    projected_move = velocity * SNIPE_VELOCITY_WINDOW
     
-    # Normalize by the current gap to see how much of our remaining safety we lost
-    return gap_change / max(past_gap, 1e-9)
+    if direction == "YES":
+        # Price > threshold. If move is negative, gap is shrinking.
+        gap_change = projected_move
+    else:
+        # Price < threshold. If move is positive, gap is shrinking.
+        gap_change = -projected_move
+        
+    # Normalize by the current gap to see how much of our remaining safety is projected to be lost
+    return gap_change / max(now_gap, 1e-9)
 
 
 # ── Quant signal 4: regime (efficiency ratio) ─────────────────────────────────

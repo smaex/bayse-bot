@@ -27,7 +27,7 @@ from risk import RiskManager
 from client import BayseClient
 from config import (
     TELEGRAM_TOKEN, CURRENCY, SCAN_INTERVAL_SECONDS, ARB_MAX_SIZE_NGN,
-    MIN_PAYOUT_RATIO,
+    MIN_PAYOUT_RATIO, SYSTEMIC_RISK_HALT_MINS,
 )
 
 logging.basicConfig(
@@ -46,6 +46,7 @@ _user_daily:    dict[str, dict]         = {}  # {chat_id: {date, start_balance, 
 _user_tasks:    dict[str, asyncio.Task] = {}
 _last_balance:  dict[str, float]        = {}  # for deposit/withdrawal detection
 _low_bal_notified: dict[str, str]       = {}  # chat_id → date last notified (max once/day)
+_systemic_alert_sent: dict[str, bool]   = {}  # chat_id → bool
 _scan_client:   BayseClient | None = None
 _tg_app        = None
 
@@ -292,7 +293,25 @@ async def _user_loop(chat_id: str):
                 await telegram_bot.notify_drawdown(_tg_app, chat_id, equity, risk.peak_balance, dd)
             continue
 
-        # ── News notifications ─────────────────────────────────────────────────
+        # ── Systemic Risk Halt ─────────────────────────────────────────────────
+        risk_alert = strategy.check_systemic_risk()
+        if risk_alert:
+            if not _systemic_alert_sent.get(chat_id):
+                _systemic_alert_sent[chat_id] = True
+                log.warning(f"[{chat_id}] {risk_alert}")
+                if _tg_app:
+                    await telegram_bot.send_message(
+                        _tg_app, chat_id,
+                        f"🚨 *SYSTEMIC RISK ALERT*\n\n{risk_alert}\n\n"
+                        f"The entire market is experiencing extreme volatility shocks. "
+                        f"Trading is automatically paused for {SYSTEMIC_RISK_HALT_MINS} minutes to protect your capital.",
+                        parse_mode="Markdown"
+                    )
+            continue
+        else:
+            if _systemic_alert_sent.get(chat_id):
+                _systemic_alert_sent[chat_id] = False
+                log.info(f"[{chat_id}] Systemic risk cleared. Resuming.")
         for sig in news_mod.active_signals:
             key = f"{sig.source}:{sig.headline[:40]}"
             if key not in sent_news and sig.strength() > 0.4:
@@ -396,22 +415,34 @@ async def _execute_trade(chat_id, sig, client, risk, equity, free_cash, settings
             f"[{chat_id}] REJECTED {sig.strategy} | {sig.asset} — "
             f"Low RR: Est payout {est_net_payout:.3f}x < {1.0 + MIN_PAYOUT_RATIO}x minimum. "
             f"(Market price {sig.market_price:.3f} too high)"
-        )
-        return
+    # ── Strict Price Execution ──────────────────────────────────────────────────
+    # A MARKET order allows the AMM to slip our price, causing "negative wins" and 
+    # desyncing our database entry price from reality.
+    # We now calculate the exact max price that still satisfies our MIN_PAYOUT_RATIO
+    # and send a LIMIT order. If the AMM cannot fill it at or below this price, it cancels.
+    max_allowed_price = (1.0 - fee_rate) / (1.0 + MIN_PAYOUT_RATIO)
+    
+    # FX/Gold are highly liquid; 2% slip is huge. We use 0.2% for FX and 2% for Crypto.
+    is_fx = sig.asset in ["EURUSD", "GBPUSD", "EURGBP", "XAUUSD"]
+    slip_mult = 1.002 if is_fx else 1.02
+    limit_price = min(sig.market_price * slip_mult, max_allowed_price) 
 
     log.info(
         f"[{chat_id}] PLACING {sig.strategy} | {sig.asset} {sig.timeframe} {sig.outcome} "
-        f"@ {sig.market_price:.3f} certainty={sig.certainty:.0%} ₦{amount:,.0f}"
+        f"@ {sig.market_price:.3f} certainty={sig.certainty:.0%} ₦{amount:,.0f} "
+        f"(limit={limit_price:.3f})"
     )
 
     try:
         resp = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=sig.outcome_id, side="BUY", amount=amount,
-            order_type="MARKET", max_slippage=0.05, currency=CURRENCY,
+            order_type="LIMIT", price=limit_price, currency=CURRENCY,
         )
         order        = resp.get("order", resp)
-        filled_price = float(order.get("price", sig.market_price) or sig.market_price)
+        # If the API doesn't return the exact fill price instantly, we use our limit price.
+        # This is safe because a LIMIT order guarantees we didn't pay more than this.
+        filled_price = float(order.get("price", limit_price) or limit_price)
         bayse_order_id = order.get("id") or order.get("orderId") or order.get("order_id")
 
         log.info(

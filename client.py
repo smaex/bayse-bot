@@ -167,7 +167,8 @@ class BayseClient:
         }
         if order_type == "LIMIT" and price is not None:
             body["price"] = price
-            body["timeInForce"] = "GTC"
+            # Default to GTC unless otherwise specified, but allow caller to override (e.g. FAK)
+            body["timeInForce"] = "FAK" 
         else:
             body["maxSlippage"] = max_slippage
             body["timeInForce"] = "FAK"
