@@ -122,8 +122,11 @@ _btc_signal_move:      dict[str, float] = {}
 
 
 # ── GARCH and Kalman State ────────────────────────────────────────────────────
+_price_history:        dict[str, deque] = {}
+_HISTORY_MAXLEN:       int              = 180  # 15 minutes of 5s samples
 _kalman_state:         dict[str, dict]  = {}
 _garch_state:          dict[str, dict]  = {}
+_last_history_update:  dict[str, float] = {}
 _systemic_halt_until:  float            = 0.0
 
 def is_systemic_risk_active() -> bool:
