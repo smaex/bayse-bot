@@ -525,6 +525,10 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
     secs  = market["secs_to_close"]
     asset = market["asset"]
 
+    learned = learned or {}
+    raw_cert = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
+    min_certainty = max(config.SNIPE_MIN_CERTAINTY, min(raw_cert, 0.75))
+
     entry_window = config.SNIPE_ENTRY_WINDOWS.get(tf)
     # Gate 1 (FX): tighter entry window — 20 min instead of 30 min for crypto.
     # More time elapsed = move is more confirmed before we commit.
