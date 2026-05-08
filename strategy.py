@@ -52,6 +52,7 @@ Quantitative framework (5-model composite for SNIPE):
   signals earn proportionally larger positions.
 """
 
+import asyncio
 import logging
 import math
 import time
@@ -71,10 +72,12 @@ from config import (
     NEWS_MIN_SECS_LEFT, NEWS_KELLY_FRACTION, CRYPTO_MIN_DISTANCE,
     SNIPE_MAX_MARKET_PRICE, MIN_PAYOUT_RATIO,
     SNIPE_VELOCITY_WINDOW, SNIPE_VELOCITY_VETO,
-    SYSTEMIC_RISK_VOL_MULT, SYSTEMIC_RISK_COUNT_THRESHOLD, SYSTEMIC_RISK_HALT_MINS
+    SYSTEMIC_RISK_VOL_MULT, SYSTEMIC_RISK_COUNT_THRESHOLD, SYSTEMIC_RISK_HALT_MINS,
+    VOL_SPIKE_THRESHOLD, DYNAMIC_KELLY_MIN, DYNAMIC_KELLY_MAX
 )
 import feeds
 import news as news_mod
+import database
 
 log = logging.getLogger(__name__)
 
