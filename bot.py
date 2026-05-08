@@ -667,53 +667,67 @@ def _on_spot_price(asset: str, price: float):
         threshold = 0.0005 if asset in _FX_ASSETS else 0.0010  # 0.05% FX, 0.1% Crypto
         if change >= threshold:
             _last_spot[asset] = price
-            asyncio.create_task(_evaluate_all_users_for_spot(asset))
+            asyncio.create_task(_evaluate_all_users_for_spot(asset, change, threshold))
     else:
         _last_spot[asset] = price
 
 
-async def _evaluate_all_users_for_spot(asset: str):
+async def _evaluate_all_users_for_spot(asset: str, change: float, threshold: float):
     # Cooldown check: max 1 evaluation every 5 seconds per asset
     now = time.time()
     if now - _last_market_eval.get(asset, 0) < 5:
         return
     _last_market_eval[asset] = now
     
-    log.info(f"⚡ SPOT TRIGGER: {asset} moved significantly, evaluating markets...")
+    log.info(
+        f"⚡ SPOT TRIGGER: {asset} moved {change:.2%} "
+        f"(threshold {threshold:.2%}), evaluating markets..."
+    )
     
     users = database.get_all_active()
     for user in users:
-        chat_id = user["chat_id"]
-        client = _user_clients.get(chat_id)
-        risk = _user_risks.get(chat_id)
+        asyncio.create_task(_evaluate_single_user(user, asset))
+
+
+async def _evaluate_single_user(user: dict, trigger_asset: str):
+    """Encapsulates per-user evaluation logic to run concurrently with proper context."""
+    chat_id = user["chat_id"]
+    strategy.set_user_context(chat_id)  # ensures [chat_id] prefix in all strategy logs
+    
+    client = _user_clients.get(chat_id)
+    risk = _user_risks.get(chat_id)
+    
+    if not client or not risk or risk.paused:
+        return
         
-        if not client or not risk or risk.paused:
-            continue
-            
-        settings = user["settings"]
-        if settings.get("paused"):
-            continue
-            
-        # Use cached balance if possible to avoid API rate limits
-        equity = _last_balance.get(chat_id)
-        if not equity:
-            try:
-                free_cash = await client.get_balance_ngn()
-                equity = free_cash + risk.deployed()
-            except Exception:
-                continue
-        else:
-            free_cash = equity - risk.deployed()
-            
-        user_assets = settings.get("assets", ["BTC", "ETH", "SOL"])
-        user_tfs = settings.get("timeframes", ["5min", "15min", "1h"])
-        user_strats = settings.get("strategies", ["SNIPE", "CORRELATE", "ARB", "NEWS"])
-        learned = settings.get("learned", {})
-        suspended = learned.get("suspended_strategies", [])
-        active_strats = [s for s in user_strats if s not in suspended]
-        max_exp = settings.get("maxexposure", 30.0) / 100.0
+    settings = user["settings"]
+    if settings.get("paused"):
+        return
         
-        await _evaluate_markets(chat_id, settings, client, risk, equity, free_cash, active_strats, learned, max_exp, user_assets, user_tfs, trigger_asset=asset)
+    # Use cached balance if possible to avoid API rate limits
+    equity = _last_balance.get(chat_id)
+    if not equity:
+        try:
+            free_cash = await client.get_balance_ngn()
+            equity = free_cash + risk.deployed()
+        except Exception:
+            return
+    else:
+        free_cash = equity - risk.deployed()
+        
+    user_assets = settings.get("assets", ["BTC", "ETH", "SOL"])
+    user_tfs = settings.get("timeframes", ["5min", "15min", "1h"])
+    user_strats = settings.get("strategies", ["SNIPE", "CORRELATE", "ARB", "NEWS"])
+    learned = settings.get("learned", {})
+    suspended = learned.get("suspended_strategies", [])
+    active_strats = [s for s in user_strats if s not in suspended]
+    max_exp = settings.get("maxexposure", 30.0) / 100.0
+    
+    await _evaluate_markets(
+        chat_id, settings, client, risk, equity, free_cash, 
+        active_strats, learned, max_exp, user_assets, user_tfs, 
+        trigger_asset=trigger_asset
+    )
 
 
 def _on_market_update(market_id: str, prices: dict):
