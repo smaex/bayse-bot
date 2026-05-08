@@ -114,6 +114,7 @@ _btc_signal_move:      dict[str, float] = {}
 # ── GARCH and Kalman State ────────────────────────────────────────────────────
 _price_history:        dict[str, deque] = {}
 _HISTORY_MAXLEN:       int              = 180  # 15 minutes of 5s samples
+_FX_TREND_LOOKBACK:    int              = 120  # 10 minutes of 5s samples
 _kalman_state:         dict[str, dict]  = {}
 _garch_state:          dict[str, dict]  = {}
 _last_history_update:  dict[str, float] = {}
@@ -268,7 +269,7 @@ def _update_garch(asset: str, price: float) -> None:
             _systemic_halt_until = time.time() + (config.SYSTEMIC_RISK_HALT_MINS * 60)
             log.critical(
                 f"VOLATILITY SPIKE DETECTED on {asset} | "
-                f"accel={acceleration:.2f}x | HALTING ALL TRADING for {SYSTEMIC_RISK_HALT_MINS}m"
+                f"accel={acceleration:.2f}x | HALTING ALL TRADING for {config.SYSTEMIC_RISK_HALT_MINS}m"
             )
 
     _garch_state[asset] = {"var": new_var, "last_price": price}
@@ -318,7 +319,7 @@ def win_probability(distance_pct: float, secs_remaining: float, asset: str,
 
     sigma_override lets callers pass realized vol instead of config vol.
     """
-    sigma_h = sigma_override if sigma_override is not None else ASSET_HOURLY_VOL.get(asset, 0.022)
+    sigma_h = sigma_override if sigma_override is not None else config.ASSET_HOURLY_VOL.get(asset, 0.022)
     t_hours = max(secs_remaining / 3600.0, 1.0 / 3600.0)
     z = abs(distance_pct) / (sigma_h * math.sqrt(t_hours))
     return _norm_cdf(z)
@@ -330,13 +331,13 @@ def max_ev_price(win_prob: float, fee_rate: float = 0.04, min_margin: float = 0.
     
     Formula v2: 
     1. Primary: win_prob * (1.0 - fee_rate) - min_margin
-    2. Floor: Must allow at least MIN_PAYOUT_RATIO net profit.
+    2. Floor: Must allow at least config.MIN_PAYOUT_RATIO net profit.
        payout = (1.0 - fee_rate) / price
-       (1.0 - fee_rate) / price >= 1.0 + MIN_PAYOUT_RATIO
-       price <= (1.0 - fee_rate) / (1.0 + MIN_PAYOUT_RATIO)
+       (1.0 - fee_rate) / price >= 1.0 + config.MIN_PAYOUT_RATIO
+       price <= (1.0 - fee_rate) / (1.0 + config.MIN_PAYOUT_RATIO)
     """
     ev_limit = win_prob * (1.0 - fee_rate) - min_margin
-    payout_limit = (1.0 - fee_rate) / (1.0 + MIN_PAYOUT_RATIO)
+    payout_limit = (1.0 - fee_rate) / (1.0 + config.MIN_PAYOUT_RATIO)
     return min(ev_limit, payout_limit)
 
 
@@ -432,7 +433,7 @@ def _momentum_score(asset: str, direction: str) -> float:
 def _velocity_score(asset: str, threshold: float, direction: str) -> float:
     """
     Measures the 'crash velocity' toward the threshold using the Kalman filter.
-    Returns the fraction of the safety gap projected to be closed in the next SNIPE_VELOCITY_WINDOW.
+    Returns the fraction of the safety gap projected to be closed in the next config.SNIPE_VELOCITY_WINDOW.
     
     Positive = price moving AWAY from threshold (safe).
     Negative = price moving TOWARD threshold (dangerous).
@@ -451,7 +452,7 @@ def _velocity_score(asset: str, threshold: float, direction: str) -> float:
     if (direction == "YES" and price < threshold) or (direction == "NO" and price > threshold):
         return -1.0
         
-    projected_move = velocity * SNIPE_VELOCITY_WINDOW
+    projected_move = velocity * config.SNIPE_VELOCITY_WINDOW
     
     if direction == "YES":
         # Price > threshold. If move is negative, gap is shrinking.
@@ -524,11 +525,11 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
     secs  = market["secs_to_close"]
     asset = market["asset"]
 
-    entry_window = SNIPE_ENTRY_WINDOWS.get(tf)
+    entry_window = config.SNIPE_ENTRY_WINDOWS.get(tf)
     # Gate 1 (FX): tighter entry window — 20 min instead of 30 min for crypto.
     # More time elapsed = move is more confirmed before we commit.
-    if asset in FX_SESSION_UTC and tf == "1h":
-        entry_window = FX_ENTRY_WINDOW_1H
+    if asset in config.FX_SESSION_UTC and tf == "1h":
+        entry_window = config.FX_ENTRY_WINDOW_1H
     if entry_window is None or secs > entry_window or secs < 0:
         return None
 
@@ -547,8 +548,8 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
     distance_pct = (live_spot - threshold) / threshold   # +ve → YES wins
 
     # Crypto Minimum Distance Guard (Pin Risk)
-    if asset not in FX_SESSION_UTC:
-        min_dist = CRYPTO_MIN_DISTANCE.get(asset, 0.0010)
+    if asset not in config.FX_SESSION_UTC:
+        min_dist = config.CRYPTO_MIN_DISTANCE.get(asset, 0.0010)
         if abs(distance_pct) < min_dist:
             log.debug(
                 f"{_u()}SNIPE [{asset} {tf}] REJECTED — distance {distance_pct:+.4%} "
@@ -557,16 +558,16 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
             return None
 
     # ── FX gate cascade (gates 1–3) ───────────────────────────────────────────
-    if asset in FX_SESSION_UTC:
+    if asset in config.FX_SESSION_UTC:
         # Gate 1: active session only
         hour_utc = datetime.now(timezone.utc).hour
-        session_start, session_end = FX_SESSION_UTC[asset]
+        session_start, session_end = config.FX_SESSION_UTC[asset]
         if not (session_start <= hour_utc < session_end):
             log.debug(f"{_u()}SNIPE [{asset} {tf}] outside active session (UTC {hour_utc:02d}h)")
             return None
 
         # Gate 2: minimum distance — need a genuine move, not noise
-        min_dist = FX_MIN_DISTANCE[asset]
+        min_dist = config.FX_MIN_DISTANCE[asset]
         if abs(distance_pct) < min_dist:
             log.info(
                 f"{_u()}SNIPE [{asset} {tf}] FX G2 DIST — {distance_pct:+.4%} < "
@@ -577,7 +578,7 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
         # Gate 3: distance trend — move must be holding or growing, not reversing
         direction_early = "YES" if distance_pct > 0 else "NO"
         trend = _fx_distance_trend(asset, threshold, direction_early)
-        veto_level = -min_dist * FX_TREND_VETO_MULT
+        veto_level = -min_dist * config.FX_TREND_VETO_MULT
         if trend < veto_level:
             log.info(
                 f"{_u()}SNIPE [{asset} {tf}] FX G3 TREND — converging {trend:+.4%}/10min "
@@ -618,18 +619,18 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
 
     # ── Signal 5: Velocity (Falling Knife Guard) ──────────────────────────────
     velocity = _velocity_score(asset, threshold, direction)
-    if velocity < -SNIPE_VELOCITY_VETO:
+    if velocity < -config.SNIPE_VELOCITY_VETO:
         log.info(
-            f"{_u()}SNIPE [{asset} {tf}] VETOED — Velocity crash detected "
-            f"({velocity:+.1%} gap closed in {SNIPE_VELOCITY_WINDOW}s)"
+            f"{_u()}SNIPE [{asset} {tf}] ✗ G5 VELOCITY — price converging too fast "
+            f"({velocity:+.1%} gap closed in {config.SNIPE_VELOCITY_WINDOW}s)"
         )
         return None
 
-    # Gate 4 (FX): regime veto — choppy FX markets mean-revert and kill the edge
-    if asset in FX_SESSION_UTC and regime < FX_MIN_REGIME:
+    # ── Guard 6: Regime Filter (FX only) ──────────────────────────────────────
+    if asset in config.FX_SESSION_UTC and regime < config.FX_MIN_REGIME:
         log.info(
-            f"{_u()}SNIPE [{asset} {tf}] FX G4 REGIME — regime={regime:.2f} < {FX_MIN_REGIME} "
-            f"(choppy, likely to revert)"
+            f"{_u()}SNIPE [{asset} {tf}] FX G4 REGIME — regime={regime:.2f} < {config.FX_MIN_REGIME} "
+            "(market too choppy for FX signals)"
         )
         return None
 
@@ -672,10 +673,10 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
         return None
 
     # ── Hard Price Ceiling ──────────────────────────────────────────────────
-    if market_price > SNIPE_MAX_MARKET_PRICE:
+    if market_price > config.SNIPE_MAX_MARKET_PRICE:
         log.info(
-            f"{_u()}SNIPE [{asset} {tf}] REJECTED — market {market_price:.3f} > "
-            f"SNIPE_MAX_MARKET_PRICE {SNIPE_MAX_MARKET_PRICE:.3f}"
+            f"{_u()}SNIPE [{asset} {tf}] ✗ G7 MARKET PRICE — {market_price:.3f} > "
+            f"SNIPE_MAX_MARKET_PRICE {config.SNIPE_MAX_MARKET_PRICE:.3f}"
         )
         return None
 
@@ -715,7 +716,7 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
 
 # ── BTC spot move detector (feeds CORRELATE) ─────────────────────────────────
 
-def _btc_spot_move_pct(window_sec: float = CORRELATION_WINDOW_SEC) -> tuple[float, str]:
+def _btc_spot_move_pct(window_sec: float = config.CORRELATION_WINDOW_SEC) -> tuple[float, str]:
     """
     Returns (move_pct, direction) of BTC spot price over the last window_sec.
     Uses price history — no market scan needed, fires as soon as spot moves.
@@ -750,7 +751,7 @@ def record_btc_move(market: dict, yes_price_new: float):
 
 _CRYPTO_ASSETS = {"BTC", "ETH", "SOL"}
 
-def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD, learned: dict = None, spot_price: float = None) -> Optional[TradeSignal]:
+def correlate_signal(market: dict, threshold: float = config.CORRELATION_THRESHOLD, learned: dict = None, spot_price: float = None) -> Optional[TradeSignal]:
     """
     BTC spot price moves ≥threshold % → trade same direction on ETH/SOL.
 
@@ -768,7 +769,7 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD, lea
     asset = market["asset"]
 
     # Primary: BTC spot move (fast, fires before markets reprice)
-    spot_move, spot_dir = _btc_spot_move_pct(CORRELATION_WINDOW_SEC)
+    spot_move, spot_dir = _btc_spot_move_pct(config.CORRELATION_WINDOW_SEC)
     if spot_move >= threshold:
         direction = spot_dir
         freshness = 1.0
@@ -782,10 +783,10 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD, lea
         if not signal_time:
             return None
         age = time.time() - signal_time
-        if age > CORRELATION_WINDOW_SEC or _btc_signal_move.get(tf, 0.0) < threshold:
+        if age > config.CORRELATION_WINDOW_SEC or _btc_signal_move.get(tf, 0.0) < threshold:
             return None
         direction = _btc_signal_direction.get(tf)
-        freshness = 1.0 - (age / CORRELATION_WINDOW_SEC)
+        freshness = 1.0 - (age / config.CORRELATION_WINDOW_SEC)
 
     # ── Guard 0: Time to play out ──────────────────────────────────────────────
     secs = market.get("secs_to_close", 0)
@@ -797,18 +798,18 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD, lea
         return None
 
     # ── Guard 1: has the target asset already moved in the same direction? ─────
-    target_move, target_dir = _btc_spot_move_pct(CORRELATION_WINDOW_SEC)  # reuse helper
+    target_move, target_dir = _btc_spot_move_pct(config.CORRELATION_WINDOW_SEC)  # reuse helper
     # Actually measure target asset's own move
     target_hist = list(_price_history.get(asset, []))
     if len(target_hist) >= 6:
-        cutoff_time = time.time() - CORRELATION_WINDOW_SEC
+        cutoff_time = time.time() - config.CORRELATION_WINDOW_SEC
         past_entry = next(((t, p) for t, p in target_hist if t >= cutoff_time), None)
         if past_entry:
             target_asset_move = abs(target_hist[-1][1] - past_entry[1]) / past_entry[1]
-            if target_asset_move > spot_move * CORRELATE_ALREADY_MOVED:
+            if target_asset_move > spot_move * config.CORRELATE_ALREADY_MOVED:
                 log.info(
                     f"{_u()}CORRELATE [{asset} {tf}] REJECTED — {asset} already moved "
-                    f"{target_asset_move:.2%} (>{CORRELATE_ALREADY_MOVED:.0%} of BTC's {spot_move:.2%})"
+                    f"{target_asset_move:.2%} (>{config.CORRELATE_ALREADY_MOVED:.0%} of BTC's {spot_move:.2%})"
                 )
                 return None
 
@@ -835,19 +836,19 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD, lea
         outcome, outcome_id, market_price = "NO",  market["no_id"],  market["no_price"]
 
     # ── Guard 3: market already repriced ───────────────────────────────────────
-    if market_price > CORRELATE_MAX_MARKET_PRICE:
+    if market_price > config.CORRELATE_MAX_MARKET_PRICE:
         log.info(
             f"{_u()}CORRELATE [{asset} {tf}] REJECTED — market already at "
-            f"{market_price:.3f} > {CORRELATE_MAX_MARKET_PRICE} (move priced in)"
+            f"{market_price:.3f} > {config.CORRELATE_MAX_MARKET_PRICE} (move priced in)"
         )
         return None
 
     # ── Guard 4: regime filter on target asset ─────────────────────────────────
     regime = _regime_score(asset)
-    if regime < CORRELATE_MIN_REGIME:
+    if regime < config.CORRELATE_MIN_REGIME:
         log.info(
             f"{_u()}CORRELATE [{asset} {tf}] REJECTED — target regime "
-            f"{regime:.2f} < {CORRELATE_MIN_REGIME} (choppy, will revert)"
+            f"{regime:.2f} < {config.CORRELATE_MIN_REGIME} (choppy, will revert)"
         )
         return None
 
@@ -860,7 +861,7 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD, lea
         )
         return None
     mom       = _momentum_score(asset, mom_dir)
-    certainty = min(CORRELATE_BASE_CERTAINTY * freshness * (1.0 + 0.20 * mom), 0.99)
+    certainty = min(config.CORRELATE_BASE_CERTAINTY * freshness * (1.0 + 0.20 * mom), 0.99)
 
     w_est      = certainty_to_prob(certainty)
     fee_rate   = market.get("fee_rate", 0.04)
@@ -920,7 +921,7 @@ def arb_signal(market: dict) -> Optional[TradeSignal]:
     no_p     = market["no_price"]
     combined = yes_p + no_p
 
-    if combined > ARB_TRIGGER:
+    if combined > config.ARB_TRIGGER:
         return None
 
     fee_rate   = market.get("fee_rate", 0.04)
@@ -954,7 +955,7 @@ def arb_signal(market: dict) -> Optional[TradeSignal]:
 
 # ── Strategy 4: NEWS — sentiment-driven directional trade ────────────────────
 
-def news_signal(market: dict, sentiment_threshold: float = 0.35, spot_price: float = None) -> Optional[TradeSignal]:
+def news_signal(market: dict, sentiment_threshold: float = config.NEWS_SENTIMENT_THRESHOLD, spot_price: float = None) -> Optional[TradeSignal]:
     """
     Trade in the direction of a live high-confidence news signal.
 
@@ -977,10 +978,10 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35, spot_price: flo
         return None
 
     # ── Guard 1: minimum time remaining ────────────────────────────────────────
-    if secs < NEWS_MIN_SECS_LEFT:
+    if secs < config.NEWS_MIN_SECS_LEFT:
         log.info(
             f"{_u()}NEWS [{asset}] REJECTED — only {secs:.0f}s left "
-            f"(need ≥{NEWS_MIN_SECS_LEFT}s for news to play out)"
+            f"(need ≥{config.NEWS_MIN_SECS_LEFT}s for news to play out)"
         )
         return None
 
@@ -1004,19 +1005,19 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35, spot_price: flo
         direction = "NO"
 
     # ── Guard 2: market already repriced ───────────────────────────────────────
-    if market_price > NEWS_MAX_MARKET_PRICE:
+    if market_price > config.NEWS_MAX_MARKET_PRICE:
         log.info(
             f"{_u()}NEWS [{asset}] REJECTED — market at {market_price:.3f} "
-            f"> {NEWS_MAX_MARKET_PRICE} (move already priced in)"
+            f"> {config.NEWS_MAX_MARKET_PRICE} (move already priced in)"
         )
         return None
 
     # ── Guard 3: regime filter ─────────────────────────────────────────────────
     regime = _regime_score(asset)
-    if regime < NEWS_MIN_REGIME:
+    if regime < config.NEWS_MIN_REGIME:
         log.info(
             f"{_u()}NEWS [{asset}] REJECTED — regime {regime:.2f} "
-            f"< {NEWS_MIN_REGIME} (choppy market absorbs news shocks)"
+            f"< {config.NEWS_MIN_REGIME} (choppy market absorbs news shocks)"
         )
         return None
 
@@ -1034,7 +1035,7 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35, spot_price: flo
     # ── Dampened certainty (v2) ────────────────────────────────────────────────
     # VADER compound 0.80 × dampen 0.55 = effective 0.44 → win_prob ≈ 70%
     # Old: 0.80 raw → certainty 0.80 → win_prob 86% (wildly overconfident)
-    dampened     = strength * NEWS_CERTAINTY_DAMPEN
+    dampened     = strength * config.NEWS_CERTAINTY_DAMPEN
     strength_adj = min(dampened * (1.0 + 0.15 * mom), 0.99)
 
     w_est      = certainty_to_prob(strength_adj)
@@ -1056,7 +1057,7 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35, spot_price: flo
         )
         return None
 
-    size = kelly_size(w_est, market_price, fee_rate, fraction=NEWS_KELLY_FRACTION, asset=asset)
+    size = kelly_size(w_est, market_price, fee_rate, fraction=config.NEWS_KELLY_FRACTION, asset=asset)
 
     log.info(
         f"{_u()}NEWS [{asset}] ✅ SIGNAL | {sig.direction} "
@@ -1142,11 +1143,11 @@ def evaluate(market: dict, strategies: list[str], learned: dict = None, spot_pri
         strategies = ["SNIPE", "CORRELATE", "ARB", "NEWS"]
     learned = learned or {}
 
-    raw_cert    = learned.get("snipe_min_certainty", SNIPE_MIN_CERTAINTY)
-    min_cert    = max(SNIPE_MIN_CERTAINTY, min(raw_cert, 0.75))
-    raw_corr    = learned.get("correlation_threshold", CORRELATION_THRESHOLD)
-    corr_thresh = max(CORRELATION_THRESHOLD, min(raw_corr, 0.20))
-    news_thresh = learned.get("news_sentiment_threshold", 0.35)
+    raw_cert    = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
+    min_cert    = max(config.SNIPE_MIN_CERTAINTY, min(raw_cert, 0.75))
+    raw_corr    = learned.get("correlation_threshold", config.CORRELATION_THRESHOLD)
+    corr_thresh = max(config.CORRELATION_THRESHOLD, min(raw_corr, 0.20))
+    news_thresh = learned.get("news_sentiment_threshold", config.NEWS_SENTIMENT_THRESHOLD)
 
     signals = []
     try:
