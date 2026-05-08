@@ -471,7 +471,7 @@ async def cmd_learning(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 @_guard
 async def cmd_resetlearning(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
-    user = database.get_user(cid)
+    user = await asyncio.to_thread(database.get_user, cid)
     if not user:
         return
     s = user["settings"]
@@ -823,15 +823,15 @@ def _calc_target(settings: dict, start_balance: float) -> float:
     return start_balance * settings.get("daily_multiplier", 10) / 100
 
 
-def _set_paused(cid: str, paused: bool):
-    user = database.get_user(cid)
+async def _set_paused(cid: str, paused: bool):
+    user = await asyncio.to_thread(database.get_user, cid)
     if user:
         s = user["settings"]
         s["paused"] = paused
-        database.update_settings(cid, s)
+        await asyncio.to_thread(database.update_settings, cid, s)
 
 
-def _clear_target_hit(cid: str):
+async def _clear_target_hit(cid: str):
     # Drop the entry entirely so the next loop tick resets start_balance
     # to the actual current balance — prevents deposits looking like profit
     _user_daily.pop(cid, None)
