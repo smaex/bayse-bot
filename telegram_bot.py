@@ -6,6 +6,7 @@ Existing users: all commands work immediately.
 """
 
 import logging
+import asyncio
 from datetime import date
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup

@@ -10,6 +10,7 @@ Produces a report on:
 """
 
 import logging
+import asyncio
 import database
 from client import BayseClient
 
