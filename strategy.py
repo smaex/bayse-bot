@@ -61,20 +61,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, Literal
-from config import (
-    SNIPE_MIN_CERTAINTY, SNIPE_ENTRY_WINDOWS, ASSET_HOURLY_VOL,
-    CORRELATION_THRESHOLD, CORRELATION_WINDOW_SEC, ARB_TRIGGER,
-    FX_SESSION_UTC, FX_MIN_DISTANCE, FX_MIN_REGIME,
-    FX_ENTRY_WINDOW_1H, FX_TREND_VETO_MULT,
-    CORRELATE_BASE_CERTAINTY, CORRELATE_ALREADY_MOVED,
-    CORRELATE_MAX_MARKET_PRICE, CORRELATE_MIN_REGIME,
-    NEWS_CERTAINTY_DAMPEN, NEWS_MAX_MARKET_PRICE, NEWS_MIN_REGIME,
-    NEWS_MIN_SECS_LEFT, NEWS_KELLY_FRACTION, CRYPTO_MIN_DISTANCE,
-    SNIPE_MAX_MARKET_PRICE, MIN_PAYOUT_RATIO,
-    SNIPE_VELOCITY_WINDOW, SNIPE_VELOCITY_VETO,
-    SYSTEMIC_RISK_VOL_MULT, SYSTEMIC_RISK_COUNT_THRESHOLD, SYSTEMIC_RISK_HALT_MINS,
-    VOL_SPIKE_THRESHOLD, DYNAMIC_KELLY_MIN, DYNAMIC_KELLY_MAX
-)
+import config
 import feeds
 import news as news_mod
 import database
@@ -185,14 +172,14 @@ def check_systemic_risk() -> Optional[str]:
 
     spike_assets = []
     for asset, garch in _garch_state.items():
-        config_vol = ASSET_HOURLY_VOL.get(asset, 0.022)
+        config_vol = config.ASSET_HOURLY_VOL.get(asset, 0.022)
         current_vol = math.sqrt(garch["var"] * 720.0)
         
-        if current_vol > config_vol * SYSTEMIC_RISK_VOL_MULT:
+        if current_vol > config_vol * config.SYSTEMIC_RISK_VOL_MULT:
             spike_assets.append(asset)
             
-    if len(spike_assets) >= SYSTEMIC_RISK_COUNT_THRESHOLD:
-        _systemic_halt_until = time.time() + (SYSTEMIC_RISK_HALT_MINS * 60)
+    if len(spike_assets) >= config.SYSTEMIC_RISK_COUNT_THRESHOLD:
+        _systemic_halt_until = time.time() + (config.SYSTEMIC_RISK_HALT_MINS * 60)
         return f"GLOBAL VOLATILITY SHOCK: Spikes in {', '.join(spike_assets)}"
         
     return None
@@ -245,13 +232,12 @@ def _update_kalman(state: dict, z: float, dt: float) -> dict:
 
 def _update_garch(asset: str, price: float) -> None:
     """Recursive pseudo-GARCH(1,1) update."""
-    from config import ASSET_HOURLY_VOL
     omega_weight = 0.05
     alpha = 0.15  # shock sensitivity
     beta = 0.80   # persistence
     
     state = _garch_state.get(asset)
-    config_vol = ASSET_HOURLY_VOL.get(asset, 0.022)
+    config_vol = config.ASSET_HOURLY_VOL.get(asset, 0.022)
     # Convert hourly config vol to a rough 5s variance target
     # hourly_vol = sqrt(var_5s * 720) -> var_5s = (hourly_vol^2) / 720
     target_var = (config_vol ** 2) / 720.0
@@ -277,9 +263,9 @@ def _update_garch(asset: str, price: float) -> None:
     old_var = state.get("var", new_var)
     if old_var > 0:
         acceleration = new_var / old_var
-        if acceleration > VOL_SPIKE_THRESHOLD:
+        if acceleration > config.VOL_SPIKE_THRESHOLD:
             global _systemic_halt_until
-            _systemic_halt_until = time.time() + (SYSTEMIC_RISK_HALT_MINS * 60)
+            _systemic_halt_until = time.time() + (config.SYSTEMIC_RISK_HALT_MINS * 60)
             log.critical(
                 f"VOLATILITY SPIKE DETECTED on {asset} | "
                 f"accel={acceleration:.2f}x | HALTING ALL TRADING for {SYSTEMIC_RISK_HALT_MINS}m"
@@ -371,13 +357,13 @@ def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.04,
     if asset and asset in _garch_state:
         garch_var = _garch_state[asset]["var"]
         current_vol = math.sqrt(garch_var * 720.0) # approx hourly
-        base_vol = ASSET_HOURLY_VOL.get(asset, 0.022)
+        base_vol = config.ASSET_HOURLY_VOL.get(asset, 0.022)
         
         # Vol ratio: 1.0 = normal, >1.0 = high vol, <1.0 = low vol
         vol_ratio = current_vol / base_vol
         # Invert ratio for scaling: higher vol -> lower multiplier
         # Scale fraction between DYNAMIC_KELLY_MIN and DYNAMIC_KELLY_MAX
-        dynamic_fraction = min(max(fraction / vol_ratio, DYNAMIC_KELLY_MIN), DYNAMIC_KELLY_MAX)
+        dynamic_fraction = min(max(fraction / vol_ratio, config.DYNAMIC_KELLY_MIN), config.DYNAMIC_KELLY_MAX)
         fraction = dynamic_fraction
 
     raw_kelly = (win_prob * b - (1.0 - win_prob)) / b
@@ -401,8 +387,7 @@ def realized_vol_hourly(asset: str) -> float:
     Actual hourly vol computed from recursive GARCH(1,1) estimates.
     Blends with config value if insufficient data.
     """
-    from config import ASSET_HOURLY_VOL
-    config_vol = ASSET_HOURLY_VOL.get(asset, 0.022)
+    config_vol = config.ASSET_HOURLY_VOL.get(asset, 0.022)
     
     garch = _garch_state.get(asset)
     if not garch:
