@@ -72,7 +72,7 @@ def build_app() -> Application:
 
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
-    if database.get_user(cid):
+    if await asyncio.to_thread(database.get_user, cid):
         await _main_menu(update)
         return
 
@@ -122,10 +122,10 @@ async def on_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             from client import BayseClient
             client  = BayseClient(pub, text)
             balance = await client.get_balance_ngn()
-            database.add_user(cid, pub, text)
+            await asyncio.to_thread(database.add_user, cid, pub, text)
             _user_clients[cid] = client
             if _start_user_fn:
-                _start_user_fn(cid)
+                await _start_user_fn(cid)
             await msg.delete()
             await update.message.reply_text(
                 f"🎉 *Connected!*\n\n"
@@ -145,7 +145,7 @@ async def on_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    if not database.get_user(cid):
+    if not await asyncio.to_thread(database.get_user, cid):
         await update.message.reply_text("Use /start to connect your Bayse account.")
 
 
@@ -169,29 +169,29 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     cid = str(query.from_user.id)
-    if not database.get_user(cid):
+    if not await asyncio.to_thread(database.get_user, cid):
         await query.message.reply_text("Use /start to connect your account.")
         return
     data = query.data
     if   data == "status":   await query.message.reply_text(await _status_text(cid), parse_mode="Markdown")
     elif data == "balance":  await query.message.reply_text(await _balance_text(cid), parse_mode="Markdown")
-    elif data == "markets":  await query.message.reply_text(_markets_text(cid), parse_mode="Markdown")
-    elif data == "settings": await query.message.reply_text(_settings_text(cid), parse_mode="Markdown")
+    elif data == "markets":  await query.message.reply_text(await _markets_text(cid), parse_mode="Markdown")
+    elif data == "settings": await query.message.reply_text(await _settings_text(cid), parse_mode="Markdown")
     elif data == "pause":
-        _set_paused(cid, True)
+        await _set_paused(cid, True)
         await query.message.reply_text("⏸ Trading paused.")
     elif data == "resume":
-        _set_paused(cid, False)
-        _clear_target_hit(cid)
+        await _set_paused(cid, False)
+        await _clear_target_hit(cid)
         await query.message.reply_text("▶️ Trading resumed.")
     elif data in _MODES:
         mode   = _MODES[data]
-        user   = database.get_user(cid)
+        user   = await asyncio.to_thread(database.get_user, cid)
         s      = user["settings"]
         s.update(mode["settings"])
         # Store the mode name so /settings and /status can show it
         s["mode"] = data.replace("mode_", "")   # e.g. "mode_safe" → "safe"
-        database.update_settings(cid, s)
+        await asyncio.to_thread(database.update_settings, cid, s)
         await query.message.reply_text(
             f"{mode['description']}\n\n✅ *Mode applied. Trading resumes now.*\n"
             f"Use `/set` to fine-tune any individual setting.",
@@ -204,7 +204,7 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 def _guard(fn):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cid = str(update.effective_chat.id)
-        if not database.get_user(cid):
+        if not await asyncio.to_thread(database.get_user, cid):
             await update.message.reply_text("Use /start to connect your account.")
             return
         await fn(update, ctx)
@@ -292,7 +292,7 @@ async def cmd_debug(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 @_guard
 async def cmd_trades(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid  = str(update.effective_chat.id)
-    rows = database.recent_trades(cid, limit=10)
+    rows = await asyncio.to_thread(database.recent_trades, cid, limit=10)
     if not rows:
         await update.message.reply_text("No trades yet.")
         return
@@ -307,7 +307,7 @@ async def cmd_trades(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 @_guard
 async def cmd_markets(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        _markets_text(str(update.effective_chat.id)), parse_mode="Markdown"
+        await _markets_text(str(update.effective_chat.id)), parse_mode="Markdown"
     )
 
 
@@ -326,7 +326,7 @@ async def cmd_analysis(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 @_guard
 async def cmd_settings(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        _settings_text(str(update.effective_chat.id)), parse_mode="Markdown"
+        await _settings_text(str(update.effective_chat.id)), parse_mode="Markdown"
     )
 
 
@@ -350,7 +350,7 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    user = database.get_user(cid)
+    user = await asyncio.to_thread(database.get_user, cid)
     s    = user["settings"]
     key, vals = args[0].lower(), args[1:]
 
@@ -433,22 +433,22 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Unknown setting `{key}`.", parse_mode="Markdown"); return
 
     s["mode"] = "custom"   # individual /set changes override the preset mode
-    database.update_settings(cid, s)
+    await asyncio.to_thread(database.update_settings, cid, s)
     await update.message.reply_text(f"✅ {msg}\n_(Mode → Custom)_", parse_mode="Markdown")
 
 
 @_guard
 async def cmd_pause(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
-    _set_paused(cid, True)
+    await _set_paused(cid, True)
     await update.message.reply_text("⏸ Trading paused. Use /resume to restart.")
 
 
 @_guard
 async def cmd_resume(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
-    _set_paused(cid, False)
-    _clear_target_hit(cid)
+    await _set_paused(cid, False)
+    await _clear_target_hit(cid)
     # Reset in-memory drawdown state so the risk manager doesn't immediately
     # re-pause on the next loop tick.  peak_balance=0 causes update_peak() to
     # re-anchor to the current live balance on the next balance fetch.
@@ -463,7 +463,7 @@ async def cmd_resume(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_learning(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
     await update.message.reply_text("🧠 Running intelligence cycle…")
-    _, report = learner.run_learning(cid)
+    _, report = await learner.run_learning(cid)
     await update.message.reply_text(report, parse_mode="Markdown")
 
 
@@ -475,7 +475,7 @@ async def cmd_resetlearning(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         return
     s = user["settings"]
     s["learned"] = {}
-    database.update_settings(cid, s)
+    await asyncio.to_thread(database.update_settings, cid, s)
     await update.message.reply_text(
         "🔄 *Learned settings cleared.*\n\n"
         "The bot will now use the base config thresholds.\n"
@@ -487,7 +487,7 @@ async def cmd_resetlearning(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 @_guard
 async def cmd_learnstats(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid  = str(update.effective_chat.id)
-    rows = database.recent_stats(cid, days=7)
+    rows = await asyncio.to_thread(database.recent_stats, cid, days=7)
     if not rows:
         await update.message.reply_text("No resolved trades in the last 7 days.")
         return
@@ -662,7 +662,7 @@ async def cmd_mode(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 @_guard
 async def cmd_disconnect(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
-    database.deactivate(cid)
+    await asyncio.to_thread(database.deactivate, cid)
     _user_clients.pop(cid, None)
     _user_risks.pop(cid, None)
     _user_daily.pop(cid, None)
@@ -705,7 +705,7 @@ async def _status_text(cid: str) -> str:
         return "Could not fetch balance right now."
 
     risk  = _user_risks.get(cid)
-    user  = database.get_user(cid)
+    user  = await asyncio.to_thread(database.get_user, cid)
     s     = user["settings"] if user else {}
 
     # Prefer in-memory cache; fall back to DB-persisted daily_state on cold restart
@@ -725,7 +725,7 @@ async def _status_text(cid: str) -> str:
         n_pos    = len(risk.open_positions)
         deployed = sum(p.get("amount_ngn", 0) for p in risk.open_positions.values())
 
-    stats = database.all_time_stats(cid)
+    stats = await asyncio.to_thread(database.all_time_stats, cid)
 
     lines = [
         "📊 *Bot Status*\n",
@@ -758,8 +758,8 @@ async def _balance_text(cid: str) -> str:
         return f"Could not fetch balance: {e}"
 
 
-def _markets_text(cid: str) -> str:
-    user = database.get_user(cid)
+async def _markets_text(cid: str) -> str:
+    user = await asyncio.to_thread(database.get_user, cid)
     if not user:
         return "Not connected."
     s  = user["settings"]
@@ -779,8 +779,8 @@ def _markets_text(cid: str) -> str:
     return "\n".join(lines)
 
 
-def _settings_text(cid: str) -> str:
-    user = database.get_user(cid)
+async def _settings_text(cid: str) -> str:
+    user = await asyncio.to_thread(database.get_user, cid)
     if not user:
         return "Not connected."
     s    = user["settings"]

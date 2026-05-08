@@ -42,27 +42,27 @@ except ImportError:
 # Direct crypto catalyst keywords — headlines must match at least one to trigger a trade.
 # Geopolitical noise (Iran, war, tariffs) scores high on VADER but has no reliable
 # crypto price correlation.  We still NOTIFY users about those headlines but don't trade.
-_CRYPTO_CATALYSTS = {
-    # Regulatory / legal
-    "etf", "sec", "cftc", "regulation", "regulatory", "ban", "lawsuit", "legal",
-    "approval", "approved", "reject", "rejected", "compliance", "enforcement",
-    # Market structure
-    "exchange", "binance", "coinbase", "kraken", "ftx", "hack", "hacked", "exploit",
-    "breach", "insolvent", "insolvency", "bankrupt", "bankruptcy", "delisted", "delist",
-    "liquidity", "liquidation", "liquidated", "whale", "dump", "dumped",
-    # Monetary policy (direct crypto impact)
-    "fed", "federal reserve", "fomc", "rate cut", "rate hike", "interest rate",
-    "inflation", "cpi", "monetary", "quantitative", "tightening", "easing",
-    "treasury", "yield", "bond",
-    # Crypto-specific events
-    "halving", "halvening", "fork", "upgrade", "merge", "staking", "unstaking",
-    "airdrop", "token", "defi", "nft", "layer 2", "l2", "rollup", "bridge",
-    "stablecoin", "tether", "usdt", "usdc", "depeg", "peg",
-    # Adoption / institutional
-    "adoption", "institutional", "microstrategy", "saylor", "tesla", "payment",
-    "custody", "etf approval", "spot etf", "blackrock", "fidelity", "grayscale",
-    # Direct asset mentions (redundant with _CRYPTO_KEYWORDS but explicit for catalyst check)
-    "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto", "cryptocurrency",
+# Professional Catalyst Weights: some news moves markets more than others.
+_CATALYST_WEIGHTS = {
+    "sec": 2.5, "etf": 2.5, "approval": 2.0, "approved": 2.0,
+    "fed": 1.8, "fomc": 2.0, "cpi": 1.8, "inflation": 1.5,
+    "hack": 2.2, "exploit": 2.0, "bankrupt": 2.5, "ftx": 2.0,
+    "binance": 1.5, "coinbase": 1.5, "blackrock": 1.8,
+    "halving": 1.5, "merge": 1.5, "upgrade": 1.2,
+    "lawsuit": 1.8, "settlement": 1.5, "rejected": 2.0,
+    # Common keywords (baseline weight)
+    "bitcoin": 1.0, "btc": 1.0, "ethereum": 1.0, "eth": 1.0,
+    "solana": 1.0, "sol": 1.0, "crypto": 1.0, "cryptocurrency": 1.0,
+}
+
+# Source Reliability: how much to trust specific outlets
+_SOURCE_RELIABILITY = {
+    "coindesk.com": 1.2,
+    "theblock.co": 1.2,
+    "bloomberg.com": 1.5,
+    "reuters.com": 1.5,
+    "cointelegraph.com": 0.9, # often sensationalist
+    "decrypt.co": 1.0,
 }
 
 
@@ -90,11 +90,33 @@ class NewsSignal:
 active_signals: list[NewsSignal] = []
 
 
-def _score(text: str) -> float:
-    """VADER compound score, -1 to +1. Sign = direction, magnitude = confidence."""
+def _score(text: str, source_url: str = "") -> float:
+    """
+    Professional Sentiment Score:
+    Final Score = VADER_Compound * max(Catalyst_Weights) * Source_Reliability
+    """
     if not _vader_ok:
         return 0.0
-    return _vader.polarity_scores(text)["compound"]
+    
+    base_score = _vader.polarity_scores(text)["compound"]
+    
+    # Apply Catalyst Multipliers
+    text_lower = text.lower()
+    catalyst_mult = 1.0
+    for kw, weight in _CATALYST_WEIGHTS.items():
+        if kw in text_lower:
+            catalyst_mult = max(catalyst_mult, weight)
+            
+    # Apply Source Reliability
+    source_mult = 1.0
+    for domain, weight in _SOURCE_RELIABILITY.items():
+        if domain in source_url:
+            source_mult = weight
+            break
+            
+    final_score = base_score * catalyst_mult * source_mult
+    # Cap at ±1.0 to avoid over-leveraging
+    return min(max(final_score, -1.0), 1.0)
 
 
 def _assets_from_text(text: str) -> list[str]:
@@ -112,7 +134,7 @@ def _assets_from_text(text: str) -> list[str]:
 def _has_crypto_catalyst(text: str) -> bool:
     """Check if headline contains a direct crypto catalyst keyword."""
     text_lower = text.lower()
-    return any(kw in text_lower for kw in _CRYPTO_CATALYSTS)
+    return any(kw in text_lower for kw in _CATALYST_WEIGHTS)
 
 
 def _push_signal(signal: NewsSignal):
@@ -207,7 +229,7 @@ async def newsapi_feed():
                                 continue
 
                             assets   = _assets_from_text(text)
-                            compound = _score(text)
+                            compound = _score(text, article_url)
 
                             if compound > NEWS_SENTIMENT_THRESHOLD:
                                 _push_signal(NewsSignal(

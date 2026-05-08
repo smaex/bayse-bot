@@ -128,6 +128,44 @@ _kalman_state:         dict[str, dict]  = {}
 _garch_state:          dict[str, dict]  = {}
 _last_history_update:  dict[str, float] = {}
 _systemic_halt_until:  float            = 0.0
+_circuit_breakers:     dict[str, dict]  = {} # {strategy_asset: {"fails": 0, "halt_until": 0}}
+
+async def load_memory():
+    """Load Kalman/GARCH states from DB to avoid 'blind' periods on restart."""
+    try:
+        states = await asyncio.to_thread(database.load_quant_states)
+        for asset, data in states.items():
+            _kalman_state[asset] = data.get("kalman")
+            _garch_state[asset]  = data.get("garch")
+            # Convert history list back to deque
+            hist_list = data.get("history", [])
+            _price_history[asset] = deque(hist_list, maxlen=_HISTORY_MAXLEN)
+        log.info(f"Loaded memory for {len(states)} assets.")
+    except Exception as e:
+        log.warning(f"Could not load quant memory: {e}")
+
+def _check_circuit_breaker(strategy: str, asset: str) -> bool:
+    key = f"{strategy}_{asset}"
+    breaker = _circuit_breakers.get(key)
+    if not breaker: return True
+    if time.time() < breaker.get("halt_until", 0):
+        return False
+    return True
+
+def record_failure(strategy: str, asset: str):
+    key = f"{strategy}_{asset}"
+    breaker = _circuit_breakers.get(key, {"fails": 0, "halt_until": 0})
+    breaker["fails"] += 1
+    if breaker["fails"] >= 3:
+        # Halt for 12 hours
+        breaker["halt_until"] = time.time() + (12 * 3600)
+        log.warning(f"CIRCUIT BREAKER TRIGGERED: {key} halted for 12h after 3 losses.")
+    _circuit_breakers[key] = breaker
+
+def record_success(strategy: str, asset: str):
+    key = f"{strategy}_{asset}"
+    if key in _circuit_breakers:
+        _circuit_breakers[key]["fails"] = 0
 
 def is_systemic_risk_active() -> bool:
     """Returns True if the bot is currently in a systemic risk cooldown."""
@@ -230,6 +268,20 @@ def _update_garch(asset: str, price: float) -> None:
     
     # GARCH update: var_t = omega + alpha * shock^2 + beta * var_{t-1}
     new_var = omega + alpha * shock_sq + beta * state["var"]
+    
+    # ── Guard: Volatility Spike Kill-Switch ───────────────────────────────────
+    # If variance accelerates too fast (>VOL_SPIKE_THRESHOLD), trigger halt.
+    old_var = state.get("var", new_var)
+    if old_var > 0:
+        acceleration = new_var / old_var
+        if acceleration > VOL_SPIKE_THRESHOLD:
+            global _systemic_halt_until
+            _systemic_halt_until = time.time() + (SYSTEMIC_RISK_HALT_MINS * 60)
+            log.critical(
+                f"VOLATILITY SPIKE DETECTED on {asset} | "
+                f"accel={acceleration:.2f}x | HALTING ALL TRADING for {SYSTEMIC_RISK_HALT_MINS}m"
+            )
+
     _garch_state[asset] = {"var": new_var, "last_price": price}
 
 def update_price_history(asset: str, price: float) -> None:
@@ -250,6 +302,16 @@ def update_price_history(asset: str, price: float) -> None:
     if dt < 60: # only update filters if tick is continuous (avoid huge jumps)
         _kalman_state[asset] = _update_kalman(_kalman_state[asset], price, dt)
         _update_garch(asset, price)
+        
+        # Periodically persist to DB (every 5 mins)
+        if now - _last_history_update.get(f"{asset}_save", 0) > 300:
+            _last_history_update[f"{asset}_save"] = now
+            state = {
+                "kalman": _kalman_state[asset],
+                "garch": _garch_state[asset],
+                "history": list(_price_history[asset])
+            }
+            asyncio.create_task(asyncio.to_thread(database.save_quant_state, asset, state))
 
 # ── Quantitative helpers ──────────────────────────────────────────────────────
 
@@ -290,11 +352,31 @@ def max_ev_price(win_prob: float, fee_rate: float = 0.04, min_margin: float = 0.
 
 
 def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.04,
-               fraction: float = 0.25, cap: float = 0.05) -> float:
-    """Quarter-Kelly position size, capped at `cap`."""
+               fraction: float = 0.25, cap: float = 0.05, asset: str = None) -> float:
+    """
+    Quarter-Kelly position size, capped at `cap`.
+    v2: Dynamic scaling based on GARCH volatility.
+    """
     b = (1.0 - fee_rate) / market_price - 1.0
     if b <= 0:
         return 0.0
+        
+    # ── Dynamic Kelly Scaling ──────────────────────────────────────────────────
+    # Compare current hourly GARCH vol to baseline config vol.
+    # High vol relative to baseline = reduce bet size (risk of trend break).
+    # Low vol relative to baseline = increase bet size (stable environment).
+    if asset and asset in _garch_state:
+        garch_var = _garch_state[asset]["var"]
+        current_vol = math.sqrt(garch_var * 720.0) # approx hourly
+        base_vol = ASSET_HOURLY_VOL.get(asset, 0.022)
+        
+        # Vol ratio: 1.0 = normal, >1.0 = high vol, <1.0 = low vol
+        vol_ratio = current_vol / base_vol
+        # Invert ratio for scaling: higher vol -> lower multiplier
+        # Scale fraction between DYNAMIC_KELLY_MIN and DYNAMIC_KELLY_MAX
+        dynamic_fraction = min(max(fraction / vol_ratio, DYNAMIC_KELLY_MIN), DYNAMIC_KELLY_MAX)
+        fraction = dynamic_fraction
+
     raw_kelly = (win_prob * b - (1.0 - win_prob)) / b
     return min(max(raw_kelly * fraction, 0.0), cap)
 
@@ -436,7 +518,7 @@ def _fx_distance_trend(asset: str, threshold: float, direction: str) -> float:
 
 # ── Strategy 1: SNIPE — 5-model composite ────────────────────────────────────
 
-def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Optional[TradeSignal]:
+def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -> Optional[TradeSignal]:
     """
     Enter when the diffusion model AND supporting signals agree.
 
@@ -468,7 +550,7 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
         return None
 
     threshold = market.get("threshold")
-    live_spot = feeds.spot.get(asset)
+    live_spot  = spot_price if spot_price is not None else feeds.spot.get(asset)
     if not threshold or not live_spot:
         if not live_spot:
             log.warning(f"{_u()}SNIPE [{asset} {tf}] no spot price in feeds.spot")
@@ -610,7 +692,7 @@ def snipe_signal(market: dict, min_certainty: float = SNIPE_MIN_CERTAINTY) -> Op
         return None
 
     # ── Quarter-Kelly sizing ──────────────────────────────────────────────────
-    size = kelly_size(w_est, market_price, fee_rate)
+    size = kelly_size(w_est, market_price, fee_rate, asset=asset)
 
     log.info(
         f"{_u()}SNIPE [{asset} {tf}] ✅ SIGNAL | "
@@ -680,7 +762,7 @@ def record_btc_move(market: dict, yes_price_new: float):
 
 _CRYPTO_ASSETS = {"BTC", "ETH", "SOL"}
 
-def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> Optional[TradeSignal]:
+def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD, learned: dict = None, spot_price: float = None) -> Optional[TradeSignal]:
     """
     BTC spot price moves ≥threshold % → trade same direction on ETH/SOL.
 
@@ -744,7 +826,7 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> 
 
     # ── Guard 2: target spot must be on the correct side of threshold ──────────
     target_threshold = market.get("threshold")
-    target_spot = feeds.spot.get(asset)
+    target_spot = spot_price if spot_price is not None else feeds.spot.get(asset)
     if target_threshold and target_spot:
         if direction == "UP" and target_spot < target_threshold:
             log.info(
@@ -803,7 +885,7 @@ def correlate_signal(market: dict, threshold: float = CORRELATION_THRESHOLD) -> 
         )
         return None
 
-    size = kelly_size(w_est, market_price, fee_rate)
+    size = kelly_size(w_est, market_price, fee_rate, asset=asset)
 
     log.info(
         f"{_u()}CORRELATE [{asset} {tf}] ✅ SIGNAL | "
@@ -884,7 +966,7 @@ def arb_signal(market: dict) -> Optional[TradeSignal]:
 
 # ── Strategy 4: NEWS — sentiment-driven directional trade ────────────────────
 
-def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[TradeSignal]:
+def news_signal(market: dict, sentiment_threshold: float = 0.35, spot_price: float = None) -> Optional[TradeSignal]:
     """
     Trade in the direction of a live high-confidence news signal.
 
@@ -986,7 +1068,7 @@ def news_signal(market: dict, sentiment_threshold: float = 0.35) -> Optional[Tra
         )
         return None
 
-    size = kelly_size(w_est, market_price, fee_rate, fraction=NEWS_KELLY_FRACTION)
+    size = kelly_size(w_est, market_price, fee_rate, fraction=NEWS_KELLY_FRACTION, asset=asset)
 
     log.info(
         f"{_u()}NEWS [{asset}] ✅ SIGNAL | {sig.direction} "
@@ -1063,8 +1145,11 @@ def _apply_convergence(signals: list[TradeSignal]) -> list[TradeSignal]:
 
 # ── Main evaluate entrypoint ──────────────────────────────────────────────────
 
-def evaluate(market: dict, strategies: list | None = None, learned: dict | None = None) -> list[TradeSignal]:
-    """Run the given strategies on one market. Returns signals sorted by certainty."""
+def evaluate(market: dict, strategies: list[str], learned: dict = None, spot_price: float = None) -> list[TradeSignal]:
+    """
+    Main evaluation entry point.
+    spot_price: if provided, overrides the global feeds.spot[asset] (used for backtesting).
+    """
     if strategies is None:
         strategies = ["SNIPE", "CORRELATE", "ARB", "NEWS"]
     learned = learned or {}
@@ -1075,23 +1160,29 @@ def evaluate(market: dict, strategies: list | None = None, learned: dict | None 
     corr_thresh = max(CORRELATION_THRESHOLD, min(raw_corr, 0.20))
     news_thresh = learned.get("news_sentiment_threshold", 0.35)
 
-    dispatch = {
-        "SNIPE":     lambda m: snipe_signal(m, min_certainty=min_cert),
-        "CORRELATE": lambda m: correlate_signal(m, threshold=corr_thresh),
-        "ARB":       arb_signal,
-        "NEWS":      lambda m: news_signal(m, sentiment_threshold=news_thresh),
-    }
-
     signals = []
-    for name in strategies:
-        fn = dispatch.get(name)
-        if fn:
-            try:
-                sig = fn(market)
-                if sig:
-                    signals.append(sig)
-            except Exception as e:
-                log.error(f"Strategy {name} error on {market.get('market_id')}: {e}", exc_info=True)
+    try:
+        if "SNIPE" in strategies:
+            if _check_circuit_breaker("SNIPE", market["asset"]):
+                sig = snipe_signal(market, learned, spot_price=spot_price)
+                if sig: signals.append(sig)
+            else:
+                log.debug(f"SNIPE {market['asset']} skipped (Circuit Breaker active)")
+
+        if "CORRELATE" in strategies:
+            if _check_circuit_breaker("CORRELATE", market["asset"]):
+                sig = correlate_signal(market, threshold=corr_thresh, spot_price=spot_price)
+                if sig: signals.append(sig)
+
+        if "ARB" in strategies:
+            sig = arb_signal(market)
+            if sig: signals.append(sig)
+
+        if "NEWS" in strategies:
+            sig = news_signal(market, sentiment_threshold=news_thresh, spot_price=spot_price)
+            if sig: signals.append(sig)
+    except Exception as e:
+        log.error(f"Strategy error on {market.get('market_id')}: {e}", exc_info=True)
 
     if not signals:
         return []

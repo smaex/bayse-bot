@@ -23,9 +23,9 @@ DEFAULT_LEARNED: dict = {
 }
 
 
-def run_learning(chat_id: str) -> tuple[dict, str]:
+async def run_learning(chat_id: str) -> tuple[dict, str]:
     """Analyse 30-day trades for one user, save updated learned params, return report."""
-    user = database.get_user(chat_id)
+    user = await asyncio.to_thread(database.get_user, chat_id)
     if not user:
         return DEFAULT_LEARNED.copy(), "User not found."
 
@@ -34,7 +34,7 @@ def run_learning(chat_id: str) -> tuple[dict, str]:
     mults   = dict(learned.get("size_multipliers", {k: 1.0 for k in ["SNIPE", "CORRELATE", "ARB", "NEWS"]}))
     suspended = set(learned.get("suspended_strategies", []))
 
-    stats = database.recent_stats(chat_id, days=30)
+    stats = await asyncio.to_thread(database.recent_stats, chat_id, days=30)
     changes, warnings = [], []
 
     by_strategy: dict[str, list] = {}
@@ -115,10 +115,10 @@ def run_learning(chat_id: str) -> tuple[dict, str]:
 
     # Save learned params back into settings
     s["learned"] = learned
-    database.update_settings(chat_id, s)
+    await asyncio.to_thread(database.update_settings, chat_id, s)
 
     # Build report
-    overall = database.all_time_stats(chat_id)
+    overall = await asyncio.to_thread(database.all_time_stats, chat_id)
     lines   = [
         "🧠 *Daily Learning Report*",
         f"Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
@@ -180,7 +180,7 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
     while True:
         await asyncio.sleep(120)
         for chat_id, client in list(user_clients.items()):
-            pending = database.get_unresolved(chat_id, older_than_minutes=6)
+            pending = await asyncio.to_thread(database.get_unresolved, chat_id, older_than_minutes=6)
             for trade in pending:
                 try:
                     event    = await client.get_event(trade["event_id"])
@@ -224,7 +224,13 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                         else:
                             pnl = -amount
 
-                    database.resolve_trade(trade["trade_id"], won, pnl)
+                    await asyncio.to_thread(database.resolve_trade, trade["trade_id"], won, pnl)
+                    
+                    import strategy
+                    if won:
+                        strategy.record_success(trade["strategy"], trade["asset"])
+                    else:
+                        strategy.record_failure(trade["strategy"], trade["asset"])
 
                     # Free up position in risk manager so exposure cap doesn't block new trades
                     if user_risks and chat_id in user_risks:
@@ -264,12 +270,13 @@ async def daily_learning_loop(tg_app=None):
         log.info(f"Next learning cycle in {wait / 3600:.1f}h")
         await asyncio.sleep(wait)
 
-        for user in database.get_all_active():
+        for user in await asyncio.to_thread(database.get_all_active):
             cid = user["chat_id"]
             try:
-                _, report = run_learning(cid)
+                _, report = await run_learning(cid)
                 log.info(f"Learning complete for {cid}")
                 if tg_app:
+                    import telegram_bot as tgb
                     await tgb.send_message(
                         tg_app, cid,
                         f"🧠 *Daily Intelligence Report*\n\n{report}",

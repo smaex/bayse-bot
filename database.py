@@ -179,8 +179,11 @@ def init_db():
                 ON trades(chat_id, created_at DESC)
             """)
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_trades_open
-                ON trades(chat_id, won) WHERE won IS NULL
+                CREATE TABLE IF NOT EXISTS quant_state (
+                    asset      TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT
+                )
             """)
         conn.commit()
     log.info("Database ready (PostgreSQL, pooled connections)")
@@ -309,3 +312,17 @@ def recent_trades(chat_id: str, limit: int = 10) -> list[dict]:
         SELECT * FROM trades WHERE chat_id=%s
         ORDER BY created_at DESC LIMIT %s
     """, (chat_id, limit))
+
+# ── Quant State Persistence ──────────────────────────────────────────────────
+
+def save_quant_state(asset: str, state: dict):
+    now = datetime.now(timezone.utc).isoformat()
+    _execute(
+        "INSERT INTO quant_state (asset, state_json, updated_at) VALUES (%s,%s,%s) "
+        "ON CONFLICT (asset) DO UPDATE SET state_json=EXCLUDED.state_json, updated_at=EXCLUDED.updated_at",
+        (asset, json.dumps(state), now)
+    )
+
+def load_quant_states() -> dict[str, dict]:
+    rows = _fetch_all("SELECT asset, state_json FROM quant_state")
+    return {r["asset"]: json.loads(r["state_json"]) for r in rows}

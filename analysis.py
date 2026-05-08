@@ -38,9 +38,9 @@ async def full_report(client: BayseClient, chat_id: str | None = None) -> str:
     realized_pnl = float(pnl_data.get("realizedPnl", 0) or pnl_data.get("pnl", 0))
 
     # Pull per-strategy stats from our own database (last 30 days)
-    stats_rows = database.recent_stats(chat_id, days=30) if chat_id else []
-    all_time   = database.all_time_stats(chat_id) if chat_id else {}
-    recent     = database.recent_trades(chat_id, limit=5) if chat_id else []
+    stats_rows = await asyncio.to_thread(database.recent_stats, chat_id, days=30) if chat_id else []
+    all_time   = await asyncio.to_thread(database.all_time_stats, chat_id) if chat_id else {}
+    recent     = await asyncio.to_thread(database.recent_trades, chat_id, limit=5) if chat_id else []
 
     total = all_time.get("total", 0)
 

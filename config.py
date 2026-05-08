@@ -190,6 +190,9 @@ MAX_DRAWDOWN_STOP = 0.15       # pause all trading at 15% drawdown (was 20%)
 SYSTEMIC_RISK_COUNT_THRESHOLD = 3
 SYSTEMIC_RISK_VOL_MULT        = 1.5
 SYSTEMIC_RISK_HALT_MINS       = 60
+VOL_SPIKE_THRESHOLD           = 3.0   # trigger halt if variance acceleration > 3.0
+DYNAMIC_KELLY_MIN             = 0.05  # floor for kelly sizing in stressed markets
+DYNAMIC_KELLY_MAX             = 0.40  # ceiling for kelly sizing in ideal markets
 
 # Minimum Net Payout: Ensure for every 100 spent, we get at least 115 back (15% net profit).
 # This prevents the "risk 100 to win 5" trades that wipe out bankrolls.
