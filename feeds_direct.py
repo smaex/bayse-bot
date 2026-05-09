@@ -95,7 +95,14 @@ async def binance_feed():
     while True:
         endpoint = endpoints[current_idx]
         suffix = endpoint["suffix"]
-        stream_list = [f"{s.lower().replace('usdt', suffix)}@aggTrade" for s in _CRYPTO_SYMBOLS.keys()]
+        stream_list = []
+        for s in _CRYPTO_SYMBOLS.keys():
+            # e.g. BTCUSDT -> btcusdt@aggTrade
+            stream_list.append(f"{s.lower()}@aggTrade")
+            if suffix == "usd":
+                # For Binance.US, also try the fiat USD pair: btcusd@aggTrade
+                stream_list.append(f"{s.lower().replace('usdt', 'usd')}@aggTrade")
+            
         full_url = f"{endpoint['url']}/stream?streams={'/'.join(stream_list)}"
         
         try:

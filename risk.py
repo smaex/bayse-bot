@@ -18,6 +18,11 @@ class RiskManager:
         if balance > self.peak_balance:
             self.peak_balance = balance
 
+    def update_balance(self, balance: float):
+        """Unified update for peak tracking and drawdown checks."""
+        self.update_peak(balance)
+        self.check_drawdown(balance)
+
     def check_drawdown(self, balance: float) -> bool:
         if self.peak_balance <= 0:
             self.peak_balance = balance
