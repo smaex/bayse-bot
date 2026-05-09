@@ -23,6 +23,15 @@ DEFAULT_LEARNED: dict = {
 }
 
 
+def get_learned_overrides(chat_id: str) -> dict:
+    """Helper for bot.py to fetch current AI-tuned settings for a user."""
+    user = database.get_user(chat_id)
+    if not user:
+        return DEFAULT_LEARNED.copy()
+    s = user.get("settings", {})
+    return {**DEFAULT_LEARNED, **s.get("learned", {})}
+
+
 async def run_learning(chat_id: str) -> tuple[dict, str]:
     """Analyse 30-day trades for one user, save updated learned params, return report."""
     user = await asyncio.to_thread(database.get_user, chat_id)
