@@ -39,10 +39,18 @@ async def binance_feed():
         full_url = f"{endpoint['url']}/stream?streams={streams}"
         
         try:
+            log.info(f"Connecting to Binance Direct feed ({endpoint['url']})...")
             async with websockets.connect(full_url, ping_interval=20) as ws:
-                log.info(f"Direct Binance feed connected ({endpoint['url']})")
+                log.info(f"✅ Direct Binance feed connected ({endpoint['url']})")
                 backoff = 1
-                async for raw in ws:
+                while True:
+                    # Heartbeat Monitor: If no data for 30s, force reconnect
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                    except asyncio.TimeoutError:
+                        log.warning(f"⚠️ Direct feed stall detected on {endpoint['url']}. Reconnecting...")
+                        break
+
                     msg = json.loads(raw)
                     data = msg.get("data", {})
                     # Using @aggTrade format: 's' is symbol, 'p' is price

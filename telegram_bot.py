@@ -194,6 +194,7 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         # Store the mode name so /settings and /status can show it
         s["mode"] = data.replace("mode_", "")   # e.g. "mode_safe" → "safe"
         await asyncio.to_thread(database.update_settings, cid, s)
+        log.info(f"[USER ACTION] {cid} switched to mode: {s['mode']}")
         await query.message.reply_text(
             f"{mode['description']}\n\n✅ *Mode applied. Trading resumes now.*\n"
             f"Use `/set` to fine-tune any individual setting.",
@@ -793,6 +794,8 @@ async def _set_paused(cid: str, paused: bool):
         s = user["settings"]
         s["paused"] = paused
         await asyncio.to_thread(database.update_settings, cid, s)
+        action = "PAUSED" if paused else "RESUMED"
+        log.info(f"[USER ACTION] {cid} {action} trading.")
 
 
 async def _clear_target_hit(cid: str):

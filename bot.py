@@ -360,18 +360,19 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
     
     client  = _user_clients.get(chat_id)
     risk    = _user_risks.get(chat_id)
-    settings = user.get("settings", {})
     
     if not client or not risk:
         return
         
+    settings = user.get("settings", {})
     if settings.get("paused"):
         return
     
     # 1. Refresh balance
     try:
-        equity = await client.get_equity_ngn()
+        # Calculate equity: free cash + currently deployed capital
         free_cash = await client.get_balance_ngn()
+        equity = free_cash + risk.deployed()
         risk.update_equity(equity)
     except Exception as e:
         log.error(f"[{chat_id}] balance refresh error: {e}")
