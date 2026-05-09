@@ -705,11 +705,20 @@ async def _status_text(cid: str) -> str:
         f"Drawdown from peak: {dd:.1%}",
         f"Open positions: {n_pos} (₦{deployed:,.0f} deployed)",
         "",
-        f"All-time: {stats['wins']}/{stats['total']} wins "
-        f"({stats['win_rate']:.0%} WR) ₦{stats['total_pnl']:+,.0f}",
+        f"All-time: {stats['wins']}/{stats['total']} wins ({stats['win_rate']:.0%} WR) ₦{stats['total_pnl']:+,.0f}",
+    ]
+
+    lines += [
         f"\nStatus: {'⏸ Paused' if s.get('paused') else '🟢 Active'}",
         f"Mode: *{_mode_label(s.get('mode', 'balanced'))}*",
     ]
+
+    # Mode Advisor Tip
+    if balance < 3000 and s.get("mode", "balanced") not in ("aggressive", "full_send"):
+        lines.append("\n💡 *Mode Advisor*: Your balance is under ₦3,000. Switch to *Aggressive* or *Full Send* to beat the platform's ₦100 fee floor effectively.")
+    elif balance >= 10000 and s.get("mode") == "full_send":
+        lines.append("\n💡 *Mode Advisor*: Great balance! Consider *Balanced* mode to preserve your gains with tighter conviction guards.")
+
     return "\n".join(lines)
 
 
