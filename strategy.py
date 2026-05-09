@@ -34,10 +34,13 @@ Quantitative framework (5-model composite for SNIPE):
   Positive edge (market underpricing our side) → up to +0.12 bonus.
   Negative edge (market already priced our move) → up to −0.08 penalty.
 
-  Composite certainty
-  ────────────────────
-  composite = (base + mom_bonus + edge_bonus) × regime_factor
-  Trade fires only when composite ≥ SNIPE_MIN_CERTAINTY (0.40).
+    # ── Composite Calculation ──────────────────────────────────────────────────
+    # Apply penalty (from infrastructure lag) to the base certainty
+    composite = (base + mom_bonus + edge_bonus - penalty) * regime_factor
+    
+    # Mode-based certainty hurdle
+    mode = learned.get("mode", "balanced")
+Trade fires only when composite ≥ SNIPE_MIN_CERTAINTY (0.40).
   Hard veto: adverse momentum (< −0.7) on a weak base (< 0.55).
 
   Dynamic EV ceiling (Kelly-derived)
@@ -509,7 +512,13 @@ def _fx_distance_trend(asset: str, threshold: float, direction: str, state: Mark
 
 # ── Strategy 1: SNIPE — 5-model composite ────────────────────────────────────
 
-def snipe_signal(market: dict, learned: dict = None, spot_price: float = None, state: MarketState = global_state) -> Optional[TradeSignal]:
+def snipe_signal(
+    market: dict, 
+    spot_price: float, 
+    learned: dict, 
+    state: MarketState = global_state,
+    penalty: float = 0.0
+) -> Optional[TradeSignal]:
     """
     Enter when the diffusion model AND supporting signals agree.
 
@@ -518,7 +527,7 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None, s
       mom      = ±0.12 from 90-second momentum
       edge     = ±0.08–0.12 from model vs market-implied price
       regime   = ×0.75 (choppy) to ×1.25 (trending)
-      composite = (base + mom_bonus + edge_bonus) × regime_factor
+      composite = (base + mom_bonus + edge_bonus - penalty) × regime_factor
 
     Hard veto: composite below threshold, or strong adverse momentum
     on a weak base signal.  EV ceiling still applied after all filters.
@@ -685,7 +694,7 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None, s
             log.info(f"{_u()}SNIPE [{asset} {tf}] SAFE MODE VETO — Models do not agree (base={base:.2f}, mom={mom:+.2f}, edge={raw_edge:+.3f}, regime={regime:.2f})")
             return None
     else:
-        composite = min((base + mom_bonus + edge_bonus) * regime_factor, 0.99)
+        composite = min((base + mom_bonus + edge_bonus - penalty) * regime_factor, 0.99)
 
     log.info(
         f"{_u()}SNIPE [{asset} {tf}] {secs:.0f}s | "
@@ -1184,7 +1193,14 @@ def _apply_convergence(signals: list[TradeSignal]) -> list[TradeSignal]:
 
 # ── Main evaluate entrypoint ──────────────────────────────────────────────────
 
-def evaluate(market: dict, strategies: list[str], learned: dict = None, spot_price: float = None, state: MarketState = global_state) -> list[TradeSignal]:
+def evaluate(
+    market: dict, 
+    strategies: list[str], 
+    learned: dict = None, 
+    spot_price: float = None, 
+    state: MarketState = global_state,
+    penalty: float = 0.0
+) -> list[TradeSignal]:
     """
     Main evaluation entry point.
     spot_price: if provided, overrides the global feeds.spot[asset] (used for backtesting).
@@ -1220,14 +1236,14 @@ def evaluate(market: dict, strategies: list[str], learned: dict = None, spot_pri
     try:
         if "SNIPE" in strategies:
             if _check_circuit_breaker("SNIPE", market["asset"], state=state):
-                sig = snipe_signal(market, learned, spot_price=spot_price, state=state)
+                sig = snipe_signal(market, spot_price=spot_price, learned=learned, state=state, penalty=penalty)
                 if sig: signals.append(sig)
             else:
                 log.debug(f"SNIPE {market['asset']} skipped (Circuit Breaker active)")
 
         if "CORRELATE" in strategies:
             if _check_circuit_breaker("CORRELATE", market["asset"], state=state):
-                sig = correlate_signal(market, threshold=corr_thresh, spot_price=spot_price, state=state)
+                sig = correlate_signal(market, threshold=corr_thresh, learned=learned, spot_price=spot_price, state=state)
                 if sig: signals.append(sig)
 
         if "ARB" in strategies:

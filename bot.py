@@ -348,9 +348,58 @@ async def _user_loop(chat_id: str):
         active_strats = [s for s in user_strats if s not in suspended]
         max_exp      = settings.get("maxexposure", 30.0) / 100.0
 
-        await _evaluate_markets(chat_id, settings, client, risk, equity, free_cash, active_strats, learned, max_exp, user_assets, user_tfs)
+        await _evaluate_single_user(user, penalty=0.0)
 
-async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash, active_strats, learned, max_exp, user_assets, user_tfs, trigger_asset=None):
+async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: float = 0.0):
+    """
+    Trench-Hardened Evaluation:
+    Refreshes balance, checks risk guards, and evaluates markets with an adaptive safety penalty.
+    """
+    chat_id = user["chat_id"]
+    strategy.set_user_context(chat_id)
+    
+    client  = _user_clients.get(chat_id)
+    risk    = _user_risks.get(chat_id)
+    settings = user.get("settings", {})
+    
+    if not client or not risk:
+        return
+        
+    if settings.get("paused"):
+        return
+    
+    # 1. Refresh balance
+    try:
+        equity = await client.get_equity_ngn()
+        free_cash = await client.get_balance_ngn()
+        risk.update_equity(equity)
+    except Exception as e:
+        log.error(f"[{chat_id}] balance refresh error: {e}")
+        return
+
+    # 2. Check risk guards (drawdown, target)
+    if risk.target_hit or risk.max_drawdown_hit:
+        return
+
+    # 3. Evaluate all relevant markets
+    active_strats = settings.get("strategies", ["SNIPE", "CORRELATE", "ARB", "NEWS"])
+    learned = await asyncio.to_thread(learner.get_learned_overrides, chat_id)
+    max_exp = settings.get("maxexposure", 100) / 100.0
+    user_assets = settings.get("assets", config.ALL_ASSETS)
+    user_tfs = settings.get("timeframes", ["1m", "5m", "15m"])
+
+    await _evaluate_markets(
+        chat_id, settings, client, risk, equity, free_cash, 
+        active_strats, learned, max_exp, user_assets, user_tfs, 
+        trigger_asset=trigger_asset, penalty=penalty
+    )
+
+
+async def _evaluate_markets(
+    chat_id, settings, client, risk, equity, free_cash,
+    active_strats, learned, max_exp, user_assets, user_tfs,
+    trigger_asset: str = None, penalty: float = 0.0
+):
     try:
         for market in active_markets:
             if market.get("status") != "open":
@@ -367,15 +416,29 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash, 
                 market["yes_price"] = ws["yes"]
                 market["no_price"]  = ws["no"]
 
-            signals = strategy.evaluate(market, strategies=active_strats, learned=learned)
+            # Ground Truth Override: feeds_direct already updated strategy history
+            spot_p = feeds.spot.get(market["asset"], 0)
+            
+            signals = strategy.evaluate(
+                market, 
+                strategies=active_strats, 
+                learned=learned, 
+                spot_price=spot_p, 
+                penalty=penalty
+            )
             for sig in signals:
                 if sig.strategy == "ARB":
                     await executor.execute_arb(chat_id, sig, client, equity, free_cash, settings)
                 elif not risk.already_in(sig.market_id):
+                    # Check global exposure before entering
+                    if risk.deployed() / equity >= max_exp:
+                        log.debug(f"[{chat_id}] Max exposure reached ({max_exp:.0%})")
+                        continue
+                        
                     await executor.execute_trade(
                         chat_id, sig, client, risk, settings, equity, free_cash
                     )
-                break  # best signal per market per tick
+                break 
     except Exception as e:
         log.error(f"[{chat_id}] market eval error: {e}", exc_info=True)
 
@@ -408,90 +471,50 @@ def _refresh_timers():
 
 
 def _on_spot_price(asset: str, price: float):
-    strategy.update_price_history(asset, price)
-    recorder.record_spot_tick(asset, price)
-    log.debug(f"Spot {asset}: {price:,.4f}")
-    
-    # ── Stale Data Guard ──────────────────────────────────────────────────────
-    # If the direct Binance feed shows this price is laggy, we abort evaluation.
+    # ── Stale Data Guard (Adaptive) ──────────────────────────────────────────
+    # We check if the relay is lagging. Instead of just blocking, we try to 
+    # use the direct price or apply a safety spread.
     lag = feeds_direct.check_lag(asset, price)
+    best_price = lag["price"]
+    
     if lag["status"] == "stale":
         log.warning(
-            f"⚠️ INFRA GUARD TRIPPED: {asset} relay is laggy. "
-            f"Diff: {lag['diff_pct']:.4%}, Lag: {lag['lag_sec']:.1f}s. "
-            f"Relay: {lag['relay']}, Direct: {lag['direct']}. Aborting evaluation."
+            f"⚠️ INFRA GUARD: {asset} STALE. Blocking entry. "
+            f"Lag: {lag['lag_sec']:.1f}s, Diff: {lag['diff_pct']:.4%}"
         )
         return
-    # ──────────────────────────────────────────────────────────────────────────
+        
+    safety_penalty = 0.0
+    if lag["status"] == "degraded":
+        # 0.1% penalty makes the bot demand a higher profit margin to compensate for lag
+        safety_penalty = 0.0010 
+        log.info(f"🟡 {asset} lag ({lag['lag_sec']:.1f}s) — applying 0.1% safety spread.")
+
+    # Always use the most recent history/recording
+    strategy.update_price_history(asset, best_price)
+    recorder.record_spot_tick(asset, best_price)
+    log.debug(f"Spot {asset}: {best_price:,.4f}")
     
     last = _last_spot.get(asset)
     if last is not None:
-        change = abs(price - last) / last
-        threshold = 0.0005 if asset in ["USDT", "USDC"] else 0.0010  # 0.05% FX, 0.1% Crypto
+        change = abs(best_price - last) / last
+        threshold = 0.0005 if asset in ["USDT", "USDC"] else 0.0010
         if change >= threshold:
-            _last_spot[asset] = price
-            asyncio.create_task(_evaluate_all_users_for_spot(asset, change, threshold))
+            _last_spot[asset] = best_price
+            asyncio.create_task(_evaluate_all_users_for_spot(asset, change, threshold, safety_penalty))
     else:
-        _last_spot[asset] = price
+        _last_spot[asset] = best_price
 
 
-async def _evaluate_all_users_for_spot(asset: str, change: float, threshold: float):
-    # Cooldown check: max 1 evaluation every 5 seconds per asset
+async def _evaluate_all_users_for_spot(asset: str, change: float, threshold: float, penalty: float = 0.0):
     now = time.time()
     if now - _last_market_eval.get(asset, 0) < 5:
         return
     _last_market_eval[asset] = now
     
-    log.info(
-        f"⚡ SPOT TRIGGER: {asset} moved {change:.2%} "
-        f"(threshold {threshold:.2%}), evaluating markets..."
-    )
-    
     users = await asyncio.to_thread(database.get_all_active)
     for user in users:
-        asyncio.create_task(_evaluate_single_user(user, asset))
-
-
-async def _evaluate_single_user(user: dict, trigger_asset: str):
-    """Encapsulates per-user evaluation logic to run concurrently with proper context."""
-    chat_id = user["chat_id"]
-    strategy.set_user_context(chat_id)  # ensures [chat_id] prefix in all strategy logs
-    
-    client = _user_clients.get(chat_id)
-    risk = _user_risks.get(chat_id)
-    
-    if not client or not risk or risk.paused:
-        return
-        
-    settings = user["settings"]
-    if settings.get("paused"):
-        return
-        
-    # Use cached balance if possible to avoid API rate limits
-    equity = _last_balance.get(chat_id)
-    if not equity:
-        try:
-            free_cash = await client.get_balance_ngn()
-            equity = free_cash + risk.deployed()
-        except Exception:
-            return
-    else:
-        free_cash = equity - risk.deployed()
-        
-    user_assets = settings.get("assets", config.ALL_ASSETS)
-    user_tfs = settings.get("timeframes", ["5min", "15min", "1h"])
-    user_strats = settings.get("strategies", ["SNIPE", "CORRELATE", "ARB", "NEWS"])
-    learned = settings.get("learned", {})
-    learned["mode"] = settings.get("mode", "balanced")
-    suspended = learned.get("suspended_strategies", [])
-    active_strats = [s for s in user_strats if s not in suspended]
-    max_exp = settings.get("maxexposure", 30.0) / 100.0
-    
-    await _evaluate_markets(
-        chat_id, settings, client, risk, equity, free_cash, 
-        active_strats, learned, max_exp, user_assets, user_tfs, 
-        trigger_asset=trigger_asset
-    )
+        asyncio.create_task(_evaluate_single_user(user, asset, penalty=penalty))
 
 
 def _on_market_update(market_id: str, prices: dict):

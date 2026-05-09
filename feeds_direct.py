@@ -79,28 +79,42 @@ def get_direct_price(asset: str) -> tuple[float, float]:
 
 def check_lag(asset: str, relay_price: float) -> dict:
     """
-    Compares the relay price against the direct Binance truth.
-    Returns a status dict with lag metrics.
+    Trench-Hardened Lag Logic:
+    1. Returns 'ok' for < 5s lag.
+    2. Returns 'degraded' for 5-15s lag (suggests using a safety spread).
+    3. Returns 'stale' for > 15s lag or > 0.15% price diff.
     """
     direct_p, direct_t = get_direct_price(asset)
     if not direct_p:
-        return {"status": "ok", "reason": "no_direct_data"}
+        # Fallback if Binance feed is down — trust relay but log it
+        return {"status": "ok", "price": relay_price, "reason": "no_direct_feed"}
         
     price_diff_pct = abs(direct_p - relay_price) / relay_price
     time_diff = time.time() - direct_t
     
-    # 0.08% is a massive move for a single second in crypto
-    # If the relay is off by more than this, it's likely stale.
-    is_stale_price = price_diff_pct > 0.0008 
-    is_stale_time = time_diff > 3.0
-    
-    if is_stale_price or is_stale_time:
+    # ── Tiered Logic ──────────────────────────────────────────────────────────
+    # If Binance has a newer price, we always prefer it as the 'Ground Truth'
+    best_price = direct_p if direct_t > (time.time() - 2.0) else relay_price
+
+    if price_diff_pct > 0.0015 or time_diff > 15.0:
         return {
             "status": "stale",
+            "price": best_price,
             "diff_pct": price_diff_pct,
-            "lag_sec": time_diff,
-            "direct": direct_p,
-            "relay": relay_price
+            "lag_sec": time_diff
+        }
+    
+    if time_diff > 5.0 or price_diff_pct > 0.0005:
+        return {
+            "status": "degraded",
+            "price": best_price,
+            "diff_pct": price_diff_pct,
+            "lag_sec": time_diff
         }
         
-    return {"status": "ok", "diff_pct": price_diff_pct, "lag_sec": time_diff}
+    return {
+        "status": "ok", 
+        "price": best_price, 
+        "diff_pct": price_diff_pct, 
+        "lag_sec": time_diff
+    }
