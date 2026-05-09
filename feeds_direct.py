@@ -1,90 +1,44 @@
-import asyncio
+import os
 import json
-import logging
 import time
+import asyncio
+import logging
 import websockets
+from typing import Tuple
 
 log = logging.getLogger("feeds_direct")
 
-# Shared state — {"BTC": {"price": float, "time": float}, ...}
+# Ground Truth Storage: { Asset: {"price": float, "time": float} }
 direct_spot: dict[str, dict] = {}
 
-# Mapping Binance symbols to our internal keys
-_SYMBOLS = {
+# ── Crypto Config ─────────────────────────────────────────────────────────────
+_CRYPTO_SYMBOLS = {
     "BTCUSDT": "BTC",
     "ETHUSDT": "ETH",
+    "BNBUSDT": "BNB",
     "SOLUSDT": "SOL",
-    "BNBUSDT": "BNB"
+    "ADAUSDT": "ADA",
 }
 
-async def binance_feed():
-    """
-    Direct high-speed WebSocket feed from Binance.
-    Provides the 'Ground Truth' for crypto prices to detect relay lag.
-    Automatically switches to Binance.US if Binance.com is geoblocked.
-    """
-    # Try .com first, then .us if geoblocked (HTTP 451)
-    endpoints = [
-        {"url": "wss://stream.binance.com:9443", "suffix": "usdt"},
-        {"url": "wss://stream.binance.us:9443",  "suffix": "usd"}
-    ]
-    
-    current_idx = 0
-    backoff = 1
-    
-    while True:
-        endpoint = endpoints[current_idx]
-        # Switching to @aggTrade for real-time (ms) updates instead of 1s tickers
-        streams = "/".join([f"{s.lower().replace('usdt', endpoint['suffix'])}@aggTrade" for s in _SYMBOLS.keys()])
-        full_url = f"{endpoint['url']}/stream?streams={streams}"
-        
-        try:
-            log.info(f"Connecting to Binance Direct feed ({endpoint['url']})...")
-            async with websockets.connect(full_url, ping_interval=20) as ws:
-                log.info(f"✅ Direct Binance feed connected ({endpoint['url']})")
-                backoff = 1
-                while True:
-                    # Heartbeat Monitor: If no data for 30s, force reconnect
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                    except asyncio.TimeoutError:
-                        log.warning(f"⚠️ Direct feed stall detected on {endpoint['url']}. Reconnecting...")
-                        break
+# ── FX Config (Tiingo) ────────────────────────────────────────────────────────
+_FX_SYMBOLS = {
+    "eurusd": "EURUSD",
+    "gbpusd": "GBPUSD",
+    "usdjpy": "USDJPY",
+    "eurjpy": "EURJPY",
+    "gbpjpy": "GBPJPY",
+    "eurgbp": "EURGBP",
+    "xauusd": "XAUUSD", # Gold
+}
 
-                    msg = json.loads(raw)
-                    data = msg.get("data", {})
-                    # Using @aggTrade format: 's' is symbol, 'p' is price
-                    raw_symbol = data.get("s", "")
-                    symbol = raw_symbol.replace("USD", "USDT")
-                    if not symbol.endswith("T"):
-                         symbol = symbol + "T"
+TIINGO_API_KEY = os.getenv("TIINGO_API_KEY", "")
 
-                    price = data.get("p") # 'p' in aggTrade
-                    
-                    asset = _SYMBOLS.get(symbol)
-                    if asset and price:
-                        direct_spot[asset] = {
-                            "price": float(price),
-                            # Use LOCAL arrival time to eliminate server clock drift issues
-                            "time": time.time() 
-                        }
-        except Exception as e:
-            if "451" in str(e) and current_idx == 0:
-                log.warning("Binance.com is geoblocked (451). Switching to Binance.US oracle...")
-                current_idx = 1
-                backoff = 1
-                continue
-                
-            log.warning(f"Direct Binance feed error ({endpoint['url']}): {e}. Reconnecting in {backoff}s")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-
-def get_direct_price(asset: str) -> tuple[float, float]:
-    """Returns (price, timestamp) for an asset from the direct feed."""
-    entry = direct_spot.get(asset)
-    if not entry:
-        return 0.0, 0.0
-    return entry["price"], entry["time"]
+def get_direct_price(asset: str) -> Tuple[float, float]:
+    """Returns (price, local_arrival_time) from the direct oracles."""
+    data = direct_spot.get(asset)
+    if data:
+        return data["price"], data["time"]
+    return 0.0, 0.0
 
 def check_lag(asset: str, relay_price: float) -> dict:
     """
@@ -95,15 +49,14 @@ def check_lag(asset: str, relay_price: float) -> dict:
     """
     direct_p, direct_t = get_direct_price(asset)
     if not direct_p:
-        # Fallback if Binance feed is down — trust relay but log it
+        # Fallback if oracle is down or not tracking this asset
         return {"status": "ok", "price": relay_price, "reason": "no_direct_feed"}
         
     price_diff_pct = abs(direct_p - relay_price) / relay_price
     time_diff = time.time() - direct_t
     
-    # ── Tiered Logic ──────────────────────────────────────────────────────────
-    # If Binance has a newer price, we always prefer it as the 'Ground Truth'
-    best_price = direct_p if direct_t > (time.time() - 2.0) else relay_price
+    # Use direct price as ground truth if it's fresh (last 2s)
+    best_price = direct_p if time_diff < 2.0 else relay_price
 
     if price_diff_pct > 0.0015 or time_diff > 15.0:
         return {
@@ -127,3 +80,105 @@ def check_lag(asset: str, relay_price: float) -> dict:
         "diff_pct": price_diff_pct, 
         "lag_sec": time_diff
     }
+
+# ── Oracle 1: Binance (Crypto) ────────────────────────────────────────────────
+
+async def binance_feed():
+    """High-speed WebSocket feed for Crypto Ground Truth."""
+    endpoints = [
+        {"url": "wss://stream.binance.com:9443", "suffix": "usdt"},
+        {"url": "wss://stream.binance.us:9443",  "suffix": "usd"}
+    ]
+    current_idx = 0
+    backoff = 1
+    
+    while True:
+        endpoint = endpoints[current_idx]
+        suffix = endpoint["suffix"]
+        stream_list = [f"{s.lower().replace('usdt', suffix)}@aggTrade" for s in _CRYPTO_SYMBOLS.keys()]
+        full_url = f"{endpoint['url']}/stream?streams={'/'.join(stream_list)}"
+        
+        try:
+            log.info(f"Connecting to Binance Direct feed ({endpoint['url']})...")
+            async with websockets.connect(full_url, ping_interval=10, ping_timeout=10) as ws:
+                log.info(f"✅ Direct Binance feed connected ({endpoint['url']})")
+                backoff = 1
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                    except asyncio.TimeoutError:
+                        log.warning(f"⚠️ Direct feed stall detected ({endpoint['url']}). Reconnecting...")
+                        break
+
+                    msg = json.loads(raw)
+                    data = msg.get("data", {})
+                    raw_symbol = data.get("s", "").upper()
+                    
+                    # Normalize back to USDT key
+                    lookup_key = raw_symbol
+                    if not lookup_key.endswith("USDT"):
+                        lookup_key = lookup_key.replace("USD", "USDT")
+                    if not lookup_key.endswith("T"):
+                        lookup_key += "T"
+
+                    asset = _CRYPTO_SYMBOLS.get(lookup_key)
+                    price = data.get("p")
+                    
+                    if asset and price:
+                        direct_spot[asset] = {"price": float(price), "time": time.time()}
+        except Exception as e:
+            if "451" in str(e) and current_idx == 0:
+                log.warning("Geoblocked by Binance.com. Switching to Binance.US oracle...")
+                current_idx = 1
+                backoff = 1
+                continue
+            else:
+                log.error(f"Binance feed error: {e}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+
+# ── Oracle 2: Tiingo (FX & Gold) ──────────────────────────────────────────────
+
+async def tiingo_fx_feed():
+    """High-speed WebSocket feed for Forex and Gold Ground Truth."""
+    if not TIINGO_API_KEY:
+        log.warning("❌ No TIINGO_API_KEY found. FX Infra Guard is DISABLED.")
+        return
+
+    url = "wss://api.tiingo.com/fx"
+    backoff = 1
+    
+    while True:
+        try:
+            async with websockets.connect(url) as ws:
+                # Tiingo Auth
+                subscribe = {
+                    "eventName": "subscribe",
+                    "authorization": TIINGO_API_KEY,
+                    "eventData": { "thresholdLevel": 5 } # Only send updates on 5 pip moves
+                }
+                await ws.send(json.dumps(subscribe))
+                log.info("✅ Tiingo FX Oracle connected")
+                backoff = 1
+                
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=40)
+                    except asyncio.TimeoutError:
+                        break
+                        
+                    msg = json.loads(raw)
+                    if msg.get("messageType") == "A":
+                        data = msg.get("data", [])
+                        # Tiingo format: [ 'A', ticker, date, bid_size, bid, mid, ask, ask_size ]
+                        if len(data) >= 6:
+                            ticker = data[1].lower()
+                            mid_price = data[5]
+                            asset = _FX_SYMBOLS.get(ticker)
+                            if asset:
+                                direct_spot[asset] = {"price": float(mid_price), "time": time.time()}
+                                
+        except Exception as e:
+            log.error(f"Tiingo FX error: {e}")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)

@@ -373,7 +373,7 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
         # Calculate equity: free cash + currently deployed capital
         free_cash = await client.get_balance_ngn()
         equity = free_cash + risk.deployed()
-        risk.update_equity(equity)
+        risk.update_balance(equity)
     except Exception as e:
         log.error(f"[{chat_id}] balance refresh error: {e}")
         return
@@ -585,6 +585,7 @@ async def main():
     # Start feeds
     asyncio.create_task(feeds.start_feeds(on_price=_on_spot_price))
     asyncio.create_task(feeds_direct.binance_feed())
+    asyncio.create_task(feeds_direct.tiingo_fx_feed())
     asyncio.create_task(news_mod.start_news_feeds())
     asyncio.create_task(learner.resolution_monitor(_user_clients, _user_risks, _tg_app))
     asyncio.create_task(learner.daily_learning_loop(_tg_app))
