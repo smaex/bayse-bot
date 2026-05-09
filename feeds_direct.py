@@ -11,6 +11,11 @@ log = logging.getLogger("feeds_direct")
 
 # Ground Truth Storage: { Asset: {"price": float, "time": float} }
 direct_spot: dict[str, dict] = {}
+startup_time: float = time.time()
+
+def is_warming_up(grace_period=60) -> bool:
+    """Returns True if the bot started less than grace_period seconds ago."""
+    return (time.time() - startup_time) < grace_period
 
 # ── Crypto Config ─────────────────────────────────────────────────────────────
 _CRYPTO_SYMBOLS = {
@@ -48,6 +53,10 @@ def check_lag(asset: str, relay_price: float) -> dict:
     2. Returns 'degraded' for moderate lag/diff (suggests using a safety spread).
     3. Returns 'stale' for excessive lag/diff (blocks entry).
     """
+    if is_warming_up(60):
+        # During first 60s, don't block entry while oracles are connecting
+        return {"status": "ok", "price": relay_price, "reason": "startup_grace"}
+
     direct_p, direct_t = get_direct_price(asset)
     if not direct_p:
         # Fallback if oracle is down or not tracking this asset
@@ -98,11 +107,11 @@ async def binance_feed():
         suffix = endpoint["suffix"]
         stream_list = []
         for s in _CRYPTO_SYMBOLS.keys():
-            # miniTicker provides a consistent heartbeat (usually 1s) regardless of trade activity
-            stream_list.append(f"{s.lower()}@miniTicker")
+            # bookTicker provides the fastest possible heartbeat (every bid/ask change)
+            stream_list.append(f"{s.lower()}@bookTicker")
             if suffix == "usd":
-                # For Binance.US, also try the fiat USD pair: btcusd@miniTicker
-                stream_list.append(f"{s.lower().replace('usdt', 'usd')}@miniTicker")
+                # For Binance.US, also try the fiat USD pair: btcusd@bookTicker
+                stream_list.append(f"{s.lower().replace('usdt', 'usd')}@bookTicker")
             
         full_url = f"{endpoint['url']}/stream?streams={'/'.join(stream_list)}"
         
@@ -113,7 +122,6 @@ async def binance_feed():
                 backoff = 1
                 while True:
                     try:
-                        # Increased timeout to 60s to account for low-volume lulls on Binance.US
                         raw = await asyncio.wait_for(ws.recv(), timeout=60)
                     except asyncio.TimeoutError:
                         log.warning(f"⚠️ Direct feed stall detected ({endpoint['url']}). Reconnecting...")
@@ -131,11 +139,14 @@ async def binance_feed():
                         lookup_key += "T"
 
                     asset = _CRYPTO_SYMBOLS.get(lookup_key)
-                    # miniTicker uses 'c' for last price
-                    price = data.get("c")
+                    # bookTicker uses 'b' for bid and 'a' for ask
+                    bid = data.get("b")
+                    ask = data.get("a")
                     
-                    if asset and price:
-                        direct_spot[asset] = {"price": float(price), "time": time.time()}
+                    if asset and bid and ask:
+                        # Use mid-price for the most accurate spot representation
+                        mid_price = (float(bid) + float(ask)) / 2
+                        direct_spot[asset] = {"price": mid_price, "time": time.time()}
         except Exception as e:
             if "451" in str(e) and current_idx == 0:
                 log.warning("Geoblocked by Binance.com. Switching to Binance.US oracle...")
