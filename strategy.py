@@ -105,74 +105,76 @@ class TradeSignal:
     realized_vol_at_entry: float = 0.0
 
 
-# ── BTC tracking for CORRELATE ────────────────────────────────────────────────
-_btc_signal_time:      dict[str, float] = {}
-_btc_signal_direction: dict[str, str]   = {}
-_btc_signal_move:      dict[str, float] = {}
-
-
-# ── GARCH and Kalman State ────────────────────────────────────────────────────
-_price_history:        dict[str, deque] = {}
+# ── Market State Encapsulation ───────────────────────────────────────────────
 _HISTORY_MAXLEN:       int              = 180  # 15 minutes of 5s samples
 _FX_TREND_LOOKBACK:    int              = 120  # 10 minutes of 5s samples
-_kalman_state:         dict[str, dict]  = {}
-_garch_state:          dict[str, dict]  = {}
-_last_history_update:  dict[str, float] = {}
-_systemic_halt_until:  float            = 0.0
-_circuit_breakers:     dict[str, dict]  = {} # {strategy_asset: {"fails": 0, "halt_until": 0}}
 
-async def load_memory():
+@dataclass
+class MarketState:
+    price_history:        dict[str, deque] = field(default_factory=dict)
+    kalman_state:         dict[str, dict]  = field(default_factory=dict)
+    garch_state:          dict[str, dict]  = field(default_factory=dict)
+    last_history_update:  dict[str, float] = field(default_factory=dict)
+    circuit_breakers:     dict[str, dict]  = field(default_factory=dict)
+    systemic_halt_until:  float            = 0.0
+    # For CORRELATE
+    btc_signal_time:      dict[str, float] = field(default_factory=dict)
+    btc_signal_direction: dict[str, str]   = field(default_factory=dict)
+    btc_signal_move:      dict[str, float] = field(default_factory=dict)
+
+global_state = MarketState()
+
+async def load_memory(state: MarketState = global_state):
     """Load Kalman/GARCH states from DB to avoid 'blind' periods on restart."""
     try:
         states = await asyncio.to_thread(database.load_quant_states)
         for asset, data in states.items():
-            _kalman_state[asset] = data.get("kalman")
-            _garch_state[asset]  = data.get("garch")
+            state.kalman_state[asset] = data.get("kalman")
+            state.garch_state[asset]  = data.get("garch")
             # Convert history list back to deque
             hist_list = data.get("history", [])
-            _price_history[asset] = deque(hist_list, maxlen=_HISTORY_MAXLEN)
+            state.price_history[asset] = deque(hist_list, maxlen=_HISTORY_MAXLEN)
         log.info(f"Loaded memory for {len(states)} assets.")
     except Exception as e:
         log.warning(f"Could not load quant memory: {e}")
 
-def _check_circuit_breaker(strategy: str, asset: str) -> bool:
+def _check_circuit_breaker(strategy: str, asset: str, state: MarketState = global_state) -> bool:
     key = f"{strategy}_{asset}"
-    breaker = _circuit_breakers.get(key)
+    breaker = state.circuit_breakers.get(key)
     if not breaker: return True
     if time.time() < breaker.get("halt_until", 0):
         return False
     return True
 
-def record_failure(strategy: str, asset: str):
+def record_failure(strategy: str, asset: str, state: MarketState = global_state):
     key = f"{strategy}_{asset}"
-    breaker = _circuit_breakers.get(key, {"fails": 0, "halt_until": 0})
+    breaker = state.circuit_breakers.get(key, {"fails": 0, "halt_until": 0})
     breaker["fails"] += 1
     if breaker["fails"] >= 3:
         # Halt for 12 hours
         breaker["halt_until"] = time.time() + (12 * 3600)
         log.warning(f"CIRCUIT BREAKER TRIGGERED: {key} halted for 12h after 3 losses.")
-    _circuit_breakers[key] = breaker
+    state.circuit_breakers[key] = breaker
 
-def record_success(strategy: str, asset: str):
+def record_success(strategy: str, asset: str, state: MarketState = global_state):
     key = f"{strategy}_{asset}"
-    if key in _circuit_breakers:
-        _circuit_breakers[key]["fails"] = 0
+    if key in state.circuit_breakers:
+        state.circuit_breakers[key]["fails"] = 0
 
-def is_systemic_risk_active() -> bool:
+def is_systemic_risk_active(state: MarketState = global_state) -> bool:
     """Returns True if the bot is currently in a systemic risk cooldown."""
-    return time.time() < _systemic_halt_until
+    return time.time() < state.systemic_halt_until
 
-def check_systemic_risk() -> Optional[str]:
+def check_systemic_risk(state: MarketState = global_state) -> Optional[str]:
     """
     Scans all assets for volatility shocks. 
     If enough assets spike simultaneously, triggers a global halt.
     """
-    global _systemic_halt_until
-    if is_systemic_risk_active():
-        return f"Systemic halt active for {int(_systemic_halt_until - time.time())}s"
+    if is_systemic_risk_active(state):
+        return f"Systemic halt active for {int(state.systemic_halt_until - time.time())}s"
 
     spike_assets = []
-    for asset, garch in _garch_state.items():
+    for asset, garch in state.garch_state.items():
         config_vol = config.ASSET_HOURLY_VOL.get(asset, 0.022)
         current_vol = math.sqrt(garch["var"] * 720.0)
         
@@ -180,7 +182,7 @@ def check_systemic_risk() -> Optional[str]:
             spike_assets.append(asset)
             
     if len(spike_assets) >= config.SYSTEMIC_RISK_COUNT_THRESHOLD:
-        _systemic_halt_until = time.time() + (config.SYSTEMIC_RISK_HALT_MINS * 60)
+        state.systemic_halt_until = time.time() + (config.SYSTEMIC_RISK_HALT_MINS * 60)
         return f"GLOBAL VOLATILITY SHOCK: Spikes in {', '.join(spike_assets)}"
         
     return None
@@ -231,77 +233,76 @@ def _update_kalman(state: dict, z: float, dt: float) -> dict:
 
     return {"x": x_new, "P": P_new}
 
-def _update_garch(asset: str, price: float) -> None:
+def _update_garch(asset: str, price: float, state: MarketState = global_state) -> None:
     """Recursive pseudo-GARCH(1,1) update."""
     omega_weight = 0.05
     alpha = 0.15  # shock sensitivity
     beta = 0.80   # persistence
     
-    state = _garch_state.get(asset)
+    g_state = state.garch_state.get(asset)
     config_vol = config.ASSET_HOURLY_VOL.get(asset, 0.022)
     # Convert hourly config vol to a rough 5s variance target
     # hourly_vol = sqrt(var_5s * 720) -> var_5s = (hourly_vol^2) / 720
     target_var = (config_vol ** 2) / 720.0
     omega = target_var * omega_weight
 
-    if not state:
-        _garch_state[asset] = {"var": target_var, "last_price": price}
+    if not g_state:
+        state.garch_state[asset] = {"var": target_var, "last_price": price}
         return
         
-    last_price = state["last_price"]
+    last_price = g_state["last_price"]
     if last_price <= 0:
-        _garch_state[asset]["last_price"] = price
+        state.garch_state[asset]["last_price"] = price
         return
         
     log_return = math.log(price / last_price)
     shock_sq = log_return ** 2
     
     # GARCH update: var_t = omega + alpha * shock^2 + beta * var_{t-1}
-    new_var = omega + alpha * shock_sq + beta * state["var"]
+    new_var = omega + alpha * shock_sq + beta * g_state["var"]
     
     # ── Guard: Volatility Spike Kill-Switch ───────────────────────────────────
     # If variance accelerates too fast (>VOL_SPIKE_THRESHOLD), trigger halt.
-    old_var = state.get("var", new_var)
+    old_var = g_state.get("var", new_var)
     if old_var > 0:
         acceleration = new_var / old_var
         if acceleration > config.VOL_SPIKE_THRESHOLD:
-            global _systemic_halt_until
-            _systemic_halt_until = time.time() + (config.SYSTEMIC_RISK_HALT_MINS * 60)
+            state.systemic_halt_until = time.time() + (config.SYSTEMIC_RISK_HALT_MINS * 60)
             log.critical(
                 f"VOLATILITY SPIKE DETECTED on {asset} | "
                 f"accel={acceleration:.2f}x | HALTING ALL TRADING for {config.SYSTEMIC_RISK_HALT_MINS}m"
             )
 
-    _garch_state[asset] = {"var": new_var, "last_price": price}
+    state.garch_state[asset] = {"var": new_var, "last_price": price}
 
-def update_price_history(asset: str, price: float) -> None:
+def update_price_history(asset: str, price: float, state: MarketState = global_state) -> None:
     """Record spot tick for quant signals (throttled to 1 sample per 5 s)."""
     now = time.time()
-    last_t = _last_history_update.get(asset, 0)
+    last_t = state.last_history_update.get(asset, 0)
     dt = now - last_t
     if dt < 5:
         return
         
-    _last_history_update[asset] = now
-    if asset not in _price_history:
-        _price_history[asset] = deque(maxlen=_HISTORY_MAXLEN)
-        _kalman_state[asset] = _init_kalman(price)
+    state.last_history_update[asset] = now
+    if asset not in state.price_history:
+        state.price_history[asset] = deque(maxlen=_HISTORY_MAXLEN)
+        state.kalman_state[asset] = _init_kalman(price)
     
-    _price_history[asset].append((now, price))
+    state.price_history[asset].append((now, price))
     
     if dt < 60: # only update filters if tick is continuous (avoid huge jumps)
-        _kalman_state[asset] = _update_kalman(_kalman_state[asset], price, dt)
-        _update_garch(asset, price)
+        state.kalman_state[asset] = _update_kalman(state.kalman_state[asset], price, dt)
+        _update_garch(asset, price, state=state)
         
         # Periodically persist to DB (every 5 mins)
-        if now - _last_history_update.get(f"{asset}_save", 0) > 300:
-            _last_history_update[f"{asset}_save"] = now
-            state = {
-                "kalman": _kalman_state[asset],
-                "garch": _garch_state[asset],
-                "history": list(_price_history[asset])
+        if now - state.last_history_update.get(f"{asset}_save", 0) > 300:
+            state.last_history_update[f"{asset}_save"] = now
+            save_data = {
+                "kalman": state.kalman_state[asset],
+                "garch": state.garch_state[asset],
+                "history": list(state.price_history[asset])
             }
-            asyncio.create_task(asyncio.to_thread(database.save_quant_state, asset, state))
+            asyncio.create_task(asyncio.to_thread(database.save_quant_state, asset, save_data))
 
 # ── Quantitative helpers ──────────────────────────────────────────────────────
 
@@ -342,7 +343,8 @@ def max_ev_price(win_prob: float, fee_rate: float = 0.04, min_margin: float = 0.
 
 
 def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.04,
-               fraction: float = 0.25, cap: float = 0.05, asset: str = None) -> float:
+               fraction: float = 0.25, cap: float = 0.05, asset: str = None,
+               state: MarketState = global_state) -> float:
     """
     Quarter-Kelly position size, capped at `cap`.
     v2: Dynamic scaling based on GARCH volatility.
@@ -355,8 +357,8 @@ def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.04,
     # Compare current hourly GARCH vol to baseline config vol.
     # High vol relative to baseline = reduce bet size (risk of trend break).
     # Low vol relative to baseline = increase bet size (stable environment).
-    if asset and asset in _garch_state:
-        garch_var = _garch_state[asset]["var"]
+    if asset and asset in state.garch_state:
+        garch_var = state.garch_state[asset]["var"]
         current_vol = math.sqrt(garch_var * 720.0) # approx hourly
         base_vol = config.ASSET_HOURLY_VOL.get(asset, 0.022)
         
@@ -383,14 +385,14 @@ def certainty_to_prob(certainty: float) -> float:
 
 # ── Quant signal 2: realized volatility ──────────────────────────────────────
 
-def realized_vol_hourly(asset: str) -> float:
+def realized_vol_hourly(asset: str, state: MarketState = global_state) -> float:
     """
     Actual hourly vol computed from recursive GARCH(1,1) estimates.
     Blends with config value if insufficient data.
     """
     config_vol = config.ASSET_HOURLY_VOL.get(asset, 0.022)
     
-    garch = _garch_state.get(asset)
+    garch = state.garch_state.get(asset)
     if not garch:
         return config_vol
         
@@ -407,14 +409,14 @@ def realized_vol_hourly(asset: str) -> float:
 
 # ── Quant signal 3: momentum ──────────────────────────────────────────────────
 
-def _momentum_score(asset: str, direction: str) -> float:
+def _momentum_score(asset: str, direction: str, state: MarketState = global_state) -> float:
     """
     +1 = price moving strongly in our favour (away from threshold).
     −1 = price moving strongly against us (toward threshold).
     direction: 'YES' (we want higher price) or 'NO' (we want lower price).
     Uses Kalman Filter velocity to estimate 90s smoothed trajectory.
     """
-    kalman = _kalman_state.get(asset)
+    kalman = state.kalman_state.get(asset)
     if not kalman:
         return 0.0
         
@@ -430,7 +432,7 @@ def _momentum_score(asset: str, direction: str) -> float:
     return min(max(signed / 0.001, -1.0), 1.0)
 
 
-def _velocity_score(asset: str, threshold: float, direction: str) -> float:
+def _velocity_score(asset: str, threshold: float, direction: str, state: MarketState = global_state) -> float:
     """
     Measures the 'crash velocity' toward the threshold using the Kalman filter.
     Returns the fraction of the safety gap projected to be closed in the next config.SNIPE_VELOCITY_WINDOW.
@@ -439,7 +441,7 @@ def _velocity_score(asset: str, threshold: float, direction: str) -> float:
     Negative = price moving TOWARD threshold (dangerous).
     -1.0 = price projected to close the entire gap.
     """
-    kalman = _kalman_state.get(asset)
+    kalman = state.kalman_state.get(asset)
     if not kalman:
         return 0.0
         
@@ -467,13 +469,13 @@ def _velocity_score(asset: str, threshold: float, direction: str) -> float:
 
 # ── Quant signal 4: regime (efficiency ratio) ─────────────────────────────────
 
-def _regime_score(asset: str) -> float:
+def _regime_score(asset: str, state: MarketState = global_state) -> float:
     """
     0 = pure choppy noise, 1 = clean directional trend.
     Uses efficiency ratio: net displacement / total path length over 5 min.
     Efficiency ≥ 0.50 scores 1.0 (already a decent trend).
     """
-    hist = list(_price_history.get(asset, []))
+    hist = list(state.price_history.get(asset, []))
     n = min(len(hist), 60)   # 60 × 5s = 5-minute window
     if n < 10:
         return 0.5            # neutral when insufficient data
@@ -487,14 +489,14 @@ def _regime_score(asset: str) -> float:
 
 # ── Quant signal 5b: FX distance trend ───────────────────────────────────────
 
-def _fx_distance_trend(asset: str, threshold: float, direction: str) -> float:
+def _fx_distance_trend(asset: str, threshold: float, direction: str, state: MarketState = global_state) -> float:
     """
     How the price-to-threshold distance has changed over the last 10 minutes.
       Positive = distance growing in our direction (move has conviction).
       Negative = distance shrinking (price converging back — reversal risk).
     Returns 0.0 when insufficient history (treated as neutral).
     """
-    hist = list(_price_history.get(asset, []))
+    hist = list(state.price_history.get(asset, []))
     if len(hist) < 12:       # need at least ~60 s of ticks
         return 0.0
     now_price  = hist[-1][1]
@@ -507,7 +509,7 @@ def _fx_distance_trend(asset: str, threshold: float, direction: str) -> float:
 
 # ── Strategy 1: SNIPE — 5-model composite ────────────────────────────────────
 
-def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -> Optional[TradeSignal]:
+def snipe_signal(market: dict, learned: dict = None, spot_price: float = None, state: MarketState = global_state) -> Optional[TradeSignal]:
     """
     Enter when the diffusion model AND supporting signals agree.
 
@@ -526,8 +528,28 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
     asset = market["asset"]
 
     learned = learned or {}
-    raw_cert = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
-    min_certainty = max(config.SNIPE_MIN_CERTAINTY, min(raw_cert, 0.75))
+    mode    = learned.get("mode", "balanced")
+    
+    # ── Mode-based Thresholds (Tiered Certainty) ──
+    # Safe: 0.65 | Balanced: 0.55 | Aggressive: 0.45 | Full Send: 0.35
+    min_certainty = {
+        "safe": 0.65, "balanced": 0.55, "aggressive": 0.45, "full_send": 0.35
+    }.get(mode, 0.55)
+    
+    # If user has a learned override, respect it but keep it within mode-sensible bounds
+    if "snipe_min_certainty" in learned:
+        min_certainty = max(min_certainty - 0.05, min(learned["snipe_min_certainty"], min_certainty + 0.15))
+
+    # ── Mode-based Market Filtering ──
+    if mode == "safe":
+        if tf not in ["1h", "6h", "1d"]:
+            log.debug(f"{_u()}SNIPE [{asset} {tf}] REJECTED — TF too noisy for SAFE mode")
+            return None
+        # Safe Mode: BTC and FX universe only (Low-vol)
+        low_vol_assets = ["BTC", "EURUSD", "GBPUSD", "USDJPY", "EURJPY", "GBPJPY", "EURGBP", "XAUUSD"]
+        if asset not in low_vol_assets:
+             log.debug(f"{_u()}SNIPE [{asset} {tf}] REJECTED — Asset too volatile for SAFE mode")
+             return None
 
     entry_window = config.SNIPE_ENTRY_WINDOWS.get(tf)
     # Gate 1 (FX): tighter entry window — 20 min instead of 30 min for crypto.
@@ -538,15 +560,23 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
         return None
 
     # Time Decay Guard (Gamma Guard): Reject if too close to expiration
-    if secs < 90:
+    # FULL SEND bypasses this guard
+    if mode != "full_send" and secs < 90:
         log.debug(f"{_u()}SNIPE [{asset} {tf}] REJECTED — {secs:.0f}s left (Gamma Guard)")
         return None
 
     threshold = market.get("threshold")
     live_spot  = spot_price if spot_price is not None else feeds.spot.get(asset)
+    
+    # ── Kalman Smoothing ──
+    # Use the Kalman Filter's estimated price if available to strip out tick noise.
+    k_state = state.kalman_state.get(asset)
+    if k_state and spot_price is None: # only smooth if using shared feed, not manual override
+        live_spot = k_state["x"][0]
+
     if not threshold or not live_spot:
         if not live_spot:
-            log.warning(f"{_u()}SNIPE [{asset} {tf}] no spot price in feeds.spot")
+            log.warning(f"{_u()}SNIPE [{asset} {tf}] no spot price in feeds.spot or kalman")
         return None
 
     distance_pct = (live_spot - threshold) / threshold   # +ve → YES wins
@@ -581,7 +611,7 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
 
         # Gate 3: distance trend — move must be holding or growing, not reversing
         direction_early = "YES" if distance_pct > 0 else "NO"
-        trend = _fx_distance_trend(asset, threshold, direction_early)
+        trend = _fx_distance_trend(asset, threshold, direction_early, state=state)
         veto_level = -min_dist * config.FX_TREND_VETO_MULT
         if trend < veto_level:
             log.info(
@@ -595,7 +625,7 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
         )
 
     # ── Signal 1: diffusion win probability (realized vol) ────────────────────
-    rv    = realized_vol_hourly(asset)
+    rv    = realized_vol_hourly(asset, state=state)
 
     # Fat-tail penalty: inflate realized volatility artificially in the final minutes
     # to force the model to demand a larger price gap for high certainty.
@@ -614,16 +644,19 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
         outcome, outcome_id, market_price = "NO",  market["no_id"],  market["no_price"]
 
     # ── Signal 3: momentum ────────────────────────────────────────────────────
-    mom       = _momentum_score(asset, direction)
-    mom_bonus = 0.12 * mom                     # ±0.12 range
+    mom       = _momentum_score(asset, direction, state=state)
+    # Aggressive Mode: Momentum-weighted (1.5x effect)
+    mom_weight = 0.18 if mode == "aggressive" else 0.12
+    mom_bonus = mom_weight * mom
 
     # ── Signal 4: regime ──────────────────────────────────────────────────────
-    regime        = _regime_score(asset)
+    regime        = _regime_score(asset, state=state)
     regime_factor = 0.75 + 0.50 * regime       # 0.75 (choppy) → 1.25 (trending)
 
     # ── Signal 5: Velocity (Falling Knife Guard) ──────────────────────────────
-    velocity = _velocity_score(asset, threshold, direction)
-    if velocity < -config.SNIPE_VELOCITY_VETO:
+    velocity = _velocity_score(asset, threshold, direction, state=state)
+    # FULL SEND bypasses velocity guard
+    if mode != "full_send" and velocity < -config.SNIPE_VELOCITY_VETO:
         log.info(
             f"{_u()}SNIPE [{asset} {tf}] ✗ G5 VELOCITY — price converging too fast "
             f"({velocity:+.1%} gap closed in {config.SNIPE_VELOCITY_WINDOW}s)"
@@ -643,7 +676,16 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
     edge_bonus = min(max(raw_edge * 0.40, -0.08), 0.12)
 
     # ── Composite certainty ───────────────────────────────────────────────────
-    composite = min((base + mom_bonus + edge_bonus) * regime_factor, 0.99)
+    if mode == "safe":
+        # Safe Mode: strip away complex bonuses, use Pure Diffusion (base)
+        # But require 2+ models to agree (base + at least one of mom, edge, regime)
+        composite = base
+        models_agree = (base >= 0.60) and (mom > 0 or raw_edge > 0 or regime > 0.6)
+        if not models_agree:
+            log.info(f"{_u()}SNIPE [{asset} {tf}] SAFE MODE VETO — Models do not agree (base={base:.2f}, mom={mom:+.2f}, edge={raw_edge:+.3f}, regime={regime:.2f})")
+            return None
+    else:
+        composite = min((base + mom_bonus + edge_bonus) * regime_factor, 0.99)
 
     log.info(
         f"{_u()}SNIPE [{asset} {tf}] {secs:.0f}s | "
@@ -654,7 +696,8 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
     )
 
     # Hard veto: price racing toward threshold on an already-weak signal
-    if mom < -0.7 and base < 0.55:
+    # FULL SEND bypasses hard vetos
+    if mode != "full_send" and mom < -0.7 and base < 0.55:
         log.info(
             f"{_u()}SNIPE [{asset} {tf}] VETOED — adverse momentum ({mom:+.2f}) "
             f"with weak base ({base:.2f})"
@@ -664,15 +707,18 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
     if composite < min_certainty:
         return None
 
-    # ── Dynamic EV gate ───────────────────────────────────────────────────────
+    # ── Dynamic EV gate ──
     fee_rate  = market.get("fee_rate", 0.04)
-    # Require at least a 10% margin above fees
-    ev_ceiling = max_ev_price(w_est, fee_rate, min_margin=0.10)
+    # Safe Mode demands higher margin (20%); Full Send demands lower (5%)
+    margin_map = {"safe": 0.20, "balanced": 0.10, "aggressive": 0.08, "full_send": 0.05}
+    min_margin = margin_map.get(mode, 0.10)
+    
+    ev_ceiling = max_ev_price(w_est, fee_rate, min_margin=min_margin)
 
     if market_price >= ev_ceiling:
         log.info(
             f"{_u()}SNIPE [{asset} {tf}] REJECTED — market {market_price:.3f} >= "
-            f"EV ceiling {ev_ceiling:.3f} (w_est={w_est:.1%}, margin buffer=10%)"
+            f"EV ceiling {ev_ceiling:.3f} (w_est={w_est:.1%}, mode={mode}, margin={min_margin:.0%})"
         )
         return None
 
@@ -685,7 +731,7 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
         return None
 
     # ── Quarter-Kelly sizing ──────────────────────────────────────────────────
-    size = kelly_size(w_est, market_price, fee_rate, asset=asset)
+    size = kelly_size(w_est, market_price, fee_rate, asset=asset, state=state)
 
     log.info(
         f"{_u()}SNIPE [{asset} {tf}] ✅ SIGNAL | "
@@ -720,12 +766,12 @@ def snipe_signal(market: dict, learned: dict = None, spot_price: float = None) -
 
 # ── BTC spot move detector (feeds CORRELATE) ─────────────────────────────────
 
-def _btc_spot_move_pct(window_sec: float = config.CORRELATION_WINDOW_SEC) -> tuple[float, str]:
+def _btc_spot_move_pct(window_sec: float = config.CORRELATION_WINDOW_SEC, state: MarketState = global_state) -> tuple[float, str]:
     """
     Returns (move_pct, direction) of BTC spot price over the last window_sec.
     Uses price history — no market scan needed, fires as soon as spot moves.
     """
-    hist = list(_price_history.get("BTC", []))
+    hist = list(state.price_history.get("BTC", []))
     if len(hist) < 6:
         return 0.0, ""
     now     = time.time()
@@ -739,7 +785,7 @@ def _btc_spot_move_pct(window_sec: float = config.CORRELATION_WINDOW_SEC) -> tup
 
 # ── Strategy 2: CORRELATE — BTC → ETH/SOL lead-lag ───────────────────────────
 
-def record_btc_move(market: dict, yes_price_new: float):
+def record_btc_move(market: dict, yes_price_new: float, state: MarketState = global_state):
     """Record any BTC market move ≥1%. Per-user threshold applied later."""
     if market["asset"] != "BTC":
         return
@@ -747,15 +793,15 @@ def record_btc_move(market: dict, yes_price_new: float):
     old = feeds.prev_yes.get(market["market_id"], yes_price_new)
     move = yes_price_new - old
     if abs(move) >= 0.01:
-        _btc_signal_time[tf]      = time.time()
-        _btc_signal_direction[tf] = "UP" if move > 0 else "DOWN"
-        _btc_signal_move[tf]      = abs(move)
+        state.btc_signal_time[tf]      = time.time()
+        state.btc_signal_direction[tf] = "UP" if move > 0 else "DOWN"
+        state.btc_signal_move[tf]      = abs(move)
         log.info(f"{_u()}BTC {tf} market moved {move:+.3f} — stored for CORRELATE")
 
 
 _CRYPTO_ASSETS = {"BTC", "ETH", "SOL"}
 
-def correlate_signal(market: dict, threshold: float = config.CORRELATION_THRESHOLD, learned: dict = None, spot_price: float = None) -> Optional[TradeSignal]:
+def correlate_signal(market: dict, threshold: float = config.CORRELATION_THRESHOLD, learned: dict = None, spot_price: float = None, state: MarketState = global_state) -> Optional[TradeSignal]:
     """
     BTC spot price moves ≥threshold % → trade same direction on ETH/SOL.
 
@@ -773,7 +819,7 @@ def correlate_signal(market: dict, threshold: float = config.CORRELATION_THRESHO
     asset = market["asset"]
 
     # Primary: BTC spot move (fast, fires before markets reprice)
-    spot_move, spot_dir = _btc_spot_move_pct(config.CORRELATION_WINDOW_SEC)
+    spot_move, spot_dir = _btc_spot_move_pct(config.CORRELATION_WINDOW_SEC, state=state)
     if spot_move >= threshold:
         direction = spot_dir
         freshness = 1.0
@@ -783,13 +829,13 @@ def correlate_signal(market: dict, threshold: float = config.CORRELATION_THRESHO
         )
     else:
         # Fallback: BTC market-price signal from record_btc_move
-        signal_time = _btc_signal_time.get(tf)
+        signal_time = state.btc_signal_time.get(tf)
         if not signal_time:
             return None
         age = time.time() - signal_time
-        if age > config.CORRELATION_WINDOW_SEC or _btc_signal_move.get(tf, 0.0) < threshold:
+        if age > config.CORRELATION_WINDOW_SEC or state.btc_signal_move.get(tf, 0.0) < threshold:
             return None
-        direction = _btc_signal_direction.get(tf)
+        direction = state.btc_signal_direction.get(tf)
         freshness = 1.0 - (age / config.CORRELATION_WINDOW_SEC)
 
     # ── Guard 0: Time to play out ──────────────────────────────────────────────
@@ -802,9 +848,9 @@ def correlate_signal(market: dict, threshold: float = config.CORRELATION_THRESHO
         return None
 
     # ── Guard 1: has the target asset already moved in the same direction? ─────
-    target_move, target_dir = _btc_spot_move_pct(config.CORRELATION_WINDOW_SEC)  # reuse helper
+    target_move, target_dir = _btc_spot_move_pct(config.CORRELATION_WINDOW_SEC, state=state)  # reuse helper
     # Actually measure target asset's own move
-    target_hist = list(_price_history.get(asset, []))
+    target_hist = list(state.price_history.get(asset, []))
     if len(target_hist) >= 6:
         cutoff_time = time.time() - config.CORRELATION_WINDOW_SEC
         past_entry = next(((t, p) for t, p in target_hist if t >= cutoff_time), None)
@@ -1138,7 +1184,7 @@ def _apply_convergence(signals: list[TradeSignal]) -> list[TradeSignal]:
 
 # ── Main evaluate entrypoint ──────────────────────────────────────────────────
 
-def evaluate(market: dict, strategies: list[str], learned: dict = None, spot_price: float = None) -> list[TradeSignal]:
+def evaluate(market: dict, strategies: list[str], learned: dict = None, spot_price: float = None, state: MarketState = global_state) -> list[TradeSignal]:
     """
     Main evaluation entry point.
     spot_price: if provided, overrides the global feeds.spot[asset] (used for backtesting).
@@ -1146,25 +1192,42 @@ def evaluate(market: dict, strategies: list[str], learned: dict = None, spot_pri
     if strategies is None:
         strategies = ["SNIPE", "CORRELATE", "ARB", "NEWS"]
     learned = learned or {}
+    
+    # Inject mode into learned if not already there so signal functions can see it
+    if "mode" not in learned:
+        learned["mode"] = market.get("mode", "balanced")
 
-    raw_cert    = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
-    min_cert    = max(config.SNIPE_MIN_CERTAINTY, min(raw_cert, 0.75))
-    raw_corr    = learned.get("correlation_threshold", config.CORRELATION_THRESHOLD)
-    corr_thresh = max(config.CORRELATION_THRESHOLD, min(raw_corr, 0.20))
-    news_thresh = learned.get("news_sentiment_threshold", config.NEWS_SENTIMENT_THRESHOLD)
+    # Use mode-adjusted defaults if not overridden by learned settings
+    mode = learned["mode"]
+    
+    # Safe: 0.65 | Balanced: 0.55 | Aggressive: 0.45 | Full Send: 0.35
+    mode_cert = {"safe": 0.65, "balanced": 0.55, "aggressive": 0.45, "full_send": 0.35}.get(mode, 0.55)
+    
+    raw_cert    = learned.get("snipe_min_certainty", mode_cert)
+    min_cert    = max(0.35, min(raw_cert, 0.85))
+    
+    # Correlate and News thresholds also scale with mode
+    # Safe: higher hurdle | Full Send: lower hurdle
+    mode_hurdle = {"safe": 0.10, "balanced": 0.00, "aggressive": -0.10, "full_send": -0.20}.get(mode, 0.0)
+    
+    raw_corr    = learned.get("correlation_threshold", config.CORRELATION_THRESHOLD + (mode_hurdle * 0.1))
+    corr_thresh = max(0.005, min(raw_corr, 0.20))
+    
+    news_thresh = learned.get("news_sentiment_threshold", config.NEWS_SENTIMENT_THRESHOLD + (mode_hurdle * 0.5))
+    news_thresh = max(0.40, min(news_thresh, 0.95))
 
     signals = []
     try:
         if "SNIPE" in strategies:
-            if _check_circuit_breaker("SNIPE", market["asset"]):
-                sig = snipe_signal(market, learned, spot_price=spot_price)
+            if _check_circuit_breaker("SNIPE", market["asset"], state=state):
+                sig = snipe_signal(market, learned, spot_price=spot_price, state=state)
                 if sig: signals.append(sig)
             else:
                 log.debug(f"SNIPE {market['asset']} skipped (Circuit Breaker active)")
 
         if "CORRELATE" in strategies:
-            if _check_circuit_breaker("CORRELATE", market["asset"]):
-                sig = correlate_signal(market, threshold=corr_thresh, spot_price=spot_price)
+            if _check_circuit_breaker("CORRELATE", market["asset"], state=state):
+                sig = correlate_signal(market, threshold=corr_thresh, spot_price=spot_price, state=state)
                 if sig: signals.append(sig)
 
         if "ARB" in strategies:

@@ -25,6 +25,7 @@ import learner
 import telegram_bot
 import executor
 import server
+import recorder
 from risk import RiskManager
 from client import BayseClient
 from config import (
@@ -191,14 +192,6 @@ async def _user_loop(chat_id: str):
         if not user or not user.get("is_active"):
             log.info(f"[{chat_id}] trading loop exiting (user inactive)")
             break
-        settings = user["settings"]
-        if settings.get("paused"):
-            if iter_count % 18 == 0:  # log every 3 minutes while paused
-                log.info(f"[{chat_id}] trading paused — send /resume to restart")
-            continue
-        if iter_count % 18 == 0:  # heartbeat every 3 minutes
-            log.info(f"[{chat_id}] loop alive (iter={iter_count}, spot={feeds.spot})")
-
         client = _get_client(user)
         risk   = _get_risk(chat_id)
 
@@ -225,12 +218,16 @@ async def _user_loop(chat_id: str):
                 await asyncio.to_thread(database.update_settings, chat_id, settings)
                 risk.peak_balance = equity
                 _user_daily[chat_id] = day_now
+                # AUTOMATIC RESUME: if the user was paused due to low balance/drawdown, 
+                # a significant deposit should likely unpause them, or at least 
+                # we should check if we should unpause. 
+                # Actually, better to just let them /resume, but we MUST update _last_balance.
                 if _tg_app:
                     await telegram_bot.notify_deposit_detected(
                         _tg_app, chat_id, delta, "NGN"
                     )
             elif delta < -threshold:
-                # Withdrawal detected — re-anchor peak so drawdown isn't triggered
+                # Withdrawal detected
                 log.info(f"[{chat_id}] Withdrawal detected: ₦{delta:,.0f} (₦{last_bal:,.0f} → ₦{equity:,.0f})")
                 day_now = _user_daily.get(chat_id, {})
                 day_now["start_balance"] = equity
@@ -247,6 +244,15 @@ async def _user_loop(chat_id: str):
                         parse_mode="Markdown",
                     )
         _last_balance[chat_id] = equity
+
+        # ── Pause check (moved below housekeeping) ─────────────────────────────
+        if settings.get("paused"):
+            if iter_count % 18 == 0:  # log every 3 minutes while paused
+                log.info(f"[{chat_id}] trading paused — send /resume to restart")
+            continue
+
+        if iter_count % 18 == 0:  # heartbeat every 3 minutes
+            log.info(f"[{chat_id}] loop alive (iter={iter_count}, spot={feeds.spot})")
 
         # ── Low balance guard ──────────────────────────────────────────────────
         if equity < _MIN_VIABLE_BALANCE:
@@ -335,6 +341,7 @@ async def _user_loop(chat_id: str):
         user_tfs     = settings.get("timeframes",  ["5min", "15min", "1h"])
         user_strats  = settings.get("strategies",  ["SNIPE", "CORRELATE", "ARB", "NEWS"])
         learned      = settings.get("learned",     {})
+        learned["mode"] = settings.get("mode", "balanced")
         suspended    = learned.get("suspended_strategies", [])
         active_strats = [s for s in user_strats if s not in suspended]
         max_exp      = settings.get("maxexposure", 30.0) / 100.0
@@ -386,6 +393,9 @@ async def _scan_loop():
             telegram_bot._active_markets = active_markets
             log.info(f"Rescanned: {len(active_markets)} markets")
             feeds.restart_bayse_feed(active_markets, _on_market_update)
+            
+            # Record the new market snapshot for backtesting
+            recorder.record_market_snapshot(active_markets)
         except Exception as e:
             log.warning(f"Scan failed: {e}")
 
@@ -397,6 +407,7 @@ def _refresh_timers():
 
 def _on_spot_price(asset: str, price: float):
     strategy.update_price_history(asset, price)
+    recorder.record_spot_tick(asset, price)
     log.debug(f"Spot {asset}: {price:,.4f}")
     
     last = _last_spot.get(asset)
@@ -453,10 +464,11 @@ async def _evaluate_single_user(user: dict, trigger_asset: str):
     else:
         free_cash = equity - risk.deployed()
         
-    user_assets = settings.get("assets", ["BTC", "ETH", "SOL"])
+    user_assets = settings.get("assets", config.ALL_ASSETS)
     user_tfs = settings.get("timeframes", ["5min", "15min", "1h"])
     user_strats = settings.get("strategies", ["SNIPE", "CORRELATE", "ARB", "NEWS"])
     learned = settings.get("learned", {})
+    learned["mode"] = settings.get("mode", "balanced")
     suspended = learned.get("suspended_strategies", [])
     active_strats = [s for s in user_strats if s not in suspended]
     max_exp = settings.get("maxexposure", 30.0) / 100.0

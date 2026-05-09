@@ -185,6 +185,15 @@ def init_db():
                     updated_at TEXT
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS recordings (
+                    id         SERIAL PRIMARY KEY,
+                    type       TEXT NOT NULL,
+                    asset      TEXT,
+                    data_json  TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
         conn.commit()
     log.info("Database ready (PostgreSQL, pooled connections)")
 
@@ -326,3 +335,23 @@ def save_quant_state(asset: str, state: dict):
 def load_quant_states() -> dict[str, dict]:
     rows = _fetch_all("SELECT asset, state_json FROM quant_state")
     return {r["asset"]: json.loads(r["state_json"]) for r in rows}
+
+
+# ── Persistent Recordings ────────────────────────────────────────────────────
+
+def save_recording(type: str, data: dict, asset: str = None):
+    """Save a market snapshot or spot tick for future backtesting."""
+    _execute(
+        "INSERT INTO recordings (type, asset, data_json) VALUES (%s, %s, %s)",
+        (type, asset, json.dumps(data))
+    )
+
+def get_recordings(type: str = None, limit: int = 1000) -> list[dict]:
+    query = "SELECT * FROM recordings"
+    params = ()
+    if type:
+        query += " WHERE type=%s"
+        params = (type,)
+    query += " ORDER BY created_at ASC LIMIT %s"
+    params += (limit,)
+    return _fetch_all(query, params)

@@ -37,8 +37,12 @@ _REALTIME_SYMBOLS = {
     "BTCUSDT": "BTC",
     "ETHUSDT": "ETH",
     "SOLUSDT": "SOL",
+    "BNBUSDT": "BNB",
     "EURUSD":  "EURUSD",
     "GBPUSD":  "GBPUSD",
+    "USDJPY":  "USDJPY",
+    "EURJPY":  "EURJPY",
+    "GBPJPY":  "GBPJPY",
     "XAUUSD":  "XAUUSD",
     # USDNGN subscribed for future markets but no active series yet
     "USDNGN":  "USDNGN",

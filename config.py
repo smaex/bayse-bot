@@ -43,9 +43,19 @@ SERIES = {
         "6h":    "crypto-sol-6h",
         "1d":    "crypto-sol-1d",
     },
-    # ── FX (confirmed slugs from live API — 1h only as of 2026-04-28) ─────────
+    "BNB": {
+        "5min":  "crypto-bnb-5min",
+        "15min": "crypto-bnb-15min",
+        "1h":    "crypto-bnb-1h",
+        "6h":    "crypto-bnb-6h",
+        "1d":    "crypto-bnb-1d",
+    },
+    # ── FX (confirmed slugs from live API — 1h only as of 2026-05-09) ─────────
     "EURUSD": {"1h": "fx-eurusd-1h"},
     "GBPUSD": {"1h": "fx-gbpusd-1h"},
+    "USDJPY": {"1h": "fx-usdjpy-1h"},
+    "EURJPY": {"1h": "fx-eurjpy-1h"},
+    "GBPJPY": {"1h": "fx-gbpjpy-1h"},
     "EURGBP": {"1h": "fx-eurgbp-1h"},   # derived price: EURUSD / GBPUSD
     # ── Commodities ────────────────────────────────────────────────────────────
     "XAUUSD": {"1h": "commodity-xauusd-1h"},
@@ -53,9 +63,10 @@ SERIES = {
 
 # Which oracle each asset uses for resolution
 ASSET_ORACLE = {
-    "BTC": "BINANCE", "ETH": "BINANCE", "SOL": "BINANCE",
-    "EURUSD": "TWELVEDATA", "GBPUSD": "TWELVEDATA",
-    "EURGBP": "TWELVEDATA", "XAUUSD": "TWELVEDATA",
+    "BTC": "BINANCE", "ETH": "BINANCE", "SOL": "BINANCE", "BNB": "BINANCE",
+    "EURUSD": "TWELVEDATA", "GBPUSD": "TWELVEDATA", "USDJPY": "TWELVEDATA",
+    "EURJPY": "TWELVEDATA", "GBPJPY": "TWELVEDATA", "EURGBP": "TWELVEDATA", 
+    "XAUUSD": "TWELVEDATA",
 }
 
 # News & sentiment
@@ -87,7 +98,11 @@ CPI_ADVANCE_MINUTES = 2  # enter position 2 min before scheduled release
 CURRENCY = "NGN"
 
 # ── All possible assets / timeframes (superset — per-user settings stored in DB) ─
-ALL_ASSETS     = ["BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "EURGBP", "XAUUSD"]
+ALL_ASSETS     = [
+    "BTC", "ETH", "SOL", "BNB",
+    "EURUSD", "GBPUSD", "USDJPY", "EURJPY", "GBPJPY", "EURGBP",
+    "XAUUSD"
+]
 ALL_TIMEFRAMES = ["5min", "15min", "1h", "6h", "1d"]
 
 # ── Sniping ───────────────────────────────────────────────────────────────────
@@ -110,18 +125,25 @@ SNIPE_MAX_MARKET_PRICE = 0.80
 # P(win) = Φ( |spot_distance| / (σ_h × √T_hours) )  ← same math as options pricing
 ASSET_HOURLY_VOL = {
     # Crypto
-    "BTC":    0.018,   # ~1.8% per hour (annualised ~28%)
-    "ETH":    0.022,   # ~2.2% per hour (annualised ~34%)
-    "SOL":    0.028,   # ~2.8% per hour (annualised ~43%)
-    # FX — much lower vol; realized vol will refine these quickly
-    "EURUSD": 0.0006,  # ~0.06% per hour (major pair, very stable)
+    "BTC":    0.018,   # ~1.8% per hour
+    "ETH":    0.022,   # ~2.2% per hour
+    "SOL":    0.028,   # ~2.8% per hour
+    "BNB":    0.025,   # ~2.5% per hour
+    # FX
+    "EURUSD": 0.0006,  # ~0.06% per hour
     "GBPUSD": 0.0007,  # ~0.07% per hour
-    "EURGBP": 0.0004,  # ~0.04% per hour (cross rate, tightest range)
+    "USDJPY": 0.0007,  # ~0.07% per hour
+    "EURJPY": 0.0006,  # ~0.06% per hour
+    "GBPJPY": 0.0008,  # ~0.08% per hour
+    "EURGBP": 0.0004,  # ~0.04% per hour
     # Commodities
-    "XAUUSD": 0.0015,  # ~0.15% per hour (Gold)
+    "XAUUSD": 0.0015,  # ~0.15% per hour
 }
 
-SNIPE_MIN_CERTAINTY = 0.55   # min win_prob of ~75% (was 0.40/68% — too risky for small bankrolls)
+# ── Tiered Certainty (Adaptive Frequency) ───────────────────────────────────
+SNIPE_MIN_CERTAINTY        = 0.55   # global default
+SNIPE_MIN_CERTAINTY_CRYPTO = 0.55   # high conviction for volatile crypto
+SNIPE_MIN_CERTAINTY_FX     = 0.45   # allow higher frequency for stable FX
 
 # ── FX-specific trading rules ─────────────────────────────────────────────────
 # Only trade FX/Gold during their active market sessions (UTC).
@@ -129,6 +151,9 @@ SNIPE_MIN_CERTAINTY = 0.55   # min win_prob of ~75% (was 0.40/68% — too risky 
 FX_SESSION_UTC = {
     "EURUSD": (6, 17),   # London open → NY close
     "GBPUSD": (6, 17),
+    "USDJPY": (0, 24),   # Tokyo overlap; 24h liquidity is generally fine
+    "EURJPY": (0, 24),
+    "GBPJPY": (0, 24),
     "EURGBP": (6, 17),
     "XAUUSD": (8, 20),   # London overlap → NY afternoon
 }
@@ -138,6 +163,9 @@ FX_SESSION_UTC = {
 FX_MIN_DISTANCE = {
     "EURUSD": 0.0006,  # 0.06% — 1σ/hr
     "GBPUSD": 0.0007,  # 0.07%
+    "USDJPY": 0.0007,
+    "EURJPY": 0.0006,
+    "GBPJPY": 0.0008,
     "EURGBP": 0.0004,  # 0.04%
     "XAUUSD": 0.0015,  # 0.15%
 }
@@ -147,6 +175,7 @@ CRYPTO_MIN_DISTANCE = {
     "BTC": 0.0010,  # 0.10%
     "ETH": 0.0015,  # 0.15%
     "SOL": 0.0020,  # 0.20%
+    "BNB": 0.0015,
 }
 
 # Velocity Guard: Reject if price is crashing toward the threshold too fast.

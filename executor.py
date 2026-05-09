@@ -21,7 +21,10 @@ def init_executor(markets, tg_app):
 
 async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash):
     """decide and execute a single-sided trade"""
-    base_pct = settings.get("risk_pct", 3.0) / 100.0
+    mode = settings.get("mode", "balanced")
+    # Base risk per mode: Safe=0.5%, Balanced=1.5%, Aggressive=3%, Full Send=5%
+    mode_risk = {"safe": 0.005, "balanced": 0.015, "aggressive": 0.03, "full_send": 0.05}
+    base_pct = mode_risk.get(mode, 0.015)
     min_t    = settings.get("mintrade", 100)
     max_t    = settings.get("maxtrade", 500_000)
     max_exp  = settings.get("maxexposure", 30.0) / 100.0
@@ -59,7 +62,9 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
 
     max_allowed_price = (1.0 - fee_rate) / (1.0 + MIN_PAYOUT_RATIO)
     is_fx = sig.asset in _FX_ASSETS
-    slip_mult = 1.002 if is_fx else 1.02
+    # Slippage tolerance: Safe=0.2%, Balanced=0.5%, Aggressive=1%, Full Send=2.5%
+    slip_map = {"safe": 0.002, "balanced": 0.005, "aggressive": 0.01, "full_send": 0.025}
+    slip_mult = 1.0 + slip_map.get(mode, 0.005)
     limit_price = min(sig.market_price * slip_mult, max_allowed_price) 
 
     log.info(

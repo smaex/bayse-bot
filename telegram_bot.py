@@ -510,127 +510,93 @@ _MODES = {
     "mode_safe": {
         "label": "🟢 Safe",
         "description": (
-            "*🟢 Safe Mode*\n\n"
-            "Built for small balances or first-time users.\n"
-            "Only the two most reliable strategies. Small trades, tight limits.\n\n"
-            "• Assets: BTC, ETH\n"
-            "• Timeframes: 15min, 1h\n"
-            "• Strategies: SNIPE, ARB\n"
-            "• Risk per trade: 2%\n"
-            "• Min trade: ₦100\n"
-            "• Max exposure: 15%\n"
-            "• Daily target: 5% of starting balance"
+            "*🟢 Safe Mode (Quant Conservative)*\n\n"
+            "Prioritizes capital preservation. High-conviction engine filters noise.\n\n"
+            "• *Entry Guard*: 0.65 (Ultra-high conviction)\n"
+            "• *Engine Logic*: Requires 2+ models to agree\n"
+            "• *Slippage Guard*: 0.2% limit\n"
+            "• *Risk per Trade*: 0.5%\n"
+            "• *Markets*: 1h, 6h, 1d (no noise)\n"
+            "• *Assets*: Low-vol (FX & BTC only)"
         ),
         "settings": {
-            "assets":           ["BTC", "ETH"],
-            "timeframes":       ["15min", "1h"],
+            "mode":             "safe",
+            "assets":           ["BTC", "EURUSD", "GBPUSD", "USDJPY", "EURJPY", "GBPJPY", "EURGBP", "XAUUSD"],
+            "timeframes":       ["1h", "6h", "1d"],
             "strategies":       ["SNIPE", "ARB"],
-            "risk_pct":         2.0,
+            "risk_pct":         0.5,
             "mintrade":         100,
             "maxexposure":      15.0,
             "daily_multiplier": 5,
-            "daily_target_ngn": 0,
         },
     },
     "mode_balanced": {
         "label": "🔵 Balanced",
         "description": (
-            "*🔵 Balanced Mode*\n\n"
-            "A solid all-round setup. Three strategies, all major assets.\n"
-            "Good for users who've seen the bot run for a few days.\n\n"
-            "• Assets: BTC, ETH, SOL\n"
-            "• Timeframes: 5min, 15min, 1h\n"
-            "• Strategies: SNIPE, ARB, CORRELATE\n"
-            "• Risk per trade: 3%\n"
-            "• Min trade: ₦100\n"
-            "• Max exposure: 25%\n"
-            "• Daily target: 10% of starting balance"
+            "*🔵 Balanced Mode (Default)*\n\n"
+            "Mathematically optimized blend of frequency and safety.\n\n"
+            "• *Entry Guard*: 0.55 (Standard)\n"
+            "• *Engine Logic*: Standard 5-model blend\n"
+            "• *Slippage Guard*: 0.5% limit\n"
+            "• *Risk per Trade*: 1.5%\n"
+            "• *Markets*: All timeframes\n"
+            "• *Assets*: Full Universe"
         ),
         "settings": {
-            "assets":           ["BTC", "ETH", "SOL"],
-            "timeframes":       ["5min", "15min", "1h"],
+            "mode":             "balanced",
+            "assets":           config.ALL_ASSETS,
+            "timeframes":       ["15min", "1h", "6h"],
             "strategies":       ["SNIPE", "ARB", "CORRELATE"],
-            "risk_pct":         3.0,
+            "risk_pct":         1.5,
             "mintrade":         100,
             "maxexposure":      25.0,
             "daily_multiplier": 10,
-            "daily_target_ngn": 0,
         },
     },
     "mode_aggressive": {
         "label": "🟠 Aggressive",
         "description": (
-            "*🟠 Aggressive Mode*\n\n"
-            "Higher frequency, more strategies, bigger trades.\n"
-            "Best for users with a proven track record and larger balance.\n\n"
-            "• Assets: BTC, ETH, SOL\n"
-            "• Timeframes: 5min, 15min, 1h\n"
-            "• Strategies: SNIPE, ARB, CORRELATE, NEWS\n"
-            "• Risk per trade: 4%\n"
-            "• Min trade: ₦200\n"
-            "• Max exposure: 35%\n"
-            "• Daily target: 20% of starting balance"
+            "*🟠 Aggressive Mode (Growth Focus)*\n\n"
+            "Chases momentum. Lower certainty requirements, higher frequency.\n\n"
+            "• *Entry Guard*: 0.45 (Frequency-bias)\n"
+            "• *Engine Logic*: Momentum-weighted\n"
+            "• *Slippage Guard*: 1.0% limit\n"
+            "• *Risk per Trade*: 3.0%\n"
+            "• *Markets*: All timeframes\n"
+            "• *Assets*: Full Universe"
         ),
         "settings": {
-            "assets":           ["BTC", "ETH", "SOL"],
+            "mode":             "aggressive",
+            "assets":           config.ALL_ASSETS,
             "timeframes":       ["5min", "15min", "1h"],
             "strategies":       ["SNIPE", "ARB", "CORRELATE", "NEWS"],
-            "risk_pct":         4.0,
+            "risk_pct":         3.0,
             "mintrade":         200,
             "maxexposure":      35.0,
             "daily_multiplier": 20,
-            "daily_target_ngn": 0,
         },
     },
     "mode_degen": {
         "label": "🔴 Full Send",
         "description": (
-            "*🔴 Full Send Mode*\n\n"
-            "Maximum aggression. All assets, all timeframes, all strategies.\n"
-            "High reward, high risk. Only for experienced users with capital to absorb losses.\n\n"
-            "• Assets: BTC, ETH, SOL\n"
-            "• Timeframes: 5min, 15min, 1h, 6h\n"
-            "• Strategies: All 4\n"
-            "• Risk per trade: 5%\n"
-            "• Min trade: ₦500\n"
-            "• Max exposure: 50%\n"
-            "• Daily target: 50% of starting balance"
+            "*🔴 Full Send Mode (Raw Alpha)*\n\n"
+            "Maximum aggression. No mathematical safety guards, raw EV only.\n\n"
+            "• *Entry Guard*: 0.35 (Gambler's Edge)\n"
+            "• *Engine Logic*: Raw EV (no guards)\n"
+            "• *Slippage Guard*: 2.5% limit\n"
+            "• *Risk per Trade*: 5.0%\n"
+            "• *Markets*: All timeframes\n"
+            "• *Assets*: Full Universe"
         ),
         "settings": {
-            "assets":           ["BTC", "ETH", "SOL"],
-            "timeframes":       ["5min", "15min", "1h", "6h"],
+            "mode":             "full_send",
+            "assets":           config.ALL_ASSETS,
+            "timeframes":       config.ALL_TIMEFRAMES,
             "strategies":       ["SNIPE", "ARB", "CORRELATE", "NEWS"],
             "risk_pct":         5.0,
             "mintrade":         500,
             "maxexposure":      50.0,
             "daily_multiplier": 50,
-            "daily_target_ngn": 0,
-        },
-    },
-    "mode_fx": {
-        "label": "💱 FX + Crypto",
-        "description": (
-            "*💱 FX + Crypto Mode*\n\n"
-            "Trades both crypto and FX/Gold markets.\n"
-            "FX markets are calmer — high win probability at small distances.\n"
-            "More markets open = more opportunities per day.\n\n"
-            "• Assets: BTC, ETH, SOL + EUR/USD, GBP/USD, EUR/GBP, Gold\n"
-            "• Timeframes: 15min, 1h\n"
-            "• Strategies: SNIPE, ARB\n"
-            "• Risk per trade: 3%\n"
-            "• Min trade: ₦100\n"
-            "• Max exposure: 25%\n"
-            "• Daily target: 10% of starting balance"
-        ),
-        "settings": {
-            "assets":           ["BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "EURGBP", "XAUUSD"],
-            "timeframes":       ["15min", "1h"],
-            "strategies":       ["SNIPE", "ARB"],
-            "risk_pct":         3.0,
-            "mintrade":         100,
-            "maxexposure":      25.0,
-            "daily_multiplier": 10,
-            "daily_target_ngn": 0,
         },
     },
 }
@@ -646,9 +612,6 @@ async def cmd_mode(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("🟠 Aggressive", callback_data="mode_aggressive"),
             InlineKeyboardButton("🔴 Full Send",  callback_data="mode_degen"),
-        ],
-        [
-            InlineKeyboardButton("💱 FX + Crypto", callback_data="mode_fx"),
         ],
     ]
     await update.message.reply_text(
@@ -900,5 +863,8 @@ async def notify_news(app, cid: str, headline: str, direction: str, assets: list
 
 async def notify_deposit_detected(app, cid: str, amount: float, currency: str):
     await send_message(
-        app, cid, f"💸 *Deposit Detected* +{currency} {amount:,.0f}", parse_mode="Markdown"
+        app, cid, 
+        f"💸 *Deposit Detected* +{currency} {amount:,.0f}\n\n"
+        "Your drawdown baseline has been reset. If your bot was previously paused, send /resume to start trading with your new balance.",
+        parse_mode="Markdown"
     )
