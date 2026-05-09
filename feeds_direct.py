@@ -13,7 +13,7 @@ log = logging.getLogger("feeds_direct")
 direct_spot: dict[str, dict] = {}
 startup_time: float = time.time()
 
-def is_warming_up(grace_period=120) -> bool:
+def is_warming_up(grace_period=60) -> bool:
     """Returns True if the bot started less than grace_period seconds ago."""
     return (time.time() - startup_time) < grace_period
 
@@ -53,7 +53,7 @@ def check_lag(asset: str, relay_price: float) -> dict:
     2. Returns 'degraded' for moderate lag/diff (suggests using a safety spread).
     3. Returns 'stale' for excessive lag/diff (blocks entry).
     """
-    if is_warming_up(120):
+    if is_warming_up(60):
         # During first 60s, don't block entry while oracles are connecting
         return {"status": "ok", "price": relay_price, "reason": "startup_grace"}
 
@@ -120,12 +120,18 @@ async def binance_feed():
             async with websockets.connect(full_url, ping_interval=10, ping_timeout=10) as ws:
                 log.info(f"✅ Direct Binance feed connected ({endpoint['url']})")
                 backoff = 1
+                msg_count = 0
                 while True:
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=60)
+                        # Shorten timeout from 60s to 20s to detect zombie connections faster
+                        raw = await asyncio.wait_for(ws.recv(), timeout=20)
                     except asyncio.TimeoutError:
                         log.warning(f"⚠️ Direct feed stall detected ({endpoint['url']}). Reconnecting...")
                         break
+
+                    msg_count += 1
+                    if msg_count % 500 == 0:
+                        log.debug(f"Direct Binance feed heartbeat ({endpoint['url']})")
 
                     msg = json.loads(raw)
                     data = msg.get("data", {})
@@ -176,7 +182,7 @@ async def tiingo_fx_feed():
                 subscribe = {
                     "eventName": "subscribe",
                     "authorization": TIINGO_API_KEY,
-                    "eventData": { "thresholdLevel": 5 } # Only send updates on 5 pip moves
+                    "eventData": { "thresholdLevel": 2 } # Filter noise but stay responsive (2 pips)
                 }
                 await ws.send(json.dumps(subscribe))
                 log.info("✅ Tiingo FX Oracle connected")
@@ -184,8 +190,10 @@ async def tiingo_fx_feed():
                 
                 while True:
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=40)
+                        # Increase timeout from 40s to 300s. FX can be quiet.
+                        raw = await asyncio.wait_for(ws.recv(), timeout=300)
                     except asyncio.TimeoutError:
+                        log.debug("Tiingo FX heartbeat timeout (300s). Reconnecting to ensure fresh session...")
                         break
                         
                     msg = json.loads(raw)

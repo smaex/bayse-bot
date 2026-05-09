@@ -57,6 +57,7 @@ _tg_app        = None
 
 _last_spot:        dict[str, float] = {}
 _last_market_eval: dict[str, float] = {}
+_last_lag_log:     dict[str, float] = {}  # throttle lag warnings to once per minute
 
 # Minimum change to be considered a deposit/withdrawal (not just trade P&L noise)
 _BALANCE_EVENT_MIN_NGN = 200
@@ -493,7 +494,12 @@ def _on_spot_price(asset: str, price: float):
     if lag["status"] == "degraded":
         safety_penalty = 0.0010 
         reason = f"lag {lag['lag_sec']:.1f}s" if lag['lag_sec'] > config.INFRA_DEGRADED_LAG_SEC else f"diff {lag['diff_pct']:.4%}"
-        log.info(f"🟡 {asset} {reason} — applying 0.1% safety spread.")
+        
+        # Throttle log to once per minute per asset
+        now = time.time()
+        if now - _last_lag_log.get(asset, 0) > 60:
+            _last_lag_log[asset] = now
+            log.info(f"🟡 {asset} {reason} — applying 0.1% safety spread.")
 
     # Always use the most recent history/recording
     strategy.update_price_history(asset, best_price)
