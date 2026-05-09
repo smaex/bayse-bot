@@ -27,6 +27,7 @@ import executor
 import server
 import recorder
 import config
+import feeds_direct
 from risk import RiskManager
 from client import BayseClient
 from config import (
@@ -411,6 +412,18 @@ def _on_spot_price(asset: str, price: float):
     recorder.record_spot_tick(asset, price)
     log.debug(f"Spot {asset}: {price:,.4f}")
     
+    # ── Stale Data Guard ──────────────────────────────────────────────────────
+    # If the direct Binance feed shows this price is laggy, we abort evaluation.
+    lag = feeds_direct.check_lag(asset, price)
+    if lag["status"] == "stale":
+        log.warning(
+            f"⚠️ INFRA GUARD TRIPPED: {asset} relay is laggy. "
+            f"Diff: {lag['diff_pct']:.4%}, Lag: {lag['lag_sec']:.1f}s. "
+            f"Relay: {lag['relay']}, Direct: {lag['direct']}. Aborting evaluation."
+        )
+        return
+    # ──────────────────────────────────────────────────────────────────────────
+    
     last = _last_spot.get(asset)
     if last is not None:
         change = abs(price - last) / last
@@ -545,8 +558,9 @@ async def main():
     # Initialize Modules
     executor.init_executor(active_markets, _tg_app)
     await strategy.load_memory()
-    
+    # Start feeds
     asyncio.create_task(feeds.start_feeds(on_price=_on_spot_price))
+    asyncio.create_task(feeds_direct.binance_feed())
     asyncio.create_task(news_mod.start_news_feeds())
     asyncio.create_task(learner.resolution_monitor(_user_clients, _user_risks, _tg_app))
     asyncio.create_task(learner.daily_learning_loop(_tg_app))
