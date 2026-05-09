@@ -17,6 +17,7 @@ from telegram.ext import (
 
 import database
 import learner
+import config
 from config import TELEGRAM_TOKEN
 
 log = logging.getLogger("telegram_bot")
