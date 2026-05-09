@@ -34,7 +34,8 @@ async def binance_feed():
     
     while True:
         endpoint = endpoints[current_idx]
-        streams = "/".join([f"{s.lower().replace('usdt', endpoint['suffix'])}@ticker" for s in _SYMBOLS.keys()])
+        # Switching to @aggTrade for real-time (ms) updates instead of 1s tickers
+        streams = "/".join([f"{s.lower().replace('usdt', endpoint['suffix'])}@aggTrade" for s in _SYMBOLS.keys()])
         full_url = f"{endpoint['url']}/stream?streams={streams}"
         
         try:
@@ -44,20 +45,20 @@ async def binance_feed():
                 async for raw in ws:
                     msg = json.loads(raw)
                     data = msg.get("data", {})
-                    symbol = data.get("s", "").replace("USD", "USDT") # normalize back to USDT
-                    if symbol.endswith("T"): # e.g. BTCUSDT
-                         pass
-                    else:
-                         symbol = symbol + "T" # normalize BTCUSD -> BTCUSDT
+                    # Using @aggTrade format: 's' is symbol, 'p' is price
+                    raw_symbol = data.get("s", "")
+                    symbol = raw_symbol.replace("USD", "USDT")
+                    if not symbol.endswith("T"):
+                         symbol = symbol + "T"
 
-                    price = data.get("c")
-                    event_time = data.get("E")
+                    price = data.get("p") # 'p' in aggTrade
                     
                     asset = _SYMBOLS.get(symbol)
                     if asset and price:
                         direct_spot[asset] = {
                             "price": float(price),
-                            "time": event_time / 1000.0 if event_time else time.time()
+                            # Use LOCAL arrival time to eliminate server clock drift issues
+                            "time": time.time() 
                         }
         except Exception as e:
             if "451" in str(e) and current_idx == 0:
