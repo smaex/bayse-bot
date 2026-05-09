@@ -217,7 +217,7 @@ MAX_DRAWDOWN_STOP = 0.15       # pause all trading at 15% drawdown (was 20%)
 # ── Infra Guard (Data Staleness & Mispricing) ──────────────────────────────────
 # Prevents trading on stale or mispriced relay feeds by comparing to Ground Truth.
 INFRA_STALE_LAG_SEC    = 45.0   # > 45s lag = Hard Block
-INFRA_DEGRADED_LAG_SEC = 10.0   # > 10s lag = 0.1% Safety Spread
+INFRA_DEGRADED_LAG_SEC = 15.0   # > 15s lag = 0.1% Safety Spread
 INFRA_STALE_DIFF_PCT   = 0.0020 # > 0.2% price diff = Hard Block
 INFRA_DEGRADED_DIFF_PCT = 0.0008 # > 0.08% price diff = 0.1% Safety Spread
 

@@ -29,7 +29,9 @@ def get_learned_overrides(chat_id: str) -> dict:
     if not user:
         return DEFAULT_LEARNED.copy()
     s = user.get("settings", {})
-    return {**DEFAULT_LEARNED, **s.get("learned", {})}
+    learned = {**DEFAULT_LEARNED, **s.get("learned", {})}
+    learned["mode"] = s.get("mode", "balanced")
+    return learned
 
 
 async def run_learning(chat_id: str) -> tuple[dict, str]:
