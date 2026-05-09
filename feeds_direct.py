@@ -13,7 +13,7 @@ log = logging.getLogger("feeds_direct")
 direct_spot: dict[str, dict] = {}
 startup_time: float = time.time()
 
-def is_warming_up(grace_period=60) -> bool:
+def is_warming_up(grace_period=120) -> bool:
     """Returns True if the bot started less than grace_period seconds ago."""
     return (time.time() - startup_time) < grace_period
 
@@ -53,7 +53,7 @@ def check_lag(asset: str, relay_price: float) -> dict:
     2. Returns 'degraded' for moderate lag/diff (suggests using a safety spread).
     3. Returns 'stale' for excessive lag/diff (blocks entry).
     """
-    if is_warming_up(60):
+    if is_warming_up(120):
         # During first 60s, don't block entry while oracles are connecting
         return {"status": "ok", "price": relay_price, "reason": "startup_grace"}
 

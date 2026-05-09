@@ -570,9 +570,20 @@ async def main():
         active_markets=active_markets,
         start_user_fn=start_user,
     )
+    # Telegram: Auto-heal conflict by kicking ghost instances
+    log.info("Telegram: Kicking any ghost instances by resetting update stream...")
+    try:
+        # Forcing a webhook kills all other active 'getUpdates' (polling) sessions immediately
+        await _tg_app.bot.set_webhook(url="https://render-auto-kick.internal")
+        await asyncio.sleep(2)
+        await _tg_app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Telegram: Update stream cleared.")
+    except Exception as e:
+        log.warning(f"Telegram: Could not clear update stream: {e}")
+
     await _tg_app.initialize()
     await _tg_app.start()
-    await _tg_app.updater.start_polling()
+    await _tg_app.updater.start_polling(drop_pending_updates=True)
     log.info("Telegram bot running")
 
     # Start Health-Check Server
@@ -590,6 +601,7 @@ async def main():
     asyncio.create_task(learner.resolution_monitor(_user_clients, _user_risks, _tg_app))
     asyncio.create_task(learner.daily_learning_loop(_tg_app))
     asyncio.create_task(_scan_loop())
+    asyncio.create_task(_update_dashboard_stats())
 
     # Reconnect all existing users and notify them
     existing_users = await asyncio.to_thread(database.get_all_active)
@@ -631,6 +643,47 @@ async def main():
     await _tg_app.updater.stop()
     await _tg_app.stop()
     await _tg_app.shutdown()
+
+
+async def _update_dashboard_stats():
+    """Periodically push live runtime data to the web dashboard server."""
+    while True:
+        try:
+            user_stats = []
+            for cid, client in _user_clients.items():
+                risk = _user_risks.get(cid)
+                balance = 0
+                try:
+                    balance = await client.get_balance_ngn()
+                except: pass
+                
+                user_stats.append({
+                    "id": f"{cid[:4]}...{cid[-4:]}" if len(cid) > 8 else cid,
+                    "paused": risk.paused if risk else True,
+                    "balance": balance,
+                    "pnl_today": 0, # Placeholder for more complex logic
+                    "mode": risk.mode if hasattr(risk, 'mode') else "balanced",
+                    "exposure": (sum(p.get('amount_ngn', 0) for p in risk.open_positions.values()) / balance * 100) if (risk and balance > 0) else 0,
+                    "open_count": len(risk.open_positions) if risk else 0
+                })
+            
+            # Sync oracles
+            oracle_stats = {}
+            for asset, data in feeds_direct.direct_spot.items():
+                oracle_stats[asset] = {
+                    "price": data['price'],
+                    "lag": time.time() - data['time']
+                }
+
+            server.stats_cache.update({
+                "users": user_stats,
+                "oracles": oracle_stats,
+                "last_update": time.time()
+            })
+        except Exception as e:
+            log.error(f"Dashboard update failed: {e}")
+            
+        await asyncio.sleep(30)
 
 
 if __name__ == "__main__":

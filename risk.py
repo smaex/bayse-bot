@@ -11,8 +11,19 @@ log = logging.getLogger(__name__)
 class RiskManager:
     def __init__(self):
         self.peak_balance: float = 0.0
+        self.daily_target: float = 0.0
         self.paused: bool = False
         self.open_positions: dict[str, dict] = {}  # market_id → position
+
+    @property
+    def target_hit(self) -> bool:
+        """Returns True if the daily profit target has been reached."""
+        return self.daily_target > 0 and self.peak_balance >= self.daily_target
+
+    @property
+    def max_drawdown_hit(self) -> bool:
+        """Returns True if the bot is currently paused due to drawdown."""
+        return self.paused
 
     def update_peak(self, balance: float):
         if balance > self.peak_balance:

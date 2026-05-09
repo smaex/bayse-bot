@@ -83,31 +83,51 @@ def _init_pool():
 @contextmanager
 def _cx():
     """
-    Context manager that checks out a connection from the pool and
-    guarantees it's returned — even on error.  Validates the connection
-    with a lightweight query to handle CockroachDB dropping idle conns.
+    Trench-Hardened Connection Manager:
+    1. Checks out a connection from the pool.
+    2. Validates it with a 'SELECT 1' to ensure it hasn't been dropped by CockroachDB.
+    3. If dropped, it closes the dead handle and creates a fresh one.
     """
     if _pool is None:
         _init_pool()
-    conn = _pool.getconn()
+    
+    conn = None
     try:
-        # Validate connection — CockroachDB may have dropped it while idle
+        conn = _pool.getconn()
+        # Validate connection — CockroachDB free tier drops idle conns aggressively
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            conn.close()
+            log.warning("Detected dead DB connection. Reconnecting...")
+            _pool.putconn(conn, close=True) # Ensure dead conn is fully removed
             conn = _pool.getconn()
+            
         yield conn
+        conn.commit() # Auto-commit successful transactions
+    except Exception as e:
+        if conn:
+            conn.rollback() # Rollback on error
+        log.error(f"Database transaction error: {e}")
+        raise
     finally:
-        _pool.putconn(conn)
+        if conn:
+            _pool.putconn(conn)
+
+
+def check_connection() -> bool:
+    """Used for health checks to ensure DB is reachable."""
+    try:
+        with _cx() as conn:
+            return True
+    except Exception:
+        return False
 
 
 def _execute(query: str, params: tuple = ()):
     with _cx() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
-        conn.commit()
 
 
 def _fetch_one(query: str, params: tuple = ()) -> dict | None:
