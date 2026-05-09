@@ -26,6 +26,7 @@ import telegram_bot
 import executor
 import server
 import recorder
+import config
 from risk import RiskManager
 from client import BayseClient
 from config import (
