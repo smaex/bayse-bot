@@ -366,6 +366,7 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
         
     settings = user.get("settings", {})
     risk.mode = settings.get("mode", "balanced")
+    log.info(f"[{chat_id}] Evaluating in {risk.mode} mode")
     
     if settings.get("paused"):
         return

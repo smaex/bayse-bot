@@ -701,7 +701,7 @@ def snipe_signal(
         f"spot={live_spot:,.2f} threshold={threshold:,.2f} ({distance_pct:+.3%}) | "
         f"w={w_est:.1%} rv={rv:.3f} base={base:.2f} mom={mom:+.2f} "
         f"regime={regime:.2f} edge={raw_edge:+.3f} ➜ composite={composite:.2f} "
-        f"{'✓' if composite >= min_certainty else '✗ LOW'}"
+        f"[{mode} mode, need {min_certainty:.2f}] {'✓' if composite >= min_certainty else '✗ LOW'}"
     )
 
     # Hard veto: price racing toward threshold on an already-weak signal
