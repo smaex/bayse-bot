@@ -21,20 +21,35 @@ async def binance_feed():
     """
     Direct high-speed WebSocket feed from Binance.
     Provides the 'Ground Truth' for crypto prices to detect relay lag.
+    Automatically switches to Binance.US if Binance.com is geoblocked.
     """
-    streams = "/".join([f"{s.lower()}@ticker" for s in _SYMBOLS.keys()])
-    url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+    # Try .com first, then .us if geoblocked (HTTP 451)
+    endpoints = [
+        {"url": "wss://stream.binance.com:9443", "suffix": "usdt"},
+        {"url": "wss://stream.binance.us:9443",  "suffix": "usd"}
+    ]
     
+    current_idx = 0
     backoff = 1
+    
     while True:
+        endpoint = endpoints[current_idx]
+        streams = "/".join([f"{s.lower().replace('usdt', endpoint['suffix'])}@ticker" for s in _SYMBOLS.keys()])
+        full_url = f"{endpoint['url']}/stream?streams={streams}"
+        
         try:
-            async with websockets.connect(url, ping_interval=20) as ws:
-                log.info(f"Direct Binance feed connected — {len(_SYMBOLS)} symbols")
+            async with websockets.connect(full_url, ping_interval=20) as ws:
+                log.info(f"Direct Binance feed connected ({endpoint['url']})")
                 backoff = 1
                 async for raw in ws:
                     msg = json.loads(raw)
                     data = msg.get("data", {})
-                    symbol = data.get("s")
+                    symbol = data.get("s", "").replace("USD", "USDT") # normalize back to USDT
+                    if symbol.endswith("T"): # e.g. BTCUSDT
+                         pass
+                    else:
+                         symbol = symbol + "T" # normalize BTCUSD -> BTCUSDT
+
                     price = data.get("c")
                     event_time = data.get("E")
                     
@@ -45,7 +60,13 @@ async def binance_feed():
                             "time": event_time / 1000.0 if event_time else time.time()
                         }
         except Exception as e:
-            log.warning(f"Direct Binance feed error: {e}. Reconnecting in {backoff}s")
+            if "451" in str(e) and current_idx == 0:
+                log.warning("Binance.com is geoblocked (451). Switching to Binance.US oracle...")
+                current_idx = 1
+                backoff = 1
+                continue
+                
+            log.warning(f"Direct Binance feed error ({endpoint['url']}): {e}. Reconnecting in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
