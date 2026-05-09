@@ -5,6 +5,7 @@ import asyncio
 import logging
 import websockets
 from typing import Tuple
+import config
 
 log = logging.getLogger("feeds_direct")
 
@@ -43,9 +44,9 @@ def get_direct_price(asset: str) -> Tuple[float, float]:
 def check_lag(asset: str, relay_price: float) -> dict:
     """
     Trench-Hardened Lag Logic:
-    1. Returns 'ok' for < 5s lag.
-    2. Returns 'degraded' for 5-15s lag (suggests using a safety spread).
-    3. Returns 'stale' for > 15s lag or > 0.15% price diff.
+    1. Returns 'ok' for fresh data with tight price alignment.
+    2. Returns 'degraded' for moderate lag/diff (suggests using a safety spread).
+    3. Returns 'stale' for excessive lag/diff (blocks entry).
     """
     direct_p, direct_t = get_direct_price(asset)
     if not direct_p:
@@ -58,7 +59,7 @@ def check_lag(asset: str, relay_price: float) -> dict:
     # Use direct price as ground truth if it's fresh (last 2s)
     best_price = direct_p if time_diff < 2.0 else relay_price
 
-    if price_diff_pct > 0.0015 or time_diff > 15.0:
+    if price_diff_pct > config.INFRA_STALE_DIFF_PCT or time_diff > config.INFRA_STALE_LAG_SEC:
         return {
             "status": "stale",
             "price": best_price,
@@ -66,7 +67,7 @@ def check_lag(asset: str, relay_price: float) -> dict:
             "lag_sec": time_diff
         }
     
-    if time_diff > 5.0 or price_diff_pct > 0.0005:
+    if time_diff > config.INFRA_DEGRADED_LAG_SEC or price_diff_pct > config.INFRA_DEGRADED_DIFF_PCT:
         return {
             "status": "degraded",
             "price": best_price,
@@ -97,11 +98,11 @@ async def binance_feed():
         suffix = endpoint["suffix"]
         stream_list = []
         for s in _CRYPTO_SYMBOLS.keys():
-            # e.g. BTCUSDT -> btcusdt@aggTrade
-            stream_list.append(f"{s.lower()}@aggTrade")
+            # miniTicker provides a consistent heartbeat (usually 1s) regardless of trade activity
+            stream_list.append(f"{s.lower()}@miniTicker")
             if suffix == "usd":
-                # For Binance.US, also try the fiat USD pair: btcusd@aggTrade
-                stream_list.append(f"{s.lower().replace('usdt', 'usd')}@aggTrade")
+                # For Binance.US, also try the fiat USD pair: btcusd@miniTicker
+                stream_list.append(f"{s.lower().replace('usdt', 'usd')}@miniTicker")
             
         full_url = f"{endpoint['url']}/stream?streams={'/'.join(stream_list)}"
         
@@ -112,7 +113,8 @@ async def binance_feed():
                 backoff = 1
                 while True:
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        # Increased timeout to 60s to account for low-volume lulls on Binance.US
+                        raw = await asyncio.wait_for(ws.recv(), timeout=60)
                     except asyncio.TimeoutError:
                         log.warning(f"⚠️ Direct feed stall detected ({endpoint['url']}). Reconnecting...")
                         break
@@ -129,7 +131,8 @@ async def binance_feed():
                         lookup_key += "T"
 
                     asset = _CRYPTO_SYMBOLS.get(lookup_key)
-                    price = data.get("p")
+                    # miniTicker uses 'c' for last price
+                    price = data.get("c")
                     
                     if asset and price:
                         direct_spot[asset] = {"price": float(price), "time": time.time()}

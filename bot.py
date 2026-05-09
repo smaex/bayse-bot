@@ -487,9 +487,9 @@ def _on_spot_price(asset: str, price: float):
         
     safety_penalty = 0.0
     if lag["status"] == "degraded":
-        # 0.1% penalty makes the bot demand a higher profit margin to compensate for lag
         safety_penalty = 0.0010 
-        log.info(f"🟡 {asset} lag ({lag['lag_sec']:.1f}s) — applying 0.1% safety spread.")
+        reason = f"lag {lag['lag_sec']:.1f}s" if lag['lag_sec'] > config.INFRA_DEGRADED_LAG_SEC else f"diff {lag['diff_pct']:.4%}"
+        log.info(f"🟡 {asset} {reason} — applying 0.1% safety spread.")
 
     # Always use the most recent history/recording
     strategy.update_price_history(asset, best_price)

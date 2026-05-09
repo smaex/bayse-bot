@@ -214,6 +214,13 @@ BANKROLL_PCT_PER_TRADE = 0.02  # 2% of bankroll per trade (was 3% — too aggres
 MAX_PORTFOLIO_EXPOSURE = 0.20  # never have >20% of bankroll in open positions (was 30%)
 MAX_DRAWDOWN_STOP = 0.15       # pause all trading at 15% drawdown (was 20%)
 
+# ── Infra Guard (Data Staleness & Mispricing) ──────────────────────────────────
+# Prevents trading on stale or mispriced relay feeds by comparing to Ground Truth.
+INFRA_STALE_LAG_SEC    = 45.0   # > 45s lag = Hard Block
+INFRA_DEGRADED_LAG_SEC = 10.0   # > 10s lag = 0.1% Safety Spread
+INFRA_STALE_DIFF_PCT   = 0.0020 # > 0.2% price diff = Hard Block
+INFRA_DEGRADED_DIFF_PCT = 0.0008 # > 0.08% price diff = 0.1% Safety Spread
+
 # Systemic Risk: If 3+ assets spike >50% above baseline vol, it's a global shock.
 # Halt all new entries for 60 minutes to let the market settle.
 SYSTEMIC_RISK_COUNT_THRESHOLD = 3
