@@ -12,6 +12,7 @@ class RiskManager:
     def __init__(self):
         self.peak_balance: float = 0.0
         self.daily_target: float = 0.0
+        self.mode: str = "balanced"
         self.paused: bool = False
         self.open_positions: dict[str, dict] = {}  # market_id → position
 

@@ -22,8 +22,8 @@ def init_executor(markets, tg_app):
 async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash):
     """decide and execute a single-sided trade"""
     mode = settings.get("mode", "balanced")
-    # Base risk per mode: Safe=0.5%, Balanced=1.5%, Aggressive=3%, Full Send=5%
-    mode_risk = {"safe": 0.005, "balanced": 0.015, "aggressive": 0.03, "full_send": 0.05}
+    # Base risk per mode: Safe=0.5%, Balanced=1.5%, Aggressive=5%, Full Send=8%
+    mode_risk = {"safe": 0.005, "balanced": 0.015, "aggressive": 0.05, "full_send": 0.08}
     base_pct = mode_risk.get(mode, 0.015)
     min_t    = settings.get("mintrade", 100)
     max_t    = settings.get("maxtrade", 500_000)
@@ -34,12 +34,15 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
     raw_pct = base_pct * mult * sig.certainty * fx_factor
 
-    if equity < 2000 and sig.strategy != "ARB":
-        raw_pct *= 0.5
-        log.info(f"[{chat_id}] Small Account Mode: scaling {sig.strategy} size by 0.5x")
-
-    amount  = equity * min(raw_pct, 0.05)
-    amount  = max(min_t, min(max_t, amount))
+    # ── Micro-Account Handling (For ₦2,000 starts) ─────────────────────────
+    if equity < 3000:
+        # On tiny accounts, we can't trade < ₦100. 
+        # We force ₦100 but keep the strategy conviction filters.
+        amount = 100.0
+        log.info(f"[{chat_id}] Micro-Account Mode: forcing ₦100 minimum viable size")
+    else:
+        amount  = equity * min(raw_pct, 0.10)
+        amount  = max(min_t, min(max_t, amount))
 
     hard_cap = equity * 0.08
     if amount > hard_cap:

@@ -365,6 +365,8 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
         return
         
     settings = user.get("settings", {})
+    risk.mode = settings.get("mode", "balanced")
+    
     if settings.get("paused"):
         return
     
@@ -382,9 +384,10 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
     if risk.target_hit or risk.max_drawdown_hit:
         return
 
-    # 3. Evaluate all relevant markets
+    # 3. Evaluate all relevant markets with Adaptive Sizing
     active_strats = settings.get("strategies", ["SNIPE", "CORRELATE", "ARB", "NEWS"])
     learned = await asyncio.to_thread(learner.get_learned_overrides, chat_id)
+    
     max_exp = settings.get("maxexposure", 100) / 100.0
     user_assets = settings.get("assets", config.ALL_ASSETS)
     user_tfs = settings.get("timeframes", ["1m", "5m", "15m"])
