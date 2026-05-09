@@ -573,16 +573,16 @@ async def main():
         active_markets=active_markets,
         start_user_fn=start_user,
     )
-    # Telegram: Auto-heal conflict by kicking ghost instances
-    log.info("Telegram: Kicking any ghost instances by resetting update stream...")
+    # Telegram: NUCLEAR GHOST KICK
+    # Forcing a webhook kills all other active 'getUpdates' (polling) sessions immediately
+    log.info("Telegram: NUCLEAR KICK — Purging ghost instances via webhook reset...")
     try:
-        # Forcing a webhook kills all other active 'getUpdates' (polling) sessions immediately
-        await _tg_app.bot.set_webhook(url="https://render-auto-kick.internal")
-        await asyncio.sleep(2)
+        await _tg_app.bot.set_webhook(url="https://ghost-kick.internal")
+        await asyncio.sleep(5)
         await _tg_app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Telegram: Update stream cleared.")
+        log.info("Telegram: Update stream PURGED. Ghosts should be dead.")
     except Exception as e:
-        log.warning(f"Telegram: Could not clear update stream: {e}")
+        log.warning(f"Telegram: Ghost-kick error: {e}")
 
     await _tg_app.initialize()
     await _tg_app.start()
