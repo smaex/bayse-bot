@@ -107,11 +107,11 @@ async def binance_feed():
         suffix = endpoint["suffix"]
         stream_list = []
         for s in _CRYPTO_SYMBOLS.keys():
-            # bookTicker provides the fastest possible heartbeat (every bid/ask change)
-            stream_list.append(f"{s.lower()}@bookTicker")
+            # ticker provides a 1-second heartbeat (reduced from bookTicker which was too noisy)
+            stream_list.append(f"{s.lower()}@ticker")
             if suffix == "usd":
-                # For Binance.US, also try the fiat USD pair: btcusd@bookTicker
-                stream_list.append(f"{s.lower().replace('usdt', 'usd')}@bookTicker")
+                # For Binance.US, also try the fiat USD pair: btcusd@ticker
+                stream_list.append(f"{s.lower().replace('usdt', 'usd')}@ticker")
             
         full_url = f"{endpoint['url']}/stream?streams={'/'.join(stream_list)}"
         
@@ -145,7 +145,7 @@ async def binance_feed():
                         lookup_key += "T"
 
                     asset = _CRYPTO_SYMBOLS.get(lookup_key)
-                    # bookTicker uses 'b' for bid and 'a' for ask
+                    # ticker stream uses 'b' for bid and 'a' for ask
                     bid = data.get("b")
                     ask = data.get("a")
                     
@@ -153,6 +153,10 @@ async def binance_feed():
                         # Use mid-price for the most accurate spot representation
                         mid_price = (float(bid) + float(ask)) / 2
                         direct_spot[asset] = {"price": mid_price, "time": time.time()}
+                        
+                        # Throttled log to confirm oracle health
+                        if msg_count % 100 == 0:
+                            log.debug(f"Oracle update [{asset}]: {mid_price:,.2f}")
         except Exception as e:
             if "451" in str(e) and current_idx == 0:
                 log.warning("Geoblocked by Binance.com. Switching to Binance.US oracle...")
