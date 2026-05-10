@@ -66,7 +66,7 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         wr_suspend = 0.85 if strat == "SNIPE" else 0.55
         wr_recover = 0.90 if strat == "SNIPE" else 0.65
 
-        if win_rate is not None and win_rate < wr_suspend and total >= 15:
+        if win_rate is not None and win_rate < wr_suspend and total >= 10:
             if strat not in suspended:
                 suspended.add(strat)
                 warnings.append(f"⚠️ {strat} suspended — WR {win_rate:.0%} < {wr_suspend:.0%} threshold")
@@ -77,9 +77,9 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         # Size multiplier (range 0.25×–2.0×)
         m = mults.get(strat, 1.0)
         if win_rate is not None:
-            if win_rate >= 0.75:   m = min(2.0, m + 0.10)
-            elif win_rate >= 0.60: m = min(1.5, m + 0.05)
-            elif win_rate < 0.55:  m = max(0.25, m - 0.10)
+            if win_rate >= 0.75:   m = min(3.0, m + 0.25)  # Aggressive: ride hot streaks 3x harder
+            elif win_rate >= 0.60: m = min(1.5, m + 0.10)
+            elif win_rate < 0.55:  m = max(0.10, m - 0.25) # Cut losers instantly down to 10% size
         mults[strat] = round(m, 2)
 
         # Strategy-specific threshold tuning

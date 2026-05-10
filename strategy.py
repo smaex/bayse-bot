@@ -153,10 +153,10 @@ def record_failure(strategy: str, asset: str, state: MarketState = global_state)
     key = f"{strategy}_{asset}"
     breaker = state.circuit_breakers.get(key, {"fails": 0, "halt_until": 0})
     breaker["fails"] += 1
-    if breaker["fails"] >= 3:
+    if breaker["fails"] >= 2:
         # Halt for 12 hours
         breaker["halt_until"] = time.time() + (12 * 3600)
-        log.warning(f"CIRCUIT BREAKER TRIGGERED: {key} halted for 12h after 3 losses.")
+        log.warning(f"CIRCUIT BREAKER TRIGGERED: {key} halted for 12h after 2 losses.")
     state.circuit_breakers[key] = breaker
 
 def record_success(strategy: str, asset: str, state: MarketState = global_state):

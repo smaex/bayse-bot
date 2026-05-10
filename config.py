@@ -79,11 +79,11 @@ NEWS_SIGNAL_DECAY_MIN = 3        # news signal expires after 3 min — stale new
 # A raw VADER compound of 0.80 × 0.55 = effective certainty of 0.44 → win_prob ≈ 70%.
 # Without dampening, 0.80 → certainty 0.80 → win_prob 86% which is wildly overconfident.
 NEWS_CERTAINTY_DAMPEN = 0.55     # multiply VADER strength by this before using as certainty
-NEWS_MAX_MARKET_PRICE  = 0.55    # reject if market already repriced past this (guarantees ~80% profit margin)
+NEWS_MAX_MARKET_PRICE  = 0.75    # reject if market already repriced past this
 NEWS_MIN_REGIME        = 0.25    # reject in choppy markets (news shock gets absorbed)
 NEWS_MIN_SECS_LEFT     = 120     # need at least 2 min for news to play out
 NEWS_KELLY_FRACTION    = 0.12    # conservative sizing for sentiment-based signals
-NEWS_REQUIRE_CRYPTO_CATALYST = True  # only trade on headlines with direct crypto catalysts
+NEWS_REQUIRE_CRYPTO_CATALYST = False  # trade massive macro/global shocks, not just crypto
 
 # Economic calendar events (UTC times — add to this list as needed)
 FOMC_DATES_2026 = [
@@ -196,17 +196,17 @@ FX_ENTRY_WINDOW_1H = 1200  # seconds (20 min)
 FX_TREND_VETO_MULT = 1.0   # reject if 10-min convergence > FX_MIN_DISTANCE × this
 
 # ── Correlation Signal ─────────────────────────────────────────────────────────
-CORRELATION_THRESHOLD = 0.015  # BTC spot must move ≥1.5% — spot-based, much more reactive
+CORRELATION_THRESHOLD = 0.008  # BTC spot must move ≥0.8% (lowered to catch standard breakouts)
 CORRELATION_WINDOW_SEC = 180   # signal valid for 3 minutes (edge evaporates fast)
 
 # CORRELATE strategy guards — the target asset may have already followed BTC
 CORRELATE_BASE_CERTAINTY   = 0.40   # base certainty (was 0.60 — too high, caused losses)
 CORRELATE_ALREADY_MOVED    = 0.50   # reject if target moved > 50% of BTC's move
-CORRELATE_MAX_MARKET_PRICE = 0.55   # reject if market already repriced past this (guarantees ~80% profit margin)
+CORRELATE_MAX_MARKET_PRICE = 0.65   # reject if market already repriced past this
 CORRELATE_MIN_REGIME       = 0.25   # reject choppy target assets
 
 # ── Arbitrage (Mint/Burn) ─────────────────────────────────────────────────────
-ARB_TRIGGER = 0.94           # enter burn arb when YES+NO sum ≤ this (demands wider 6% spread for safety)
+ARB_TRIGGER = 0.98           # enter burn arb when YES+NO sum <= this (demands 2% spread, high volume)
 ARB_MAX_SIZE_NGN = 50_000    # max per arb trade
 
 # ── Risk Management ───────────────────────────────────────────────────────────
