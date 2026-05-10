@@ -110,9 +110,9 @@ ALL_TIMEFRAMES = ["5min", "15min", "1h", "6h", "1d"]
 # Short timeframes move fast — enter late when signal is strong.
 # Long timeframes need early entry to catch markets before they fully price in.
 SNIPE_ENTRY_WINDOWS = {
-    "5min":  240,    # last 4 min — BTC 1% above threshold gives ~98% win prob here
-    "15min": 600,    # last 10 min — good balance of certainty vs market price
-    "1h":    1800,   # last 30 min — catches 1h markets while still at 0.60-0.75
+    "5min":  270,    # last 4.5 min (widened for early entry)
+    "15min": 720,    # last 12 min (widened to beat market repricing)
+    "1h":    2400,   # last 40 min (widened to beat market repricing)
     "6h":    7200,   # last 2 hours
     "1d":    21600,  # last 6 hours
 }
@@ -230,9 +230,9 @@ VOL_SPIKE_THRESHOLD           = 3.0   # trigger halt if variance acceleration > 
 DYNAMIC_KELLY_MIN             = 0.05  # floor for kelly sizing in stressed markets
 DYNAMIC_KELLY_MAX             = 0.40  # ceiling for kelly sizing in ideal markets
 
-# Minimum Net Payout: Ensure for every 100 spent, we get at least 115 back (15% net profit).
-# This prevents the "risk 100 to win 5" trades that wipe out bankrolls.
-MIN_PAYOUT_RATIO = 0.15
+# Minimum Net Payout: Ensure for every 100 spent, we get at least 108 back (8% net profit).
+# Lowered to capture highly certain setups before they are rejected by EV ceilings.
+MIN_PAYOUT_RATIO = 0.08
 PROFIT_ALERT_NGN = 20_000      # Telegram alert when unrealized profit hits this
 
 # ── Rate Limiting (stay well under 20 write/sec, 30 read/sec) ─────────────────
