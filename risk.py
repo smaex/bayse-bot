@@ -14,6 +14,7 @@ class RiskManager:
         self.daily_target: float = 0.0
         self.mode: str = "balanced"
         self.paused: bool = False
+        self.current_free_cash: float = 0.0
         self.open_positions: dict[str, dict] = {}  # market_id → position
 
     @property

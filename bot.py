@@ -200,11 +200,13 @@ async def _user_loop(chat_id: str):
 
         try:
             free_cash = await client.get_balance_ngn()
+            risk.current_free_cash = free_cash
         except Exception as e:
             log.warning(f"[{chat_id}] balance fetch failed: {e}")
             continue
 
         equity = free_cash + risk.deployed()
+        risk.update_balance(equity)
         risk.update_peak(equity)
 
         # ── Deposit / withdrawal detection ─────────────────────────────────────
@@ -372,10 +374,17 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
     if settings.get("paused"):
         return
     
-    # 1. Refresh balance
+    # 1. Get cached balance
     try:
-        # Calculate equity: free cash + currently deployed capital
-        free_cash = await client.get_balance_ngn()
+        # Use cached balance from RiskManager to avoid hitting API rate limits on every tick.
+        # The 30s loop refreshes this value periodically.
+        free_cash = risk.current_free_cash
+        
+        # Fallback for startup if cache is empty
+        if free_cash <= 0:
+            free_cash = await client.get_balance_ngn()
+            risk.current_free_cash = free_cash
+            
         equity = free_cash + risk.deployed()
         risk.update_balance(equity)
     except Exception as e:
