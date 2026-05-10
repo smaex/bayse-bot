@@ -88,12 +88,23 @@ def _cx():
     2. Validates it with a 'SELECT 1' to ensure it hasn't been dropped by CockroachDB.
     3. If dropped, it closes the dead handle and creates a fresh one.
     """
+    import time
+    
     if _pool is None:
         _init_pool()
     
     conn = None
+    for attempt in range(50):
+        try:
+            conn = _pool.getconn()
+            break
+        except psycopg2.pool.PoolError:
+            if attempt == 49:
+                log.error("Database connection pool exhausted after 50 retries (5 seconds).")
+                raise
+            time.sleep(0.1)
+            
     try:
-        conn = _pool.getconn()
         # Validate connection — CockroachDB free tier drops idle conns aggressively
         try:
             with conn.cursor() as cur:
