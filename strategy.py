@@ -590,15 +590,39 @@ def snipe_signal(
 
     distance_pct = (live_spot - threshold) / threshold   # +ve → YES wins
 
-    # Crypto Minimum Distance Guard (Pin Risk)
+    # Crypto Minimum Distance Guard (Smart Shield)
     if asset not in config.FX_SESSION_UTC:
-        min_dist = config.CRYPTO_MIN_DISTANCE.get(asset, 0.0010)
-        if abs(distance_pct) < min_dist:
+        base_min_dist = config.CRYPTO_MIN_DISTANCE.get(asset, 0.0010)
+        base_vol = config.ASSET_HOURLY_VOL.get(asset, 0.022)
+        
+        # 1. Dynamic Volatility Scaling
+        current_vol = base_vol
+        if asset in state.garch_state:
+            garch_var = state.garch_state[asset]["var"]
+            current_vol = math.sqrt(garch_var * 720.0)
+            
+        vol_ratio = current_vol / base_vol
+        dynamic_min_dist = base_min_dist * vol_ratio
+        dynamic_min_dist = max(base_min_dist * 0.5, min(dynamic_min_dist, base_min_dist * 1.5))
+        
+        if abs(distance_pct) < dynamic_min_dist:
             log.debug(
-                f"{_u()}SNIPE [{asset} {tf}] REJECTED — distance {distance_pct:+.4%} "
-                f"< min {min_dist:.4%} (Pin Risk Guard)"
+                f"{_u()}SNIPE [{asset} {tf}] REJECTED — distance {abs(distance_pct):.4%} "
+                f"< dynamic min {dynamic_min_dist:.4%} (Smart Shield)"
             )
             return None
+            
+        # 2. Momentum Veto for relaxed buffers
+        if abs(distance_pct) < base_min_dist:
+            # Inside the original danger zone, momentum MUST be moving away from the threshold
+            direction = "YES" if distance_pct > 0 else "NO"
+            mom = _momentum_score(asset, direction, state=state)
+            if mom <= 0:
+                log.debug(
+                    f"{_u()}SNIPE [{asset} {tf}] REJECTED — distance {abs(distance_pct):.4%} < {base_min_dist:.4%} "
+                    f"AND momentum {mom:+.2f} is adverse (Smart Shield Veto)"
+                )
+                return None
 
     # ── FX gate cascade (gates 1–3) ───────────────────────────────────────────
     if asset in config.FX_SESSION_UTC:
