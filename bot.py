@@ -474,8 +474,8 @@ async def _scan_loop():
             log.info(f"Rescanned: {len(active_markets)} markets")
             feeds.restart_bayse_feed(active_markets, _on_market_update)
             
-            # Record the new market snapshot for backtesting
-            recorder.record_market_snapshot(active_markets)
+            # Record the new market snapshot for backtesting (async)
+            asyncio.create_task(asyncio.to_thread(recorder.record_market_snapshot, active_markets))
         except Exception as e:
             log.warning(f"Scan failed: {e}")
 
@@ -510,9 +510,9 @@ def _on_spot_price(asset: str, price: float):
             _last_lag_log[asset] = now
             log.info(f"🟡 {asset} {reason} — applying 0.1% safety spread.")
 
-    # Always use the most recent history/recording
+    # Always use the most recent history/recording (async to avoid blocking)
     strategy.update_price_history(asset, best_price)
-    recorder.record_spot_tick(asset, best_price)
+    asyncio.create_task(asyncio.to_thread(recorder.record_spot_tick, asset, best_price))
     log.debug(f"Spot {asset}: {best_price:,.4f}")
     
     last = _last_spot.get(asset)

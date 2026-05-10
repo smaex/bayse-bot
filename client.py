@@ -5,6 +5,7 @@ import time
 import json
 import asyncio
 import logging
+import uuid
 import aiohttp
 from typing import Optional
 from config import BASE_URL, WRITE_RATE_LIMIT, READ_RATE_LIMIT
@@ -175,6 +176,25 @@ class BayseClient:
         return await self._post(
             f"/v1/pm/events/{event_id}/markets/{market_id}/orders", body
         )
+
+    async def batch_place_orders(self, orders: list) -> dict:
+        """Place up to 50 CLOB orders in a single round-trip."""
+        await self._write_rl.acquire()
+        session = await self._session_get()
+        body_str = json.dumps({"orders": orders}, separators=(",", ":"))
+        headers = self._write_headers("POST", "/v1/pm/orders/batch", body_str)
+        headers["Idempotency-Key"] = str(uuid.uuid4())
+        
+        for attempt in range(3):
+            async with session.post(f"{BASE_URL}/v1/pm/orders/batch", data=body_str, headers=headers) as r:
+                if r.status == 429:
+                    data = await r.json()
+                    wait = data.get("retryAfter", 2 ** attempt)
+                    await asyncio.sleep(wait)
+                    continue
+                r.raise_for_status()
+                return await r.json()
+        raise RuntimeError(f"POST /v1/pm/orders/batch failed after retries")
 
     async def cancel_order(self, order_id: str) -> dict:
         return await self._delete(f"/v1/pm/orders/{order_id}")

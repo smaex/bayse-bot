@@ -53,14 +53,17 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
         return
 
     if amount > free_cash:
+        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Insufficient free cash (Need ₦{amount:,.0f}, Have ₦{free_cash:,.0f})")
         return
 
     if not risk.can_trade(equity, amount, max_exp):
+        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Risk limit or max exposure reached")
         return
 
     fee_rate = settings.get("fee_rate", 0.04)
     est_net_payout = (1.0 - fee_rate) / sig.market_price
     if est_net_payout < 1.0 + MIN_PAYOUT_RATIO:
+        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — est. net payout {(est_net_payout - 1.0):.1%} < {MIN_PAYOUT_RATIO:.1%} minimum")
         return
 
     max_allowed_price = (1.0 - fee_rate) / (1.0 + MIN_PAYOUT_RATIO)
@@ -128,6 +131,7 @@ async def execute_arb(chat_id, sig, client, equity, free_cash, settings):
     try:
         yes_p = market["yes_price"]; no_p = market["no_price"]
         amount_yes = round(budget * (yes_p / (yes_p + no_p)), 2)
+        amount_no = round(budget * (no_p / (yes_p + no_p)), 2)
         
         quote = await client.get_quote(sig.event_id, sig.market_id, market["yes_id"], "BUY", amount_yes, CURRENCY)
         if float(quote.get("sharesMatched", 0)) <= 0: return
@@ -135,22 +139,46 @@ async def execute_arb(chat_id, sig, client, equity, free_cash, settings):
 
     yes_ok = False; yes_shares = 0
     try:
-        resp_yes = await client.place_order(sig.event_id, sig.market_id, market["yes_id"], "BUY", amount_yes, "MARKET", currency=CURRENCY)
-        yes_ok = True
-        y_ord = resp_yes.get("order", resp_yes)
-        yes_shares = float(y_ord.get("shares", y_ord.get("quantity", 0)) or 0)
-        if yes_shares <= 0: raise RuntimeError("YES fill 0")
+        batch_orders = [
+            {
+                "outcomeId": market["yes_id"],
+                "side": "BUY",
+                "type": "MARKET",
+                "amount": amount_yes,
+                "currency": CURRENCY,
+                "timeInForce": "FAK"
+            },
+            {
+                "outcomeId": market["no_id"],
+                "side": "BUY",
+                "type": "MARKET",
+                "amount": amount_no,
+                "currency": CURRENCY,
+                "timeInForce": "FAK"
+            }
+        ]
         
-        ws = feeds.market_prices.get(sig.market_id)
-        if not ws: raise RuntimeError("Feed lost")
-        live_no_p = ws["no"]
-        amount_no = round(yes_shares * live_no_p, 2)
+        batch_resp = await client.batch_place_orders(batch_orders)
+        results = batch_resp.get("results", [])
+        if len(results) < 2:
+            raise RuntimeError("Invalid batch response")
+            
+        yes_res = results[0]
+        no_res = results[1]
         
-        if (yes_p + live_no_p) >= 0.995: raise RuntimeError("Arb gone")
-
-        resp_no = await client.place_order(sig.event_id, sig.market_id, market["no_id"], "BUY", amount_no, "MARKET", currency=CURRENCY)
-        n_ord = resp_no.get("order", resp_no)
-        no_shares = float(n_ord.get("shares", n_ord.get("quantity", 0)) or 0)
+        yes_ok = yes_res.get("success", False)
+        if yes_ok:
+            y_ord = yes_res.get("order", {})
+            yes_shares = float(y_ord.get("shares", y_ord.get("quantity", 0)) or 0)
+            
+        no_ok = no_res.get("success", False)
+        no_shares = 0
+        if no_ok:
+            n_ord = no_res.get("order", {})
+            no_shares = float(n_ord.get("shares", n_ord.get("quantity", 0)) or 0)
+            
+        if not yes_ok or not no_ok:
+            raise RuntimeError(f"Batch incomplete. YES ok: {yes_ok}, NO ok: {no_ok}")
 
         burn_pairs = min(yes_shares, no_shares)
         if burn_pairs > 0:
