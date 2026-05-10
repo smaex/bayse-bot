@@ -718,8 +718,8 @@ def snipe_signal(
 
     # ── Dynamic EV gate ──
     fee_rate  = market.get("fee_rate", 0.04)
-    # Safe Mode demands higher margin (20%); Full Send demands lower (5%)
-    margin_map = {"safe": 0.20, "balanced": 0.10, "aggressive": 0.08, "full_send": 0.05}
+    # Safe Mode demands higher margin (20%); Full Send demands lower (2%)
+    margin_map = {"safe": 0.20, "balanced": 0.06, "aggressive": 0.04, "full_send": 0.02}
     min_margin = margin_map.get(mode, 0.10)
     
     ev_ceiling = max_ev_price(w_est, fee_rate, min_margin=min_margin)
