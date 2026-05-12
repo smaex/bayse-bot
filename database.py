@@ -85,7 +85,6 @@ def _cx():
     """
     Connection Manager — checks out from pool, validates, yields, returns.
     Retry is minimal (3 attempts / 0.3s) to avoid blocking the thread pool.
-    The old 50-retry / 5-second loop was causing total system deadlock.
     """
     import time
     
@@ -93,15 +92,18 @@ def _cx():
         _init_pool()
     
     conn = None
-    for attempt in range(3):
+    max_retries = 3
+    retry_delay = 0.1
+    
+    for attempt in range(max_retries):
         try:
             conn = _pool.getconn()
             break
         except psycopg2.pool.PoolError:
-            if attempt == 2:
+            if attempt == max_retries - 1:
                 log.error("Database connection pool exhausted (3 retries).")
                 raise
-            time.sleep(0.1)
+            time.sleep(retry_delay)
             
     try:
         # Validate connection — CockroachDB free tier drops idle conns aggressively

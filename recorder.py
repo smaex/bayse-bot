@@ -40,6 +40,8 @@ def record_spot_tick(asset: str, price: float):
     # Check if we should flush (time-based or size-based)
     now = time.time()
     if now - _last_flush >= FLUSH_INTERVAL or len(_tick_buffer) >= MAX_BUFFER_SIZE:
+        # Note: We trigger a thread here or just call it directly since we are often 
+        # inside a thread already (to_thread from bot.py)
         flush_tick_buffer()
 
 
@@ -57,7 +59,7 @@ def flush_tick_buffer():
         _tick_buffer.clear()
         _last_flush = time.time()
 
-    # Write all ticks in one transaction (non-blocking — skip if pool is busy)
+    # Write all ticks in one transaction (using the new batch method in database.py)
     try:
         database.save_recordings_batch(batch)
         log.debug(f"Flushed {len(batch)} spot ticks to DB")
@@ -67,7 +69,7 @@ def flush_tick_buffer():
 
 
 def record_market_snapshot(markets: list):
-    """Saves a snapshot of all active markets with their current AMM prices to the DB."""
+    """Saves a snapshot of all active markets using the non-blocking DB path."""
     data = [
         {
             "market_id": m.get("market_id"),
@@ -81,10 +83,8 @@ def record_market_snapshot(markets: list):
         }
         for m in markets
     ]
-    try:
-        database.save_recording_nonblocking("market_snapshot", data)
-    except Exception as e:
-        log.warning(f"Market snapshot save failed (non-critical): {e}")
+    # Market snapshots are large — use the fire-and-forget path
+    database.save_recording_nonblocking("market_snapshot", data)
 
 
 log.info("Persistent Database Recorder initialized (batched mode)")
