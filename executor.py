@@ -6,6 +6,7 @@ import feeds
 import scanner
 import telegram_bot
 import strategy
+import comparative_analysis
 from config import ARB_MAX_SIZE_NGN, CURRENCY, MIN_PAYOUT_RATIO
 
 log = logging.getLogger("executor")
@@ -165,6 +166,9 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
             regime_at_entry=sig.regime_at_entry,
             edge_at_entry=sig.edge_at_entry,
             realized_vol_at_entry=sig.realized_vol_at_entry,
+            market_price_at_entry=sig.market_price,
+            slippage_ngn=((filled_price / sig.market_price) - 1.0) * amount if sig.market_price > 0 else 0,
+            poly_price_at_entry=await comparative_analysis.get_comparative_price(sig.asset, market.get("threshold", 0)) if market else None
         )
 
         risk.add_position(sig.market_id, {

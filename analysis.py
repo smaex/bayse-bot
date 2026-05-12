@@ -155,6 +155,27 @@ async def full_report(client: BayseClient, chat_id: str | None = None) -> str:
         "",
     ]
 
+    # ── Execution & Comparative Analysis ─────────────────────────────────────
+    if recent:
+        filled_trades = [t for t in recent if t.get("market_price_at_entry") is not None]
+        if filled_trades:
+            avg_slip = sum((t["entry_price"] - t["market_price_at_entry"]) / t["market_price_at_entry"] for t in filled_trades) / len(filled_trades)
+            avg_poly_diff = 0.0
+            poly_count = 0
+            for t in filled_trades:
+                if t.get("poly_price_at_entry"):
+                    # Edge: how much 'cheaper' our entry was than Poly (as a % of market price)
+                    avg_poly_diff += (t["poly_price_at_entry"] - t["market_price_at_entry"]) / t["market_price_at_entry"]
+                    poly_count += 1
+            
+            lines += [
+                "🔬 *Execution & Market Intel*",
+                f"   Avg Slippage: {avg_slip:+.2%}",
+            ]
+            if poly_count > 0:
+                lines.append(f"   Avg Edge vs Poly: {avg_poly_diff/poly_count:+.2%}")
+            lines.append("")
+
     # ── Recent trades ─────────────────────────────────────────────────────────
     if recent:
         lines.append("🕐 *Last 5 Trades*")

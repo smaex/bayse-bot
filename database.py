@@ -205,6 +205,9 @@ def init_db():
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS regime_at_entry REAL")
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS edge_at_entry REAL")
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS realized_vol_at_entry REAL")
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS market_price_at_entry REAL")
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS poly_price_at_entry REAL")
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS slippage_ngn REAL")
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_trades_user
                 ON trades(chat_id, created_at DESC)
@@ -276,8 +279,9 @@ def record_trade(chat_id: str, **kw) -> str:
            market_id, event_id, order_id, entry_price, amount_ngn, certainty,
            secs_to_close, spot_vs_threshold_pct,
            momentum_at_entry, regime_at_entry, edge_at_entry, realized_vol_at_entry,
+           market_price_at_entry, poly_price_at_entry, slippage_ngn,
            created_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
         trade_id, chat_id,
         kw.get("strategy"), kw.get("asset"), kw.get("timeframe"),
@@ -288,6 +292,7 @@ def record_trade(chat_id: str, **kw) -> str:
         kw.get("spot_vs_threshold_pct", 0.0),
         kw.get("momentum_at_entry", 0.0), kw.get("regime_at_entry", 0.0),
         kw.get("edge_at_entry", 0.0), kw.get("realized_vol_at_entry", 0.0),
+        kw.get("market_price_at_entry"), kw.get("poly_price_at_entry"), kw.get("slippage_ngn"),
         now,
     ))
     return trade_id
