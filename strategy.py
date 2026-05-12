@@ -128,6 +128,22 @@ class MarketState:
 
 global_state = MarketState()
 
+def _check_circuit_breaker(strategy_name: str, asset: str, state: MarketState = global_state) -> bool:
+    now = time.time()
+    # Check asset-specific halt
+    if now < _HALT_UNTIL.get(asset, 0):
+        return False
+    # Check global/macro halt (if any)
+    if now < _HALT_UNTIL.get("GLOBAL", 0):
+        return False
+    return True
+
+def _trigger_halt(asset: str, reason: str, duration_mins: int = 60):
+    until = time.time() + (duration_mins * 60)
+    _HALT_UNTIL[asset] = until
+    _HALT_REASON[asset] = reason
+    log.critical(f"CIRCUIT BREAKER: {asset} halted for {duration_mins}m. Reason: {reason}")
+
 async def load_memory(state: MarketState = global_state):
     """Load Kalman/GARCH states from DB to avoid 'blind' periods on restart."""
     try:
@@ -141,14 +157,6 @@ async def load_memory(state: MarketState = global_state):
         log.info(f"Loaded memory for {len(states)} assets.")
     except Exception as e:
         log.warning(f"Could not load quant memory: {e}")
-
-def _check_circuit_breaker(strategy: str, asset: str, state: MarketState = global_state) -> bool:
-    key = f"{strategy}_{asset}"
-    breaker = state.circuit_breakers.get(key)
-    if not breaker: return True
-    if time.time() < breaker.get("halt_until", 0):
-        return False
-    return True
 
 def record_failure(strategy: str, asset: str, state: MarketState = global_state):
     key = f"{strategy}_{asset}"
@@ -186,8 +194,9 @@ def check_systemic_risk(state: MarketState = global_state) -> Optional[str]:
             spike_assets.append(asset)
             
     if len(spike_assets) >= config.SYSTEMIC_RISK_COUNT_THRESHOLD:
-        state.systemic_halt_until = time.time() + (config.SYSTEMIC_RISK_HALT_MINS * 60)
-        return f"GLOBAL VOLATILITY SHOCK: Spikes in {', '.join(spike_assets)}"
+        reason = f"GLOBAL VOLATILITY SHOCK: Spikes in {', '.join(spike_assets)}"
+        _trigger_halt("GLOBAL", reason, config.SYSTEMIC_RISK_HALT_MINS)
+        return reason
         
     return None
 
@@ -271,11 +280,8 @@ def _update_garch(asset: str, price: float, state: MarketState = global_state) -
     if old_var > 0:
         acceleration = new_var / old_var
         if acceleration > config.VOL_SPIKE_THRESHOLD:
-            state.systemic_halt_until = time.time() + (config.SYSTEMIC_RISK_HALT_MINS * 60)
-            log.critical(
-                f"VOLATILITY SPIKE DETECTED on {asset} | "
-                f"accel={acceleration:.2f}x | HALTING ALL TRADING for {config.SYSTEMIC_RISK_HALT_MINS}m"
-            )
+            reason = f"Volatility Spike (accel={acceleration:.2f}x)"
+            _trigger_halt(asset, reason, config.SYSTEMIC_RISK_HALT_MINS)
 
     state.garch_state[asset] = {"var": new_var, "last_price": price}
 
@@ -326,6 +332,10 @@ def get_volatility_multiplier(asset: str, state: MarketState = global_state) -> 
     ratio = current_vol / base_vol
     # Dampen the ratio so we don't get wild swings in limit prices (cap at 0.5x to 2.5x)
     return min(max(ratio, 0.5), 2.5)
+
+# ── Circuit Breakers ──────────────────────────────────────────────────────────
+_HALT_UNTIL: dict[str, float] = {} # asset -> timestamp
+_HALT_REASON: dict[str, str] = {}
 
 # ── Quantitative helpers ──────────────────────────────────────────────────────
 

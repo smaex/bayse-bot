@@ -42,6 +42,14 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
     raw_pct = base_pct * mult * sig.certainty * fx_factor
 
+    # ── Conviction Booster (Idea B: Double Down) ──
+    # If certainty is extreme (>= 95%), we boost the size significantly (up to 5x)
+    # to win back faster on 'sure things'.
+    if sig.certainty >= 0.95:
+        conviction_mult = 5.0
+        raw_pct *= conviction_mult
+        log.info(f"[{chat_id}] 🔥 CONVICTION BOOSTER: Boosting size by {conviction_mult}x (Certainty {sig.certainty:.0%})")
+
     # ── Probationary Sizing ──
     if risk.is_on_probation():
         probation_mult = 0.25
@@ -80,7 +88,14 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
         log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — est. net payout {(est_net_payout - 1.0):.1%} < {MIN_PAYOUT_RATIO:.1%} minimum")
         return
 
-    max_allowed_price = (1.0 - fee_rate) / (1.0 + MIN_PAYOUT_RATIO)
+    # ── Dynamic Payout Hurdle (Idea A: Take the Penny) ──
+    # If certainty is high, we lower the profit bar.
+    current_min_payout = MIN_PAYOUT_RATIO
+    if sig.certainty >= 0.90:
+        current_min_payout = ABSOLUTE_MIN_PAYOUT_RATIO
+        log.debug(f"[{chat_id}] Hurdle lowered to {current_min_payout:.1%} due to high certainty.")
+
+    max_allowed_price = (1.0 - fee_rate) / (1.0 + current_min_payout)
     is_fx = sig.asset in _FX_ASSETS
     
     # ── Adaptive Slippage ──

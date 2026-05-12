@@ -233,6 +233,7 @@ DYNAMIC_KELLY_MAX             = 0.40  # ceiling for kelly sizing in ideal market
 # Minimum Net Payout: Ensure for every 100 spent, we get at least 108 back (8% net profit).
 # Lowered to capture highly certain setups before they are rejected by EV ceilings.
 MIN_PAYOUT_RATIO = 0.08
+ABSOLUTE_MIN_PAYOUT_RATIO = 0.02
 PROFIT_ALERT_NGN = 20_000      # Telegram alert when unrealized profit hits this
 
 # ── Rate Limiting (stay well under 20 write/sec, 30 read/sec) ─────────────────
