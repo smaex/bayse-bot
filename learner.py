@@ -49,8 +49,12 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
     changes, warnings = [], []
 
     by_strategy: dict[str, list] = {}
+    by_hour: dict[int, list] = {}
     for row in stats:
         by_strategy.setdefault(row["strategy"], []).append(row)
+        # Extract hour from a potential 'created_at' or 'resolved_at' if available in the row
+        # Since stats is aggregated, we need to make sure the underlying query returns hour
+        pass # Will update database.py next to support this aggregation
 
     for strat, rows in by_strategy.items():
         total    = sum(r["total"] for r in rows)
@@ -162,6 +166,18 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         f"Suspended: {list(suspended) or 'None'}",
     ]
 
+    # Add temporal analysis
+    temporal_stats = await asyncio.to_thread(database.get_hourly_stats, chat_id)
+    if temporal_stats:
+        lines.append("\n🕒 *Time-of-Day Performance (UTC)*")
+        # Sort by win rate to show the user their "Golden Hours"
+        sorted_hours = sorted(temporal_stats, key=lambda x: x["win_rate"], reverse=True)
+        for h in sorted_hours[:3]: # top 3 hours
+            lines.append(f"  🌟 {h['hour']:02d}:00 — {h['win_rate']:.0%} WR ({h['total']} trades)")
+        for h in sorted_hours[-3:]: # bottom 3 hours
+            if h["win_rate"] < 0.45 and h["total"] >= 5:
+                lines.append(f"  🚫 {h['hour']:02d}:00 — {h['win_rate']:.0%} WR (DANGER ZONE)")
+
     return learned, "\n".join(lines)
 
 
@@ -243,9 +259,11 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                     else:
                         strategy.record_failure(trade["strategy"], trade["asset"])
 
-                    # Free up position in risk manager so exposure cap doesn't block new trades
+                    # Update risk manager with the result
                     if user_risks and chat_id in user_risks:
-                        user_risks[chat_id].remove_position(trade["market_id"])
+                        risk_mgr = user_risks[chat_id]
+                        risk_mgr.add_pnl(pnl)
+                        risk_mgr.remove_position(trade["market_id"])
 
                     result = "WIN" if won else "LOSS"
                     log.info(

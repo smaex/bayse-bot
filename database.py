@@ -83,10 +83,9 @@ def _init_pool():
 @contextmanager
 def _cx():
     """
-    Trench-Hardened Connection Manager:
-    1. Checks out a connection from the pool.
-    2. Validates it with a 'SELECT 1' to ensure it hasn't been dropped by CockroachDB.
-    3. If dropped, it closes the dead handle and creates a fresh one.
+    Connection Manager — checks out from pool, validates, yields, returns.
+    Retry is minimal (3 attempts / 0.3s) to avoid blocking the thread pool.
+    The old 50-retry / 5-second loop was causing total system deadlock.
     """
     import time
     
@@ -94,13 +93,13 @@ def _cx():
         _init_pool()
     
     conn = None
-    for attempt in range(50):
+    for attempt in range(3):
         try:
             conn = _pool.getconn()
             break
         except psycopg2.pool.PoolError:
-            if attempt == 49:
-                log.error("Database connection pool exhausted after 50 retries (5 seconds).")
+            if attempt == 2:
+                log.error("Database connection pool exhausted (3 retries).")
                 raise
             time.sleep(0.1)
             
@@ -111,15 +110,14 @@ def _cx():
                 cur.execute("SELECT 1")
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
             log.warning("Detected dead DB connection. Reconnecting...")
-            _pool.putconn(conn, close=True) # Ensure dead conn is fully removed
+            _pool.putconn(conn, close=True)
             conn = _pool.getconn()
             
         yield conn
-        conn.commit() # Auto-commit successful transactions
+        conn.commit()
     except Exception as e:
         if conn:
-            conn.rollback() # Rollback on error
-        log.error(f"Database transaction error: {e}")
+            conn.rollback()
         raise
     finally:
         if conn:
@@ -367,6 +365,25 @@ def load_quant_states() -> dict[str, dict]:
     rows = _fetch_all("SELECT asset, state_json FROM quant_state")
     return {r["asset"]: json.loads(r["state_json"]) for r in rows}
 
+def get_hourly_stats(chat_id: str, days: int = 30) -> list[dict]:
+    """Returns win rates indexed by UTC hour for the last X days."""
+    query = """
+        SELECT 
+            EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC')::INTEGER as hour,
+            COUNT(*) as total,
+            SUM(CASE WHEN won = True THEN 1 ELSE 0 END)::FLOAT / COUNT(*) as win_rate
+        FROM trades
+        WHERE chat_id = %s 
+          AND resolved = True 
+          AND created_at > NOW() - INTERVAL '30 days'
+        GROUP BY hour
+        ORDER BY hour ASC
+    """
+    with _cx() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(query, (chat_id,))
+            return cur.fetchall()
+
 
 # ── Persistent Recordings ────────────────────────────────────────────────────
 
@@ -376,6 +393,48 @@ def save_recording(type: str, data: dict, asset: str = None):
         "INSERT INTO recordings (type, asset, data_json) VALUES (%s, %s, %s)",
         (type, asset, json.dumps(data))
     )
+
+
+def save_recording_nonblocking(type: str, data, asset: str = None):
+    """
+    Non-blocking save — silently drops the write if the connection pool is busy.
+    Used for expendable data (snapshots) that must never block critical operations.
+    """
+    try:
+        _execute(
+            "INSERT INTO recordings (type, asset, data_json) VALUES (%s, %s, %s)",
+            (type, asset, json.dumps(data))
+        )
+    except psycopg2.pool.PoolError:
+        pass  # Expendable — drop silently
+
+
+def save_recordings_batch(ticks: list[dict]):
+    """
+    Batch-insert spot ticks in a SINGLE connection checkout.
+    Receives a list of {"asset": ..., "price": ..., "time": ...} dicts.
+    This replaces the old per-tick INSERT that was exhausting the pool.
+    """
+    if not ticks:
+        return
+    try:
+        with _cx() as conn:
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    "INSERT INTO recordings (type, asset, data_json) VALUES %s",
+                    [
+                        ("spot_tick", t["asset"], json.dumps({"price": t["price"], "time": t["time"]}))
+                        for t in ticks
+                    ],
+                    page_size=100,
+                )
+        log.debug(f"Batch-inserted {len(ticks)} spot ticks")
+    except psycopg2.pool.PoolError:
+        log.debug("Tick batch skipped — pool busy (non-critical)")
+    except Exception as e:
+        log.warning(f"Tick batch failed: {e}")
+
 
 def get_recordings(type: str = None, limit: int = 1000) -> list[dict]:
     query = "SELECT * FROM recordings"

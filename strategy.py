@@ -66,6 +66,7 @@ from datetime import datetime, timezone
 from typing import Optional, Literal
 import config
 import feeds
+import feeds_direct
 import news as news_mod
 import database
 
@@ -306,6 +307,25 @@ def update_price_history(asset: str, price: float, state: MarketState = global_s
                 "history": list(state.price_history[asset])
             }
             asyncio.create_task(asyncio.to_thread(database.save_quant_state, asset, save_data))
+
+def get_volatility_multiplier(asset: str, state: MarketState = global_state) -> float:
+    """
+    Returns a multiplier based on current variance vs baseline.
+    1.0 = Normal Volatility
+    2.0 = High Volatility (doubles the allowed slippage)
+    0.5 = Low Volatility (halves the allowed slippage)
+    """
+    garch = state.garch_state.get(asset)
+    if not garch:
+        return 1.0
+    
+    current_vol = math.sqrt(garch["var"] * 720.0)
+    base_vol = config.ASSET_HOURLY_VOL.get(asset, 0.022)
+    
+    # Ratio of current vol to historical baseline
+    ratio = current_vol / base_vol
+    # Dampen the ratio so we don't get wild swings in limit prices (cap at 0.5x to 2.5x)
+    return min(max(ratio, 0.5), 2.5)
 
 # ── Quantitative helpers ──────────────────────────────────────────────────────
 
@@ -574,8 +594,17 @@ def snipe_signal(
         log.debug(f"{_u()}SNIPE [{asset} {tf}] REJECTED — {secs:.0f}s left (Gamma Guard)")
         return None
 
+    # ── Pin Risk Guard (Phase 3) ──
+    # If we are in the final 5 minutes and price is extremely close to threshold,
+    # the probability of a random 'pinning' tick is too high.
     threshold = market.get("threshold")
     live_spot  = spot_price if spot_price is not None else feeds.spot.get(asset)
+    
+    if threshold and live_spot:
+        dist_abs = abs(live_spot - threshold) / threshold
+        if secs < 300 and dist_abs < 0.0005: # 0.05% distance
+            log.info(f"{_u()}SNIPE [{asset} {tf}] VETOED — Pin Risk (distance {dist_abs:.4%} < 0.05% in final 5m)")
+            return None
     
     # ── Kalman Smoothing ──
     # Use the Kalman Filter's estimated price if available to strip out tick noise.
@@ -719,6 +748,18 @@ def snipe_signal(
             return None
     else:
         composite = min((base + mom_bonus + edge_bonus - penalty) * regime_factor, 0.99)
+
+    # ── Macro Bias Bonus (Phase 2) ──
+    biases = feeds_direct.get_macro_bias()
+    if "USD_SPIKE" in biases:
+        # If USD is spiking, 'NO' (Down) trades on Crypto/FX get a +0.10 bonus
+        if direction == "NO":
+            composite = min(composite + 0.10, 0.99)
+            log.info(f"{_u()}SNIPE [{asset} {tf}] Macro Alignment: USD Spike Bonus (+0.10)")
+        else:
+            # Opposite direction gets a penalty
+            composite = max(composite - 0.15, 0.0)
+            log.info(f"{_u()}SNIPE [{asset} {tf}] Macro Conflict: USD Spike Penalty (-0.15)")
 
     log.info(
         f"{_u()}SNIPE [{asset} {tf}] {secs:.0f}s | "
@@ -1285,3 +1326,32 @@ def evaluate(
 
     signals = _apply_convergence(signals)
     return sorted(signals, key=lambda s: s.certainty, reverse=True)
+
+
+def evaluate_global_v2(market: dict, spot_price: float = None, state: MarketState = global_state) -> dict[str, TradeSignal]:
+    """
+    Evaluates all strategies globally using BALANCED defaults.
+    Returns a dict of signals that passed VETOS (momentum/distance/etc.) but not necessarily thresholds.
+    """
+    results = {}
+    
+    # Balanced defaults for global evaluation
+    balanced_learned = {"mode": "balanced", "snipe_min_certainty": 0.0} # 0.0 so we get all signals
+    
+    if _check_circuit_breaker("SNIPE", market["asset"], state=state):
+        sig = snipe_signal(market, spot_price=spot_price, learned=balanced_learned, state=state)
+        if sig: results["SNIPE"] = sig
+
+    if _check_circuit_breaker("CORRELATE", market["asset"], state=state):
+        # Use a very low threshold for global capture
+        sig = correlate_signal(market, threshold=0.005, learned=balanced_learned, spot_price=spot_price, state=state)
+        if sig: results["CORRELATE"] = sig
+
+    # ARB and NEWS are already global-ish
+    sig_arb = arb_signal(market)
+    if sig_arb: results["ARB"] = sig_arb
+
+    sig_news = news_signal(market, sentiment_threshold=0.50, spot_price=spot_price)
+    if sig_news: results["NEWS"] = sig_news
+
+    return results

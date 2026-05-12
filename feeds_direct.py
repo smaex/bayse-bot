@@ -11,6 +11,7 @@ log = logging.getLogger("feeds_direct")
 
 # Ground Truth Storage: { Asset: {"price": float, "time": float} }
 direct_spot: dict[str, dict] = {}
+macro_bias: dict[str, dict] = {} # { "USD_SPIKE": {"active": bool, "strength": float, "expires": float} }
 startup_time: float = time.time()
 
 def is_warming_up(grace_period=60) -> bool:
@@ -90,6 +91,17 @@ def check_lag(asset: str, relay_price: float) -> dict:
         "diff_pct": price_diff_pct, 
         "lag_sec": time_diff
     }
+
+def get_macro_bias() -> dict:
+    """Returns currently active macro biases (e.g. USD spike, Gold crash)."""
+    now = time.time()
+    active = {}
+    for key, data in list(macro_bias.items()):
+        if data["expires"] > now:
+            active[key] = data
+        else:
+            macro_bias.pop(key, None)
+    return active
 
 # ── Oracle 1: Binance (Crypto) ────────────────────────────────────────────────
 
@@ -209,7 +221,20 @@ async def tiingo_fx_feed():
                             mid_price = data[5]
                             asset = _FX_SYMBOLS.get(ticker)
                             if asset:
+                                old_data = direct_spot.get(asset)
                                 direct_spot[asset] = {"price": float(mid_price), "time": time.time()}
+                                
+                                # ── Macro Lead Detection ──
+                                if old_data and asset == "EURUSD":
+                                    move = (float(mid_price) - old_data["price"]) / old_data["price"]
+                                    # If EURUSD drops >0.1% in a single tick stream update, it's a USD spike
+                                    if move < -0.0010:
+                                        macro_bias["USD_SPIKE"] = {
+                                            "active": True,
+                                            "strength": abs(move),
+                                            "expires": time.time() + 300 # valid for 5 min
+                                        }
+                                        log.info(f"🚨 MACRO BIAS: USD Spike detected (EURUSD {move:+.3%})")
                                 
         except Exception as e:
             log.error(f"Tiingo FX error: {e}")

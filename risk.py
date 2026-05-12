@@ -16,6 +16,9 @@ class RiskManager:
         self.paused: bool = False
         self.current_free_cash: float = 0.0
         self.open_positions: dict[str, dict] = {}  # market_id → position
+        self.daily_realized_pnl: float = 0.0
+        self.last_reset_date: str = ""
+        self.probation_trades_left: int = 0
 
     @property
     def target_hit(self) -> bool:
@@ -30,6 +33,15 @@ class RiskManager:
     def update_peak(self, balance: float):
         if balance > self.peak_balance:
             self.peak_balance = balance
+
+    def reset_daily_if_needed(self):
+        """Reset daily PnL tracker at midnight UTC."""
+        import datetime
+        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        if self.last_reset_date != today:
+            log.info(f"Daily risk reset: profit was ₦{self.daily_realized_pnl:,.0f}")
+            self.daily_realized_pnl = 0.0
+            self.last_reset_date = today
 
     def update_balance(self, balance: float):
         """Unified update for peak tracking and drawdown checks."""
@@ -65,6 +77,31 @@ class RiskManager:
             )
             return False
         return True
+
+    def is_in_strict_mode(self) -> bool:
+        """
+        Returns True if we have hit 80% of our daily target.
+        In strict mode, we only take 'God Tier' signals.
+        """
+        self.reset_daily_if_needed()
+        if self.daily_target > 0:
+            if self.daily_realized_pnl >= self.daily_target * 0.8:
+                return True
+        return False
+
+    def is_on_probation(self) -> bool:
+        return self.probation_trades_left > 0
+
+    def add_pnl(self, pnl: float):
+        self.daily_realized_pnl += pnl
+        if pnl < 0:
+            # Entering probation after a loss: next 2 trades are at 25% size
+            self.probation_trades_left = 2
+            log.warning(f"Risk Manager: Entering PROBATION for next 2 trades after loss of ₦{abs(pnl):,.0f}")
+        elif pnl > 0 and self.probation_trades_left > 0:
+            self.probation_trades_left -= 1
+            if self.probation_trades_left == 0:
+                log.info("Risk Manager: Probation cleared! Returning to full position sizes.")
 
     def add_position(self, market_id: str, pos: dict):
         self.open_positions[market_id] = pos

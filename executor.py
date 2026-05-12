@@ -5,6 +5,7 @@ import database
 import feeds
 import scanner
 import telegram_bot
+import strategy
 from config import ARB_MAX_SIZE_NGN, CURRENCY, MIN_PAYOUT_RATIO
 
 log = logging.getLogger("executor")
@@ -31,8 +32,21 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     learned  = settings.get("learned", {})
     mult     = learned.get("size_multipliers", {}).get(sig.strategy, 1.0)
 
+    # ── Trailing Profit Shield (Strict Mode) ──
+    if risk.is_in_strict_mode():
+        # Once 80% of daily target is reached, only take 'God Tier' signals (>= 0.70)
+        if sig.certainty < 0.70:
+            log.info(f"[{chat_id}] SKIPPED — Strict Mode active (Gain Shield), certainty {sig.certainty:.2f} < 0.70")
+            return
+
     fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
     raw_pct = base_pct * mult * sig.certainty * fx_factor
+
+    # ── Probationary Sizing ──
+    if risk.is_on_probation():
+        probation_mult = 0.25
+        raw_pct *= probation_mult
+        log.info(f"[{chat_id}] PROBATION ACTIVE: Slashing size by {1-probation_mult:.0%}")
 
     # ── Micro-Account Handling (For ₦2,000 starts) ─────────────────────────
     if equity < 3000:
@@ -68,27 +82,58 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
 
     max_allowed_price = (1.0 - fee_rate) / (1.0 + MIN_PAYOUT_RATIO)
     is_fx = sig.asset in _FX_ASSETS
-    # Slippage tolerance: Safe=0.2%, Balanced=0.5%, Aggressive=1%, Full Send=2.5%
+    
+    # ── Adaptive Slippage ──
+    # 1. Base slippage by mode
     slip_map = {"safe": 0.002, "balanced": 0.005, "aggressive": 0.01, "full_send": 0.025}
-    slip_mult = 1.0 + slip_map.get(mode, 0.005)
-    limit_price = min(sig.market_price * slip_mult, max_allowed_price) 
+    base_slip = slip_map.get(mode, 0.005)
+    # 2. Volatility multiplier from strategy.py (GARCH-derived)
+    vol_mult = strategy.get_volatility_multiplier(sig.asset)
+    adaptive_slip = base_slip * vol_mult
+    
+    limit_price = min(sig.market_price * (1.0 + adaptive_slip), max_allowed_price) 
+
+    # ── Engine Detection ──
+    market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
+    engine = market.get("engine", "AMM") if market else "AMM"
 
     log.info(
-        f"[{chat_id}] PLACING {sig.strategy} | {sig.asset} {sig.timeframe} {sig.outcome} "
-        f"@ {sig.market_price:.3f} certainty={sig.certainty:.0%} ₦{amount:,.0f}"
+        f"[{chat_id}] PLACING {sig.strategy} | {sig.asset} ({engine}) "
+        f"price={sig.market_price:.3f} limit={limit_price:.3f} slip={adaptive_slip:.2%} "
+        f"certainty={sig.certainty:.0%} ₦{amount:,.0f}"
     )
 
     try:
+        # First Attempt
         resp = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=sig.outcome_id, side="BUY", amount=amount,
             order_type="LIMIT", price=limit_price, currency=CURRENCY,
         )
         order = resp.get("order", resp)
+        shares_filled = float(order.get("shares", order.get("quantity", 0)) or 0)
+        
+        # ── Order Chaser (CLOB only) ──
+        # If CLOB and zero fill, try one more time at a slightly more aggressive price (if still profitable)
+        if engine == "CLOB" and shares_filled <= 0:
+            chase_price = min(limit_price * 1.002, max_allowed_price)
+            if chase_price > limit_price:
+                log.info(f"[{chat_id}] CLOB CHASE: First order missed. Retrying at {chase_price:.3f}")
+                resp = await client.place_order(
+                    event_id=sig.event_id, market_id=sig.market_id,
+                    outcome_id=sig.outcome_id, side="BUY", amount=amount,
+                    order_type="LIMIT", price=chase_price, currency=CURRENCY,
+                )
+                order = resp.get("order", resp)
+                shares_filled = float(order.get("shares", order.get("quantity", 0)) or 0)
+
+        if shares_filled <= 0:
+            log.info(f"[{chat_id}] {sig.asset} order not filled (price moved away)")
+            return
+
         filled_price = float(order.get("price", limit_price) or limit_price)
         bayse_order_id = order.get("id") or order.get("orderId") or order.get("order_id")
 
-        market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
         spot_vs_thresh = 0.0
         if market and market.get("threshold") and feeds.spot.get(sig.asset):
             spot_vs_thresh = (feeds.spot[sig.asset] - market["threshold"]) / market["threshold"]

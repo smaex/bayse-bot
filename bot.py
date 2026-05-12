@@ -58,6 +58,7 @@ _tg_app        = None
 _last_spot:        dict[str, float] = {}
 _last_market_eval: dict[str, float] = {}
 _last_lag_log:     dict[str, float] = {}  # throttle lag warnings to once per minute
+global_signals:    dict[str, dict]  = {}  # {market_id: {strat: TradeSignal}}
 
 # Minimum change to be considered a deposit/withdrawal (not just trade P&L noise)
 _BALANCE_EVENT_MIN_NGN = 200
@@ -426,22 +427,24 @@ async def _evaluate_markets(
             if market["timeframe"] not in user_tfs:
                 continue
 
-            ws = feeds.market_prices.get(market["market_id"])
-            if ws:
-                market["yes_price"] = ws["yes"]
-                market["no_price"]  = ws["no"]
+            # ── Lookup Global Pre-Calculated Signal ──
+            signals_map = global_signals.get(market["market_id"], {})
+            for strat, sig in signals_map.items():
+                if strat not in active_strats:
+                    continue
+                
+                # Apply user-specific conviction hurdles (Safe, Balanced, Aggressive)
+                mode = learned.get("mode", "balanced")
+                min_cert = {"safe": 0.65, "balanced": 0.55, "aggressive": 0.45, "full_send": 0.35}.get(mode, 0.55)
+                
+                # Apply user's ML learned threshold override
+                learned_min = learned.get("snipe_min_certainty")
+                if learned_min:
+                    min_cert = max(min_cert - 0.05, min(learned_min, min_cert + 0.15))
+                
+                if sig.certainty < min_cert:
+                    continue
 
-            # Ground Truth Override: feeds_direct already updated strategy history
-            spot_p = feeds.spot.get(market["asset"], 0)
-            
-            signals = strategy.evaluate(
-                market, 
-                strategies=active_strats, 
-                learned=learned, 
-                spot_price=spot_p, 
-                penalty=penalty
-            )
-            for sig in signals:
                 if sig.strategy == "ARB":
                     await executor.execute_arb(chat_id, sig, client, equity, free_cash, settings)
                 elif not risk.already_in(sig.market_id):
@@ -474,7 +477,7 @@ async def _scan_loop():
             log.info(f"Rescanned: {len(active_markets)} markets")
             feeds.restart_bayse_feed(active_markets, _on_market_update)
             
-            # Record the new market snapshot for backtesting (async)
+            # Record the new market snapshot for backtesting (non-blocking)
             asyncio.create_task(asyncio.to_thread(recorder.record_market_snapshot, active_markets))
         except Exception as e:
             log.warning(f"Scan failed: {e}")
@@ -510,9 +513,9 @@ def _on_spot_price(asset: str, price: float):
             _last_lag_log[asset] = now
             log.info(f"🟡 {asset} {reason} — applying 0.1% safety spread.")
 
-    # Always use the most recent history/recording (async to avoid blocking)
+    # Always use the most recent history/recording
     strategy.update_price_history(asset, best_price)
-    asyncio.create_task(asyncio.to_thread(recorder.record_spot_tick, asset, best_price))
+    recorder.record_spot_tick(asset, best_price)  # In-memory buffer, no DB hit
     log.debug(f"Spot {asset}: {best_price:,.4f}")
     
     last = _last_spot.get(asset)
@@ -528,10 +531,23 @@ def _on_spot_price(asset: str, price: float):
 
 async def _evaluate_all_users_for_spot(asset: str, change: float, threshold: float, penalty: float = 0.0):
     now = time.time()
-    if now - _last_market_eval.get(asset, 0) < 5:
+    if now - _last_market_eval.get(asset, 0) < 3: # allow slightly more frequent evals
         return
     _last_market_eval[asset] = now
     
+    # ── Global Evaluation ──
+    # Evaluate all open markets for this asset ONCE for all users
+    spot_p = feeds.spot.get(asset, 0)
+    for market in active_markets:
+        if market.get("status") == "open" and market["asset"] == asset:
+            ws = feeds.market_prices.get(market["market_id"])
+            if ws:
+                market["yes_price"] = ws["yes"]
+                market["no_price"]  = ws["no"]
+            
+            global_signals[market["market_id"]] = strategy.evaluate_global_v2(market, spot_price=spot_p)
+
+    # ── Local Dispatch ──
     users = await asyncio.to_thread(database.get_all_active)
     for user in users:
         asyncio.create_task(_evaluate_single_user(user, asset, penalty=penalty))
