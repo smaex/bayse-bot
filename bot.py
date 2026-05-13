@@ -28,6 +28,7 @@ import server
 import recorder
 import config
 import feeds_direct
+import comparative_analysis
 from risk import RiskManager
 from client import BayseClient
 from config import (
@@ -198,6 +199,7 @@ async def _user_loop(chat_id: str):
             break
         client = _get_client(user)
         risk   = _get_risk(chat_id)
+        settings = user.get("settings", {})
 
         try:
             free_cash = await client.get_balance_ngn()
@@ -370,7 +372,6 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
         
     settings = user.get("settings", {})
     risk.mode = settings.get("mode", "balanced")
-    log.info(f"[{chat_id}] Evaluating in {risk.mode} mode")
     
     if settings.get("paused"):
         return
@@ -433,9 +434,16 @@ async def _evaluate_markets(
                 if strat not in active_strats:
                     continue
                 
+                # ── Self-Correction: Check if this specific combo is suspended ──
+                suspended_combos = set(learned.get("suspended_combos", []))
+                combo_key = f"{strat}:{market['asset']}:{market['timeframe']}"
+                if combo_key in suspended_combos:
+                    log.debug(f"[{chat_id}] SELF-CORRECT: Skipping {combo_key} (suspended)")
+                    continue
+                
                 # Apply user-specific conviction hurdles (Safe, Balanced, Aggressive)
                 mode = learned.get("mode", "balanced")
-                min_cert = {"safe": 0.65, "balanced": 0.55, "aggressive": 0.45, "full_send": 0.35}.get(mode, 0.55)
+                min_cert = {"safe": 0.65, "balanced": 0.45, "aggressive": 0.45, "full_send": 0.35}.get(mode, 0.45)
                 
                 # Apply user's ML learned threshold override
                 learned_min = learned.get("snipe_min_certainty")
@@ -444,6 +452,7 @@ async def _evaluate_markets(
                 
                 if sig.certainty < min_cert:
                     continue
+
 
                 if sig.strategy == "ARB":
                     await executor.execute_arb(chat_id, sig, client, equity, free_cash, settings)
@@ -637,6 +646,7 @@ async def main():
     asyncio.create_task(learner.daily_learning_loop(_tg_app))
     asyncio.create_task(_scan_loop())
     asyncio.create_task(_update_dashboard_stats())
+    asyncio.create_task(_polymarket_polling_loop())
 
     # Reconnect all existing users and notify them
     existing_users = await asyncio.to_thread(database.get_all_active)
@@ -719,6 +729,16 @@ async def _update_dashboard_stats():
             log.error(f"Dashboard update failed: {e}")
             
         await asyncio.sleep(30)
+
+async def _polymarket_polling_loop():
+    """Background task to poll Polymarket every 5 minutes."""
+    while True:
+        try:
+            await comparative_analysis.update_cache()
+            await asyncio.sleep(300) # 5 minutes
+        except Exception as e:
+            log.error(f"Polymarket Polling error: {e}")
+            await asyncio.sleep(60)
 
 
 if __name__ == "__main__":

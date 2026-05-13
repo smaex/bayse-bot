@@ -297,6 +297,25 @@ def record_trade(chat_id: str, **kw) -> str:
     ))
     return trade_id
 
+def get_avg_slippage(asset: str, strategy: str, limit: int = 5) -> float:
+    """Returns the average slippage percentage for the last N trades."""
+    with _cx() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT slippage_ngn, amount_ngn FROM trades
+                WHERE asset = %s AND strategy = %s AND slippage_ngn IS NOT NULL
+                ORDER BY created_at DESC LIMIT %s
+            """, (asset, strategy, limit))
+            rows = cur.fetchall()
+            if not rows:
+                return 0.0
+            
+            total_slip_pct = 0.0
+            for slip_ngn, amount in rows:
+                if amount > 0:
+                    total_slip_pct += (slip_ngn / amount)
+            return total_slip_pct / len(rows)
+
 def resolve_trade(trade_id: str, won: bool, pnl_ngn: float):
     now = datetime.now(timezone.utc).isoformat()
     _execute(
@@ -357,6 +376,37 @@ def recent_trades(chat_id: str, limit: int = 10) -> list[dict]:
         SELECT * FROM trades WHERE chat_id=%s
         ORDER BY created_at DESC LIMIT %s
     """, (chat_id, limit))
+
+def get_combo_stats(chat_id: str, days: int = 14) -> list[dict]:
+    """
+    Returns granular win rates for each (strategy, asset, timeframe) combo.
+    Used by the Self-Correction Engine to identify and deactivate
+    specific losing patterns (e.g. 'SNIPE on SOL 5min' losing 80% of the time).
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    rows = _fetch_all("""
+        SELECT strategy, asset, timeframe,
+               COUNT(*)       AS total,
+               SUM(won)       AS wins,
+               SUM(pnl_ngn)   AS total_pnl
+        FROM trades
+        WHERE chat_id=%s AND won IS NOT NULL AND created_at > %s
+        GROUP BY strategy, asset, timeframe
+        HAVING COUNT(*) >= 3
+        ORDER BY SUM(pnl_ngn) ASC
+    """, (chat_id, cutoff))
+    for r in rows:
+        r["win_rate"] = (r["wins"] or 0) / r["total"] if r["total"] else 0.0
+    return rows
+
+def get_recent_streak(chat_id: str, strategy: str, asset: str, timeframe: str, limit: int = 5) -> list[bool]:
+    """Returns the last N trade outcomes for a specific combo (True=win, False=loss)."""
+    rows = _fetch_all("""
+        SELECT won FROM trades
+        WHERE chat_id=%s AND strategy=%s AND asset=%s AND timeframe=%s AND won IS NOT NULL
+        ORDER BY created_at DESC LIMIT %s
+    """, (chat_id, strategy, asset, timeframe, limit))
+    return [bool(r["won"]) for r in rows]
 
 # ── Quant State Persistence ──────────────────────────────────────────────────
 

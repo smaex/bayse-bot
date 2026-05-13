@@ -141,8 +141,8 @@ ASSET_HOURLY_VOL = {
 }
 
 # ── Tiered Certainty (Adaptive Frequency) ───────────────────────────────────
-SNIPE_MIN_CERTAINTY        = 0.55   # global default
-SNIPE_MIN_CERTAINTY_CRYPTO = 0.55   # high conviction for volatile crypto
+SNIPE_MIN_CERTAINTY        = 0.45   # global default (Lowered for Conviction Sizing)
+SNIPE_MIN_CERTAINTY_CRYPTO = 0.45   # allow more crypto signals for tiered sizing
 SNIPE_MIN_CERTAINTY_FX     = 0.45   # allow higher frequency for stable FX
 
 # ── FX-specific trading rules ─────────────────────────────────────────────────
@@ -216,7 +216,7 @@ MAX_DRAWDOWN_STOP = 0.15       # pause all trading at 15% drawdown (was 20%)
 
 # ── Infra Guard (Data Staleness & Mispricing) ──────────────────────────────────
 # Prevents trading on stale or mispriced relay feeds by comparing to Ground Truth.
-INFRA_STALE_LAG_SEC    = 90.0   # > 90s lag = Hard Block (was 45s)
+INFRA_STALE_LAG_SEC    = 180.0  # > 180s lag = Hard Block (relaxed for FX feeds)
 INFRA_DEGRADED_LAG_SEC = 30.0   # > 30s lag = 0.1% Safety Spread (was 15s)
 INFRA_STALE_DIFF_PCT   = 0.0020 # > 0.2% price diff = Hard Block
 INFRA_DEGRADED_DIFF_PCT = 0.0008 # > 0.08% price diff = 0.1% Safety Spread
@@ -225,7 +225,7 @@ INFRA_DEGRADED_DIFF_PCT = 0.0008 # > 0.08% price diff = 0.1% Safety Spread
 # Halt all new entries for 60 minutes to let the market settle.
 SYSTEMIC_RISK_COUNT_THRESHOLD = 3
 SYSTEMIC_RISK_VOL_MULT        = 1.5
-SYSTEMIC_RISK_HALT_MINS       = 60
+SYSTEMIC_RISK_HALT_MINS       = 30
 VOL_SPIKE_THRESHOLD           = 3.0   # trigger halt if variance acceleration > 3.0
 DYNAMIC_KELLY_MIN             = 0.05  # floor for kelly sizing in stressed markets
 DYNAMIC_KELLY_MAX             = 0.40  # ceiling for kelly sizing in ideal markets

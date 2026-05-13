@@ -35,7 +35,14 @@ def get_learned_overrides(chat_id: str) -> dict:
 
 
 async def run_learning(chat_id: str) -> tuple[dict, str]:
-    """Analyse 30-day trades for one user, save updated learned params, return report."""
+    """
+    Analyse 30-day trades for one user, save updated learned params, return report.
+    
+    v2: Self-Correction Engine
+    - Detects losing (strategy, asset, timeframe) combos and suspends them
+    - Detects losing streaks (3+ consecutive losses) and applies cooldowns
+    - Auto-reactivates combos when performance recovers
+    """
     user = await asyncio.to_thread(database.get_user, chat_id)
     if not user:
         return DEFAULT_LEARNED.copy(), "User not found."
@@ -44,17 +51,17 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
     learned = {**DEFAULT_LEARNED, **s.get("learned", {})}
     mults   = dict(learned.get("size_multipliers", {k: 1.0 for k in ["SNIPE", "CORRELATE", "ARB", "NEWS"]}))
     suspended = set(learned.get("suspended_strategies", []))
+    
+    # Self-Correction Engine: suspended combos (granular)
+    # Format: ["SNIPE:SOL:5min", "NEWS:ETH:1h", ...]
+    suspended_combos = set(learned.get("suspended_combos", []))
 
     stats = await asyncio.to_thread(database.recent_stats, chat_id, days=30)
     changes, warnings = [], []
 
     by_strategy: dict[str, list] = {}
-    by_hour: dict[int, list] = {}
     for row in stats:
         by_strategy.setdefault(row["strategy"], []).append(row)
-        # Extract hour from a potential 'created_at' or 'resolved_at' if available in the row
-        # Since stats is aggregated, we need to make sure the underlying query returns hour
-        pass # Will update database.py next to support this aggregation
 
     for strat, rows in by_strategy.items():
         total    = sum(r["total"] for r in rows)
@@ -65,8 +72,6 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
             continue
 
         # Suspend / reactivate — strategy-specific thresholds
-        # SNIPE needs ~87% WR to break even with 15% profit floor.
-        # CORRELATE/NEWS need ~57% WR with their 0.55 price ceiling.
         wr_suspend = 0.85 if strat == "SNIPE" else 0.55
         wr_recover = 0.90 if strat == "SNIPE" else 0.65
 
@@ -81,15 +86,14 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         # Size multiplier (range 0.25×–2.0×)
         m = mults.get(strat, 1.0)
         if win_rate is not None:
-            if win_rate >= 0.75:   m = min(3.0, m + 0.25)  # Aggressive: ride hot streaks 3x harder
+            if win_rate >= 0.75:   m = min(3.0, m + 0.25)
             elif win_rate >= 0.60: m = min(1.5, m + 0.10)
-            elif win_rate < 0.55:  m = max(0.10, m - 0.25) # Cut losers instantly down to 10% size
+            elif win_rate < 0.55:  m = max(0.10, m - 0.25)
         mults[strat] = round(m, 2)
 
         # Strategy-specific threshold tuning
         if strat == "SNIPE" and win_rate is not None:
             cur = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
-            # Be much more aggressive in raising certainty if WR is below break-even (87%)
             if win_rate < 0.88:
                 new = min(round(cur + 0.05, 2), 0.98)
                 learned["snipe_min_certainty"] = new
@@ -125,8 +129,66 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
                 learned["news_sentiment_threshold"] = new
                 changes.append(f"📰 NEWS threshold lowered {cur} → {new}")
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # SELF-CORRECTION ENGINE (Granular Combo Analysis)
+    # Examines each (strategy, asset, timeframe) independently.
+    # A losing combo gets suspended WITHOUT affecting the same strategy on
+    # other assets/timeframes.
+    # ══════════════════════════════════════════════════════════════════════════
+    combo_stats = await asyncio.to_thread(database.get_combo_stats, chat_id, days=14)
+    
+    for combo in combo_stats:
+        key = f"{combo['strategy']}:{combo['asset']}:{combo['timeframe']}"
+        wr = combo["win_rate"]
+        total = combo["total"]
+        pnl = combo.get("total_pnl") or 0
+        
+        # Rule 1: Suspend combos with negative PnL AND win rate below 45% (min 5 trades)
+        if total >= 5 and wr < 0.45 and pnl < 0:
+            if key not in suspended_combos:
+                suspended_combos.add(key)
+                warnings.append(
+                    f"🔴 SELF-CORRECT: {key} suspended — "
+                    f"WR {wr:.0%} ({total} trades, ₦{pnl:+,.0f})"
+                )
+        
+        # Rule 2: Reactivate if performance has recovered (WR > 60%)
+        elif key in suspended_combos and wr >= 0.60:
+            suspended_combos.discard(key)
+            changes.append(
+                f"🟢 SELF-CORRECT: {key} reactivated — "
+                f"WR {wr:.0%} recovered"
+            )
+    
+    # Rule 3: Losing streak detection (3+ consecutive losses on same combo)
+    for combo in combo_stats:
+        key = f"{combo['strategy']}:{combo['asset']}:{combo['timeframe']}"
+        if key in suspended_combos:
+            continue  # already suspended
+        
+        streak = await asyncio.to_thread(
+            database.get_recent_streak, chat_id,
+            combo["strategy"], combo["asset"], combo["timeframe"], 5
+        )
+        
+        # Count consecutive losses from the most recent trade
+        consec_losses = 0
+        for won in streak:
+            if not won:
+                consec_losses += 1
+            else:
+                break
+        
+        if consec_losses >= 3:
+            suspended_combos.add(key)
+            warnings.append(
+                f"🔥 STREAK HALT: {key} — {consec_losses} consecutive losses! "
+                f"Auto-suspended until next learning cycle."
+            )
+
     learned["size_multipliers"]     = mults
     learned["suspended_strategies"] = list(suspended)
+    learned["suspended_combos"]     = list(suspended_combos)
 
     # Save learned params back into settings
     s["learned"] = learned
@@ -159,26 +221,34 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
     if not changes and not warnings and stats:
         lines.append("\n✅ All strategies performing well — no changes needed.")
 
-    active = [s for s in ["SNIPE", "CORRELATE", "ARB", "NEWS"] if s not in suspended]
+    active = [s for s in ["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE"] if s not in suspended]
     lines += [
         "",
-        f"Active: {active}",
-        f"Suspended: {list(suspended) or 'None'}",
+        f"Active Strategies: {active}",
+        f"Suspended Strategies: {list(suspended) or 'None'}",
     ]
-
+    
+    if suspended_combos:
+        lines += [
+            "",
+            "🔒 *Suspended Combos (Self-Correction)*",
+        ]
+        for combo_key in sorted(suspended_combos):
+            lines.append(f"  ❌ {combo_key}")
+    
     # Add temporal analysis
     temporal_stats = await asyncio.to_thread(database.get_hourly_stats, chat_id)
     if temporal_stats:
         lines.append("\n🕒 *Time-of-Day Performance (UTC)*")
-        # Sort by win rate to show the user their "Golden Hours"
         sorted_hours = sorted(temporal_stats, key=lambda x: x["win_rate"], reverse=True)
-        for h in sorted_hours[:3]: # top 3 hours
+        for h in sorted_hours[:3]:
             lines.append(f"  🌟 {h['hour']:02d}:00 — {h['win_rate']:.0%} WR ({h['total']} trades)")
-        for h in sorted_hours[-3:]: # bottom 3 hours
+        for h in sorted_hours[-3:]:
             if h["win_rate"] < 0.45 and h["total"] >= 5:
                 lines.append(f"  🚫 {h['hour']:02d}:00 — {h['win_rate']:.0%} WR (DANGER ZONE)")
 
     return learned, "\n".join(lines)
+
 
 
 _YES_OUTCOMES = {"yes", "up", "outcome1", "1"}

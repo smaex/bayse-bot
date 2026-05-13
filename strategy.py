@@ -1328,6 +1328,10 @@ def evaluate(
         if "NEWS" in strategies:
             sig = news_signal(market, sentiment_threshold=news_thresh, spot_price=spot_price)
             if sig: signals.append(sig)
+
+        if "POLY_EDGE" in strategies:
+            sig = poly_edge_signal(market, learned=learned, state=state)
+            if sig: signals.append(sig)
     except Exception as e:
         log.error(f"Strategy error on {market.get('market_id')}: {e}", exc_info=True)
 
@@ -1336,6 +1340,90 @@ def evaluate(
 
     signals = _apply_convergence(signals)
     return sorted(signals, key=lambda s: s.certainty, reverse=True)
+
+
+# ── Strategy 5: POLY_EDGE — Lead-Lag Sniper ──────────────────────────────────
+
+def poly_edge_signal(
+    market: dict, 
+    learned: dict, 
+    state: MarketState = global_state
+) -> Optional[TradeSignal]:
+    """
+    Sniper strategy that trades pure price discrepancies.
+    Fires when Bayse is significantly mispriced compared to Polymarket global odds.
+    
+    v2: Uses Order Book Depth to verify the edge is backed by real liquidity.
+    """
+    asset = market["asset"]
+    import comparative_analysis
+    
+    # Check edge quality (depth-aware)
+    quality = comparative_analysis.get_edge_quality(asset)
+    
+    if not quality.get("price"):
+        return None
+    
+    # Ghost detection: reject if the price isn't backed by real liquidity
+    if not quality["is_real"]:
+        log.debug(f"POLY_EDGE [{asset}] REJECTED — {quality['reason']}")
+        return None
+        
+    poly_p = quality["price"]  # Use depth-adjusted price, not naive mid-price
+    yes_p  = market["yes_price"]
+    no_p   = market["no_price"]
+    
+    # Edge calculation: (Global Probability - Local Price)
+    yes_edge = poly_p - yes_p
+    no_edge  = (1.0 - poly_p) - no_p
+    
+    edge = 0.0
+    outcome = ""
+    outcome_id = ""
+    market_price = 0.0
+    
+    # We need a massive edge to justify a "blind" sniper trade (15% gap)
+    THRESHOLD = 0.15
+    
+    if yes_edge > THRESHOLD:
+        edge = yes_edge
+        outcome, outcome_id, market_price = "YES", market["yes_id"], yes_p
+    elif no_edge > THRESHOLD:
+        edge = no_edge
+        outcome, outcome_id, market_price = "NO", market["no_id"], no_p
+        
+    if not outcome:
+        return None
+
+    # Sizing: scale with edge magnitude AND depth confidence
+    size_pct = min(edge * 0.25, 0.05)
+    
+    # If depth is available but modest ($50-$200), reduce size
+    depth = quality.get("depth_usd", 0)
+    if 0 < depth < 200:
+        size_pct *= 0.5
+    
+    log.info(
+        f"🎯 [POLY_EDGE] {asset} mispricing detected! "
+        f"Poly: {poly_p:.2f} | Bayse: {market_price:.2f} | Edge: {edge:+.1%} | "
+        f"{quality['reason']}"
+    )
+    
+    return TradeSignal(
+        strategy="POLY_EDGE",
+        event_id=market["event_id"],
+        market_id=market["market_id"],
+        asset=asset,
+        timeframe=market["timeframe"],
+        outcome=outcome,
+        outcome_id=outcome_id,
+        certainty=0.90,
+        market_price=market_price,
+        size_pct=size_pct,
+        reason=f"Polymarket Discrepancy ({edge:+.1%} edge) [{quality['reason']}]",
+        edge_at_entry=edge
+    )
+
 
 
 def evaluate_global_v2(market: dict, spot_price: float = None, state: MarketState = global_state) -> dict[str, TradeSignal]:
@@ -1363,5 +1451,8 @@ def evaluate_global_v2(market: dict, spot_price: float = None, state: MarketStat
 
     sig_news = news_signal(market, sentiment_threshold=0.50, spot_price=spot_price)
     if sig_news: results["NEWS"] = sig_news
+
+    sig_poly = poly_edge_signal(market, learned=balanced_learned, state=state)
+    if sig_poly: results["POLY_EDGE"] = sig_poly
 
     return results

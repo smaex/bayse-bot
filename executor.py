@@ -24,9 +24,6 @@ def init_executor(markets, tg_app):
 async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash):
     """decide and execute a single-sided trade"""
     mode = settings.get("mode", "balanced")
-    # Base risk per mode: Safe=0.5%, Balanced=1.5%, Aggressive=5%, Full Send=8%
-    mode_risk = {"safe": 0.005, "balanced": 0.015, "aggressive": 0.05, "full_send": 0.08}
-    base_pct = mode_risk.get(mode, 0.015)
     min_t    = settings.get("mintrade", 100)
     max_t    = settings.get("maxtrade", 500_000)
     max_exp  = settings.get("maxexposure", 30.0) / 100.0
@@ -40,16 +37,27 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
             log.info(f"[{chat_id}] SKIPPED — Strict Mode active (Gain Shield), certainty {sig.certainty:.2f} < 0.70")
             return
 
-    fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
-    raw_pct = base_pct * mult * sig.certainty * fx_factor
+    # ── Conviction Sizing (Tiered Risk) ──────────────────────────────────────
+    # Scales risk based on certainty: 1% (Low) -> 4% (High)
+    if sig.certainty >= 0.90:
+        base_pct = 0.04
+    elif sig.certainty >= 0.70:
+        base_pct = 0.03
+    elif sig.certainty >= 0.55:
+        base_pct = 0.02
+    else:
+        base_pct = 0.01  # Minimum (0.45 - 0.55 range)
 
-    # ── Conviction Booster (Idea B: Double Down) ──
-    # If certainty is extreme (>= 95%), we boost the size significantly (up to 5x)
-    # to win back faster on 'sure things'.
+    # Apply external multipliers (FX factor, ML learned multipliers)
+    fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
+    raw_pct = base_pct * mult * fx_factor
+
+    # ── Conviction Booster (Extreme Certainty) ──
     if sig.certainty >= 0.95:
-        conviction_mult = 5.0
+        conviction_mult = 2.0  # Slightly more conservative than 5x with new tiered base
         raw_pct *= conviction_mult
         log.info(f"[{chat_id}] 🔥 CONVICTION BOOSTER: Boosting size by {conviction_mult}x (Certainty {sig.certainty:.0%})")
+
 
     # ── Probationary Sizing ──
     if risk.is_on_probation():
@@ -120,7 +128,14 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     )
 
     try:
-        # First Attempt
+        # ── Slippage Shield (Alpha Capture Phase) ──
+        # Check recent performance. If slippage > 1.5%, reduce size by 50%
+        avg_slip = await asyncio.to_thread(database.get_avg_slippage, sig.asset, sig.strategy)
+        if avg_slip > 0.015:
+            log.warning(f"[{chat_id}] SLIPPAGE SHIELD ACTIVE: Reducing size for {sig.asset} ({avg_slip:.1%} avg slip)")
+            amount = amount * 0.5
+
+        # Place the order
         resp = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=sig.outcome_id, side="BUY", amount=amount,

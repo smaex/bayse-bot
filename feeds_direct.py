@@ -69,7 +69,11 @@ def check_lag(asset: str, relay_price: float) -> dict:
     # Use direct price as ground truth if it's fresh (last 2s)
     best_price = direct_p if time_diff < 2.0 else relay_price
 
-    if price_diff_pct > config.INFRA_STALE_DIFF_PCT or time_diff > config.INFRA_STALE_LAG_SEC:
+    # Asset-specific stale threshold: Crypto is fast, FX is slow.
+    is_fx = asset in _FX_SYMBOLS.values()
+    max_lag = config.INFRA_STALE_LAG_SEC if is_fx else 90.0 # Strict 90s for Crypto
+    
+    if price_diff_pct > config.INFRA_STALE_DIFF_PCT or time_diff > max_lag:
         return {
             "status": "stale",
             "price": best_price,

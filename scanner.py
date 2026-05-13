@@ -124,6 +124,8 @@ async def discover_series(client: BayseClient) -> None:
     """
     Fetch all open events from the Bayse API and log every unique series slug found.
     Run once on startup to discover FX/commodity slugs for config.py.
+    
+    v2: Now also categorizes by asset type and provides actionable recommendations.
     """
     slugs: dict[str, int] = {}  # slug → count of open events
     page = 1
@@ -147,11 +149,44 @@ async def discover_series(client: BayseClient) -> None:
 
     if slugs:
         log.info("═══ Available series slugs on Bayse ══════════════════════")
-        for slug, count in sorted(slugs.items()):
-            log.info(f"  {slug}  ({count} open events)")
+        
+        # Categorize slugs
+        crypto_slugs = {s: c for s, c in slugs.items() if s.startswith("crypto-")}
+        fx_slugs = {s: c for s, c in slugs.items() if s.startswith("fx-")}
+        commodity_slugs = {s: c for s, c in slugs.items() if s.startswith("commodity-")}
+        other_slugs = {s: c for s, c in slugs.items() 
+                       if not s.startswith(("crypto-", "fx-", "commodity-"))}
+        
+        if crypto_slugs:
+            log.info("  🪙 CRYPTO:")
+            for slug, count in sorted(crypto_slugs.items()):
+                in_config = "✅" if any(slug in tf.values() for tf in SERIES.values()) else "❌ NOT TRACKED"
+                log.info(f"    {slug}  ({count} open) {in_config}")
+        
+        if fx_slugs:
+            log.info("  💱 FX:")
+            for slug, count in sorted(fx_slugs.items()):
+                in_config = "✅" if any(slug in tf.values() for tf in SERIES.values()) else "❌ NOT TRACKED"
+                log.info(f"    {slug}  ({count} open) {in_config}")
+        
+        if commodity_slugs:
+            log.info("  🥇 COMMODITIES:")
+            for slug, count in sorted(commodity_slugs.items()):
+                in_config = "✅" if any(slug in tf.values() for tf in SERIES.values()) else "❌ NOT TRACKED"
+                log.info(f"    {slug}  ({count} open) {in_config}")
+        
+        if other_slugs:
+            log.info("  ❓ OTHER:")
+            for slug, count in sorted(other_slugs.items()):
+                log.info(f"    {slug}  ({count} open)")
+        
+        total_tracked = sum(1 for s in slugs if any(s in tf.values() for tf in SERIES.values()))
+        log.info(f"  SUMMARY: {len(slugs)} total series | {total_tracked} tracked | "
+                 f"{len(slugs) - total_tracked} untracked")
         log.info("══════════════════════════════════════════════════════════")
     else:
         log.warning("discover_series: no slugs found — check API connectivity")
+
 
 
 async def scan_all(client: BayseClient) -> list[dict]:
