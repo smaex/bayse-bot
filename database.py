@@ -399,14 +399,26 @@ def get_combo_stats(chat_id: str, days: int = 14) -> list[dict]:
         r["win_rate"] = (r["wins"] or 0) / r["total"] if r["total"] else 0.0
     return rows
 
-def get_recent_streak(chat_id: str, strategy: str, asset: str, timeframe: str, limit: int = 5) -> list[bool]:
-    """Returns the last N trade outcomes for a specific combo (True=win, False=loss)."""
+def get_alpha_trend(chat_id: str, strategy: str, asset: str, limit: int = 10) -> float:
+    """
+    Calculates Alpha Decay by comparing the edge of recent trades to older ones.
+    Returns a 'Decay Factor' (1.0 = stable, < 1.0 = decaying, > 1.0 = expanding).
+    """
     rows = _fetch_all("""
-        SELECT won FROM trades
-        WHERE chat_id=%s AND strategy=%s AND asset=%s AND timeframe=%s AND won IS NOT NULL
+        SELECT edge_at_entry FROM trades
+        WHERE chat_id=%s AND strategy=%s AND asset=%s AND won IS NOT NULL
         ORDER BY created_at DESC LIMIT %s
-    """, (chat_id, strategy, asset, timeframe, limit))
-    return [bool(r["won"]) for r in rows]
+    """, (chat_id, strategy, asset, limit))
+    
+    edges = [float(r["edge_at_entry"] or 0) for r in rows]
+    if len(edges) < 6: return 1.0 # Not enough data to judge trend
+    
+    # Compare recent 3 to older 3
+    recent_avg = sum(edges[:3]) / 3
+    older_avg = sum(edges[3:6]) / 3
+    
+    if older_avg <= 0: return 1.0
+    return recent_avg / older_avg
 
 # ── Quant State Persistence ──────────────────────────────────────────────────
 

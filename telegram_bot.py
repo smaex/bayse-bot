@@ -64,6 +64,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("debug",      cmd_debug))
     app.add_handler(CommandHandler("disconnect", cmd_disconnect))
     app.add_handler(CommandHandler("wallet",     cmd_wallet))
+    app.add_handler(CommandHandler("unblock",    cmd_unblock))
     app.add_handler(CommandHandler("help",       cmd_help))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
@@ -159,9 +160,12 @@ async def _main_menu(update: Update):
          InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
         [InlineKeyboardButton("⏸ Pause",    callback_data="pause"),
          InlineKeyboardButton("▶️ Resume",   callback_data="resume")],
+        [InlineKeyboardButton("🔥 Boost (1h)", callback_data="mode_aggressive"),
+         InlineKeyboardButton("❄️ Halt (30m)", callback_data="halt_30")],
     ]
     await update.message.reply_text(
-        "🤖 *Bayse Bot — Active*\n\nWhat would you like to check?",
+        "🤖 *Bayse Bot — Active Control*\n\n"
+        "Use buttons below for tactical overrides:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -186,6 +190,11 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         await _set_paused(cid, False)
         await _clear_target_hit(cid)
         await query.message.reply_text("▶️ Trading resumed.")
+    elif data == "halt_30":
+        # Inject a global halt into strategy engine
+        from strategy import _trigger_halt
+        _trigger_halt("GLOBAL", "User Manual Halt", duration_mins=30)
+        await query.message.reply_text("❄️ *System Halted for 30 minutes.*", parse_mode="Markdown")
     elif data in _MODES:
         mode   = _MODES[data]
         user   = await asyncio.to_thread(database.get_user, cid)
@@ -198,6 +207,21 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"{mode['description']}\n\n✅ *Mode applied. Trading resumes now.*\n"
             f"Use `/set` to fine-tune any individual setting.",
+            parse_mode="Markdown"
+        )
+    elif data.startswith("unblock_"):
+        combo = data.replace("unblock_", "")
+        settings = await _get_settings(cid)
+        learned = settings.get("learned", {})
+        suspended = learned.get("suspended_combos", [])
+        if combo in suspended:
+            suspended.remove(combo)
+            learned["suspended_combos"] = suspended
+            settings["learned"] = learned
+            await asyncio.to_thread(database.update_settings, cid, settings)
+            await query.message.reply_text(f"🔓 *UNBLOCKED*: {combo}\nTrading resumed for this pattern.", parse_mode="Markdown")
+        else:
+            await query.message.reply_text("This combo is already active.")
             parse_mode="Markdown",
         )
 
@@ -880,4 +904,26 @@ async def notify_deposit_detected(app, cid: str, amount: float, currency: str):
         f"💸 *Deposit Detected* +{currency} {amount:,.0f}\n\n"
         "Your drawdown baseline has been reset. If your bot was previously paused, send /resume to start trading with your new balance.",
         parse_mode="Markdown"
+    )
+
+async def cmd_unblock(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    cid = str(update.effective_chat.id)
+    settings = await _get_settings(cid)
+    learned = settings.get("learned", {})
+    suspended = learned.get("suspended_combos", [])
+    
+    if not suspended:
+        await update.message.reply_text("✅ *All systems go!* No combos are currently suspended.", parse_mode="Markdown")
+        return
+        
+    keyboard = []
+    for combo in suspended:
+        keyboard.append([InlineKeyboardButton(f"🔓 Unblock {combo}", callback_data=f"unblock_{combo}")])
+        
+    await update.message.reply_text(
+        "🔓 *Suspended Combos*\n\n"
+        "The following patterns were auto-halted by the Self-Correction engine due to low win rates. "
+        "Tap a button to manually reactive them:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )

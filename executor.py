@@ -59,6 +59,13 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
         log.info(f"[{chat_id}] 🔥 CONVICTION BOOSTER: Boosting size by {conviction_mult}x (Certainty {sig.certainty:.0%})")
 
 
+    # ── Alpha Decay Shield (Anti-Bleed) ──
+    # If the edge magnitude is shrinking over the last 10 trades, reduce size.
+    decay_mult = await asyncio.to_thread(database.get_alpha_trend, chat_id, sig.strategy, sig.asset)
+    if decay_mult < 0.85:
+        raw_pct *= 0.5
+        log.info(f"[{chat_id}] 🛡️ ALPHA DECAY SHIELD: Slashing size by 50% (Decay Factor: {decay_mult:.2f})")
+
     # ── Probationary Sizing ──
     if risk.is_on_probation():
         probation_mult = 0.25

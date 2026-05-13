@@ -128,6 +128,69 @@ class MarketState:
 
 global_state = MarketState()
 
+def _apply_macro_filters(signal: TradeSignal) -> TradeSignal:
+    """
+    Adjusts signal certainty based on global macro bias (USD strength).
+    Crypto and FX are typically inversely correlated with the US Dollar.
+    """
+    macro = feeds_direct.get_macro_bias()
+    sentiment = macro.get("sentiment", "NEUTRAL")
+    
+    # We apply a +/- 0.08 certainty shift based on macro alignment
+    BIAS_WEIGHT = 0.08
+    
+    if sentiment == "USD_BULLISH":
+        if signal.outcome == "YES":
+            signal.certainty -= BIAS_WEIGHT
+            signal.reason += f" | USD_STRENGTH_PENALTY (-{BIAS_WEIGHT})"
+        else:
+            signal.certainty += BIAS_WEIGHT
+            signal.reason += f" | USD_STRENGTH_BOOST (+{BIAS_WEIGHT})"
+            
+    elif sentiment == "USD_BEARISH":
+        if signal.outcome == "YES":
+            signal.certainty += BIAS_WEIGHT
+            signal.reason += f" | USD_WEAKNESS_BOOST (+{BIAS_WEIGHT})"
+        else:
+            signal.certainty -= BIAS_WEIGHT
+            signal.reason += f" | USD_WEAKNESS_PENALTY (-{BIAS_WEIGHT})"
+            
+    # Clip certainty to valid range
+    signal.certainty = max(0.0, min(1.0, signal.certainty))
+    return signal
+
+def _apply_wall_filters(signal: TradeSignal) -> TradeSignal:
+    """
+    Penalizes signals that are trading directly into a Liquidity Wall.
+    (e.g. Buying 'YES' when a massive Sell order is sitting right above us).
+    """
+    import comparative_analysis
+    quality = comparative_analysis.get_edge_quality(signal.asset)
+    
+    # We penalize if a wall is within 2% of the market price
+    WALL_DISTANCE_THRESHOLD = 0.02
+    WALL_PENALTY = 0.10 # Subtract 10% certainty
+    
+    current_p = signal.market_price
+    
+    if signal.outcome == "YES":
+        # Resistance Wall (Ceiling)
+        ask_wall = quality.get("ask_wall")
+        if ask_wall and (ask_wall > current_p) and (ask_wall - current_p) < WALL_DISTANCE_THRESHOLD:
+            signal.certainty -= WALL_PENALTY
+            signal.reason += f" | RESISTANCE_WALL_AT_{ask_wall:.2f} (-{WALL_PENALTY})"
+            
+    elif signal.outcome == "NO":
+        # Support Wall (Floor)
+        bid_wall = quality.get("bid_wall")
+        if bid_wall and (bid_wall < current_p) and (current_p - bid_wall) < WALL_DISTANCE_THRESHOLD:
+            signal.certainty -= WALL_PENALTY
+            signal.reason += f" | SUPPORT_WALL_AT_{bid_wall:.2f} (-{WALL_PENALTY})"
+            
+    # Ensure certainty stays in bounds
+    signal.certainty = max(0.0, min(1.0, signal.certainty))
+    return signal
+
 def _check_circuit_breaker(strategy_name: str, asset: str, state: MarketState = global_state) -> bool:
     now = time.time()
     # Check asset-specific halt
@@ -1338,7 +1401,11 @@ def evaluate(
     if not signals:
         return []
 
+    # ── Global Filters ──
+    signals = [_apply_macro_filters(sig) for sig in signals]
+    signals = [_apply_wall_filters(sig) for sig in signals]
     signals = _apply_convergence(signals)
+    
     return sorted(signals, key=lambda s: s.certainty, reverse=True)
 
 

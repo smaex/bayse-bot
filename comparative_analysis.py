@@ -125,11 +125,28 @@ class PolymarketClient:
                 best_bid = float(bids[0]["price"]) if bids else 0.0
                 best_ask = float(asks[0]["price"]) if asks else 1.0
 
+                # ── Wall Detection Logic ──
+                # Scans the top 10 levels for a 'Liquidity Wall' (>5x average size)
+                def find_wall(orders):
+                    if not orders: return None
+                    sizes = [float(o.get("size", 0)) * float(o.get("price", 0)) for o in orders[:10]]
+                    if not sizes: return None
+                    avg_size = sum(sizes) / len(sizes)
+                    for i, s in enumerate(sizes):
+                        if s > avg_size * 5.0 and s > 100.0: # Must be 5x avg AND > $100
+                            return float(orders[i]["price"])
+                    return None
+
+                bid_wall = find_wall(bids)
+                ask_wall = find_wall(asks)
+
                 return {
                     "best_bid": best_bid,
                     "best_ask": best_ask,
                     "bid_depth_usd": bid_depth,
                     "ask_depth_usd": ask_depth,
+                    "bid_wall": bid_wall,
+                    "ask_wall": ask_wall,
                     "spread": best_ask - best_bid,
                     "mid_price": (best_bid + best_ask) / 2 if (best_bid and best_ask) else None,
                 }
@@ -174,12 +191,16 @@ async def update_cache():
                     "spread": 0.0,
                     "depth_price": price,  # fallback to gamma price
                     "has_depth": False,
+                    "bid_wall": None,
+                    "ask_wall": None,
                 }
 
                 if depth_info:
                     cache_entry.update({
                         "depth_yes": depth_info["bid_depth_usd"],
                         "depth_no": depth_info["ask_depth_usd"],
+                        "bid_wall": depth_info["bid_wall"],
+                        "ask_wall": depth_info["ask_wall"],
                         "spread": depth_info["spread"],
                         "depth_price": depth_info["mid_price"] or price,
                         "has_depth": True,
@@ -257,6 +278,8 @@ def get_edge_quality(asset: str) -> Dict:
         "price": info["depth_price"],
         "depth_usd": depth,
         "spread": spread,
+        "bid_wall": info.get("bid_wall"),
+        "ask_wall": info.get("ask_wall"),
         "reason": f"Real: ${depth:.0f} depth, {spread:.3f} spread",
     }
 
