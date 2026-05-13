@@ -222,8 +222,6 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"🔓 *UNBLOCKED*: {combo}\nTrading resumed for this pattern.", parse_mode="Markdown")
         else:
             await query.message.reply_text("This combo is already active.")
-            parse_mode="Markdown",
-        )
 
 
 # ── Guard decorator ───────────────────────────────────────────────────────────
