@@ -5,10 +5,18 @@ Uses the shared database module for trade records.
 
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone, timedelta
 
 import config
 import database
+
+def binomial_cdf(k: int, n: int, p: float) -> float:
+    """Returns the cumulative probability of getting exactly or fewer than k wins in n trials with win prob p."""
+    cdf = 0.0
+    for i in range(k + 1):
+        cdf += math.comb(n, i) * (p ** i) * ((1 - p) ** (n - i))
+    return cdf
 
 log = logging.getLogger("learner")
 
@@ -19,7 +27,9 @@ DEFAULT_LEARNED: dict = {
     "size_multipliers": {
         "SNIPE": 1.0, "CORRELATE": 1.0, "ARB": 1.0, "NEWS": 1.0,
     },
-    "suspended_strategies": [],
+    "certainty_multipliers": {
+        "SNIPE": 1.0, "CORRELATE": 1.0, "ARB": 1.0, "NEWS": 1.0,
+    },
 }
 
 
@@ -50,11 +60,8 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
     s       = user["settings"]
     learned = {**DEFAULT_LEARNED, **s.get("learned", {})}
     mults   = dict(learned.get("size_multipliers", {k: 1.0 for k in ["SNIPE", "CORRELATE", "ARB", "NEWS"]}))
-    suspended = set(learned.get("suspended_strategies", []))
-    
-    # Self-Correction Engine: suspended combos (granular)
-    # Format: ["SNIPE:SOL:5min", "NEWS:ETH:1h", ...]
-    suspended_combos = set(learned.get("suspended_combos", []))
+    cert_mults = dict(learned.get("certainty_multipliers", {k: 1.0 for k in ["SNIPE", "CORRELATE", "ARB", "NEWS"]}))
+    counts = {}
 
     stats = await asyncio.to_thread(database.recent_stats, chat_id, days=30)
     changes, warnings = [], []
@@ -67,21 +74,30 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         total    = sum(r["total"] for r in rows)
         wins     = sum(r.get("wins") or 0 for r in rows)
         win_rate = wins / total if total > 0 else None
+        
+        counts[strat] = total
 
         if total < 5:
             continue
 
-        # Suspend / reactivate — strategy-specific thresholds
-        wr_suspend = 0.85 if strat == "SNIPE" else 0.55
-        wr_recover = 0.90 if strat == "SNIPE" else 0.65
-
-        if win_rate is not None and win_rate < wr_suspend and total >= 10:
-            if strat not in suspended:
-                suspended.add(strat)
-                warnings.append(f"⚠️ {strat} suspended — WR {win_rate:.0%} < {wr_suspend:.0%} threshold")
-        elif strat in suspended and win_rate and win_rate >= wr_recover:
-            suspended.discard(strat)
-            changes.append(f"✅ {strat} reactivated — WR {win_rate:.0%} recovered above {wr_recover:.0%}")
+        expected_wr = 0.90 if strat == "SNIPE" else 0.60
+        
+        if total >= 5:
+            # p-value: probability of observing 'wins' or fewer if the true win rate was 'expected_wr'
+            p_value = binomial_cdf(wins, total, expected_wr)
+            
+            c_mult = cert_mults.get(strat, 1.0)
+            if p_value < 0.05:
+                # Bayesian certainty decay
+                c_mult = max(0.1, c_mult - 0.25)
+                warnings.append(f"⚠️ {strat} certainty penalized (-25%) — edge broken (p={p_value:.3f})")
+            elif win_rate >= expected_wr:
+                # Recover
+                c_mult = min(1.5, c_mult + 0.10)
+                if c_mult > cert_mults.get(strat, 1.0):
+                    changes.append(f"✅ {strat} certainty boosted (+10%) — expected WR maintained")
+            
+            cert_mults[strat] = round(c_mult, 2)
 
         # Size multiplier (range 0.25×–2.0×)
         m = mults.get(strat, 1.0)
@@ -143,28 +159,28 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         total = combo["total"]
         pnl = combo.get("total_pnl") or 0
         
-        # Rule 1: Suspend combos with negative PnL AND win rate below 45% (min 5 trades)
-        if total >= 5 and wr < 0.45 and pnl < 0:
-            if key not in suspended_combos:
-                suspended_combos.add(key)
-                warnings.append(
-                    f"🔴 SELF-CORRECT: {key} suspended — "
-                    f"WR {wr:.0%} ({total} trades, ₦{pnl:+,.0f})"
-                )
+        # We will adjust the cert_mults for this specific combo
+        expected_wr = 0.90 if combo['strategy'] == "SNIPE" else 0.60
+        wins = int(wr * total)
+        p_value = binomial_cdf(wins, total, expected_wr)
         
-        # Rule 2: Reactivate if performance has recovered (WR > 60%)
-        elif key in suspended_combos and wr >= 0.60:
-            suspended_combos.discard(key)
-            changes.append(
-                f"🟢 SELF-CORRECT: {key} reactivated — "
-                f"WR {wr:.0%} recovered"
+        c_mult = cert_mults.get(key, 1.0)
+        if total >= 5 and p_value < 0.05 and pnl < 0:
+            c_mult = max(0.1, c_mult - 0.50) # Massive penalty for broken combo
+            warnings.append(
+                f"🔴 SELF-CORRECT: {key} certainty penalized (-50%) — "
+                f"Statistically broken edge p={p_value:.3f} ({total} trades, ₦{pnl:+,.0f})"
             )
+        elif p_value > 0.20 and wr >= expected_wr:
+            c_mult = min(1.5, c_mult + 0.20)
+            if c_mult > cert_mults.get(key, 1.0):
+                changes.append(f"🟢 SELF-CORRECT: {key} certainty recovered")
+                
+        cert_mults[key] = round(c_mult, 2)
     
     # Rule 3: Losing streak detection (3+ consecutive losses on same combo)
     for combo in combo_stats:
         key = f"{combo['strategy']}:{combo['asset']}:{combo['timeframe']}"
-        if key in suspended_combos:
-            continue  # already suspended
         
         streak = await asyncio.to_thread(
             database.get_recent_streak, chat_id,
@@ -180,15 +196,15 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
                 break
         
         if consec_losses >= 3:
-            suspended_combos.add(key)
+            cert_mults[key] = max(0.1, cert_mults.get(key, 1.0) - 0.3)
             warnings.append(
                 f"🔥 STREAK HALT: {key} — {consec_losses} consecutive losses! "
-                f"Auto-suspended until next learning cycle."
+                f"Certainty penalized (-30%)."
             )
 
-    learned["size_multipliers"]     = mults
-    learned["suspended_strategies"] = list(suspended)
-    learned["suspended_combos"]     = list(suspended_combos)
+    learned["size_multipliers"] = mults
+    learned["certainty_multipliers"] = cert_mults
+    learned["trade_counts"] = counts
 
     # Save learned params back into settings
     s["learned"] = learned
@@ -302,6 +318,16 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                     if order_id:
                         try:
                             order_data = await client.get_order(order_id)
+                            
+                            # Skip if order was completely unfilled (e.g., Maker order that never hit)
+                            shares_filled = float(order_data.get("shares", order_data.get("quantity", 0)) or 0)
+                            if shares_filled <= 0:
+                                log.info(f"[{chat_id}] MAKER UNFILLED: {trade['strategy']} on {trade['asset']} resolved with zero fills.")
+                                await asyncio.to_thread(database.resolve_trade, trade["trade_id"], False, 0.0)
+                                if user_risks and chat_id in user_risks:
+                                    user_risks[chat_id].remove_position(trade["market_id"])
+                                continue
+
                             raw = (order_data.get("profit") or order_data.get("pnl")
                                    or order_data.get("realizedPnl"))
                             if raw is not None:

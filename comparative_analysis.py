@@ -149,6 +149,8 @@ class PolymarketClient:
                     "ask_wall": ask_wall,
                     "spread": best_ask - best_bid,
                     "mid_price": (best_bid + best_ask) / 2 if (best_bid and best_ask) else None,
+                    "bids": bids,
+                    "asks": asks,
                 }
         except Exception as e:
             log.debug(f"CLOB depth fetch failed for {token_id}: {e}")
@@ -193,6 +195,8 @@ async def update_cache():
                     "has_depth": False,
                     "bid_wall": None,
                     "ask_wall": None,
+                    "bids": [],
+                    "asks": [],
                 }
 
                 if depth_info:
@@ -204,6 +208,8 @@ async def update_cache():
                         "spread": depth_info["spread"],
                         "depth_price": depth_info["mid_price"] or price,
                         "has_depth": True,
+                        "bids": depth_info["bids"],
+                        "asks": depth_info["asks"],
                     })
 
                 CACHE[asset] = cache_entry
@@ -280,6 +286,8 @@ def get_edge_quality(asset: str) -> Dict:
         "spread": spread,
         "bid_wall": info.get("bid_wall"),
         "ask_wall": info.get("ask_wall"),
+        "bids": info.get("bids", []),
+        "asks": info.get("asks", []),
         "reason": f"Real: ${depth:.0f} depth, {spread:.3f} spread",
     }
 

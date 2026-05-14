@@ -97,6 +97,13 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     if not risk.can_trade(equity, amount, max_exp):
         log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Risk limit or max exposure reached")
         return
+    # ── Discovery Probe ──
+    is_probe = False
+    # Probes: Small trades to collect data even if certainty is modest
+    if learned.get("discovery_mode") or (sig.certainty < 0.50 and mode != "safe"):
+        is_probe = True
+        amount = 100.0
+        log.info(f"[{chat_id}] DISCOVERY PROBE: Sizing down to ₦100 for Bayesian data collection.")
 
     fee_rate = settings.get("fee_rate", 0.04)
     est_net_payout = (1.0 - fee_rate) / sig.market_price
@@ -104,32 +111,55 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
         log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — est. net payout {(est_net_payout - 1.0):.1%} < {MIN_PAYOUT_RATIO:.1%} minimum")
         return
 
-    # ── Dynamic Payout Hurdle (Idea A: Take the Penny) ──
-    # If certainty is high, we lower the profit bar.
-    current_min_payout = MIN_PAYOUT_RATIO
+    # ── Dynamic Payout Hurdle (Flexibility Layer) ──
+    # We adjust the "Minimum Profit Buffer" based on the user's selected mode.
+    # Safe Mode demands 10%; Balanced 6%; Aggressive 3%; Full Send 1%.
+    mode_hurdle = {"safe": 0.10, "balanced": 0.06, "aggressive": 0.03, "full_send": 0.01}.get(mode, 0.06)
+    current_min_payout = mode_hurdle
+    
+    # Conviction Boost: If we are >90% sure, we are extra flexible on price
     if sig.certainty >= 0.90:
-        current_min_payout = ABSOLUTE_MIN_PAYOUT_RATIO
-        log.debug(f"[{chat_id}] Hurdle lowered to {current_min_payout:.1%} due to high certainty.")
+        current_min_payout = min(current_min_payout, 0.02)
+        log.debug(f"[{chat_id}] Conviction Boost: Hurdle lowered to {current_min_payout:.1%}")
 
     max_allowed_price = (1.0 - fee_rate) / (1.0 + current_min_payout)
     is_fx = sig.asset in _FX_ASSETS
     
     # ── Adaptive Slippage ──
-    # 1. Base slippage by mode
     slip_map = {"safe": 0.002, "balanced": 0.005, "aggressive": 0.01, "full_send": 0.025}
     base_slip = slip_map.get(mode, 0.005)
-    # 2. Volatility multiplier from strategy.py (GARCH-derived)
-    vol_mult = strategy.get_volatility_multiplier(sig.asset)
+    
+    # Volatility multiplier
+    from strategies.utils import realized_vol_hourly
+    from strategies.base import global_state
+    import config
+    current_vol = realized_vol_hourly(sig.asset, global_state)
+    base_vol = config.ASSET_HOURLY_VOL.get(sig.asset, 0.022)
+    vol_mult = current_vol / base_vol
     adaptive_slip = base_slip * vol_mult
     
-    limit_price = min(sig.market_price * (1.0 + adaptive_slip), max_allowed_price) 
-
     # ── Engine Detection ──
     market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
     engine = market.get("engine", "AMM") if market else "AMM"
 
+    # ── Hybrid Maker/Taker Routing ──
+    is_maker = False
+    time_in_force = "FAK"
+    
+    # Toxicity Check: Disable MAKER if volatility is elevated
+    if engine == "CLOB" and vol_mult <= 1.5:
+        normalized_threshold = 0.005 * vol_mult
+        if abs(sig.momentum_at_entry) < normalized_threshold:
+            is_maker = True
+            limit_price = min(sig.market_price * 0.98, max_allowed_price)
+            time_in_force = "GTC"
+    
+    if not is_maker:
+        limit_price = min(sig.market_price * (1.0 + adaptive_slip), max_allowed_price)
+
+    execution_style = "MAKER" if is_maker else "TAKER"
     log.info(
-        f"[{chat_id}] PLACING {sig.strategy} | {sig.asset} ({engine}) "
+        f"[{chat_id}] PLACING {sig.strategy} | {sig.asset} ({engine} {execution_style}) "
         f"price={sig.market_price:.3f} limit={limit_price:.3f} slip={adaptive_slip:.2%} "
         f"certainty={sig.certainty:.0%} ₦{amount:,.0f}"
     )
@@ -147,13 +177,14 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=sig.outcome_id, side="BUY", amount=amount,
             order_type="LIMIT", price=limit_price, currency=CURRENCY,
+            time_in_force=time_in_force
         )
         order = resp.get("order", resp)
         shares_filled = float(order.get("shares", order.get("quantity", 0)) or 0)
         
         # ── Order Chaser (CLOB only) ──
         # If CLOB and zero fill, try one more time at a slightly more aggressive price (if still profitable)
-        if engine == "CLOB" and shares_filled <= 0:
+        if engine == "CLOB" and not is_maker and shares_filled <= 0:
             chase_price = min(limit_price * 1.002, max_allowed_price)
             if chase_price > limit_price:
                 log.info(f"[{chat_id}] CLOB CHASE: First order missed. Retrying at {chase_price:.3f}")

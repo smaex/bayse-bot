@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from typing import Optional
 import aiohttp
 from config import (
-    NEWSAPI_KEY, NEWS_POLL_SEC,
+    NEWSAPI_KEY, GEMINI_API_KEY, NEWS_POLL_SEC,
     NEWS_SENTIMENT_THRESHOLD, NEWS_SIGNAL_DECAY_MIN,
     FOMC_DATES_2026, NEWS_REQUIRE_CRYPTO_CATALYST,
 )
@@ -90,15 +90,32 @@ class NewsSignal:
 active_signals: list[NewsSignal] = []
 
 
-def _score(text: str, source_url: str = "") -> float:
+async def _score(text: str, source_url: str = "") -> float:
     """
-    Professional Sentiment Score:
-    Final Score = VADER_Compound * max(Catalyst_Weights) * Source_Reliability
+    Professional Sentiment Score using Gemini LLM (fallback to VADER).
+    Final Score = LLM_Score * max(Catalyst_Weights) * Source_Reliability
     """
-    if not _vader_ok:
-        return 0.0
-    
-    base_score = _vader.polarity_scores(text)["compound"]
+    base_score = 0.0
+    if GEMINI_API_KEY:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+            payload = {
+                "contents": [{"parts": [{"text": f"You are a quantitative crypto analyst. Analyze this headline: '{text}'. Is it highly bullish or bearish for Crypto? Respond ONLY with a single float between -1.0 (extremely bearish) and 1.0 (extremely bullish). Return exactly the number, nothing else."}]}]
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        text_resp = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "0.0").strip()
+                        try:
+                            base_score = float(text_resp)
+                        except ValueError:
+                            pass
+        except Exception as e:
+            log.warning(f"Gemini API failed, falling back to VADER: {e}")
+            
+    if base_score == 0.0 and _vader_ok:
+        base_score = _vader.polarity_scores(text)["compound"]
     
     # Apply Catalyst Multipliers
     text_lower = text.lower()
@@ -229,7 +246,7 @@ async def newsapi_feed():
                                 continue
 
                             assets   = _assets_from_text(text)
-                            compound = _score(text, article_url)
+                            compound = await _score(text, article_url)
 
                             if compound > NEWS_SENTIMENT_THRESHOLD:
                                 _push_signal(NewsSignal(

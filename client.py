@@ -158,7 +158,7 @@ class BayseClient:
     async def place_order(self, event_id: str, market_id: str, outcome_id: str,
                           side: str, amount: float, order_type: str = "MARKET",
                           price: float = None, currency: str = "NGN",
-                          max_slippage: float = 0.05) -> dict:
+                          max_slippage: float = 0.05, time_in_force: str = "FAK") -> dict:
         body = {
             "outcomeId": outcome_id,
             "side": side,
@@ -168,11 +168,10 @@ class BayseClient:
         }
         if order_type == "LIMIT" and price is not None:
             body["price"] = price
-            # Default to GTC unless otherwise specified, but allow caller to override (e.g. FAK)
-            body["timeInForce"] = "FAK" 
+            body["timeInForce"] = time_in_force 
         else:
             body["maxSlippage"] = max_slippage
-            body["timeInForce"] = "FAK"
+            body["timeInForce"] = time_in_force
         return await self._post(
             f"/v1/pm/events/{event_id}/markets/{market_id}/orders", body
         )

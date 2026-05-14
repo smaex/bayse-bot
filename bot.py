@@ -21,6 +21,7 @@ import feeds
 import news as news_mod
 import scanner
 import strategy
+import strategies
 import learner
 import telegram_bot
 import executor
@@ -59,7 +60,7 @@ _tg_app        = None
 _last_spot:        dict[str, float] = {}
 _last_market_eval: dict[str, float] = {}
 _last_lag_log:     dict[str, float] = {}  # throttle lag warnings to once per minute
-global_signals:    dict[str, dict]  = {}  # {market_id: {strat: TradeSignal}}
+
 
 # Minimum change to be considered a deposit/withdrawal (not just trade P&L noise)
 _BALANCE_EVENT_MIN_NGN = 200
@@ -329,7 +330,6 @@ async def _user_loop(chat_id: str):
                         f"Trading is automatically paused for {SYSTEMIC_RISK_HALT_MINS} minutes to protect your capital.",
                         parse_mode="Markdown"
                     )
-            continue
         else:
             if _systemic_alert_sent.get(chat_id):
                 _systemic_alert_sent[chat_id] = False
@@ -427,32 +427,20 @@ async def _evaluate_markets(
                 continue
             if market["timeframe"] not in user_tfs:
                 continue
+            if strategy.is_halted(market["asset"]):
+                continue
 
-            # ── Lookup Global Pre-Calculated Signal ──
-            signals_map = global_signals.get(market["market_id"], {})
-            for strat, sig in signals_map.items():
-                if strat not in active_strats:
+            # ── Modular Strategy Evaluation ──
+            signals = await strategies.evaluate_all(market, learned, strategy.global_state)
+            
+            for sig in signals:
+                if sig.strategy not in active_strats:
                     continue
                 
-                # ── Self-Correction: Check if this specific combo is suspended ──
-                suspended_combos = set(learned.get("suspended_combos", []))
-                combo_key = f"{strat}:{market['asset']}:{market['timeframe']}"
-                if combo_key in suspended_combos:
-                    log.debug(f"[{chat_id}] SELF-CORRECT: Skipping {combo_key} (suspended)")
-                    continue
-                
-                # Apply user-specific conviction hurdles (Safe, Balanced, Aggressive)
-                mode = learned.get("mode", "balanced")
-                min_cert = {"safe": 0.65, "balanced": 0.45, "aggressive": 0.45, "full_send": 0.35}.get(mode, 0.45)
-                
-                # Apply user's ML learned threshold override
-                learned_min = learned.get("snipe_min_certainty")
-                if learned_min:
-                    min_cert = max(min_cert - 0.05, min(learned_min, min_cert + 0.15))
-                
-                if sig.certainty < min_cert:
-                    continue
-
+                # Check systemic halt
+                if strategy.global_state.systemic_halt_until > time.time():
+                    log.warning(f"[{chat_id}] SYSTEMIC HALT active — skipping trade")
+                    break
 
                 if sig.strategy == "ARB":
                     await executor.execute_arb(chat_id, sig, client, equity, free_cash, settings)
@@ -544,18 +532,6 @@ async def _evaluate_all_users_for_spot(asset: str, change: float, threshold: flo
         return
     _last_market_eval[asset] = now
     
-    # ── Global Evaluation ──
-    # Evaluate all open markets for this asset ONCE for all users
-    spot_p = feeds.spot.get(asset, 0)
-    for market in active_markets:
-        if market.get("status") == "open" and market["asset"] == asset:
-            ws = feeds.market_prices.get(market["market_id"])
-            if ws:
-                market["yes_price"] = ws["yes"]
-                market["no_price"]  = ws["no"]
-            
-            global_signals[market["market_id"]] = strategy.evaluate_global_v2(market, spot_price=spot_p)
-
     # ── Local Dispatch ──
     users = await asyncio.to_thread(database.get_all_active)
     for user in users:
@@ -647,6 +623,8 @@ async def main():
     asyncio.create_task(_scan_loop())
     asyncio.create_task(_update_dashboard_stats())
     asyncio.create_task(_polymarket_polling_loop())
+    from strategies.optimizer import optimizer
+    asyncio.create_task(optimizer.schedule_loop())
 
     # Reconnect all existing users and notify them
     existing_users = await asyncio.to_thread(database.get_all_active)

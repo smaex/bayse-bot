@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import uuid
+import queue
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
@@ -62,6 +64,35 @@ def _dec(text: str) -> str:
 # churn (old: open → query → close on every DB call = connection storm).
 
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
+_db_queue: queue.Queue = queue.Queue()
+
+def _db_worker():
+    while True:
+        try:
+            batch = []
+            batch.append(_db_queue.get())
+            try:
+                while len(batch) < 100:
+                    batch.append(_db_queue.get_nowait())
+            except queue.Empty:
+                pass
+            
+            if not batch:
+                continue
+                
+            try:
+                with _cx() as conn:
+                    with conn.cursor() as cur:
+                        for query, params in batch:
+                            cur.execute(query, params)
+            except Exception as e:
+                log.error(f"DB worker batch execute error: {e}")
+                
+            for _ in batch:
+                _db_queue.task_done()
+                
+        except Exception as e:
+            log.error(f"DB worker loop error: {e}")
 
 
 def _init_pool():
@@ -140,6 +171,10 @@ def _execute(query: str, params: tuple = ()):
         with conn.cursor() as cur:
             cur.execute(query, params)
 
+def _enqueue(query: str, params: tuple = ()):
+    """Push a write query to the background worker queue."""
+    _db_queue.put((query, params))
+
 
 def _fetch_one(query: str, params: tuple = ()) -> dict | None:
     with _cx() as conn:
@@ -161,6 +196,7 @@ def _fetch_all(query: str, params: tuple = ()) -> list[dict]:
 
 def init_db():
     _init_pool()
+    threading.Thread(target=_db_worker, daemon=True).start()
     with _cx() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -252,13 +288,13 @@ def get_all_active() -> list[dict]:
     return [_hydrate(r) for r in rows]
 
 def update_settings(chat_id: str, settings: dict):
-    _execute(
+    _enqueue(
         "UPDATE users SET settings=%s WHERE chat_id=%s",
         (json.dumps(settings), chat_id),
     )
 
 def deactivate(chat_id: str):
-    _execute("UPDATE users SET is_active=0 WHERE chat_id=%s", (chat_id,))
+    _enqueue("UPDATE users SET is_active=0 WHERE chat_id=%s", (chat_id,))
 
 def _hydrate(row: dict) -> dict:
     row["public_key"] = _dec(row.pop("pub_enc"))
@@ -273,7 +309,7 @@ def _hydrate(row: dict) -> dict:
 def record_trade(chat_id: str, **kw) -> str:
     trade_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    _execute("""
+    _enqueue("""
         INSERT INTO trades
           (trade_id, chat_id, strategy, asset, timeframe, outcome, outcome_id,
            market_id, event_id, order_id, entry_price, amount_ngn, certainty,
@@ -318,7 +354,7 @@ def get_avg_slippage(asset: str, strategy: str, limit: int = 5) -> float:
 
 def resolve_trade(trade_id: str, won: bool, pnl_ngn: float):
     now = datetime.now(timezone.utc).isoformat()
-    _execute(
+    _enqueue(
         "UPDATE trades SET won=%s, pnl_ngn=%s, resolved_at=%s WHERE trade_id=%s",
         (1 if won else 0, pnl_ngn, now, trade_id),
     )
@@ -424,7 +460,7 @@ def get_alpha_trend(chat_id: str, strategy: str, asset: str, limit: int = 10) ->
 
 def save_quant_state(asset: str, state: dict):
     now = datetime.now(timezone.utc).isoformat()
-    _execute(
+    _enqueue(
         "INSERT INTO quant_state (asset, state_json, updated_at) VALUES (%s,%s,%s) "
         "ON CONFLICT (asset) DO UPDATE SET state_json=EXCLUDED.state_json, updated_at=EXCLUDED.updated_at",
         (asset, json.dumps(state), now)
@@ -458,7 +494,7 @@ def get_hourly_stats(chat_id: str, days: int = 30) -> list[dict]:
 
 def save_recording(type: str, data: dict, asset: str = None):
     """Save a market snapshot or spot tick for future backtesting."""
-    _execute(
+    _enqueue(
         "INSERT INTO recordings (type, asset, data_json) VALUES (%s, %s, %s)",
         (type, asset, json.dumps(data))
     )
@@ -466,16 +502,12 @@ def save_recording(type: str, data: dict, asset: str = None):
 
 def save_recording_nonblocking(type: str, data, asset: str = None):
     """
-    Non-blocking save — silently drops the write if the connection pool is busy.
-    Used for expendable data (snapshots) that must never block critical operations.
+    Non-blocking save — implicitly non-blocking since we enqueue it.
     """
-    try:
-        _execute(
-            "INSERT INTO recordings (type, asset, data_json) VALUES (%s, %s, %s)",
-            (type, asset, json.dumps(data))
-        )
-    except psycopg2.pool.PoolError:
-        pass  # Expendable — drop silently
+    _enqueue(
+        "INSERT INTO recordings (type, asset, data_json) VALUES (%s, %s, %s)",
+        (type, asset, json.dumps(data))
+    )
 
 
 def save_recordings_batch(ticks: list[dict]):
@@ -514,3 +546,24 @@ def get_recordings(type: str = None, limit: int = 1000) -> list[dict]:
     query += " ORDER BY created_at ASC LIMIT %s"
     params += (limit,)
     return _fetch_all(query, params)
+def get_recent_trades(days: int = 7) -> list:
+    """Fetch all trades from the last X days for optimization."""
+    try:
+        with _cx() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+                cur.execute(
+                    "SELECT * FROM trades WHERE created_at > %s",
+                    (cutoff,)
+                )
+                return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        log.error(f"Error fetching recent trades: {e}")
+        return []
+
+def save_optimized_params(params: dict):
+    """Save winning parameters from nightly optimization."""
+    # We'll store this in a 'global_config' table or as a special user record
+    # For now, we'll queue it to the batch worker for a generic key-value store
+    query = "UPSERT INTO config (key, value) VALUES (%s, %s)"
+    _db_queue.put((query, ("optimized_params", json.dumps(params))))

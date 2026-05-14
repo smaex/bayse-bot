@@ -71,6 +71,7 @@ ASSET_ORACLE = {
 
 # News & sentiment
 NEWSAPI_KEY   = os.getenv("NEWSAPI_KEY", "")  # free at newsapi.org
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 NEWS_POLL_SEC = 900       # poll every 15 minutes — free tier allows 100 requests/day
 NEWS_SENTIMENT_THRESHOLD = 0.80  # only near-unanimous sentiment creates a signal
 NEWS_SIGNAL_DECAY_MIN = 3        # news signal expires after 3 min — stale news is dangerous
@@ -224,9 +225,10 @@ INFRA_DEGRADED_DIFF_PCT = 0.0008 # > 0.08% price diff = 0.1% Safety Spread
 # Systemic Risk: If 3+ assets spike >50% above baseline vol, it's a global shock.
 # Halt all new entries for 60 minutes to let the market settle.
 SYSTEMIC_RISK_COUNT_THRESHOLD = 3
-SYSTEMIC_RISK_VOL_MULT        = 1.5
-SYSTEMIC_RISK_HALT_MINS       = 30
-VOL_SPIKE_THRESHOLD           = 3.0   # trigger halt if variance acceleration > 3.0
+SYSTEMIC_RISK_VOL_MULT        = 3.0
+SYSTEMIC_RISK_HALT_MINS       = 5
+VOL_SPIKE_THRESHOLD           = 25.0   # trigger halt if variance acceleration > 25.0
+CRYPTO_VOL_SPIKE_THRESHOLD    = 100.0  # extreme fail-safe for crypto only
 DYNAMIC_KELLY_MIN             = 0.05  # floor for kelly sizing in stressed markets
 DYNAMIC_KELLY_MAX             = 0.40  # ceiling for kelly sizing in ideal markets
 
