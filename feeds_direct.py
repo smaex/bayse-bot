@@ -226,7 +226,8 @@ async def tiingo_fx_feed():
     
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+            # 10s ping to beat Render/Tiingo idle timeouts
+            async with websockets.connect(url, ping_interval=10, ping_timeout=10) as ws:
                 # Tiingo Auth
                 subscribe = {
                     "eventName": "subscribe",

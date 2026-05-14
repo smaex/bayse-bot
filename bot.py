@@ -590,6 +590,11 @@ async def main():
         active_markets=active_markets,
         start_user_fn=start_user,
     )
+    import random
+    startup_delay = random.uniform(2, 8)
+    log.info(f"Bot: Cold start protection — delaying for {startup_delay:.1f}s...")
+    await asyncio.sleep(startup_delay)
+
     # Telegram: NUCLEAR GHOST KICK
     # Forcing a webhook kills all other active 'getUpdates' (polling) sessions immediately
     log.info("Telegram: NUCLEAR KICK — Purging ghost instances via webhook reset...")
