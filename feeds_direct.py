@@ -231,7 +231,10 @@ async def tiingo_fx_feed():
                 subscribe = {
                     "eventName": "subscribe",
                     "authorization": TIINGO_API_KEY,
-                    "eventData": { "thresholdLevel": 2 } # Filter noise but stay responsive (2 pips)
+                    "eventData": { 
+                        "tickers": list(_FX_SYMBOLS.keys()),
+                        "thresholdLevel": 5 # Slightly higher threshold to reduce noise/bandwidth
+                    } 
                 }
                 await ws.send(json.dumps(subscribe))
                 log.info("✅ Tiingo FX Oracle connected")
