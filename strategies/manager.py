@@ -1,6 +1,7 @@
 import math
 import logging
 import config
+from strategies.utils import certainty_to_prob
 
 log = logging.getLogger("strategies.manager")
 
@@ -39,11 +40,3 @@ def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.04,
 def max_ev_price(win_prob: float, fee_rate: float = 0.04, min_margin: float = 0.06) -> float:
     """Calculates the maximum price we can pay to maintain a specific EV margin."""
     return win_prob * (1.0 - fee_rate) / (1.0 + min_margin)
-
-def certainty_to_prob(certainty: float) -> float:
-    """Map certainty [0–1] → estimated win probability [0.50–0.95]."""
-    return 0.50 + 0.45 * min(certainty, 1.0)
-
-def probability_to_certainty(win_prob: float) -> float:
-    """Inverse of certainty_to_prob."""
-    return max(0.0, min((win_prob - 0.50) / 0.45, 1.0))

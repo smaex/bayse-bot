@@ -112,3 +112,12 @@ def btc_spot_move_pct(window_sec: float = 300, state: any = None) -> tuple[float
         return 0.0, ""
     move = (hist[-1][1] - past[1]) / past[1]
     return abs(move), ("UP" if move > 0 else "DOWN")
+
+def certainty_to_prob(certainty: float) -> float:
+    """Map certainty [0–1] → estimated win probability [0.50–0.95]."""
+    return 0.50 + 0.45 * min(max(certainty, 0.0), 1.0)
+
+def probability_to_certainty(win_prob: float) -> float:
+    """Inverse of certainty_to_prob."""
+    return max(0.0, min((win_prob - 0.50) / 0.45, 1.0))
+

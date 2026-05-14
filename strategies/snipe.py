@@ -8,7 +8,7 @@ import feeds_direct
 from strategies.base import BaseStrategy, TradeSignal
 from strategies.utils import (
     realized_vol_hourly, momentum_score, velocity_score, 
-    regime_score, fx_distance_trend, win_probability
+    regime_score, fx_distance_trend, win_probability, probability_to_certainty
 )
 from strategies.manager import kelly_size, max_ev_price
 
@@ -52,7 +52,7 @@ class SnipeStrategy(BaseStrategy):
         if secs < 300: rv *= (1.0 + 0.5 * ((300 - secs) / 210.0))
         
         w_est = win_probability(distance_pct, secs, asset, sigma_override=rv)
-        base = max(0.0, min((w_est - 0.50) / 0.45, 0.99)) # _certainty_from_prob
+        base = probability_to_certainty(w_est)
         
         mom = momentum_score(asset, direction, state)
         regime = regime_score(asset, state)
