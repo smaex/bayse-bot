@@ -33,7 +33,8 @@ def evaluate_global_v2(market: dict, spot_price: float = None, state: MarketStat
         return {}
 
 # Re-export key functions if needed
-from strategies.manager import kelly_size, max_ev_price, certainty_to_prob
+from strategies.manager import kelly_size, max_ev_price
+from strategies.utils import certainty_to_prob, record_btc_move
 
 def is_halted(asset: str) -> bool:
     """Compatibility for bot.py"""
@@ -45,3 +46,25 @@ def is_halted(asset: str) -> bool:
 async def load_memory():
     """Compatibility for bot.py. Now handled by individual strategy plugins if needed."""
     pass
+
+def update_price_history(asset: str, price: float):
+    """Compatibility for bot.py. Updates the global MarketState."""
+    from collections import deque
+    if asset not in global_state.price_history:
+        global_state.price_history[asset] = deque(maxlen=2000)
+    global_state.price_history[asset].append((import_time().time(), price))
+
+def import_time():
+    import time
+    return time
+
+def set_user_context(chat_id: int):
+    """Compatibility for bot.py logging context."""
+    pass
+
+def check_systemic_risk() -> str:
+    """Compatibility for bot.py."""
+    if global_state.systemic_halt_until > import_time().time():
+        return "Systemic Halt Active"
+    return ""
+

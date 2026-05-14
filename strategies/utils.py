@@ -113,6 +113,23 @@ def btc_spot_move_pct(window_sec: float = 300, state: any = None) -> tuple[float
     move = (hist[-1][1] - past[1]) / past[1]
     return abs(move), ("UP" if move > 0 else "DOWN")
 
+def record_btc_move(market: dict, yes_price_new: float, state: any):
+    """Record BTC market price moves for lead-lag detection."""
+    if market["asset"] != "BTC":
+        return
+    tf = market["timeframe"]
+    prev_p = market.get("yes_price", 0.5)
+    if prev_p <= 0: return
+    
+    move = (yes_price_new - prev_p) / prev_p
+    if abs(move) >= 0.01: # 1% threshold
+        import time
+        if not hasattr(state, 'btc_signal_time'): return
+        state.btc_signal_time[tf] = time.time()
+        state.btc_signal_direction[tf] = "UP" if move > 0 else "DOWN"
+        state.btc_signal_move[tf] = abs(move)
+
+
 def certainty_to_prob(certainty: float) -> float:
     """Map certainty [0–1] → estimated win probability [0.50–0.95]."""
     return 0.50 + 0.45 * min(max(certainty, 0.0), 1.0)

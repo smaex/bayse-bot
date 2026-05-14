@@ -226,7 +226,7 @@ async def tiingo_fx_feed():
     
     while True:
         try:
-            async with websockets.connect(url) as ws:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                 # Tiingo Auth
                 subscribe = {
                     "eventName": "subscribe",
