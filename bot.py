@@ -609,7 +609,19 @@ async def main():
 
     await _tg_app.initialize()
     await _tg_app.start()
-    await _tg_app.updater.start_polling(drop_pending_updates=True)
+    # ── Telegram Polling with Conflict-Aware Retry ──
+    while True:
+        try:
+            log.info("Telegram: Starting polling loop...")
+            await _tg_app.updater.start_polling(drop_pending_updates=True)
+            break 
+        except Exception as e:
+            if "Conflict" in str(e):
+                log.warning("Telegram Conflict: Another instance is polling. Waiting 30s for ghost to die...")
+                await asyncio.sleep(30)
+            else:
+                log.error(f"Telegram Polling Error: {e}")
+                break
     log.info("Telegram bot running")
 
     # Start Health-Check Server

@@ -290,5 +290,23 @@ async def tiingo_fx_feed():
                                 
         except Exception as e:
             log.error(f"Tiingo FX error: {e}")
+            # WS flapping? One-off REST poll to keep oracles fresh
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    url_rest = f"https://api.tiingo.com/tiingo/fx/top?tickers={','.join(_FX_SYMBOLS.keys())}&token={TIINGO_API_KEY}"
+                    async with session.get(url_rest, timeout=5) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            for item in data:
+                                ticker = item.get("ticker", "").lower()
+                                asset = _FX_SYMBOLS.get(ticker)
+                                if asset:
+                                    direct_spot[asset] = {"price": float(item["mid"]), "time": time.time()}
+                            log.debug("Tiingo Oracle: REST Fallback successful.")
+            except Exception as re:
+                log.debug(f"Tiingo REST fallback failed: {re}")
+
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
+
