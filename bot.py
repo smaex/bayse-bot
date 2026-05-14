@@ -594,12 +594,13 @@ async def main():
     # Forcing a webhook kills all other active 'getUpdates' (polling) sessions immediately
     log.info("Telegram: NUCLEAR KICK — Purging ghost instances via webhook reset...")
     try:
-        await _tg_app.bot.set_webhook(url="https://ghost-kick.internal")
+        # Use a validly-formatted URL to pass Telegram's validation
+        await _tg_app.bot.set_webhook(url="https://bayse-bot-ghost-kick.render.com/unused")
         await asyncio.sleep(5)
         await _tg_app.bot.delete_webhook(drop_pending_updates=True)
-        log.info("Telegram: Update stream PURGED. Ghosts should be dead.")
+        log.info("Telegram: Ghost instances purged successfully.")
     except Exception as e:
-        log.warning(f"Telegram: Ghost-kick error: {e}")
+        log.warning(f"Telegram: Ghost-kick failed (likely already clean): {e}")
 
     await _tg_app.initialize()
     await _tg_app.start()

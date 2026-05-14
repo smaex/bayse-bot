@@ -237,8 +237,6 @@ async def tiingo_fx_feed():
                     } 
                 }
                 await ws.send(json.dumps(subscribe))
-                log.info("✅ Tiingo FX Oracle connected")
-                backoff = 1
                 
                 while True:
                     try:
@@ -249,7 +247,14 @@ async def tiingo_fx_feed():
                         break
                         
                     msg = json.loads(raw)
+                    
+                    # ── Auth/Info Check ──
+                    if msg.get("messageType") == "I":
+                        log.info(f"Tiingo FX Info: {msg.get('data', {}).get('message')}")
+                        continue
+                        
                     if msg.get("messageType") == "A":
+
                         data = msg.get("data", [])
                         # Tiingo format: [ 'A', ticker, date, bid_size, bid, mid, ask, ask_size ]
                         if len(data) >= 6:
