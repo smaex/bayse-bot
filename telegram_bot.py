@@ -68,7 +68,18 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help",       cmd_help))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(error_handler)
     return app
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and handle Conflict gracefully."""
+    err = context.error
+    if "Conflict" in str(err):
+        log.warning("Telegram: Conflict detected in background loop. Silence and wait...")
+        # We don't need to do much here, the internal PTB loop will retry.
+        # But logging it as a warning instead of a crash helps.
+        return
+    log.error(f"Telegram Error: {err}", exc_info=err)
 
 
 # ── Setup flow ────────────────────────────────────────────────────────────────

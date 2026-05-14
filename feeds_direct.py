@@ -303,9 +303,9 @@ async def tiingo_fx_feed():
                                 asset = _FX_SYMBOLS.get(ticker)
                                 if asset:
                                     direct_spot[asset] = {"price": float(item["mid"]), "time": time.time()}
-                            log.debug("Tiingo Oracle: REST Fallback successful.")
+                            log.info("🟢 Tiingo Oracle: REST Fallback successful. Market data refreshed.")
             except Exception as re:
-                log.debug(f"Tiingo REST fallback failed: {re}")
+                log.warning(f"Tiingo REST fallback failed: {re}")
 
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
