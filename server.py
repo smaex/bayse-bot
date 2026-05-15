@@ -32,11 +32,29 @@ async def handle_api_stats(request):
 
     return web.json_response(stats_cache)
 
-async def start_server(port=8080):
+async def handle_tg_webhook(request):
+    """Handle incoming Telegram updates via Webhook."""
+    app = request.app.get("tg_app")
+    if not app:
+        return web.Response(status=500)
+    
+    try:
+        body = await request.json()
+        from telegram import Update
+        update = Update.de_json(body, app.bot)
+        await app.process_update(update)
+        return web.Response(status=200)
+    except Exception as e:
+        log.error(f"Webhook Error: {e}")
+        return web.Response(status=200) # Always return 200 to Telegram
+
+async def start_server(tg_app=None, port=8080):
     app = web.Application()
+    app["tg_app"] = tg_app
     app.router.add_get("/ping", handle_ping)
     app.router.add_get("/dashboard", handle_dashboard)
     app.router.add_get("/api/stats", handle_api_stats)
+    app.router.add_post("/tg-webhook", handle_tg_webhook)
     
     runner = web.AppRunner(app)
     await runner.setup()

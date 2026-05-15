@@ -61,6 +61,39 @@ _last_spot:        dict[str, float] = {}
 _last_market_eval: dict[str, float] = {}
 _last_lag_log:     dict[str, float] = {}  # throttle lag warnings to once per minute
 
+async def tiingo_fx_feed():
+    """Stable REST-based feed for Forex and Gold (Replaces unstable WebSocket)."""
+    if not TIINGO_API_KEY:
+        log.warning("❌ No TIINGO_API_KEY found. FX Oracle is DISABLED.")
+        return
+
+    import aiohttp
+    log.info("✅ Tiingo FX Oracle: Stable REST mode engaged.")
+    
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"https://api.tiingo.com/tiingo/fx/top?tickers={','.join(_FX_SYMBOLS.keys())}&token={TIINGO_API_KEY}"
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for item in data:
+                            ticker = item.get("ticker", "").lower()
+                            mid_price = item.get("mid")
+                            asset = _FX_SYMBOLS.get(ticker)
+                            if asset and mid_price:
+                                feeds_direct.direct_spot[asset] = {"price": float(mid_price), "time": time.time()}
+                        log.debug("Tiingo Oracle: REST update successful.")
+                    elif resp.status == 429:
+                        log.warning("Tiingo REST: Rate limited. Throttling...")
+                        await asyncio.sleep(30)
+                    else:
+                        log.error(f"Tiingo REST error: {resp.status}")
+        except Exception as e:
+            log.error(f"Tiingo Oracle error: {e}")
+            
+        # Poll every 5 seconds — perfect balance of freshness and stability
+        await asyncio.sleep(5)
 
 # Minimum change to be considered a deposit/withdrawal (not just trade P&L noise)
 _BALANCE_EVENT_MIN_NGN = 200
@@ -227,10 +260,6 @@ async def _user_loop(chat_id: str):
                 await asyncio.to_thread(database.update_settings, chat_id, settings)
                 risk.peak_balance = equity
                 _user_daily[chat_id] = day_now
-                # AUTOMATIC RESUME: if the user was paused due to low balance/drawdown, 
-                # a significant deposit should likely unpause them, or at least 
-                # we should check if we should unpause. 
-                # Actually, better to just let them /resume, but we MUST update _last_balance.
                 if _tg_app:
                     await telegram_bot.notify_deposit_detected(
                         _tg_app, chat_id, delta, "NGN"
@@ -447,12 +476,14 @@ async def _evaluate_markets(
                 elif not risk.already_in(sig.market_id):
                     # Check global exposure before entering
                     if risk.deployed() / equity >= max_exp:
-                        log.debug(f"[{chat_id}] Max exposure reached ({max_exp:.0%})")
+                        log.debug(f"[{chat_id}] {sig.strategy} SKIPPED | {sig.asset} — Max exposure reached ({max_exp:.0%})")
                         continue
                         
                     await executor.execute_trade(
                         chat_id, sig, client, risk, settings, equity, free_cash
                     )
+                else:
+                    log.debug(f"[{chat_id}] {sig.strategy} SKIPPED | {sig.asset} — Already in position.")
                 break 
     except Exception as e:
         log.error(f"[{chat_id}] market eval error: {e}", exc_info=True)
@@ -515,15 +546,7 @@ def _on_spot_price(asset: str, price: float):
     recorder.record_spot_tick(asset, best_price)  # In-memory buffer, no DB hit
     log.debug(f"Spot {asset}: {best_price:,.4f}")
     
-    last = _last_spot.get(asset)
-    if last is not None:
-        change = abs(best_price - last) / last
-        threshold = 0.0005 if asset in ["USDT", "USDC"] else 0.0010
-        if change >= threshold:
-            _last_spot[asset] = best_price
-            asyncio.create_task(_evaluate_all_users_for_spot(asset, change, threshold, safety_penalty))
-    else:
-        _last_spot[asset] = best_price
+    _last_spot[asset] = best_price
 
 
 async def _evaluate_all_users_for_spot(asset: str, change: float, threshold: float, penalty: float = 0.0):
@@ -568,6 +591,24 @@ async def _self_ping_loop():
             except Exception as e:
                 log.debug(f"Self-ping failed: {e}")
 
+async def _heartbeat_eval_loop():
+    """
+    World-Class Heartbeat: Evaluates all markets for all users every 5 seconds.
+    Ensures we never miss a window even if price moves slowly.
+    """
+    log.info("🚀 Heartbeat Evaluation Loop started (5s interval)")
+    while True:
+        try:
+            await asyncio.sleep(5)
+            if not active_markets:
+                continue
+                
+            users = await asyncio.to_thread(database.get_all_active)
+            for user in users:
+                # Run evaluation without a specific trigger asset (full scan)
+                asyncio.create_task(_evaluate_single_user(user, penalty=0.0))
+        except Exception as e:
+            log.error(f"Heartbeat loop error: {e}")
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -635,9 +676,11 @@ async def main():
     asyncio.create_task(feeds.start_feeds(on_price=_on_spot_price))
     asyncio.create_task(feeds_direct.binance_feed())
     asyncio.create_task(feeds_direct.tiingo_fx_feed())
+    asyncio.create_task(feeds_direct.tiingo_fx_rest_fallback())
     asyncio.create_task(news_mod.start_news_feeds())
     asyncio.create_task(learner.resolution_monitor(_user_clients, _user_risks, _tg_app))
     asyncio.create_task(learner.daily_learning_loop(_tg_app))
+    asyncio.create_task(_heartbeat_eval_loop())
     asyncio.create_task(_scan_loop())
     asyncio.create_task(_update_dashboard_stats())
     asyncio.create_task(_polymarket_polling_loop())

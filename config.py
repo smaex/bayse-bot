@@ -120,7 +120,7 @@ SNIPE_ENTRY_WINDOWS = {
 
 # DO NOT buy if the price is already this high.
 # Prevents buying "certain wins" that actually lose money after fees (e.g. 0.98 price).
-SNIPE_MAX_MARKET_PRICE = 0.80
+SNIPE_MAX_MARKET_PRICE = 0.90
 
 # Asset hourly volatility (1σ, fractional) — used in diffusion model for win probability.
 # P(win) = Φ( |spot_distance| / (σ_h × √T_hours) )  ← same math as options pricing
@@ -241,4 +241,4 @@ PROFIT_ALERT_NGN = 20_000      # Telegram alert when unrealized profit hits this
 # ── Rate Limiting (stay well under 20 write/sec, 30 read/sec) ─────────────────
 WRITE_RATE_LIMIT = 15          # max write requests/second (buffer below 20)
 READ_RATE_LIMIT = 25           # max read requests/second (buffer below 30)
-SCAN_INTERVAL_SECONDS = 60     # re-scan for new markets every 60s
+SCAN_INTERVAL_SECONDS = 30     # re-scan for new markets every 30s

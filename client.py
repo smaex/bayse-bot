@@ -97,6 +97,13 @@ class BayseClient:
                     wait = data.get("retryAfter", 2 ** attempt)
                     await asyncio.sleep(wait)
                     continue
+                if r.status >= 400:
+                    try:
+                        error_data = await r.json()
+                        log.error(f"API Error {r.status} on {path}: {error_data}")
+                    except:
+                        text = await r.text()
+                        log.error(f"API Error {r.status} on {path}: {text}")
                 r.raise_for_status()
                 return await r.json()
         raise RuntimeError(f"POST {path} failed after retries")

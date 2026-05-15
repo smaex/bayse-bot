@@ -85,9 +85,12 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     hard_cap = equity * 0.08
     if amount > hard_cap:
         log.info(
-            f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — "
-            f"Trade ₦{amount:,.0f} exceeds 8% hard cap (₦{hard_cap:,.0f})."
+            f"[{chat_id}] ⚖️ HARD CAP CLAMP: Scaling ₦{amount:,.0f} down to 8% cap (₦{hard_cap:,.0f})."
         )
+        amount = hard_cap
+
+    if amount < 100.0:
+        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Final amount ₦{amount:,.0f} < ₦100 minimum.")
         return
 
     if amount > free_cash:
@@ -138,6 +141,21 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     vol_mult = current_vol / base_vol
     adaptive_slip = base_slip * vol_mult
     
+    # ── Synthetic Quote Latency Shield ──
+    import feeds_direct
+    bias = feeds_direct.get_latency_bias(sig.asset)
+    # If Oracle indicates price is moving against us, and Bayse hasn't updated yet.
+    # bias > 0: Oracle > Bayse (Upward pressure)
+    # bias < 0: Oracle < Bayse (Downward pressure)
+    latency_threshold = 0.0008 # 0.08% — significant enough to front-run AMM
+    
+    if sig.outcome == "YES" and bias < -latency_threshold:
+        log.warning(f"[{chat_id}] 🛡️ LATENCY SHIELD: Blocked trade on {sig.asset}. Oracle is {bias:+.2%} below Bayse.")
+        return
+    if sig.outcome == "NO" and bias > latency_threshold:
+        log.warning(f"[{chat_id}] 🛡️ LATENCY SHIELD: Blocked trade on {sig.asset}. Oracle is {bias:+.2%} above Bayse.")
+        return
+
     # ── Engine Detection ──
     market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
     engine = market.get("engine", "AMM") if market else "AMM"
@@ -173,10 +191,15 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
             amount = amount * 0.5
 
         # Place the order
+        # AMM usually requires MARKET + maxSlippage. CLOB can take LIMIT.
+        final_order_type = "LIMIT" if engine == "CLOB" else "MARKET"
+        
         resp = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=sig.outcome_id, side="BUY", amount=amount,
-            order_type="LIMIT", price=limit_price, currency=CURRENCY,
+            order_type=final_order_type, price=limit_price if final_order_type == "LIMIT" else None,
+            max_slippage=adaptive_slip,
+            currency=CURRENCY,
             time_in_force=time_in_force
         )
         order = resp.get("order", resp)

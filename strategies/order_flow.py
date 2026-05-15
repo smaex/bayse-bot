@@ -24,9 +24,20 @@ def get_order_flow_imbalance(asset: str, depth: dict) -> float:
     # Raw imbalance ratio
     imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
     
-    # Weight by distance from mid-price (closer levels matter more)
-    # But for a simple V1, the raw ratio is already a powerful leading indicator.
-    return max(-1.0, min(1.0, imbalance))
+    # ── Exhaustion Detection ──
+    # If one side is > 10x the other, it's a 'Hollow Book' or 'Exhaustion' signal.
+    # This often precedes a massive reversal or a violent continuation.
+    exhaustion = 0.0
+    if bid_vol > 0 and ask_vol > 0:
+        if bid_vol / ask_vol > 10.0:
+            exhaustion = 1.0 # Heavy Buy Pressure (Sell Exhaustion)
+        elif ask_vol / bid_vol > 10.0:
+            exhaustion = -1.0 # Heavy Sell Pressure (Buy Exhaustion)
+            
+    # Combine raw imbalance with exhaustion spike
+    total_score = (imbalance * 0.7) + (exhaustion * 0.3)
+    
+    return max(-1.0, min(1.0, total_score))
 
 def get_ofi_boost(asset: str, direction: str, depth: dict) -> float:
     """
