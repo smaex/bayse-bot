@@ -1,0 +1,31 @@
+name: Strategy Simulation
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+jobs:
+  simulate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Run Simulation
+      env:
+        # We mock these in simulation_test.py, but need dummy env vars for safety
+        TELEGRAM_TOKEN: "mock_token"
+        DATABASE_URL: "postgresql://mock@localhost:5432/mock"
+        ENCRYPTION_KEY: "mock_key_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx="
+      run: |
+        python3 scratch/simulation_test.py
