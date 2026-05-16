@@ -71,8 +71,8 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         by_strategy.setdefault(row["strategy"], []).append(row)
 
     for strat, rows in by_strategy.items():
-        total    = sum(r["total"] for r in rows)
-        wins     = sum(r.get("wins") or 0 for r in rows)
+        total    = int(sum(r["total"] for r in rows))
+        wins     = int(sum(r.get("wins") or 0 for r in rows))
         win_rate = wins / total if total > 0 else None
         
         counts[strat] = total
@@ -156,7 +156,7 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
     for combo in combo_stats:
         key = f"{combo['strategy']}:{combo['asset']}:{combo['timeframe']}"
         wr = combo["win_rate"]
-        total = combo["total"]
+        total = int(combo["total"])
         pnl = combo.get("total_pnl") or 0
         
         # We will adjust the cert_mults for this specific combo
