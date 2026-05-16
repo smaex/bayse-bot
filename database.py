@@ -626,3 +626,16 @@ def save_optimized_params(params: dict):
     # For now, we'll queue it to the batch worker for a generic key-value store
     query = "UPSERT INTO config (key, value) VALUES (%s, %s)"
     _db_queue.put((query, ("optimized_params", json.dumps(params))))
+
+def get_recent_streak(chat_id: str, strategy: str, asset: str, timeframe: str, limit: int = 5) -> list[int]:
+    """Returns the 'won' status of the last N trades for a specific combo."""
+    query = """
+        SELECT won FROM trades
+        WHERE chat_id = %s AND strategy = %s AND asset = %s AND timeframe = %s
+          AND won IS NOT NULL
+        ORDER BY created_at DESC LIMIT %s
+    """
+    with _cx() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (chat_id, strategy, asset, timeframe, limit))
+            return [row[0] for row in cur.fetchall()]
