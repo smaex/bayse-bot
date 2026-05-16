@@ -13,6 +13,8 @@ import os
 import uuid
 import queue
 import threading
+import time
+import random
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
@@ -427,7 +429,7 @@ def recent_stats(chat_id: str, days: int = 30) -> list[dict]:
                SUM(pnl_ngn)   AS total_pnl,
                AVG(certainty) AS avg_certainty
         FROM trades
-        WHERE chat_id=%s AND won IS NOT NULL AND created_at > %s
+        WHERE chat_id=%s AND won IS NOT NULL AND created_at > %s::TIMESTAMPTZ
         GROUP BY strategy, asset, timeframe
         ORDER BY strategy, asset, timeframe
     """, (chat_id, cutoff))
