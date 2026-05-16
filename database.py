@@ -422,7 +422,7 @@ def get_unresolved(chat_id: str, older_than_minutes: int = 6) -> list[dict]:
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)).isoformat()
     return _fetch_all("""
         SELECT * FROM trades
-        WHERE chat_id=%s AND won IS NULL AND created_at < %s::TIMESTAMPTZ
+        WHERE chat_id=%s AND won IS NULL AND created_at::TIMESTAMPTZ < %s::TIMESTAMPTZ
     """, (chat_id, cutoff))
 
 def get_all_unresolved(chat_id: str) -> list[dict]:
@@ -535,11 +535,11 @@ def get_hourly_stats(chat_id: str, days: int = 30) -> list[dict]:
         SELECT 
             EXTRACT(HOUR FROM created_at AT TIME ZONE 'UTC')::INTEGER as hour,
             COUNT(*) as total,
-            SUM(CASE WHEN won = True THEN 1 ELSE 0 END)::FLOAT / COUNT(*) as win_rate
+            SUM(CASE WHEN won = 1 THEN 1 ELSE 0 END)::FLOAT / COUNT(*) as win_rate
         FROM trades
         WHERE chat_id = %s 
-          AND resolved = True 
-          AND created_at > NOW() - INTERVAL '30 days'
+          AND won IS NOT NULL 
+          AND created_at::TIMESTAMPTZ > NOW() - INTERVAL '30 days'
         GROUP BY hour
         ORDER BY hour ASC
     """
