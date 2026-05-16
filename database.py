@@ -210,9 +210,12 @@ def init_db():
                     sec_enc    TEXT NOT NULL,
                     settings   TEXT DEFAULT '{}',
                     is_active  INTEGER DEFAULT 1,
-                    created_at TEXT
+                    created_at TIMESTAMPTZ
                 )
             """)
+            try:
+                cur.execute("ALTER TABLE users ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at::TIMESTAMPTZ")
+            except: pass
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_lock (
                     lock_id    TEXT PRIMARY KEY,
@@ -246,10 +249,17 @@ def init_db():
                     realized_vol_at_entry REAL,
                     won                   INTEGER,
                     pnl_ngn               REAL,
-                    created_at            TEXT,
-                    resolved_at           TEXT
+                    created_at            TIMESTAMPTZ,
+                    resolved_at           TIMESTAMPTZ
                 )
             """)
+            # Migration: TEXT -> TIMESTAMPTZ
+            try:
+                cur.execute("ALTER TABLE trades ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at::TIMESTAMPTZ")
+                cur.execute("ALTER TABLE trades ALTER COLUMN resolved_at TYPE TIMESTAMPTZ USING resolved_at::TIMESTAMPTZ")
+            except:
+                pass # Already migrated or empty
+            
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS order_id TEXT")
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS momentum_at_entry REAL")
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS regime_at_entry REAL")
@@ -266,9 +276,12 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS quant_state (
                     asset      TEXT PRIMARY KEY,
                     state_json TEXT NOT NULL,
-                    updated_at TEXT
+                    updated_at TIMESTAMPTZ
                 )
             """)
+            try:
+                cur.execute("ALTER TABLE quant_state ALTER COLUMN updated_at TYPE TIMESTAMPTZ USING updated_at::TIMESTAMPTZ")
+            except: pass
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS recordings (
                     id         SERIAL PRIMARY KEY,
@@ -409,7 +422,7 @@ def get_unresolved(chat_id: str, older_than_minutes: int = 6) -> list[dict]:
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)).isoformat()
     return _fetch_all("""
         SELECT * FROM trades
-        WHERE chat_id=%s AND won IS NULL AND created_at < %s
+        WHERE chat_id=%s AND won IS NULL AND created_at < %s::TIMESTAMPTZ
     """, (chat_id, cutoff))
 
 def get_all_unresolved(chat_id: str) -> list[dict]:
@@ -472,7 +485,7 @@ def get_combo_stats(chat_id: str, days: int = 14) -> list[dict]:
                SUM(won)       AS wins,
                SUM(pnl_ngn)   AS total_pnl
         FROM trades
-        WHERE chat_id=%s AND won IS NOT NULL AND created_at::TIMESTAMPTZ > %s::TIMESTAMPTZ
+        WHERE chat_id=%s AND won IS NOT NULL AND created_at > %s::TIMESTAMPTZ
         GROUP BY strategy, asset, timeframe
         HAVING COUNT(*) >= 3
         ORDER BY SUM(pnl_ngn) ASC
