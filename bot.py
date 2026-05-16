@@ -579,9 +579,20 @@ async def main():
     database.init_db()
     
     # ── GHOST SHIELD: Singleton Lock ──
-    if not database.acquire_singleton_lock():
-        log.critical("🚨 GHOST SHIELD: Another instance is already active. Terminating to prevent conflicts.")
-        return
+    # During Render deploys, a new instance may start before the old one dies.
+    # We wait up to 120s for the old instance to release the lock/go stale.
+    max_wait = 120
+    waited = 0
+    while not database.acquire_singleton_lock():
+        if waited >= max_wait:
+            log.critical(f"🚨 GHOST SHIELD: Could not acquire lock after {max_wait}s. Terminating.")
+            return
+        if waited % 30 == 0:
+            log.info(f"⏳ GHOST SHIELD: Another instance is active. Standing by... ({waited}s)")
+        await asyncio.sleep(5)
+        waited += 5
+    
+    log.info("🛡️ GHOST SHIELD: Lock acquired. Starting master process.")
         
     async def _lock_heartbeat():
         while True:
