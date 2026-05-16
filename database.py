@@ -257,8 +257,8 @@ def init_db():
             try:
                 cur.execute("ALTER TABLE trades ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at::TIMESTAMPTZ")
                 cur.execute("ALTER TABLE trades ALTER COLUMN resolved_at TYPE TIMESTAMPTZ USING resolved_at::TIMESTAMPTZ")
-            except:
-                pass # Already migrated or empty
+            except Exception as e:
+                log.debug(f"Trades migration skip: {e}")
             
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS order_id TEXT")
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS momentum_at_entry REAL")
@@ -442,7 +442,7 @@ def recent_stats(chat_id: str, days: int = 30) -> list[dict]:
                SUM(pnl_ngn)   AS total_pnl,
                AVG(certainty) AS avg_certainty
         FROM trades
-        WHERE chat_id=%s AND won IS NOT NULL AND created_at > %s::TIMESTAMPTZ
+        WHERE chat_id=%s AND won IS NOT NULL AND created_at::TIMESTAMPTZ > %s::TIMESTAMPTZ
         GROUP BY strategy, asset, timeframe
         ORDER BY strategy, asset, timeframe
     """, (chat_id, cutoff))
@@ -485,7 +485,7 @@ def get_combo_stats(chat_id: str, days: int = 14) -> list[dict]:
                SUM(won)       AS wins,
                SUM(pnl_ngn)   AS total_pnl
         FROM trades
-        WHERE chat_id=%s AND won IS NOT NULL AND created_at > %s::TIMESTAMPTZ
+        WHERE chat_id=%s AND won IS NOT NULL AND created_at::TIMESTAMPTZ > %s::TIMESTAMPTZ
         GROUP BY strategy, asset, timeframe
         HAVING COUNT(*) >= 3
         ORDER BY SUM(pnl_ngn) ASC
