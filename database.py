@@ -221,38 +221,6 @@ def init_db():
             # Initialize the single lock row if not exists
             cur.execute("INSERT INTO bot_lock (lock_id, process_id) VALUES ('MASTER', 0) ON CONFLICT DO NOTHING")
 
-def acquire_singleton_lock() -> bool:
-    """
-    World-Class Ghost Shield:
-    Attempts to claim the 'MASTER' lock in the database.
-    If another process (PID) has updated the lock in the last 60 seconds, we fail.
-    """
-    import os
-    pid = os.getpid()
-    try:
-        with _cx() as conn:
-            with conn.cursor() as cur:
-                # Atomically update the lock if it's stale (>60s) or belongs to us
-                cur.execute("""
-                    UPDATE bot_lock 
-                    SET process_id = %s, updated_at = CURRENT_TIMESTAMP
-                    WHERE lock_id = 'MASTER' 
-                      AND (updated_at < CURRENT_TIMESTAMP - INTERVAL '60 seconds' OR process_id = %s)
-                    RETURNING process_id
-                """, (pid, pid))
-                row = cur.fetchone()
-                if row and row[0] == pid:
-                    return True
-    except Exception as e:
-        log.error(f"Error acquiring singleton lock: {e}")
-    return False
-
-def heartbeat_singleton_lock():
-    """Updates the lock timestamp to keep it alive."""
-    import os
-    pid = os.getpid()
-    _enqueue("UPDATE bot_lock SET updated_at = CURRENT_TIMESTAMP WHERE lock_id = 'MASTER' AND process_id = %s", (pid,))
-
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     trade_id              TEXT PRIMARY KEY,
@@ -310,6 +278,38 @@ def heartbeat_singleton_lock():
             """)
         conn.commit()
     log.info("Database ready (PostgreSQL, pooled connections)")
+
+def acquire_singleton_lock() -> bool:
+    """
+    World-Class Ghost Shield:
+    Attempts to claim the 'MASTER' lock in the database.
+    If another process (PID) has updated the lock in the last 60 seconds, we fail.
+    """
+    import os
+    pid = os.getpid()
+    try:
+        with _cx() as conn:
+            with conn.cursor() as cur:
+                # Atomically update the lock if it's stale (>60s) or belongs to us
+                cur.execute("""
+                    UPDATE bot_lock 
+                    SET process_id = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE lock_id = 'MASTER' 
+                      AND (updated_at < CURRENT_TIMESTAMP - INTERVAL '60 seconds' OR process_id = %s)
+                    RETURNING process_id
+                """, (pid, pid))
+                row = cur.fetchone()
+                if row and row[0] == pid:
+                    return True
+    except Exception as e:
+        log.error(f"Error acquiring singleton lock: {e}")
+    return False
+
+def heartbeat_singleton_lock():
+    """Updates the lock timestamp to keep it alive."""
+    import os
+    pid = os.getpid()
+    _enqueue("UPDATE bot_lock SET updated_at = CURRENT_TIMESTAMP WHERE lock_id = 'MASTER' AND process_id = %s", (pid,))
 
 
 # ── Users ─────────────────────────────────────────────────────────────────────
