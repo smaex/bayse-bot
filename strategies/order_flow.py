@@ -37,6 +37,13 @@ def get_order_flow_imbalance(asset: str, depth: dict) -> float:
     # Combine raw imbalance with exhaustion spike
     total_score = (imbalance * 0.7) + (exhaustion * 0.3)
     
+    # ── Absorption Detection ──
+    # If the imbalance is high but price is flat, it's 'Absorption'.
+    # This often precedes a violent breakout in the direction of the absorption.
+    # (Simplified for v5: we use the raw score but flag it if extreme).
+    if abs(total_score) > 0.85:
+        log.info(f"📊 ABSORPTION: Extreme pressure detected on {asset} ({total_score:+.2f})")
+    
     return max(-1.0, min(1.0, total_score))
 
 def get_ofi_boost(asset: str, direction: str, depth: dict) -> float:

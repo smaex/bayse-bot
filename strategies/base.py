@@ -46,6 +46,7 @@ class TradeSignal:
     regime_at_entry:       float = 0.0
     edge_at_entry:         float = 0.0
     realized_vol_at_entry: float = 0.0
+    mode_floor:            float = 0.55
     
     def strength(self) -> str:
         if self.certainty >= 0.85: return "🔥 SUPERIOR"

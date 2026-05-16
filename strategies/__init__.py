@@ -73,12 +73,75 @@ async def evaluate_all(market: dict, learned: dict, state: any, spot_price: floa
 
                 # Re-verify certainty hurdle after multipliers
                 mode = learned.get("mode", "balanced")
-                mode_floor = {"safe": 0.65, "balanced": 0.55, "aggressive": 0.45, "full_send": 0.35}.get(mode, 0.55)
                 
-                if sig.certainty >= mode_floor:
+                # ── Alpha Resurrection: Lowered Floors ──
+                # We lower floors by ~0.10 to capture more signals.
+                mode_floor = {"safe": 0.60, "balanced": 0.48, "aggressive": 0.40, "full_send": 0.32}.get(mode, 0.48)
+                
+                # ── Market Stagnation Relief (Pantry Raid) ──
+                # If the bot hasn't traded in 12 hours, we lower hurdles further.
+                if learned.get("pantry_raid_active"):
+                    mode_floor -= 0.10
+                
+                # ── Discovery Filter (Alpha Resurrection) ──
+                # We allow signals as low as 0.35 to pass through so the executor 
+                # can fire 'Discovery Probes' (₦100) to collect data.
+                discovery_floor = 0.35
+                
+                if sig.certainty >= mode_floor or sig.certainty >= discovery_floor:
+                    # ── Macro Compass Boost ──
+                    from feeds_direct import macro_bias
+                    now = time.time()
+                    
+                    # USD Spike is BEARISH for Crypto
+                    if macro_bias.get("USD_SPIKE", {}).get("active") and macro_bias["USD_SPIKE"]["expires"] > now:
+                        if sig.outcome == "YES": sig.certainty -= 0.05
+                        else: sig.certainty += 0.05
+                    
+                    # Gold Breakout is BULLISH for Crypto
+                    if macro_bias.get("GOLD_BREAKOUT", {}).get("active") and macro_bias["GOLD_BREAKOUT"]["expires"] > now:
+                        if sig.outcome == "YES": sig.certainty += 0.05
+                    
+                    # ── Liquidity Wall Boost ──
+                    from feeds_direct import direct_spot
+                    ds = direct_spot.get(sig.asset, {})
+                    bid_sz, ask_sz = ds.get("bid_sz", 0), ds.get("ask_sz", 0)
+                    if bid_sz > 0 and ask_sz > 0:
+                        if bid_sz > ask_sz * 5: # Support Wall
+                            if sig.outcome == "YES": sig.certainty += 0.08; sig.reason += " | BUY_WALL"
+                        elif ask_sz > bid_sz * 5: # Resistance Wall
+                            if sig.outcome == "NO": sig.certainty += 0.08; sig.reason += " | SELL_WALL"
+
+                    sig.mode_floor = mode_floor
                     signals.append(sig)
                     
         except Exception as e:
             log.error(f"Error evaluating strategy {name} on {asset}: {e}", exc_info=True)
             
     return sorted(signals, key=lambda s: s.certainty, reverse=True)
+
+def merge_signals(all_signals: List[TradeSignal]) -> List[TradeSignal]:
+    """
+    World-Class Convergence Engine:
+    Detects when multiple strategies or timeframes align on the same asset/outcome.
+    Boosts certainty by +15% for 'Stacked' conviction.
+    """
+    merged = {}
+    for sig in all_signals:
+        key = f"{sig.asset}:{sig.outcome}"
+        if key not in merged:
+            merged[key] = sig
+        else:
+            # Convergence Detected!
+            existing = merged[key]
+            if existing.timeframe != sig.timeframe:
+                existing.certainty = min(1.0, existing.certainty + 0.15)
+                existing.reason += f" | CONVERGENCE({sig.timeframe})"
+                existing.converged_with.append(sig.timeframe)
+            
+            # If multiple strategies agree, take the one with highest certainty
+            if sig.certainty > existing.certainty:
+                sig.certainty = existing.certainty # Keep the boost
+                merged[key] = sig
+                
+    return list(merged.values())

@@ -172,10 +172,18 @@ async def binance_feed():
                     
                     if asset and bid and ask:
                         mid_price = (float(bid) + float(ask)) / 2
-                        direct_spot[asset] = {"price": mid_price, "time": time.time()}
+                        bid_sz = float(data.get("B", 0))
+                        ask_sz = float(data.get("A", 0))
+                        
+                        direct_spot[asset] = {
+                            "price": mid_price, 
+                            "time": time.time(),
+                            "bid_sz": bid_sz,
+                            "ask_sz": ask_sz
+                        }
                         
                         if msg_count % 500 == 0:
-                            log.debug(f"Oracle update [{asset}]: {mid_price:,.2f}")
+                            log.debug(f"Oracle update [{asset}]: {mid_price:,.2f} | B:{bid_sz:.1f} A:{ask_sz:.1f}")
                             
         except Exception as e:
             if "451" in str(e) and current_idx == 0:
@@ -198,9 +206,23 @@ async def tiingo_fx_feed():
 
     url = "wss://api.tiingo.com/fx"
     backoff = 1
+    connection_errors = 0
+    last_error_time = 0
     
     while True:
         try:
+            # Circuit Breaker: If we've had > 5 errors in the last 10 mins, 
+            # wait longer before trying WebSocket again.
+            now = time.time()
+            if connection_errors > 5 and (now - last_error_time < 600):
+                log.warning("Tiingo FX WS Circuit Breaker active. Relying on REST fallback for 10 mins.")
+                await asyncio.sleep(60)
+                continue
+
+            # Jitter to prevent connection storms between ghost instances
+            import random
+            await asyncio.sleep(random.uniform(10, 30)) # Increased jitter
+            
             async with websockets.connect(url, ping_interval=10, ping_timeout=10) as ws:
                 subscribe = {
                     "eventName": "subscribe",
@@ -210,6 +232,7 @@ async def tiingo_fx_feed():
                 await ws.send(json.dumps(subscribe))
                 log.info("✅ Tiingo FX WebSocket connected.")
                 backoff = 1
+                connection_errors = 0 # Reset on success
                 
                 while True:
                     try:
@@ -237,16 +260,27 @@ async def tiingo_fx_feed():
                                     elif move > 0.0010:
                                         macro_bias["USD_CRASH"] = {"active": True, "strength": abs(move), "expires": time.time() + 300}
                                         log.info(f"🚀 MACRO BIAS: USD Crash detected (EURUSD {move:+.3%})")
+                                        
+                                # Gold Lead
+                                if old_data and asset == "XAUUSD":
+                                    move = (float(mid_price) - old_data["price"]) / old_data["price"]
+                                    if move > 0.0020:
+                                        macro_bias["GOLD_BREAKOUT"] = {"active": True, "strength": abs(move), "expires": time.time() + 600}
+                                        log.info(f"✨ MACRO BIAS: Gold Breakout detected ({move:+.2%})")
                                 
         except websockets.exceptions.ConnectionClosed as e:
+            connection_errors += 1
+            last_error_time = time.time()
             if e.code == 1005:
-                log.debug("Tiingo FX WS closed (1005). Reconnecting quietly...")
+                log.debug(f"Tiingo FX WS closed (1005, count={connection_errors}). Reconnecting quietly...")
             else:
-                log.warning(f"Tiingo FX WS closed ({e.code}): {e.reason}")
+                log.warning(f"Tiingo FX WS closed ({e.code}, count={connection_errors}): {e.reason}")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
         except Exception as e:
-            log.error(f"Tiingo FX error: {e}")
+            connection_errors += 1
+            last_error_time = time.time()
+            log.error(f"Tiingo FX error (count={connection_errors}): {e}")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 

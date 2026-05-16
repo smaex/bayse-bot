@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Optional
 import database
 import feeds
@@ -23,6 +24,17 @@ def init_executor(markets, tg_app):
 
 async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash):
     """decide and execute a single-sided trade"""
+    
+    # ── Systemic Halt Check ──
+    if strategy.global_state.systemic_halt_until > time.time():
+        log.warning(f"[{chat_id}] SYSTEMIC HALT active — skipping {sig.strategy}")
+        return
+
+    # ── Already in Position Check ──
+    if risk.already_in(sig.market_id):
+        log.debug(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Already in position.")
+        return
+
     mode = settings.get("mode", "balanced")
     min_t    = settings.get("mintrade", 100)
     max_t    = settings.get("maxtrade", 500_000)
@@ -97,35 +109,39 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
         log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Insufficient free cash (Need ₦{amount:,.0f}, Have ₦{free_cash:,.0f})")
         return
 
-    if not risk.can_trade(equity, amount, max_exp):
-        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Risk limit or max exposure reached")
+    # ── Safety Guardrails (Alpha Resurrection) ──
+    # 1. Global Price Cap: Never buy above 0.80 (Downside is 4x upside)
+    MAX_ENTRY_PRICE = 0.80
+    if sig.market_price > MAX_ENTRY_PRICE:
+        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Price {sig.market_price:.2f} above safety cap {MAX_ENTRY_PRICE}")
         return
+
+    # 2. Mathematical EV Filter
+    # EV = (WinProb * Payout) - (LossProb * 1.0)
+    # We demand at least 5% EV margin for non-probe trades.
+    fee_rate = settings.get("fee_rate", 0.04)
+    win_p = sig.win_prob
+    net_payout = (1.0 - fee_rate) / sig.market_price
+    ev = (win_p * net_payout) - (1.0 - win_p)
+    
     # ── Discovery Probe ──
     is_probe = False
-    # Probes: Small trades to collect data even if certainty is modest
-    if learned.get("discovery_mode") or (sig.certainty < 0.50 and mode != "safe"):
+    # Probes: Small trades (₦100) to collect data even if certainty is modest (0.35+)
+    # This keeps the bot 'in the game' without risking the bankroll.
+    if sig.certainty >= 0.35 and sig.certainty < sig.mode_floor:
         is_probe = True
         amount = 100.0
         log.info(f"[{chat_id}] DISCOVERY PROBE: Sizing down to ₦100 for Bayesian data collection.")
 
-    fee_rate = settings.get("fee_rate", 0.04)
-    est_net_payout = (1.0 - fee_rate) / sig.market_price
-    if est_net_payout < 1.0 + MIN_PAYOUT_RATIO:
-        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — est. net payout {(est_net_payout - 1.0):.1%} < {MIN_PAYOUT_RATIO:.1%} minimum")
+    if not is_probe and ev < 0.05:
+        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Insufficient EV ({ev:+.1%})")
         return
 
-    # ── Dynamic Payout Hurdle (Flexibility Layer) ──
-    # We adjust the "Minimum Profit Buffer" based on the user's selected mode.
-    # Safe Mode demands 10%; Balanced 6%; Aggressive 3%; Full Send 1%.
-    mode_hurdle = {"safe": 0.10, "balanced": 0.06, "aggressive": 0.03, "full_send": 0.01}.get(mode, 0.06)
-    current_min_payout = mode_hurdle
-    
-    # Conviction Boost: If we are >90% sure, we are extra flexible on price
-    if sig.certainty >= 0.90:
-        current_min_payout = min(current_min_payout, 0.02)
-        log.debug(f"[{chat_id}] Conviction Boost: Hurdle lowered to {current_min_payout:.1%}")
+    if not risk.can_trade(equity, amount, max_exp):
+        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Risk limit or max exposure reached")
+        return
 
-    max_allowed_price = (1.0 - fee_rate) / (1.0 + current_min_payout)
+    max_allowed_price = (1.0 - fee_rate) / (1.0 + 0.01) # Baseline 1% buffer
     is_fx = sig.asset in _FX_ASSETS
     
     # ── Adaptive Slippage ──
@@ -143,7 +159,7 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     
     # ── Synthetic Quote Latency Shield ──
     import feeds_direct
-    bias = feeds_direct.get_latency_bias(sig.asset)
+    bias = feeds_direct.get_latency_bias(sig.asset, feeds.spot.get(sig.asset, 0.0))
     # If Oracle indicates price is moving against us, and Bayse hasn't updated yet.
     # bias > 0: Oracle > Bayse (Upward pressure)
     # bias < 0: Oracle < Bayse (Downward pressure)

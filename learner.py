@@ -237,6 +237,8 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
     if not changes and not warnings and stats:
         lines.append("\n✅ All strategies performing well — no changes needed.")
 
+    suspended = learned.get("suspended_strategies", [])
+    suspended_combos = learned.get("suspended_combos", [])
     active = [s for s in ["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE"] if s not in suspended]
     lines += [
         "",
@@ -409,3 +411,45 @@ async def daily_learning_loop(tg_app=None):
                     )
             except Exception as e:
                 log.error(f"Learning failed for {cid}: {e}")
+
+async def stagnation_monitor(tg_app=None):
+    """
+    Checks for trading droughts. If no trades in 12h, activates 'Pantry Raid' mode.
+    """
+    while True:
+        await asyncio.sleep(3600) # Check every hour
+        users = await asyncio.to_thread(database.get_all_active)
+        for user in users:
+            cid = user["chat_id"]
+            try:
+                # Check last trade entry time
+                with database._cx() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT created_at FROM trades WHERE chat_id=%s ORDER BY created_at DESC LIMIT 1", (cid,))
+                        row = cur.fetchone()
+                        if not row: continue
+                        
+                        last_trade = datetime.fromisoformat(row[0])
+                        # If more than 12 hours ago
+                        if datetime.now(timezone.utc) - last_trade > timedelta(hours=12):
+                            s = user["settings"]
+                            learned = s.get("learned", {})
+                            if not learned.get("pantry_raid_active"):
+                                learned["pantry_raid_active"] = True
+                                s["learned"] = learned
+                                await asyncio.to_thread(database.update_settings, cid, s)
+                                log.info(f"[{cid}] 🚨 PANTRY RAID ACTIVATED: Trading drought detected (>12h).")
+                                if tg_app:
+                                    import telegram_bot as tgb
+                                    await tgb.send_message(tg_app, cid, "🚨 *Pantry Raid Activated* — No trades for 12h. Lowering hurdles to find alpha.")
+                        else:
+                            # Deactivate if we traded recently
+                            s = user["settings"]
+                            learned = s.get("learned", {})
+                            if learned.get("pantry_raid_active"):
+                                learned["pantry_raid_active"] = False
+                                s["learned"] = learned
+                                await asyncio.to_thread(database.update_settings, cid, s)
+                                log.info(f"[{cid}] ✅ Pantry Raid deactivated.")
+            except Exception as e:
+                log.error(f"Stagnation monitor error for {cid}: {e}")

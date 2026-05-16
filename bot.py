@@ -61,40 +61,6 @@ _last_spot:        dict[str, float] = {}
 _last_market_eval: dict[str, float] = {}
 _last_lag_log:     dict[str, float] = {}  # throttle lag warnings to once per minute
 
-async def tiingo_fx_feed():
-    """Stable REST-based feed for Forex and Gold (Replaces unstable WebSocket)."""
-    if not TIINGO_API_KEY:
-        log.warning("❌ No TIINGO_API_KEY found. FX Oracle is DISABLED.")
-        return
-
-    import aiohttp
-    log.info("✅ Tiingo FX Oracle: Stable REST mode engaged.")
-    
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                url = f"https://api.tiingo.com/tiingo/fx/top?tickers={','.join(_FX_SYMBOLS.keys())}&token={TIINGO_API_KEY}"
-                async with session.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        for item in data:
-                            ticker = item.get("ticker", "").lower()
-                            mid_price = item.get("mid")
-                            asset = _FX_SYMBOLS.get(ticker)
-                            if asset and mid_price:
-                                feeds_direct.direct_spot[asset] = {"price": float(mid_price), "time": time.time()}
-                        log.debug("Tiingo Oracle: REST update successful.")
-                    elif resp.status == 429:
-                        log.warning("Tiingo REST: Rate limited. Throttling...")
-                        await asyncio.sleep(30)
-                    else:
-                        log.error(f"Tiingo REST error: {resp.status}")
-        except Exception as e:
-            log.error(f"Tiingo Oracle error: {e}")
-            
-        # Poll every 5 seconds — perfect balance of freshness and stability
-        await asyncio.sleep(5)
-
 # Minimum change to be considered a deposit/withdrawal (not just trade P&L noise)
 _BALANCE_EVENT_MIN_NGN = 200
 _BALANCE_EVENT_MIN_PCT = 0.05   # 5% of balance
@@ -447,6 +413,7 @@ async def _evaluate_markets(
     trigger_asset: str = None, penalty: float = 0.0
 ):
     try:
+        all_signals = []
         for market in active_markets:
             if market.get("status") != "open":
                 continue
@@ -463,28 +430,17 @@ async def _evaluate_markets(
             signals = await strategies.evaluate_all(market, learned, strategy.global_state)
             
             for sig in signals:
-                if sig.strategy not in active_strats:
-                    continue
-                
-                # Check systemic halt
-                if strategy.global_state.systemic_halt_until > time.time():
-                    log.warning(f"[{chat_id}] SYSTEMIC HALT active — skipping trade")
-                    break
-
-                if sig.strategy == "ARB":
-                    await executor.execute_arb(chat_id, sig, client, equity, free_cash, settings)
-                elif not risk.already_in(sig.market_id):
-                    # Check global exposure before entering
-                    if risk.deployed() / equity >= max_exp:
-                        log.debug(f"[{chat_id}] {sig.strategy} SKIPPED | {sig.asset} — Max exposure reached ({max_exp:.0%})")
-                        continue
-                        
-                    await executor.execute_trade(
-                        chat_id, sig, client, risk, settings, equity, free_cash
-                    )
-                else:
-                    log.debug(f"[{chat_id}] {sig.strategy} SKIPPED | {sig.asset} — Already in position.")
-                break 
+                if sig.strategy in active_strats:
+                    all_signals.append(sig)
+            
+        # ── Convergence Engine ──
+        final_signals = strategies.merge_signals(all_signals)
+            
+        for sig in final_signals:
+            if sig.strategy == "ARB":
+                await executor.execute_arb(chat_id, sig, client, equity, free_cash, settings)
+            else:
+                await executor.execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     except Exception as e:
         log.error(f"[{chat_id}] market eval error: {e}", exc_info=True)
 
@@ -621,6 +577,17 @@ async def main():
 
     log.info("=== Bayse Bot Starting (multi-user) ===")
     database.init_db()
+    
+    # ── GHOST SHIELD: Singleton Lock ──
+    if not database.acquire_singleton_lock():
+        log.critical("🚨 GHOST SHIELD: Another instance is already active. Terminating to prevent conflicts.")
+        return
+        
+    async def _lock_heartbeat():
+        while True:
+            database.heartbeat_singleton_lock()
+            await asyncio.sleep(30)
+    asyncio.create_task(_lock_heartbeat())
 
     # Telegram
     _tg_app = telegram_bot.build_app()
@@ -680,6 +647,7 @@ async def main():
     asyncio.create_task(news_mod.start_news_feeds())
     asyncio.create_task(learner.resolution_monitor(_user_clients, _user_risks, _tg_app))
     asyncio.create_task(learner.daily_learning_loop(_tg_app))
+    asyncio.create_task(learner.stagnation_monitor(_tg_app))
     asyncio.create_task(_heartbeat_eval_loop())
     asyncio.create_task(_scan_loop())
     asyncio.create_task(_update_dashboard_stats())

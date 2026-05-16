@@ -57,6 +57,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("set",        cmd_set))
     app.add_handler(CommandHandler("pause",      cmd_pause))
     app.add_handler(CommandHandler("resume",     cmd_resume))
+    app.add_handler(CommandHandler("pulse",      cmd_pulse))
     app.add_handler(CommandHandler("learning",      cmd_learning))
     app.add_handler(CommandHandler("resetlearning", cmd_resetlearning))
     app.add_handler(CommandHandler("learnstats", cmd_learnstats))
@@ -493,6 +494,42 @@ async def cmd_resume(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         risk.paused = False
         risk.peak_balance = 0
     await update.message.reply_text("▶️ Trading resumed.")
+
+
+@_guard
+async def cmd_pulse(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+    """Real-time view of Macro and Liquidity intelligence."""
+    import feeds_direct
+    import time
+    
+    lines = ["💓 *Bayse Pulse Dashboard*\n"]
+    
+    # 1. Macro Compass
+    lines.append("🌍 *Macro Compass:*")
+    now = time.time()
+    for key, data in feeds_direct.macro_bias.items():
+        if data.get("expires", 0) > now:
+            icon = "🚀" if "CRASH" in key or "BREAKOUT" in key else "🚨"
+            lines.append(f"  {icon} {key}: Active ({data['expires']-now:.0f}s left)")
+    if not any(d.get("expires", 0) > now for d in feeds_direct.macro_bias.values()):
+        lines.append("  ✅ USD/Gold: Neutral")
+        
+    # 2. Liquidity Walls
+    lines.append("\n🧱 *Liquidity Walls (Binance):*")
+    walls = []
+    for asset, data in feeds_direct.direct_spot.items():
+        bid_sz, ask_sz = data.get("bid_sz", 0), data.get("ask_sz", 0)
+        if bid_sz > 0 and ask_sz > 0:
+            if bid_sz > ask_sz * 3:
+                walls.append(f"  🟢 {asset}: BUY WALL (x{bid_sz/ask_sz:.1f})")
+            elif ask_sz > bid_sz * 3:
+                walls.append(f"  🔴 {asset}: SELL WALL (x{ask_sz/bid_sz:.1f})")
+    if walls:
+        lines += sorted(walls)
+    else:
+        lines.append("  ✅ Books: Balanced")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 @_guard

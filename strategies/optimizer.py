@@ -71,17 +71,26 @@ class AutoOptimizer:
 
     async def schedule_loop(self):
         while True:
-            # For testing/demo purposes, we'll allow manual trigger via a flag or just check time
-            now = datetime.now(timezone.utc)
-            # 00:00 UTC check
-            if now.hour == 0 and now.minute == 0 and (time.time() - self.last_run > 3600):
-                await self.run_nightly_optimization()
-            
-            # Also run once on startup if never run
-            if self.last_run == 0:
-                # Delay slightly for DB init
-                await asyncio.sleep(10)
-                await self.run_nightly_optimization()
+            try:
+                # For testing/demo purposes, we'll allow manual trigger via a flag or just check time
+                now = datetime.now(timezone.utc)
+                # 00:00 UTC check
+                if now.hour == 0 and now.minute == 0 and (time.time() - self.last_run > 3600):
+                    await self.run_nightly_optimization()
+                
+                # Also run once on startup if never run
+                if self.last_run == 0:
+                    # Delay slightly for DB init
+                    await asyncio.sleep(10)
+                    await self.run_nightly_optimization()
+                    # Ensure last_run is set even if optimization skips/fails inside run_nightly
+                    if self.last_run == 0:
+                        self.last_run = time.time()
+            except Exception as e:
+                log.error(f"Optimizer loop error: {e}")
+                # Ensure we don't spin in a tight loop on error
+                if self.last_run == 0:
+                    self.last_run = time.time()
 
             await asyncio.sleep(60)
 

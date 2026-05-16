@@ -69,6 +69,8 @@ _db_queue: queue.Queue = queue.Queue()
 def _db_worker():
     while True:
         try:
+            # Jitter to prevent connection storms between ghost instances
+            time.sleep(random.uniform(2, 8))
             batch = []
             batch.append(_db_queue.get())
             try:
@@ -209,6 +211,48 @@ def init_db():
                     created_at TEXT
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS bot_lock (
+                    lock_id    TEXT PRIMARY KEY,
+                    process_id INTEGER NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # Initialize the single lock row if not exists
+            cur.execute("INSERT INTO bot_lock (lock_id, process_id) VALUES ('MASTER', 0) ON CONFLICT DO NOTHING")
+
+def acquire_singleton_lock() -> bool:
+    """
+    World-Class Ghost Shield:
+    Attempts to claim the 'MASTER' lock in the database.
+    If another process (PID) has updated the lock in the last 60 seconds, we fail.
+    """
+    import os
+    pid = os.getpid()
+    try:
+        with _cx() as conn:
+            with conn.cursor() as cur:
+                # Atomically update the lock if it's stale (>60s) or belongs to us
+                cur.execute("""
+                    UPDATE bot_lock 
+                    SET process_id = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE lock_id = 'MASTER' 
+                      AND (updated_at < CURRENT_TIMESTAMP - INTERVAL '60 seconds' OR process_id = %s)
+                    RETURNING process_id
+                """, (pid, pid))
+                row = cur.fetchone()
+                if row and row[0] == pid:
+                    return True
+    except Exception as e:
+        log.error(f"Error acquiring singleton lock: {e}")
+    return False
+
+def heartbeat_singleton_lock():
+    """Updates the lock timestamp to keep it alive."""
+    import os
+    pid = os.getpid()
+    _enqueue("UPDATE bot_lock SET updated_at = CURRENT_TIMESTAMP WHERE lock_id = 'MASTER' AND process_id = %s", (pid,))
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
                     trade_id              TEXT PRIMARY KEY,
@@ -419,14 +463,14 @@ def get_combo_stats(chat_id: str, days: int = 14) -> list[dict]:
     Used by the Self-Correction Engine to identify and deactivate
     specific losing patterns (e.g. 'SNIPE on SOL 5min' losing 80% of the time).
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     rows = _fetch_all("""
         SELECT strategy, asset, timeframe,
                COUNT(*)       AS total,
                SUM(won)       AS wins,
                SUM(pnl_ngn)   AS total_pnl
         FROM trades
-        WHERE chat_id=%s AND won IS NOT NULL AND created_at > %s
+        WHERE chat_id=%s AND won IS NOT NULL AND created_at::TIMESTAMPTZ > %s::TIMESTAMPTZ
         GROUP BY strategy, asset, timeframe
         HAVING COUNT(*) >= 3
         ORDER BY SUM(pnl_ngn) ASC
@@ -553,7 +597,7 @@ def get_recent_trades(days: int = 7) -> list:
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
                 cutoff = datetime.now(timezone.utc) - timedelta(days=days)
                 cur.execute(
-                    "SELECT * FROM trades WHERE created_at > %s",
+                    "SELECT * FROM trades WHERE created_at::TIMESTAMPTZ > %s::TIMESTAMPTZ",
                     (cutoff,)
                 )
                 return [dict(r) for r in cur.fetchall()]

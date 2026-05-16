@@ -39,8 +39,8 @@ class FrontrunStrategy(BaseStrategy):
             
         bias = (oracle_p - bayse_spot) / bayse_spot
         
-        # 2. Threshold: If gap > 0.15% (World Class bots trigger at 0.05% but we have fees)
-        trigger = 0.0015 # 15 bps
+        # 2. Threshold: Lowered for Alpha Resurrection (8 bps)
+        trigger = 0.0008 
         
         direction = None
         outcome = None
