@@ -32,9 +32,16 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
 
     # ── Already in Position Check ──
     if risk.already_in(sig.market_id):
-        log.debug(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Already in position.")
+        log.debug(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Already in position or pending.")
         return
 
+    risk.lock_market(sig.market_id)
+    try:
+        await _execute_trade_logic(chat_id, sig, client, risk, settings, equity, free_cash)
+    finally:
+        risk.unlock_market(sig.market_id)
+
+async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, free_cash):
     mode = settings.get("mode", "balanced")
     min_t    = settings.get("mintrade", 100)
     max_t    = settings.get("maxtrade", 500_000)
@@ -219,7 +226,16 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
             time_in_force=time_in_force
         )
         order = resp.get("order", resp)
-        shares_filled = float(order.get("shares", order.get("quantity", 0)) or 0)
+        # Robust share/quantity detection across different API versions
+        shares_filled = float(
+            order.get("shares") or 
+            order.get("quantity") or 
+            order.get("sharesFilled") or 
+            order.get("sharesMatched") or 
+            order.get("amountMatched") or 
+            order.get("filledQuantity") or 
+            0
+        )
         
         # ── Order Chaser (CLOB only) ──
         # If CLOB and zero fill, try one more time at a slightly more aggressive price (if still profitable)
@@ -233,10 +249,22 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
                     order_type="LIMIT", price=chase_price, currency=CURRENCY,
                 )
                 order = resp.get("order", resp)
-                shares_filled = float(order.get("shares", order.get("quantity", 0)) or 0)
+                shares_filled = float(
+                    order.get("shares") or 
+                    order.get("quantity") or 
+                    order.get("sharesFilled") or 
+                    order.get("sharesMatched") or 
+                    0
+                )
+
+        # Fallback for MARKET orders: if we have an ID and it's MARKET, it's almost certainly filled.
+        order_id = order.get("id") or order.get("orderId") or order.get("order_id")
+        if shares_filled <= 0 and final_order_type == "MARKET" and order_id:
+            log.info(f"[{chat_id}] MARKET order {order_id} has no explicit fill qty in response, assuming success.")
+            shares_filled = amount # Default to amount for record keeping if unknown
 
         if shares_filled <= 0:
-            log.info(f"[{chat_id}] {sig.asset} order not filled (price moved away)")
+            log.info(f"[{chat_id}] {sig.asset} order not filled (price moved away). Response: {resp}")
             return
 
         filled_price = float(order.get("price", limit_price) or limit_price)

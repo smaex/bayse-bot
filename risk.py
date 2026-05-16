@@ -19,6 +19,7 @@ class RiskManager:
         self.daily_realized_pnl: float = 0.0
         self.last_reset_date: str = ""
         self.probation_trades_left: int = 0
+        self.pending_markets: set[str] = set() # market_id lock during execution
 
     @property
     def target_hit(self) -> bool:
@@ -115,7 +116,13 @@ class RiskManager:
         self.open_positions.pop(market_id, None)
 
     def already_in(self, market_id: str) -> bool:
-        return market_id in self.open_positions
+        return market_id in self.open_positions or market_id in self.pending_markets
+
+    def lock_market(self, market_id: str):
+        self.pending_markets.add(market_id)
+
+    def unlock_market(self, market_id: str):
+        self.pending_markets.discard(market_id)
 
     def summary(self, balance: float) -> str:
         dd = 0.0
