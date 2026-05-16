@@ -578,10 +578,15 @@ async def main():
     log.info("=== Bayse Bot Starting (multi-user) ===")
     database.init_db()
     
+    # Start Health-Check Server early so Render sees the port as open
+    # This prevents Render from killing the instance while it waits for the Ghost Shield lock.
+    asyncio.create_task(server.start_server(8080))
+    asyncio.create_task(_self_ping_loop())
+    
     # ── GHOST SHIELD: Singleton Lock ──
     # During Render deploys, a new instance may start before the old one dies.
-    # We wait up to 120s for the old instance to release the lock/go stale.
-    max_wait = 120
+    # We wait up to 300s (5 min) for the old instance to release the lock/go stale.
+    max_wait = 300
     waited = 0
     while not database.acquire_singleton_lock():
         if waited >= max_wait:
@@ -643,9 +648,7 @@ async def main():
                 break
     log.info("Telegram bot running")
 
-    # Start Health-Check Server
-    asyncio.create_task(server.start_server(8080))
-    asyncio.create_task(_self_ping_loop())
+    # Modules
 
     # Initialize Modules
     executor.init_executor(active_markets, _tg_app)
