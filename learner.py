@@ -429,7 +429,15 @@ async def stagnation_monitor(tg_app=None):
                         row = cur.fetchone()
                         if not row: continue
                         
-                        last_trade = datetime.fromisoformat(row[0])
+                        val = row[0]
+                        if isinstance(val, str):
+                            last_trade = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                        else:
+                            last_trade = val
+                        
+                        if last_trade.tzinfo is None:
+                            last_trade = last_trade.replace(tzinfo=timezone.utc)
+                            
                         # If more than 12 hours ago
                         if datetime.now(timezone.utc) - last_trade > timedelta(hours=12):
                             s = user["settings"]

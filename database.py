@@ -30,7 +30,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DEFAULT_SETTINGS: dict = {
     "assets":           ["BTC", "ETH", "SOL"],
     "timeframes":       ["5min", "15min", "1h"],
-    "strategies":       ["SNIPE", "CORRELATE", "ARB", "NEWS"],
+    "strategies":       ["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN"],
     "risk_pct":         3.0,
     "mintrade":         100,
     "maxtrade":         500_000,
@@ -81,16 +81,20 @@ def _db_worker():
             except queue.Empty:
                 pass
             
-            if not batch:
-                continue
-                
             try:
                 with _cx() as conn:
                     with conn.cursor() as cur:
                         for query, params in batch:
                             cur.execute(query, params)
             except Exception as e:
-                log.error(f"DB worker batch execute error: {e}")
+                log.error(f"DB worker batch execute error: {e}. Retrying queries individually...")
+                for query, params in batch:
+                    try:
+                        with _cx() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(query, params)
+                    except Exception as ie:
+                        log.error(f"DB worker individual query execute failed: {query} with params {params} | Error: {ie}")
                 
             for _ in batch:
                 _db_queue.task_done()

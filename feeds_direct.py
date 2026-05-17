@@ -325,3 +325,74 @@ async def tiingo_fx_rest_fallback():
                 log.error(f"Tiingo REST fallback error: {e}")
                 
             await asyncio.sleep(15)
+
+
+async def binance_rest_fallback():
+    """
+    Fallback loop that polls Binance REST API every 15s if WS has stalled (>30s).
+    Alternates between Binance.com and Binance.US to bypass geoblocks.
+    """
+    log.info("Starting Binance REST Fallback loop...")
+    urls = [
+        "https://api.binance.com/api/v3/ticker/bookTicker",
+        "https://api.binance.us/api/v3/ticker/bookTicker"
+    ]
+    
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                # Check if WS is stalled
+                stalled = False
+                for asset in _CRYPTO_SYMBOLS.values():
+                    _, last_t = get_direct_price(asset)
+                    if time.time() - last_t > 30:
+                        stalled = True
+                        break
+                
+                if stalled:
+                    success = False
+                    for url in urls:
+                        try:
+                            async with session.get(url, timeout=10) as r:
+                                if r.status == 200:
+                                    data = await r.json()
+                                    # bookTicker returns a list of symbols
+                                    for item in data:
+                                        sym = item.get("symbol", "").upper()
+                                        asset = _CRYPTO_SYMBOLS.get(sym)
+                                        if not asset:
+                                            # handle US pairs e.g. BTCUSD -> BTCUSDT lookup
+                                            lookup_key = sym
+                                            if not lookup_key.endswith("USDT"):
+                                                lookup_key = lookup_key.replace("USD", "USDT")
+                                            if not lookup_key.endswith("T"):
+                                                lookup_key += "T"
+                                            asset = _CRYPTO_SYMBOLS.get(lookup_key)
+                                            
+                                        if asset and item.get("bidPrice") and item.get("askPrice"):
+                                            bid = float(item["bidPrice"])
+                                            ask = float(item["askPrice"])
+                                            mid = (bid + ask) / 2
+                                            bid_sz = float(item.get("bidQty", 0))
+                                            ask_sz = float(item.get("askQty", 0))
+                                            
+                                            # Only update if the REST price is newer than the last WS tick
+                                            _, last_t = get_direct_price(asset)
+                                            if time.time() - last_t > 15:
+                                                direct_spot[asset] = {
+                                                    "price": mid, 
+                                                    "time": time.time(),
+                                                    "bid_sz": bid_sz,
+                                                    "ask_sz": ask_sz
+                                                }
+                                                log.debug(f"Binance REST Fallback update [{asset}]: {mid:,.2f}")
+                                    success = True
+                                    break # success, don't try other url
+                        except Exception as e:
+                            log.debug(f"Binance REST fallback failed on {url}: {e}")
+                            
+            except Exception as e:
+                log.error(f"Binance REST fallback general error: {e}")
+                
+            await asyncio.sleep(15)
+

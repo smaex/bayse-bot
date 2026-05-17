@@ -77,7 +77,8 @@ class SnipeStrategy(BaseStrategy):
             composite = min(composite + 0.10, 0.99) if direction == "NO" else max(composite - 0.15, 0.0)
 
         # 7. Final Verification
-        if composite < min_certainty: return None
+        # Relax strategy-level hurdle to 0.30 so orchestrator-level Mode Floors and Discovery Probes can process the signals
+        if composite < 0.30: return None
 
         fee_rate = market.get("fee_rate", 0.04)
         margin_map = {"safe": 0.20, "balanced": 0.06, "aggressive": 0.04, "full_send": 0.02}

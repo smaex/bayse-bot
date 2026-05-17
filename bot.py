@@ -393,12 +393,21 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
         return
 
     # 3. Evaluate all relevant markets with Adaptive Sizing
-    active_strats = settings.get("strategies", ["SNIPE", "CORRELATE", "ARB", "NEWS"])
+    active_strats = settings.get("strategies", ["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN"])
     learned = await asyncio.to_thread(learner.get_learned_overrides, chat_id)
     
     max_exp = settings.get("maxexposure", 100) / 100.0
     user_assets = settings.get("assets", config.ALL_ASSETS)
-    user_tfs = settings.get("timeframes", ["1m", "5m", "15m"])
+    
+    raw_tfs = settings.get("timeframes", ["5min", "15min", "1h"])
+    # Clean up shorthand timeframe strings (e.g. 5m -> 5min, 15m -> 15min)
+    user_tfs = []
+    for tf in raw_tfs:
+        tf_clean = tf.lower().replace("min", "").replace("m", "")
+        if tf_clean in {"5", "15"}:
+            user_tfs.append(tf_clean + "min")
+        else:
+            user_tfs.append(tf)
 
     await _evaluate_markets(
         chat_id, settings, client, risk, equity, free_cash, 
@@ -656,6 +665,7 @@ async def main():
     # Start feeds
     asyncio.create_task(feeds.start_feeds(on_price=_on_spot_price))
     asyncio.create_task(feeds_direct.binance_feed())
+    asyncio.create_task(feeds_direct.binance_rest_fallback())
     asyncio.create_task(feeds_direct.tiingo_fx_feed())
     asyncio.create_task(feeds_direct.tiingo_fx_rest_fallback())
     asyncio.create_task(news_mod.start_news_feeds())
