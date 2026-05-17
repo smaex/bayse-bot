@@ -18,6 +18,7 @@ import random
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
+import copy
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
@@ -67,6 +68,9 @@ def _dec(text: str) -> str:
 
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 _db_queue: queue.Queue = queue.Queue()
+
+_USER_CACHE: dict[str, dict] = {}
+_ACTIVE_USERS_CACHE: list[dict] | None = None
 
 def _db_worker():
     while True:
@@ -334,30 +338,59 @@ def heartbeat_singleton_lock():
 # ── Users ─────────────────────────────────────────────────────────────────────
 
 def add_user(chat_id: str, public_key: str, secret_key: str) -> dict:
+    global _ACTIVE_USERS_CACHE
     now = datetime.now(timezone.utc).isoformat()
     _execute(
         "INSERT INTO users (chat_id, pub_enc, sec_enc, settings, created_at) VALUES (%s,%s,%s,%s,%s) "
         "ON CONFLICT (chat_id) DO UPDATE SET pub_enc=EXCLUDED.pub_enc, sec_enc=EXCLUDED.sec_enc, is_active=1",
         (chat_id, _enc(public_key), _enc(secret_key), json.dumps(DEFAULT_SETTINGS), now),
     )
+    # Invalidate cache
+    _USER_CACHE.pop(chat_id, None)
+    _ACTIVE_USERS_CACHE = None
     return get_user(chat_id)
 
 def get_user(chat_id: str) -> dict | None:
+    if chat_id in _USER_CACHE:
+        return copy.deepcopy(_USER_CACHE[chat_id])
     row = _fetch_one("SELECT * FROM users WHERE chat_id=%s", (chat_id,))
-    return _hydrate(row) if row else None
+    if row:
+        hydrated = _hydrate(row)
+        _USER_CACHE[chat_id] = copy.deepcopy(hydrated)
+        return hydrated
+    return None
 
 def get_all_active() -> list[dict]:
+    global _ACTIVE_USERS_CACHE
+    if _ACTIVE_USERS_CACHE is not None:
+        return copy.deepcopy(_ACTIVE_USERS_CACHE)
     rows = _fetch_all("SELECT * FROM users WHERE is_active=1")
-    return [_hydrate(r) for r in rows]
+    hydrated_list = [_hydrate(r) for r in rows]
+    for u in hydrated_list:
+        _USER_CACHE[u["chat_id"]] = copy.deepcopy(u)
+    _ACTIVE_USERS_CACHE = copy.deepcopy(hydrated_list)
+    return hydrated_list
 
 def update_settings(chat_id: str, settings: dict):
+    global _ACTIVE_USERS_CACHE
     _enqueue(
         "UPDATE users SET settings=%s WHERE chat_id=%s",
         (json.dumps(settings), chat_id),
     )
+    # Update cache
+    if chat_id in _USER_CACHE:
+        _USER_CACHE[chat_id]["settings"] = copy.deepcopy(settings)
+    if _ACTIVE_USERS_CACHE is not None:
+        for u in _ACTIVE_USERS_CACHE:
+            if u["chat_id"] == chat_id:
+                u["settings"] = copy.deepcopy(settings)
 
 def deactivate(chat_id: str):
+    global _ACTIVE_USERS_CACHE
     _enqueue("UPDATE users SET is_active=0 WHERE chat_id=%s", (chat_id,))
+    # Invalidate cache
+    _USER_CACHE.pop(chat_id, None)
+    _ACTIVE_USERS_CACHE = None
 
 def _hydrate(row: dict) -> dict:
     row["public_key"] = _dec(row.pop("pub_enc"))
