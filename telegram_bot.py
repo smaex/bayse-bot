@@ -322,6 +322,12 @@ async def cmd_debug(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             f"\n    YES: {yes_p:.3f}  NO: {no_p:.3f}  Sum: {yes_p+no_p:.3f}"
             f"\n    ARB possible: {'✅' if yes_p+no_p < 0.97 else '❌'}"
         )
+        
+    if not relevant and _active_markets:
+        lines.append("\n*Unmatched Active Markets on Platform:*")
+        for m in _active_markets[:5]:
+            secs = int(m.get("secs_to_close", -1))
+            lines.append(f"  • {m.get('asset')} {m.get('timeframe')} (closes in {secs}s)")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 

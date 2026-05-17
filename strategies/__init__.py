@@ -121,7 +121,7 @@ async def evaluate_all(market: dict, learned: dict, state: any, spot_price: floa
             
     return sorted(signals, key=lambda s: s.certainty, reverse=True)
 
-def merge_signals(all_signals: List[TradeSignal]) -> List[TradeSignal]:
+def merge_signals(all_signals: List[TradeSignal], state: any = None) -> List[TradeSignal]:
     """
     World-Class Convergence Engine:
     Detects when multiple strategies or timeframes align on the same asset/outcome.
@@ -145,4 +145,40 @@ def merge_signals(all_signals: List[TradeSignal]) -> List[TradeSignal]:
                 sig.certainty = existing.certainty # Keep the boost
                 merged[key] = sig
                 
-    return list(merged.values())
+    final_signals = list(merged.values())
+    
+    # ── Dynamic Risk Parity (Cross-Asset Correlation) ──
+    if state and len(final_signals) > 1:
+        from strategies.utils import realized_correlation
+        by_outcome = {"YES": [], "NO": []}
+        for sig in final_signals:
+            if sig.outcome in by_outcome:
+                by_outcome[sig.outcome].append(sig)
+                
+        for outcome, sigs in by_outcome.items():
+            if len(sigs) < 2:
+                continue
+                
+            clusters = []
+            for sig in sigs:
+                assigned = False
+                for cluster in clusters:
+                    leader = cluster[0]
+                    corr = realized_correlation(sig.asset, leader.asset, state)
+                    if corr > 0.85:
+                        cluster.append(sig)
+                        assigned = True
+                        break
+                if not assigned:
+                    clusters.append([sig])
+                    
+            for cluster in clusters:
+                c_size = len(cluster)
+                if c_size > 1:
+                    cluster_assets = [s.asset for s in cluster]
+                    for sig in cluster:
+                        sig.size_pct /= c_size
+                        others = [a for a in cluster_assets if a != sig.asset]
+                        sig.reason += f" | RISK_PARITY({','.join(others)})"
+                        
+    return final_signals

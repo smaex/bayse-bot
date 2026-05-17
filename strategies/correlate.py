@@ -69,7 +69,7 @@ class CorrelateStrategy(BaseStrategy):
         certainty = min(config.CORRELATE_BASE_CERTAINTY * freshness * (1.0 + 0.20 * target_mom), 0.99)
         w_est = certainty_to_prob(certainty)
         fee_rate = market.get("fee_rate", 0.04)
-        ev_ceiling = max_ev_price(w_est, fee_rate)
+        ev_ceiling = max_ev_price(w_est, market_price, fee_rate)
 
         if market_price >= ev_ceiling: return None
 

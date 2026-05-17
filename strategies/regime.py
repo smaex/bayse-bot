@@ -29,19 +29,11 @@ class RegimeController:
         if current_vol > 0.05: # Extreme volatility
             return "STRESS"
             
-        # 2. Trend vs Chop (using a simple ADX-like logic or Momentum persistence)
-        # We'll use price history from state to check for trendiness
-        history = getattr(state, 'price_history', {}).get(asset, [])
-        if len(history) < 20:
-            return "CHOP"
-            
-        # Efficiency Ratio (ER): Net Move / Total Move
-        # ER near 1.0 = strong trend. ER near 0 = chop.
-        net_move = abs(history[-1] - history[0])
-        total_move = sum(abs(history[i] - history[i-1]) for i in range(1, len(history)))
-        er = net_move / total_move if total_move > 0 else 0
+        # 2. Trend vs Chop (Bayesian HMM Proxy)
+        from strategies.utils import regime_score
+        p_trend = regime_score(asset, state)
         
-        if er > 0.40:
+        if p_trend > 0.60:
             return "TREND"
         return "CHOP"
 

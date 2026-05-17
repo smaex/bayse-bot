@@ -395,6 +395,14 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
     # 3. Evaluate all relevant markets with Adaptive Sizing
     active_strats = settings.get("strategies", ["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN"])
     learned = await asyncio.to_thread(learner.get_learned_overrides, chat_id)
+    if not learned:
+        learned = {}
+        
+    # Inject real-time drawdown state for Drawdown-Adjusted Kelly sizing
+    if risk.peak_balance > 0:
+        learned["drawdown_pct"] = (risk.peak_balance - equity) / risk.peak_balance
+    else:
+        learned["drawdown_pct"] = 0.0
     
     max_exp = settings.get("maxexposure", 100) / 100.0
     user_assets = settings.get("assets", config.ALL_ASSETS)
@@ -443,7 +451,7 @@ async def _evaluate_markets(
                     all_signals.append(sig)
             
         # ── Convergence Engine ──
-        final_signals = strategies.merge_signals(all_signals)
+        final_signals = strategies.merge_signals(all_signals, strategy.global_state)
             
         for sig in final_signals:
             if sig.strategy == "ARB":
@@ -512,6 +520,9 @@ def _on_spot_price(asset: str, price: float):
     log.debug(f"Spot {asset}: {best_price:,.4f}")
     
     _last_spot[asset] = best_price
+    
+    # Trigger high-frequency evaluation instantly on price change
+    asyncio.create_task(_evaluate_all_users_for_spot(asset, 0.0, 0.0, penalty=safety_penalty))
 
 
 async def _evaluate_all_users_for_spot(asset: str, change: float, threshold: float, penalty: float = 0.0):

@@ -16,6 +16,14 @@ def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.04,
     if b <= 0:
         return 0.0
         
+    # ── Drawdown-Adjusted Kelly Fraction ──
+    if learned and "drawdown_pct" in learned:
+        dd = learned["drawdown_pct"]
+        if dd >= 0.10:
+            fraction *= 0.5   # 10%+ Drawdown -> Drops default 0.25 to 0.125 (Eighth-Kelly)
+        elif dd <= 0.01:
+            fraction *= 2.0   # At/Near ATH -> Boosts default 0.25 to 0.50 (Half-Kelly)
+            
     # ── Bayesian Sample Size Penalty ──
     if learned and strategy_name:
         counts = learned.get("trade_counts", {})
@@ -37,6 +45,14 @@ def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.04,
     raw_kelly = (win_prob * b - (1.0 - win_prob)) / b
     return min(max(raw_kelly * fraction, 0.0), cap)
 
-def max_ev_price(win_prob: float, fee_rate: float = 0.04, min_margin: float = 0.06) -> float:
-    """Calculates the maximum price we can pay to maintain a specific EV margin."""
-    return win_prob * (1.0 - fee_rate) / (1.0 + min_margin)
+def max_ev_price(win_prob: float, market_price: float, fee_rate: float = 0.04, min_margin: float = 0.06) -> float:
+    """
+    Calculates the maximum price we can pay to maintain a specific EV margin.
+    Applies AMM Liquidity Skew convexity to dynamically scale the required margin.
+    """
+    # AMM Curve Convexity (steepest near 1.0, flat near 0.0)
+    skew = market_price - 0.50
+    convexity_factor = 1.0 + skew  # At 0.90 -> 1.4x margin. At 0.10 -> 0.6x margin.
+    
+    dynamic_margin = max(0.01, min_margin * convexity_factor)
+    return win_prob * (1.0 - fee_rate) / (1.0 + dynamic_margin)

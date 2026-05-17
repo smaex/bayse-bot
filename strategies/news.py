@@ -46,7 +46,7 @@ class NewsStrategy(BaseStrategy):
         
         w_est = certainty_to_prob(strength_adj)
         fee_rate = market.get("fee_rate", 0.04)
-        ev_ceiling = max_ev_price(w_est, fee_rate)
+        ev_ceiling = max_ev_price(w_est, market_price, fee_rate)
 
         if market_price >= ev_ceiling: return None
         if market_price > ev_ceiling * 0.98: return None

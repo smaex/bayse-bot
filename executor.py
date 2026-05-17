@@ -101,7 +101,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         amount  = equity * min(raw_pct, 0.10)
         amount  = max(min_t, min(max_t, amount))
 
-    hard_cap = equity * 0.08
+    hard_cap = max(100.0, equity * 0.08)
     if amount > hard_cap:
         log.info(
             f"[{chat_id}] ⚖️ HARD CAP CLAMP: Scaling ₦{amount:,.0f} down to 8% cap (₦{hard_cap:,.0f})."

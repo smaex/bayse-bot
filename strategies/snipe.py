@@ -59,9 +59,26 @@ class SnipeStrategy(BaseStrategy):
         velocity = velocity_score(asset, threshold, direction, state)
         
         # 4. Vetoes
-        if mode != "full_send" and velocity < -config.SNIPE_VELOCITY_VETO: return None
+        if mode != "full_send":
+            # Smart Shield (Pin Risk & Volatility Guard)
+            base_dist = config.CRYPTO_MIN_DISTANCE.get(asset) or config.FX_MIN_DISTANCE.get(asset, 0.0010)
+            base_vol = config.ASSET_HOURLY_VOL.get(asset, 0.02)
+            
+            # Dynamic Volatility Scaling: shrink requirement in calm markets, expand in chaotic ones
+            vol_ratio = rv / base_vol if base_vol > 0 else 1.0
+            dynamic_min_dist = max(base_dist * 0.5, min(base_dist * vol_ratio, base_dist * 1.5))
+            
+            if abs(distance_pct) < dynamic_min_dist: 
+                return None
+            
+            # Momentum Veto: If inside the ORIGINAL base buffer, demand positive momentum (moving away from danger)
+            if abs(distance_pct) < base_dist and mom <= 0:
+                return None
+
+            if velocity < -config.SNIPE_VELOCITY_VETO: return None
+            if mom < -0.7 and base < 0.55: return None
+
         if asset in config.FX_SESSION_UTC and regime < config.FX_MIN_REGIME: return None
-        if mode != "full_send" and mom < -0.7 and base < 0.55: return None
 
         # 5. Composite Calculation
         raw_edge = w_est - market.get("yes_price" if direction == "YES" else "no_price", 0.5)
@@ -82,9 +99,8 @@ class SnipeStrategy(BaseStrategy):
 
         fee_rate = market.get("fee_rate", 0.04)
         margin_map = {"safe": 0.20, "balanced": 0.06, "aggressive": 0.04, "full_send": 0.02}
-        ev_ceiling = max_ev_price(w_est, fee_rate, min_margin=margin_map.get(mode, 0.10))
-        
         market_price = market["yes_price"] if direction == "YES" else market["no_price"]
+        ev_ceiling = max_ev_price(w_est, market_price, fee_rate, min_margin=margin_map.get(mode, 0.10))
         if market_price >= ev_ceiling: return None
         if market_price > config.SNIPE_MAX_MARKET_PRICE: return None
 

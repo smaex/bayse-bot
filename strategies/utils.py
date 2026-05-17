@@ -55,19 +55,46 @@ def velocity_score(asset: str, threshold: float, direction: str, state: any) -> 
     return gap_change / max(now_gap, 1e-9)
 
 def regime_score(asset: str, state: any) -> float:
-    """0-1 efficiency ratio indicating trend vs noise."""
+    """Continuous Bayesian Hidden Markov Model (HMM) proxy indicating trend probability (0.0 to 1.0)."""
     if not hasattr(state, 'price_history'):
         return 0.5
     hist = list(state.price_history.get(asset, []))
     n = min(len(hist), 60)
     if n < 10:
         return 0.5
+        
     prices = [p for _, p in hist[-n:]]
-    net  = abs(prices[-1] - prices[0])
-    path = sum(abs(prices[i] - prices[i - 1]) for i in range(1, len(prices)))
-    if path < 1e-10:
+    
+    returns = []
+    for i in range(1, len(prices)):
+        if prices[i-1] <= 0: continue
+        returns.append(math.log(prices[i] / prices[i-1]))
+        
+    if not returns:
         return 0.5
-    return min(net / path / 0.5, 1.0)
+        
+    # Local volatility
+    mean_ret = sum(returns) / len(returns)
+    variance = sum((r - mean_ret)**2 for r in returns) / len(returns)
+    std_dev = math.sqrt(variance)
+    
+    if std_dev < 1e-9:
+        return 0.5
+        
+    # Bayesian Update: Prior P(Trend)
+    p_trend = 0.5
+    
+    for r in returns:
+        z = abs(r) / std_dev
+        # Likelihood proxy: Z > 1.0 favors trend, Z < 1.0 favors chop
+        likelihood_trend = min(0.95, max(0.05, z / 2.0)) 
+        likelihood_chop = 1.0 - likelihood_trend
+        
+        marginal = (likelihood_trend * p_trend) + (likelihood_chop * (1.0 - p_trend))
+        if marginal > 0:
+            p_trend = (likelihood_trend * p_trend) / marginal
+            
+    return p_trend
 
 def fx_distance_trend(asset: str, threshold: float, direction: str, state: any) -> float:
     """How the price-to-threshold distance has changed over the last 10 minutes (FX)."""
@@ -138,3 +165,28 @@ def probability_to_certainty(win_prob: float) -> float:
     """Inverse of certainty_to_prob."""
     return max(0.0, min((win_prob - 0.50) / 0.45, 1.0))
 
+def realized_correlation(asset1: str, asset2: str, state: any) -> float:
+    """Calculates Pearson correlation coefficient between two assets over recent history."""
+    if not hasattr(state, 'price_history'):
+        return 0.0
+    hist1 = state.price_history.get(asset1, [])
+    hist2 = state.price_history.get(asset2, [])
+    
+    n = min(len(hist1), len(hist2), 60)
+    if n < 10:
+        return 0.0
+        
+    prices1 = [p for _, p in hist1[-n:]]
+    prices2 = [p for _, p in hist2[-n:]]
+    
+    mean1 = sum(prices1) / n
+    mean2 = sum(prices2) / n
+    
+    num = sum((x - mean1) * (y - mean2) for x, y in zip(prices1, prices2))
+    den1 = sum((x - mean1)**2 for x in prices1)
+    den2 = sum((y - mean2)**2 for y in prices2)
+    
+    if den1 <= 1e-9 or den2 <= 1e-9:
+        return 0.0
+        
+    return num / math.sqrt(den1 * den2)
