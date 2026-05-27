@@ -1,0 +1,25 @@
+# Coolify ignores these — env vars are set in Coolify UI instead
+.env
+.env.*
+!.env.example
+!.env.vps.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Data / logs
+data/
+*.log
+*.db
+
+# macOS
+.DS_Store
+
+# Dev scratch files
+scratch/
+*.pyc
