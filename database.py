@@ -406,8 +406,20 @@ def deactivate(chat_id: str):
     _ACTIVE_USERS_CACHE = None
 
 def _hydrate(row: dict) -> dict:
-    row["public_key"] = _dec(row.pop("pub_enc"))
-    row["secret_key"] = _dec(row.pop("sec_enc"))
+    pub = row.pop("pub_enc", None)
+    sec = row.pop("sec_enc", None)
+    
+    # Try decrypting, fallback to plaintext or older column names if missing
+    try:
+        row["public_key"] = _dec(pub) if pub else (row.pop("public_key", None) or row.pop("api_key", ""))
+    except Exception:
+        row["public_key"] = pub or ""
+        
+    try:
+        row["secret_key"] = _dec(sec) if sec else (row.pop("secret_key", None) or row.pop("api_secret", ""))
+    except Exception:
+        row["secret_key"] = sec or ""
+        
     saved = json.loads(row.get("settings") or "{}")
     row["settings"] = {**DEFAULT_SETTINGS, **saved}
     return row
