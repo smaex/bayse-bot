@@ -262,6 +262,16 @@ def init_db():
                     cur.execute(f"ROLLBACK TO SAVEPOINT sp_col_{col}")
                     log.debug(f"Users migration ensuring column {col} failed: {e}")
             
+            # Migration: Ensure other columns in a shared/older DB do not violate NOT NULL constraint (e.g. email)
+            for col in ["email", "username", "password"]:
+                try:
+                    cur.execute(f"SAVEPOINT sp_drop_nn_{col}")
+                    cur.execute(f"ALTER TABLE users ALTER COLUMN {col} DROP NOT NULL")
+                    cur.execute(f"RELEASE SAVEPOINT sp_drop_nn_{col}")
+                except Exception as e:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT sp_drop_nn_{col}")
+                    log.debug(f"Drop NOT NULL on column {col} failed or skipped: {e}")
+            
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_lock (
                     lock_id    TEXT PRIMARY KEY,
