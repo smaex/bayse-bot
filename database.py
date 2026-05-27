@@ -401,7 +401,7 @@ def get_all_active() -> list[dict]:
     if _ACTIVE_USERS_CACHE is not None:
         return copy.deepcopy(_ACTIVE_USERS_CACHE)
     rows = _fetch_all("SELECT * FROM users WHERE is_active=1")
-    hydrated_list = [_hydrate(r) for r in rows]
+    hydrated_list = [_hydrate(r) for r in rows if str(r.get("chat_id", "")) != "0" and str(r.get("user_id", "")) != "0"]
     for u in hydrated_list:
         _USER_CACHE[u["chat_id"]] = copy.deepcopy(u)
     _ACTIVE_USERS_CACHE = copy.deepcopy(hydrated_list)

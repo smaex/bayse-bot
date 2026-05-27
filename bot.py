@@ -729,8 +729,9 @@ async def main():
         try:
             await telegram_bot.send_message(
                 _tg_app, cid,
-                "🔄 *Bot restarted — you're still connected.*\n\n"
-                "Your settings and trade history are intact. Trading resumes now.",
+                "🚀 *System Update Complete*\n\n"
+                "The Bayse Bot has successfully deployed the latest code update. "
+                "Your connection is secure and trading has resumed.",
                 parse_mode="Markdown",
             )
         except Exception:
