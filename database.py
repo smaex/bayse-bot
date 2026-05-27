@@ -432,9 +432,11 @@ def _hydrate(row: dict) -> dict:
     pub = row.pop("pub_enc", None)
     sec = row.pop("sec_enc", None)
     
-    # Handle older schema column names for ID
+    # Handle older schema column names and integer types for ID
     if "chat_id" not in row:
         row["chat_id"] = str(row.pop("user_id", ""))
+    else:
+        row["chat_id"] = str(row["chat_id"])
     
     # Try decrypting, fallback to plaintext or older column names if missing
     try:
