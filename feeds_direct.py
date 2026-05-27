@@ -152,9 +152,9 @@ def binance_msg_handler(msg):
         bid_sz = float(data.get("B", 0))
         ask_sz = float(data.get("A", 0))
         
-        # Layer 3 delta limit validation (if we have old data)
+        # Layer 3 delta limit validation (if we have old data and it is fresh)
         old_data = direct_spot.get(asset)
-        if old_data:
+        if old_data and (time.time() - old_data["time"] <= 5.0):
             if not feeds_hardened.check_delta_limit(asset, mid_price, old_data["price"]):
                 return
                 
@@ -185,8 +185,8 @@ def tiingo_msg_handler(msg):
                 old_data = direct_spot.get(asset)
                 new_price = float(mid_price)
                 
-                # Layer 3 delta limit validation
-                if old_data:
+                # Layer 3 delta limit validation (if we have old data and it is fresh)
+                if old_data and (time.time() - old_data["time"] <= 10.0):
                     if not feeds_hardened.check_delta_limit(asset, new_price, old_data["price"]):
                         return
                         
@@ -356,7 +356,7 @@ async def tiingo_fx_feed():
         # Hardened WS Pool
         pool = feeds_hardened.HardenedWebsocketPool(
             url=url,
-            pool_size=config.WS_POOL_SIZE,
+            pool_size=1,  # Hardcoded to 1 because Tiingo strictly allows only 1 concurrent WS connection per key
             sub_payload=subscribe,
             message_handler=tiingo_msg_handler,
             dedup_key_fn=tiingo_dedup_key
