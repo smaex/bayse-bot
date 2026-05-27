@@ -14,6 +14,7 @@ Bayse market YES/NO prices come from a separate Bayse markets WebSocket.
 import asyncio
 import json
 import logging
+import time
 import websockets
 from config import WS_MARKETS_URL, WS_REALTIME_URL
 
@@ -142,10 +143,38 @@ def _handle_market(msg: dict, on_update=None):
              or data.get("outcome2Price") or data.get("downPrice"))
 
     if yes_p is not None:
-        prev_yes[mid] = market_prices.get(mid, {}).get("yes", float(yes_p))
+        yes_val = float(yes_p)
+        no_val = float(no_p) if no_p is not None else round(1.0 - yes_val, 4)
+        
+        # Track opening prices and flips in global state
+        from strategies.base import global_state
+        
+        # 1. Track opening prices
+        if mid not in global_state.market_opening_prices:
+            global_state.market_opening_prices[mid] = {
+                "yes": yes_val,
+                "no": no_val,
+                "timestamp": time.time()
+            }
+            log.info(f"Recorded opening prices for market {mid}: YES={yes_val}, NO={no_val}")
+            
+        # 2. Track favorite flips
+        fav = "YES" if yes_val > no_val else "NO" if no_val > yes_val else None
+        if fav:
+            if mid not in global_state.market_last_fav:
+                global_state.market_last_fav[mid] = fav
+                global_state.market_flips[mid] = 0
+            else:
+                last_fav = global_state.market_last_fav[mid]
+                if last_fav != fav:
+                    global_state.market_flips[mid] = global_state.market_flips.get(mid, 0) + 1
+                    global_state.market_last_fav[mid] = fav
+                    log.info(f"Market {mid} favorite flipped from {last_fav} to {fav}. Total flips: {global_state.market_flips[mid]}")
+
+        prev_yes[mid] = market_prices.get(mid, {}).get("yes", yes_val)
         market_prices[mid] = {
-            "yes": float(yes_p),
-            "no": float(no_p) if no_p is not None else round(1.0 - float(yes_p), 4),
+            "yes": yes_val,
+            "no": no_val,
         }
         if on_update:
             on_update(mid, market_prices[mid])
@@ -155,6 +184,15 @@ def restart_bayse_feed(markets: list[dict], on_update=None):
     """Call after each market scan to keep WS subscriptions current."""
     global _bayse_task, _subscribed_ids
     new_market_ids = {m["market_id"] for m in markets}
+    
+    # Clean up stale market states in global_state to prevent memory leaks
+    from strategies.base import global_state
+    for mid in list(global_state.market_flips.keys()):
+        if mid not in new_market_ids:
+            global_state.market_flips.pop(mid, None)
+            global_state.market_last_fav.pop(mid, None)
+            global_state.market_opening_prices.pop(mid, None)
+
     if new_market_ids == _subscribed_ids and _bayse_task and not _bayse_task.done():
         return
     _subscribed_ids = new_market_ids

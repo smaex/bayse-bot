@@ -241,4 +241,32 @@ PROFIT_ALERT_NGN = 20_000      # Telegram alert when unrealized profit hits this
 # ── Rate Limiting (stay well under 20 write/sec, 30 read/sec) ─────────────────
 WRITE_RATE_LIMIT = 15          # max write requests/second (buffer below 20)
 READ_RATE_LIMIT = 25           # max read requests/second (buffer below 30)
-SCAN_INTERVAL_SECONDS = 30     # re-scan for new markets every 30s
+SCAN_INTERVAL_SECONDS = 15     # re-scan for new markets every 15s (was 30s)
+
+# ── Hardened WS Pool and Validation ───────────────────────────────────────────
+USE_HARDENED_WS = True
+
+# ── Deployment Environment ─────────────────────────────────────────────────────
+# Set DEPLOYMENT_ENV=vps in your .env file (or VPS shell) when running on a VPS.
+# Render is the default. This flag automatically tunes the WS pool for the
+# lower-latency, more resource-rich VPS environment.
+import os as _os
+DEPLOYMENT_ENV = _os.getenv("DEPLOYMENT_ENV", "render").lower()  # "render" | "vps"
+
+if DEPLOYMENT_ENV == "vps":
+    # VPS Profile — direct network path, dedicated CPU, ~20-50ms API latency
+    WS_POOL_SIZE        = 5       # more parallel connections (Render capped at 3)
+    WS_CULL_INTERVAL_SEC= 5
+    WS_MAX_JITTER_MS    = 8.0    # tighter — VPS latency baseline is low (~8ms)
+    WS_WARMUP_DELTA_LIMIT = 0.0015  # 0.15% — can afford tighter delta guard
+    WS_MIN_TICKS_WINDOW = 4      # require slightly more ticks before trusting feed
+    WS_MAX_TICK_JUMP_PCT= 0.0004  # 0.04% max jump (faster feeds = cleaner data)
+    SCAN_INTERVAL_SECONDS = 10   # scan every 10s on VPS (15s on Render)
+else:
+    # Render Profile — shared CPU, proxied network, ~100-200ms API latency
+    WS_POOL_SIZE        = 3
+    WS_CULL_INTERVAL_SEC= 5
+    WS_MAX_JITTER_MS    = 15.0   # looser — Render relay adds inherent jitter
+    WS_WARMUP_DELTA_LIMIT = 0.0020  # 0.20%
+    WS_MIN_TICKS_WINDOW = 3
+    WS_MAX_TICK_JUMP_PCT= 0.0005  # 0.05%

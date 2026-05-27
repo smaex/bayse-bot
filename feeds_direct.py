@@ -7,6 +7,7 @@ import websockets
 from typing import Tuple
 import config
 import aiohttp
+import feeds_hardened
 
 log = logging.getLogger("feeds_direct")
 
@@ -122,79 +123,173 @@ def get_latency_bias(asset: str, bayse_price: float) -> float:
 
 # ── Oracle 1: Binance (Crypto) ────────────────────────────────────────────────
 
+# ── Dedup Keys and Msg Handlers for Hardened WS ───────────────────────────────
+
+def binance_dedup_key(msg):
+    data = msg.get("data", msg)
+    symbol = data.get("s")
+    event_time = data.get("E")
+    if symbol and event_time:
+        return (symbol.upper(), event_time)
+    return None
+
+def binance_msg_handler(msg):
+    data = msg.get("data", msg)
+    raw_symbol = data.get("s", "").upper()
+    
+    lookup_key = raw_symbol
+    if not lookup_key.endswith("USDT"):
+        lookup_key = lookup_key.replace("USD", "USDT")
+    if not lookup_key.endswith("T"):
+        lookup_key += "T"
+
+    asset = _CRYPTO_SYMBOLS.get(lookup_key)
+    bid = data.get("b")
+    ask = data.get("a")
+    
+    if asset and bid and ask:
+        mid_price = (float(bid) + float(ask)) / 2
+        bid_sz = float(data.get("B", 0))
+        ask_sz = float(data.get("A", 0))
+        
+        # Layer 3 delta limit validation (if we have old data)
+        old_data = direct_spot.get(asset)
+        if old_data:
+            if not feeds_hardened.check_delta_limit(asset, mid_price, old_data["price"]):
+                return
+                
+        direct_spot[asset] = {
+            "price": mid_price, 
+            "time": time.time(),
+            "bid_sz": bid_sz,
+            "ask_sz": ask_sz
+        }
+
+def tiingo_dedup_key(msg):
+    if msg.get("messageType") == "A":
+        data = msg.get("data", [])
+        if len(data) >= 6:
+            ticker = data[1]
+            timestamp = data[2]
+            return (ticker.lower(), timestamp)
+    return None
+
+def tiingo_msg_handler(msg):
+    if msg.get("messageType") == "A":
+        data = msg.get("data", [])
+        if len(data) >= 6:
+            ticker = data[1].lower()
+            mid_price = data[5]
+            asset = _FX_SYMBOLS.get(ticker)
+            if asset:
+                old_data = direct_spot.get(asset)
+                new_price = float(mid_price)
+                
+                # Layer 3 delta limit validation
+                if old_data:
+                    if not feeds_hardened.check_delta_limit(asset, new_price, old_data["price"]):
+                        return
+                        
+                direct_spot[asset] = {"price": new_price, "time": time.time()}
+                
+                # Macro Lead Detection (EURUSD as USD proxy)
+                if old_data and asset == "EURUSD":
+                    move = (new_price - old_data["price"]) / old_data["price"]
+                    if move < -0.0010:
+                        macro_bias["USD_SPIKE"] = {"active": True, "strength": abs(move), "expires": time.time() + 300}
+                        log.info(f"🚨 MACRO BIAS: USD Spike detected (EURUSD {move:+.3%})")
+                    elif move > 0.0010:
+                        macro_bias["USD_CRASH"] = {"active": True, "strength": abs(move), "expires": time.time() + 300}
+                        log.info(f"🚀 MACRO BIAS: USD Crash detected (EURUSD {move:+.3%})")
+                        
+                # Gold Lead
+                if old_data and asset == "XAUUSD":
+                    move = (new_price - old_data["price"]) / old_data["price"]
+                    if move > 0.0020:
+                        macro_bias["GOLD_BREAKOUT"] = {"active": True, "strength": abs(move), "expires": time.time() + 600}
+                        log.info(f"✨ MACRO BIAS: Gold Breakout detected ({move:+.2%})")
+
+# ── Oracle 1: Binance (Crypto) ────────────────────────────────────────────────
+
 async def binance_feed():
     """High-speed WebSocket feed for Crypto Ground Truth."""
     endpoints = [
         {"url": "wss://stream.binance.com:9443", "suffix": "usdt"},
         {"url": "wss://stream.binance.us:9443", "suffix": "usd"}
     ]
-    current_idx = 0
-    backoff = 1
     
-    while True:
-        endpoint = endpoints[current_idx]
-        suffix = endpoint["suffix"]
-        stream_list = []
-        for s in _CRYPTO_SYMBOLS.keys():
-            stream_list.append(f"{s.lower()}@ticker")
-            if suffix == "usd":
-                stream_list.append(f"{s.lower().replace('usdt', 'usd')}@ticker")
+    if not config.USE_HARDENED_WS:
+        # Legacy loop
+        current_idx = 0
+        backoff = 1
+        while True:
+            endpoint = endpoints[current_idx]
+            suffix = endpoint["suffix"]
+            stream_list = []
+            for s in _CRYPTO_SYMBOLS.keys():
+                stream_list.append(f"{s.lower()}@ticker")
+                if suffix == "usd":
+                    stream_list.append(f"{s.lower().replace('usdt', 'usd')}@ticker")
+                
+            full_url = f"{endpoint['url']}/stream?streams={'/'.join(stream_list)}"
             
-        full_url = f"{endpoint['url']}/stream?streams={'/'.join(stream_list)}"
-        
-        try:
-            log.info(f"Connecting to Binance Direct feed ({endpoint['url']})...")
-            async with websockets.connect(full_url, ping_interval=10, ping_timeout=10) as ws:
-                log.info(f"✅ Direct Binance feed connected ({endpoint['url']})")
-                backoff = 1
-                msg_count = 0
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=20)
-                    except asyncio.TimeoutError:
-                        log.warning(f"⚠️ Direct feed stall detected ({endpoint['url']}). Reconnecting...")
-                        break
+            try:
+                log.info(f"Connecting to Binance Direct feed ({endpoint['url']})...")
+                async with websockets.connect(full_url, ping_interval=10, ping_timeout=10) as ws:
+                    log.info(f"✅ Direct Binance feed connected ({endpoint['url']})")
+                    backoff = 1
+                    msg_count = 0
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=20)
+                        except asyncio.TimeoutError:
+                            log.warning(f"⚠️ Direct feed stall detected ({endpoint['url']}). Reconnecting...")
+                            break
 
-                    msg_count += 1
-                    msg = json.loads(raw)
-                    data = msg.get("data", {})
-                    raw_symbol = data.get("s", "").upper()
-                    
-                    lookup_key = raw_symbol
-                    if not lookup_key.endswith("USDT"):
-                        lookup_key = lookup_key.replace("USD", "USDT")
-                    if not lookup_key.endswith("T"):
-                        lookup_key += "T"
-
-                    asset = _CRYPTO_SYMBOLS.get(lookup_key)
-                    bid = data.get("b")
-                    ask = data.get("a")
-                    
-                    if asset and bid and ask:
-                        mid_price = (float(bid) + float(ask)) / 2
-                        bid_sz = float(data.get("B", 0))
-                        ask_sz = float(data.get("A", 0))
-                        
-                        direct_spot[asset] = {
-                            "price": mid_price, 
-                            "time": time.time(),
-                            "bid_sz": bid_sz,
-                            "ask_sz": ask_sz
-                        }
-                        
+                        msg_count += 1
+                        msg = json.loads(raw)
+                        binance_msg_handler(msg)
                         if msg_count % 500 == 0:
-                            log.debug(f"Oracle update [{asset}]: {mid_price:,.2f} | B:{bid_sz:.1f} A:{ask_sz:.1f}")
-                            
-        except Exception as e:
-            if "451" in str(e) and current_idx == 0:
-                log.warning("Geoblocked by Binance.com. Switching to Binance.US oracle...")
-                current_idx = 1
-                backoff = 1
-                continue
-            else:
-                log.error(f"Binance feed error: {e}")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
+                            log.debug(f"Oracle update Binance tick received (count={msg_count})")
+                                
+            except Exception as e:
+                if "451" in str(e) and current_idx == 0:
+                    log.warning("Geoblocked by Binance.com. Switching to Binance.US oracle...")
+                    current_idx = 1
+                    backoff = 1
+                    continue
+                else:
+                    log.error(f"Binance feed error: {e}")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+    else:
+        # Hardened WS Pool
+        urls = []
+        for endpoint in endpoints:
+            suffix = endpoint["suffix"]
+            stream_list = []
+            for s in _CRYPTO_SYMBOLS.keys():
+                stream_list.append(f"{s.lower()}@ticker")
+                if suffix == "usd":
+                    stream_list.append(f"{s.lower().replace('usdt', 'usd')}@ticker")
+            full_url = f"{endpoint['url']}/stream?streams={'/'.join(stream_list)}"
+            urls.append(full_url)
+            
+        pool = feeds_hardened.HardenedWebsocketPool(
+            url=urls,
+            pool_size=config.WS_POOL_SIZE,
+            sub_payload=None,
+            message_handler=binance_msg_handler,
+            dedup_key_fn=binance_dedup_key
+        )
+        log.info("Starting HardenedWS Pool for Binance direct feed...")
+        await pool.start()
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await pool.stop()
+            raise
 
 # ── Oracle 2: Tiingo (FX & Gold) ──────────────────────────────────────────────
 
@@ -205,84 +300,75 @@ async def tiingo_fx_feed():
         return
 
     url = "wss://api.tiingo.com/fx"
-    backoff = 1
-    connection_errors = 0
-    last_error_time = 0
-    
-    while True:
-        try:
-            # Circuit Breaker: If we've had > 5 errors in the last 10 mins, 
-            # wait longer before trying WebSocket again.
-            now = time.time()
-            if connection_errors > 5 and (now - last_error_time < 600):
-                log.warning("Tiingo FX WS Circuit Breaker active. Relying on REST fallback for 10 mins.")
-                await asyncio.sleep(60)
-                continue
+    subscribe = {
+        "eventName": "subscribe",
+        "authorization": TIINGO_API_KEY,
+        "eventData": { "tickers": list(_FX_SYMBOLS.keys()), "thresholdLevel": 5 } 
+    }
 
-            # Jitter to prevent connection storms between ghost instances
-            import random
-            await asyncio.sleep(random.uniform(10, 30)) # Increased jitter
-            
-            async with websockets.connect(url, ping_interval=10, ping_timeout=10) as ws:
-                subscribe = {
-                    "eventName": "subscribe",
-                    "authorization": TIINGO_API_KEY,
-                    "eventData": { "tickers": list(_FX_SYMBOLS.keys()), "thresholdLevel": 5 } 
-                }
-                await ws.send(json.dumps(subscribe))
-                log.info("✅ Tiingo FX WebSocket connected.")
-                backoff = 1
-                connection_errors = 0 # Reset on success
+    if not config.USE_HARDENED_WS:
+        # Legacy loop
+        backoff = 1
+        connection_errors = 0
+        last_error_time = 0
+        while True:
+            try:
+                now = time.time()
+                if connection_errors > 5 and (now - last_error_time < 600):
+                    log.warning("Tiingo FX WS Circuit Breaker active. Relying on REST fallback for 10 mins.")
+                    await asyncio.sleep(60)
+                    continue
+
+                import random
+                await asyncio.sleep(random.uniform(10, 30))
                 
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=300)
-                    except asyncio.TimeoutError:
-                        break
-                        
-                    msg = json.loads(raw)
-                    if msg.get("messageType") == "A":
-                        data = msg.get("data", [])
-                        if len(data) >= 6:
-                            ticker = data[1].lower()
-                            mid_price = data[5]
-                            asset = _FX_SYMBOLS.get(ticker)
-                            if asset:
-                                old_data = direct_spot.get(asset)
-                                direct_spot[asset] = {"price": float(mid_price), "time": time.time()}
-                                
-                                # Macro Lead Detection (EURUSD as USD proxy)
-                                if old_data and asset == "EURUSD":
-                                    move = (float(mid_price) - old_data["price"]) / old_data["price"]
-                                    if move < -0.0010:
-                                        macro_bias["USD_SPIKE"] = {"active": True, "strength": abs(move), "expires": time.time() + 300}
-                                        log.info(f"🚨 MACRO BIAS: USD Spike detected (EURUSD {move:+.3%})")
-                                    elif move > 0.0010:
-                                        macro_bias["USD_CRASH"] = {"active": True, "strength": abs(move), "expires": time.time() + 300}
-                                        log.info(f"🚀 MACRO BIAS: USD Crash detected (EURUSD {move:+.3%})")
-                                        
-                                # Gold Lead
-                                if old_data and asset == "XAUUSD":
-                                    move = (float(mid_price) - old_data["price"]) / old_data["price"]
-                                    if move > 0.0020:
-                                        macro_bias["GOLD_BREAKOUT"] = {"active": True, "strength": abs(move), "expires": time.time() + 600}
-                                        log.info(f"✨ MACRO BIAS: Gold Breakout detected ({move:+.2%})")
-                                
-        except websockets.exceptions.ConnectionClosed as e:
-            connection_errors += 1
-            last_error_time = time.time()
-            if e.code == 1005:
-                log.debug(f"Tiingo FX WS closed (1005, count={connection_errors}). Reconnecting quietly...")
-            else:
-                log.warning(f"Tiingo FX WS closed ({e.code}, count={connection_errors}): {e.reason}")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-        except Exception as e:
-            connection_errors += 1
-            last_error_time = time.time()
-            log.error(f"Tiingo FX error (count={connection_errors}): {e}")
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+                async with websockets.connect(url, ping_interval=10, ping_timeout=10) as ws:
+                    await ws.send(json.dumps(subscribe))
+                    log.info("✅ Tiingo FX WebSocket connected.")
+                    backoff = 1
+                    connection_errors = 0
+                    
+                    while True:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=300)
+                        except asyncio.TimeoutError:
+                            break
+                            
+                        msg = json.loads(raw)
+                        tiingo_msg_handler(msg)
+                                    
+            except websockets.exceptions.ConnectionClosed as e:
+                connection_errors += 1
+                last_error_time = time.time()
+                if e.code == 1005:
+                    log.debug(f"Tiingo FX WS closed (1005, count={connection_errors}). Reconnecting quietly...")
+                else:
+                    log.warning(f"Tiingo FX WS closed ({e.code}, count={connection_errors}): {e.reason}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+            except Exception as e:
+                connection_errors += 1
+                last_error_time = time.time()
+                log.error(f"Tiingo FX error (count={connection_errors}): {e}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+    else:
+        # Hardened WS Pool
+        pool = feeds_hardened.HardenedWebsocketPool(
+            url=url,
+            pool_size=config.WS_POOL_SIZE,
+            sub_payload=subscribe,
+            message_handler=tiingo_msg_handler,
+            dedup_key_fn=tiingo_dedup_key
+        )
+        log.info("Starting HardenedWS Pool for Tiingo FX feed...")
+        await pool.start()
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await pool.stop()
+            raise
 
 async def tiingo_fx_rest_fallback():
     """

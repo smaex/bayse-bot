@@ -7,6 +7,7 @@ from strategies.correlate import CorrelateStrategy
 from strategies.news import NewsStrategy
 from strategies.poly_edge import PolyEdgeStrategy
 from strategies.frontrun import FrontrunStrategy
+from strategies.market_bias import MarketBiasStrategy
 from strategies.regime import regime_controller
 
 # Strategy instances
@@ -15,7 +16,8 @@ _strategies = {
     "CORRELATE": CorrelateStrategy(),
     "NEWS": NewsStrategy(),
     "POLY_EDGE": PolyEdgeStrategy(),
-    "FRONTRUN": FrontrunStrategy()
+    "FRONTRUN": FrontrunStrategy(),
+    "MARKET_BIAS": MarketBiasStrategy()
 }
 
 log = logging.getLogger("strategies")
@@ -30,7 +32,7 @@ async def evaluate_all(market: dict, learned: dict, state: any, spot_price: floa
     """
     asset = market["asset"]
     learned = learned or {}
-    active_strat_names = learned.get("strategies", ["SNIPE", "CORRELATE", "NEWS", "POLY_EDGE", "FRONTRUN"])
+    active_strat_names = learned.get("strategies", ["SNIPE", "CORRELATE", "NEWS", "POLY_EDGE", "FRONTRUN", "MARKET_BIAS"])
     
     # 1. Get Regime Multipliers
     regime_mults = regime_controller.get_multipliers(asset, state)

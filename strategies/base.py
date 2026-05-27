@@ -18,10 +18,15 @@ class MarketState:
     btc_signal_time:      dict[str, float] = field(default_factory=dict)
     btc_signal_direction: dict[str, str]   = field(default_factory=dict)
     btc_signal_move:      dict[str, float] = field(default_factory=dict)
+    # For market opens, favorite flips, and opening spreads
+    market_flips:          dict[str, int]   = field(default_factory=dict)
+    market_last_fav:       dict[str, str]   = field(default_factory=dict)
+    market_opening_prices: dict[str, dict]  = field(default_factory=dict)
 
 global_state = MarketState()
 
-StrategyType = Literal["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE"]
+StrategyType = Literal["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN", "MARKET_BIAS"]
+
 
 @dataclass
 class TradeSignal:

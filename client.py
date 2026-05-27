@@ -153,6 +153,19 @@ class BayseClient:
                                params={"resolution": resolution}, auth="public")
         return data if isinstance(data, list) else data.get("history", [])
 
+    async def get_orderbook(self, event_id: str, market_id: str) -> dict:
+        """Fetch order book depth for a market.
+        Returns dict with 'bids' and 'asks' arrays if CLOB, empty/absent if AMM.
+        Used by executor to infer engine type when market.engine field is missing.
+        """
+        try:
+            return await self._get(
+                f"/v1/pm/events/{event_id}/markets/{market_id}/orderbook",
+                auth="public"
+            )
+        except Exception:
+            return {}
+
     # ── Orders (write) ───────────────────────────────────────────────────────
 
     async def get_quote(self, event_id: str, market_id: str, outcome_id: str,

@@ -17,6 +17,57 @@ active_markets = []
 _tg_app = None
 _FX_ASSETS = ["EURUSD", "GBPUSD", "EURGBP", "XAUUSD"]
 
+# ── Engine inference cache ────────────────────────────────────────────────────
+# Stores the detected engine type per market_id so we only probe the order
+# book ONCE per market, not on every trade attempt.
+_market_engine_cache: dict[str, str] = {}  # market_id → "AMM" | "CLOB"
+
+
+async def _infer_engine(client, market: dict, timeout_ms: int = 300) -> str:
+    """
+    When market.get('engine') is absent, probe the order book to determine
+    if this is a CLOB or AMM market.
+
+    - Returns "CLOB" if the order book has any bids or asks.
+    - Returns "AMM"  on timeout (>300ms), error, or empty book.
+    - Results are cached so each market is only probed once.
+    """
+    market_id = market.get("market_id", "")
+
+    # Return cached result immediately if we've seen this market before
+    if market_id in _market_engine_cache:
+        return _market_engine_cache[market_id]
+
+    inferred = "AMM"  # safe default
+    try:
+        ob = await asyncio.wait_for(
+            client.get_orderbook(market["event_id"], market_id),
+            timeout=timeout_ms / 1000.0  # convert ms → seconds
+        )
+        # Bayse may return bids/asks at top level or nested under yes/no
+        bids = ob.get("bids") or ob.get("yes", {}).get("bids") or []
+        asks = ob.get("asks") or ob.get("yes", {}).get("asks") or []
+        if bids or asks:
+            inferred = "CLOB"
+            log.info(
+                f"Engine inferred as CLOB for {market_id} "
+                f"({len(bids)} bids / {len(asks)} asks in book)"
+            )
+        else:
+            log.debug(f"Engine inferred as AMM for {market_id} (empty order book)")
+
+    except asyncio.TimeoutError:
+        log.debug(
+            f"Engine inference timed out ({timeout_ms}ms) for {market_id} "
+            "— defaulting to AMM"
+        )
+    except Exception as exc:
+        log.debug(f"Engine inference failed for {market_id}: {exc} — defaulting to AMM")
+
+    # Cache so we never probe this market again
+    _market_engine_cache[market_id] = inferred
+    return inferred
+
 def init_executor(markets, tg_app):
     global active_markets, _tg_app
     active_markets = markets
@@ -170,33 +221,71 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
     # If Oracle indicates price is moving against us, and Bayse hasn't updated yet.
     # bias > 0: Oracle > Bayse (Upward pressure)
     # bias < 0: Oracle < Bayse (Downward pressure)
-    latency_threshold = 0.0008 # 0.08% — significant enough to front-run AMM
+    #
+    # BN-5 FIX: Raised from 0.08% to 0.15% for crypto. At 0.08%, normal feed
+    # scheduling differences between Bayse relay and Binance oracle caused constant
+    # false blocks. FX assets are entirely exempt — they move too slowly for latency
+    # arbitrage to matter. Also only block when the oracle data itself is fresh (<5s).
+    _oracle_data = feeds_direct.direct_spot.get(sig.asset, {})
+    _oracle_age  = time.time() - _oracle_data.get("time", 0)
+    _oracle_fresh = _oracle_age < 5.0  # only trust oracle signal if data is <5s old
     
-    if sig.outcome == "YES" and bias < -latency_threshold:
-        log.warning(f"[{chat_id}] 🛡️ LATENCY SHIELD: Blocked trade on {sig.asset}. Oracle is {bias:+.2%} below Bayse.")
-        return
-    if sig.outcome == "NO" and bias > latency_threshold:
-        log.warning(f"[{chat_id}] 🛡️ LATENCY SHIELD: Blocked trade on {sig.asset}. Oracle is {bias:+.2%} above Bayse.")
-        return
+    _is_fx = sig.asset in _FX_ASSETS
+    latency_threshold = 0.0 if _is_fx else 0.0015  # 0.15% for crypto, skip for FX
+    
+    if not _is_fx and _oracle_fresh and latency_threshold > 0:
+        if sig.outcome == "YES" and bias < -latency_threshold:
+            log.warning(f"[{chat_id}] 🛡️ LATENCY SHIELD: Blocked {sig.asset} YES. Oracle {bias:+.2%} below Bayse (oracle age {_oracle_age:.1f}s).")
+            return
+        if sig.outcome == "NO" and bias > latency_threshold:
+            log.warning(f"[{chat_id}] 🛡️ LATENCY SHIELD: Blocked {sig.asset} NO. Oracle {bias:+.2%} above Bayse (oracle age {_oracle_age:.1f}s).")
+            return
 
     # ── Engine Detection ──
     market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
-    engine = market.get("engine", "AMM") if market else "AMM"
+    declared_engine = market.get("engine") if market else None
+
+    if declared_engine:
+        # Bayse explicitly told us the engine — trust it, no extra call needed
+        engine = declared_engine
+    elif market:
+        # Engine field missing — probe order book with 300ms timeout.
+        # Result is cached so subsequent trades on this market are instant.
+        engine = await _infer_engine(client, market, timeout_ms=300)
+    else:
+        engine = "AMM"  # no market object at all — safe fallback
 
     # ── Hybrid Maker/Taker Routing ──
+    # CLOB markets: we can post a LIMIT order (maker) instead of immediately
+    # taking liquidity. Makers pay no fee and get better fill prices.
+    #
+    # Use MAKER when:
+    #   1. Market is CLOB (not AMM)
+    #   2. Volatility is not extreme (<2.5x baseline)
+    #   3. Either: high conviction signal (≥0.75) OR near-zero momentum
+    #
+    # Use TAKER otherwise (AMM always, or CLOB in fast-moving markets).
     is_maker = False
     time_in_force = "FAK"
-    
-    # Toxicity Check: Disable MAKER if volatility is elevated
-    if engine == "CLOB" and vol_mult <= 1.5:
+
+    if engine == "CLOB" and vol_mult <= 2.5:
         normalized_threshold = 0.005 * vol_mult
-        if abs(sig.momentum_at_entry) < normalized_threshold:
+        low_momentum  = abs(sig.momentum_at_entry) < normalized_threshold
+        high_conviction = sig.certainty >= 0.75  # High-conviction → post limit, save fee
+
+        if low_momentum or high_conviction:
             is_maker = True
-            limit_price = min(sig.market_price * 0.98, max_allowed_price)
+            # Post 1% below current price — patient fill, no fee paid
+            limit_price = min(sig.market_price * 0.99, max_allowed_price)
             time_in_force = "GTC"
-    
+            log.info(
+                f"[{chat_id}] CLOB MAKER: Posting limit at {limit_price:.3f} "
+                f"({'high conviction' if high_conviction else 'low momentum'}) — fee saved"
+            )
+
     if not is_maker:
         limit_price = min(sig.market_price * (1.0 + adaptive_slip), max_allowed_price)
+
 
     execution_style = "MAKER" if is_maker else "TAKER"
     log.info(
@@ -288,8 +377,11 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             realized_vol_at_entry=sig.realized_vol_at_entry,
             market_price_at_entry=sig.market_price,
             slippage_ngn=((filled_price / sig.market_price) - 1.0) * amount if sig.market_price > 0 else 0,
-            poly_price_at_entry=await comparative_analysis.get_comparative_price(sig.asset, market.get("threshold", 0)) if market else None
+            poly_price_at_entry=await comparative_analysis.get_comparative_price(sig.asset, market.get("threshold", 0)) if market else None,
+            engine=engine,
+            execution_style=execution_style
         )
+
 
         risk.add_position(sig.market_id, {
             "trade_id": trade_id, "event_id": sig.event_id,

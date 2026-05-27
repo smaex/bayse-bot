@@ -59,6 +59,15 @@ class SnipeStrategy(BaseStrategy):
         velocity = velocity_score(asset, threshold, direction, state)
         
         # 4. Vetoes
+        from strategies.base import global_state
+        market_id = market["market_id"]
+        flips = global_state.market_flips.get(market_id, 0)
+        
+        # Veto filter: if flips >= 5 after the first 90 seconds of a 5min candle
+        if secs < 210 and flips >= 5:
+            log.info(f"Snipe Veto: market {market_id} has high chaos/flips ({flips} flips)")
+            return None
+
         if mode != "full_send":
             # Smart Shield (Pin Risk & Volatility Guard)
             base_dist = config.CRYPTO_MIN_DISTANCE.get(asset) or config.FX_MIN_DISTANCE.get(asset, 0.0010)
@@ -87,6 +96,11 @@ class SnipeStrategy(BaseStrategy):
         regime_factor = 0.75 + 0.50 * regime
         
         composite = min((base + mom_bonus + edge_bonus) * regime_factor, 0.99)
+
+        # Conviction Boost: if flips <= 1 and well into the candle (elapsed > 90s)
+        if secs < 210 and flips <= 1:
+            composite = min(composite + 0.10, 0.99)
+            log.info(f"Snipe Conviction Boost: market {market_id} is highly stable ({flips} flips). Boosted composite to {composite:.2f}")
 
         # 6. Macro Bias
         biases = feeds_direct.get_macro_bias()

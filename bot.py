@@ -61,6 +61,12 @@ _last_spot:        dict[str, float] = {}
 _last_market_eval: dict[str, float] = {}
 _last_lag_log:     dict[str, float] = {}  # throttle lag warnings to once per minute
 
+# BN-9 FIX: Cache active users in memory — refreshed by 30s housekeeping loop.
+# Prevents a DB read on every single price tick (was 4+ reads/second).
+_active_users_cache: list[dict] = []
+_active_users_cache_time: float = 0.0
+_ACTIVE_USERS_CACHE_TTL = 30.0  # seconds
+
 # Minimum change to be considered a deposit/withdrawal (not just trade P&L noise)
 _BALANCE_EVENT_MIN_NGN = 200
 _BALANCE_EVENT_MIN_PCT = 0.05   # 5% of balance
@@ -339,15 +345,21 @@ async def _user_loop(chat_id: str):
                         sig.headline, sig.direction, sig.assets, sig.strength(),
                     )
 
+        # BN-9 FIX: Refresh the in-memory user cache here in the 30s loop
+        global _active_users_cache, _active_users_cache_time
+        _active_users_cache = await asyncio.to_thread(database.get_all_active)
+        _active_users_cache_time = time.time()
+
         # ── Signal evaluation ──────────────────────────────────────────────────
         user_assets  = settings.get("assets",     ["BTC", "ETH", "SOL"])
         user_tfs     = settings.get("timeframes",  ["5min", "15min", "1h"])
-        user_strats  = settings.get("strategies",  ["SNIPE", "CORRELATE", "ARB", "NEWS"])
+        # BN-2 FIX: Include all strategies in default list
+        user_strats  = settings.get("strategies",  ["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN", "MARKET_BIAS"])
         learned      = settings.get("learned",     {})
         learned["mode"] = settings.get("mode", "balanced")
         suspended    = learned.get("suspended_strategies", [])
         active_strats = [s for s in user_strats if s not in suspended]
-        max_exp      = settings.get("maxexposure", 30.0) / 100.0
+        max_exp      = settings.get("maxexposure", 20.0) / 100.0  # BN-8 FIX: unified default 20%
 
         await _evaluate_single_user(user, penalty=0.0)
 
@@ -393,7 +405,8 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
         return
 
     # 3. Evaluate all relevant markets with Adaptive Sizing
-    active_strats = settings.get("strategies", ["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN"])
+    # BN-2 FIX: Full default strategy list including new strategies
+    active_strats = settings.get("strategies", ["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN", "MARKET_BIAS"])
     learned = await asyncio.to_thread(learner.get_learned_overrides, chat_id)
     if not learned:
         learned = {}
@@ -404,7 +417,8 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
     else:
         learned["drawdown_pct"] = 0.0
     
-    max_exp = settings.get("maxexposure", 100) / 100.0
+    # BN-8 FIX: Unified maxexposure default — was 100% here (dangerous), now 20%
+    max_exp = settings.get("maxexposure", 20.0) / 100.0
     user_assets = settings.get("assets", config.ALL_ASSETS)
     
     raw_tfs = settings.get("timeframes", ["5min", "15min", "1h"])
@@ -527,20 +541,35 @@ def _on_spot_price(asset: str, price: float):
 
 async def _evaluate_all_users_for_spot(asset: str, change: float, threshold: float, penalty: float = 0.0):
     now = time.time()
-    if now - _last_market_eval.get(asset, 0) < 3: # allow slightly more frequent evals
+    # BN-1 FIX: Reduced throttle from 3s → 1s. At 3s, most signals on fast-moving
+    # assets (BTC/ETH ticking every ~1s) were silently dropped before evaluation.
+    if now - _last_market_eval.get(asset, 0) < 1.0:
         return
     _last_market_eval[asset] = now
     
-    # ── Local Dispatch ──
-    users = await asyncio.to_thread(database.get_all_active)
-    for user in users:
+    # BN-9 FIX: Use cached user list instead of hitting DB on every tick.
+    # Falls back to fresh DB read if cache is stale (>30s) or empty.
+    global _active_users_cache, _active_users_cache_time
+    if not _active_users_cache or (now - _active_users_cache_time) > _ACTIVE_USERS_CACHE_TTL:
+        _active_users_cache = await asyncio.to_thread(database.get_all_active)
+        _active_users_cache_time = now
+    
+    for user in _active_users_cache:
         asyncio.create_task(_evaluate_single_user(user, asset, penalty=penalty))
 
 
 def _on_market_update(market_id: str, prices: dict):
     market = next((m for m in active_markets if m["market_id"] == market_id), None)
-    if market and market.get("asset") == "BTC":
+    if not market:
+        return
+    asset = market.get("asset")
+    # Record BTC move for CORRELATE strategy
+    if asset == "BTC":
         strategy.record_btc_move(market, prices.get("yes", market["yes_price"]))
+    # BN-7 FIX: Also trigger a full evaluation when ANY market price updates.
+    # Previously only BTC moves triggered re-evaluation. A market shifting from
+    # 0.52 → 0.65 in one tick would not be acted on until the next heartbeat (5s).
+    asyncio.create_task(_evaluate_all_users_for_spot(asset, 0.0, 0.0, penalty=0.0))
 
 
 # ── Keep-alive web server ──────────────────────────────────────────────────────
