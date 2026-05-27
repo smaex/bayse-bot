@@ -1,9 +1,7 @@
 name: Strategy Simulation
 
 on:
-  push:
-    branches: [ main, master ]
-  workflow_dispatch: # Allows manual trigger from GitHub UI
+  workflow_dispatch: # Only runs when you click "Run workflow" in GitHub Actions UI
 
 jobs:
   simulate:
