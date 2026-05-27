@@ -197,7 +197,7 @@ FX_ENTRY_WINDOW_1H = 1200  # seconds (20 min)
 FX_TREND_VETO_MULT = 1.0   # reject if 10-min convergence > FX_MIN_DISTANCE × this
 
 # ── Correlation Signal ─────────────────────────────────────────────────────────
-CORRELATION_THRESHOLD = 0.008  # BTC spot must move ≥0.8% (lowered to catch standard breakouts)
+CORRELATION_THRESHOLD = 0.0035 # BTC spot must move ≥0.35% (lowered to catch standard breakouts)
 CORRELATION_WINDOW_SEC = 180   # signal valid for 3 minutes (edge evaporates fast)
 
 # CORRELATE strategy guards — the target asset may have already followed BTC

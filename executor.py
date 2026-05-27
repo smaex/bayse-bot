@@ -174,13 +174,16 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Price {sig.market_price:.2f} above safety cap {MAX_ENTRY_PRICE}")
         return
 
+    # Fetch market to get actual fee rate
+    market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
+
     # 2. Mathematical EV Filter
-    # EV = (WinProb * Payout) - (LossProb * 1.0)
+    # EV = win_p * (1.0 - effective_fee) / market_price - 1.0
     # We demand at least 5% EV margin for non-probe trades.
-    fee_rate = settings.get("fee_rate", 0.04)
+    fee_rate = market.get("fee_rate", settings.get("fee_rate", 0.04)) if market else settings.get("fee_rate", 0.04)
     win_p = sig.win_prob
-    net_payout = (1.0 - fee_rate) / sig.market_price
-    ev = (win_p * net_payout) - (1.0 - win_p)
+    effective_fee = fee_rate * max(1.0 - sig.market_price, 0.5)
+    ev = win_p * (1.0 - effective_fee) / sig.market_price - 1.0
     
     # ── Discovery Probe ──
     is_probe = False
@@ -199,7 +202,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Risk limit or max exposure reached")
         return
 
-    max_allowed_price = (1.0 - fee_rate) / (1.0 + 0.01) # Baseline 1% buffer
+    max_allowed_price = (1.0 - effective_fee) / (1.0 + 0.01) # Baseline 1% buffer
     is_fx = sig.asset in _FX_ASSETS
     
     # ── Adaptive Slippage ──
@@ -317,6 +320,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         order = resp.get("order", resp)
         # Robust share/quantity detection across different API versions
         shares_filled = float(
+            order.get("filledSize") or
             order.get("shares") or 
             order.get("quantity") or 
             order.get("sharesFilled") or 
@@ -339,6 +343,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
                 )
                 order = resp.get("order", resp)
                 shares_filled = float(
+                    order.get("filledSize") or
                     order.get("shares") or 
                     order.get("quantity") or 
                     order.get("sharesFilled") or 
@@ -356,7 +361,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             log.info(f"[{chat_id}] {sig.asset} order not filled (price moved away). Response: {resp}")
             return
 
-        filled_price = float(order.get("price", limit_price) or limit_price)
+        filled_price = float(order.get("avgFillPrice") or order.get("price", limit_price) or limit_price)
         bayse_order_id = order.get("id") or order.get("orderId") or order.get("order_id")
 
         spot_vs_thresh = 0.0

@@ -12,7 +12,8 @@ def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.04,
     """
     Quarter-Kelly position size with Bayesian Sample Size Penalty and Volatility Scaling.
     """
-    b = (1.0 - fee_rate) / market_price - 1.0
+    effective_fee = fee_rate * max(1.0 - market_price, 0.5)
+    b = (1.0 - effective_fee) / market_price - 1.0
     if b <= 0:
         return 0.0
         
@@ -55,4 +56,5 @@ def max_ev_price(win_prob: float, market_price: float, fee_rate: float = 0.04, m
     convexity_factor = 1.0 + skew  # At 0.90 -> 1.4x margin. At 0.10 -> 0.6x margin.
     
     dynamic_margin = max(0.01, min_margin * convexity_factor)
-    return win_prob * (1.0 - fee_rate) / (1.0 + dynamic_margin)
+    effective_fee = fee_rate * max(1.0 - market_price, 0.5)
+    return win_prob * (1.0 - effective_fee) / (1.0 + dynamic_margin)

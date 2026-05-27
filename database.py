@@ -31,7 +31,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DEFAULT_SETTINGS: dict = {
     "assets":           ["BTC", "ETH", "SOL"],
     "timeframes":       ["5min", "15min", "1h"],
-    "strategies":       ["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN"],
+    "strategies":       ["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN", "MARKET_BIAS"],
     "risk_pct":         3.0,
     "mintrade":         100,
     "maxtrade":         500_000,
@@ -245,14 +245,22 @@ def init_db():
                 except Exception:
                     cur.execute(f"ROLLBACK TO SAVEPOINT sp_ren_{i}")
             
-            # Migration: Add is_active column if missing
-            try:
-                cur.execute("SAVEPOINT sp_act")
-                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active INTEGER DEFAULT 1")
-                cur.execute("RELEASE SAVEPOINT sp_act")
-            except Exception as e:
-                cur.execute("ROLLBACK TO SAVEPOINT sp_act")
-                log.debug(f"Users migration skip: {e}")
+            # Migration: Ensure all columns exist in users table
+            for col in ["pub_enc", "sec_enc", "settings", "is_active", "created_at"]:
+                try:
+                    cur.execute(f"SAVEPOINT sp_col_{col}")
+                    if col == "is_active":
+                        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active INTEGER DEFAULT 1")
+                    elif col == "settings":
+                        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS settings TEXT DEFAULT '{}'")
+                    elif col == "created_at":
+                        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ")
+                    else:
+                        cur.execute(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS {col} TEXT")
+                    cur.execute(f"RELEASE SAVEPOINT sp_col_{col}")
+                except Exception as e:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT sp_col_{col}")
+                    log.debug(f"Users migration ensuring column {col} failed: {e}")
             
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_lock (

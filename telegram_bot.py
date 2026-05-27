@@ -397,14 +397,14 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     s    = user["settings"]
     key, vals = args[0].lower(), args[1:]
 
-    ASSETS     = {"BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "EURGBP", "XAUUSD"}
+    ASSETS     = {"BTC", "ETH", "SOL", "BNB", "EURUSD", "GBPUSD", "USDJPY", "EURJPY", "GBPJPY", "EURGBP", "XAUUSD"}
     TIMEFRAMES = {"5min", "15min", "1h", "6h", "1d"}
-    STRATEGIES = {"SNIPE", "CORRELATE", "ARB", "NEWS"}
+    STRATEGIES = {"SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN", "MARKET_BIAS"}
 
     if key == "assets":
         bad = [v for v in vals if v.upper() not in ASSETS]
         if bad:
-            await update.message.reply_text(f"Unknown: {bad}. Valid: BTC ETH SOL EURUSD GBPUSD EURGBP XAUUSD"); return
+            await update.message.reply_text(f"Unknown: {bad}. Valid: BTC ETH SOL BNB EURUSD GBPUSD USDJPY EURJPY GBPJPY EURGBP XAUUSD"); return
         s["assets"] = [v.upper() for v in vals]
         msg = f"Assets: {s['assets']}"
 
@@ -418,7 +418,7 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     elif key == "strategies":
         bad = [v for v in vals if v.upper() not in STRATEGIES]
         if bad:
-            await update.message.reply_text(f"Unknown: {bad}. Valid: SNIPE CORRELATE ARB NEWS"); return
+            await update.message.reply_text(f"Unknown: {bad}. Valid: SNIPE CORRELATE ARB NEWS POLY_EDGE FRONTRUN MARKET_BIAS"); return
         s["strategies"] = [v.upper() for v in vals]
         msg = f"Strategies: {s['strategies']}"
 

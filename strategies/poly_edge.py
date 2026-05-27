@@ -29,7 +29,7 @@ class PolyEdgeStrategy(BaseStrategy):
         outcome_id = ""
         market_price = 0.0
         
-        THRESHOLD = 0.08 # Lowered from 0.15 for Alpha Resurrection
+        THRESHOLD = 0.03 # Lowered from 0.08 for Alpha Resurrection
         if yes_edge > THRESHOLD:
             edge = yes_edge
             outcome, outcome_id, market_price = "YES", market["yes_id"], yes_p
