@@ -382,11 +382,29 @@ def acquire_singleton_lock() -> bool:
         log.error(f"Error acquiring singleton lock: {e}")
     return False
 
-def heartbeat_singleton_lock():
-    """Updates the lock timestamp to keep it alive."""
+def heartbeat_singleton_lock() -> bool:
+    """
+    Updates the lock timestamp synchronously to keep it alive.
+    Returns True if we still hold the lock, False if we lost it.
+    """
     import os
     pid = os.getpid()
-    _enqueue("UPDATE bot_lock SET updated_at = CURRENT_TIMESTAMP WHERE lock_id = 'MASTER' AND process_id = %s", (pid,))
+    try:
+        with _cx() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE bot_lock 
+                    SET updated_at = CURRENT_TIMESTAMP 
+                    WHERE lock_id = 'MASTER' AND process_id = %s
+                    RETURNING process_id
+                """, (pid,))
+                row = cur.fetchone()
+                if row and row[0] == pid:
+                    return True
+    except Exception as e:
+        log.error(f"Error sending heartbeat for singleton lock: {e}")
+        return True
+    return False
 
 
 # ── Users ─────────────────────────────────────────────────────────────────────

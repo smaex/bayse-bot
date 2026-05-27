@@ -289,7 +289,6 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
     if not is_maker:
         limit_price = min(sig.market_price * (1.0 + adaptive_slip), max_allowed_price)
 
-
     execution_style = "MAKER" if is_maker else "TAKER"
     log.info(
         f"[{chat_id}] PLACING {sig.strategy} | {sig.asset} ({engine} {execution_style}) "
@@ -309,9 +308,14 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         # AMM usually requires MARKET + maxSlippage. CLOB can take LIMIT.
         final_order_type = "LIMIT" if engine == "CLOB" else "MARKET"
         
+        multiplier = 100.0 if CURRENCY == "NGN" else 1.0
+        order_amount = amount
+        if final_order_type == "LIMIT":
+            order_amount = amount / (limit_price * multiplier)
+            
         resp = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
-            outcome_id=sig.outcome_id, side="BUY", amount=amount,
+            outcome_id=sig.outcome_id, side="BUY", amount=order_amount,
             order_type=final_order_type, price=limit_price if final_order_type == "LIMIT" else None,
             max_slippage=adaptive_slip,
             currency=CURRENCY,
@@ -336,9 +340,10 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             chase_price = min(limit_price * 1.002, max_allowed_price)
             if chase_price > limit_price:
                 log.info(f"[{chat_id}] CLOB CHASE: First order missed. Retrying at {chase_price:.3f}")
+                chase_shares = amount / (chase_price * multiplier)
                 resp = await client.place_order(
                     event_id=sig.event_id, market_id=sig.market_id,
-                    outcome_id=sig.outcome_id, side="BUY", amount=amount,
+                    outcome_id=sig.outcome_id, side="BUY", amount=chase_shares,
                     order_type="LIMIT", price=chase_price, currency=CURRENCY,
                 )
                 order = resp.get("order", resp)
@@ -348,21 +353,25 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
                     order.get("quantity") or 
                     order.get("sharesFilled") or 
                     order.get("sharesMatched") or 
+                    order.get("amountMatched") or 
+                    order.get("filledQuantity") or 
                     0
                 )
 
-        # Fallback for MARKET orders: if we have an ID and it's MARKET, it's almost certainly filled.
+        filled_price = float(order.get("avgFillPrice") or order.get("price", limit_price) or limit_price)
+        
+        # Fallback: if we have an ID and it's successful, but no shares_filled was returned, estimate it.
         order_id = order.get("id") or order.get("orderId") or order.get("order_id")
-        if shares_filled <= 0 and final_order_type == "MARKET" and order_id:
-            log.info(f"[{chat_id}] MARKET order {order_id} has no explicit fill qty in response, assuming success.")
-            shares_filled = amount # Default to amount for record keeping if unknown
+        if shares_filled <= 0 and order_id:
+            log.info(f"[{chat_id}] Order {order_id} has no explicit fill qty in response, assuming success.")
+            shares_filled = amount / (filled_price * multiplier)
 
         if shares_filled <= 0:
             log.info(f"[{chat_id}] {sig.asset} order not filled (price moved away). Response: {resp}")
             return
 
-        filled_price = float(order.get("avgFillPrice") or order.get("price", limit_price) or limit_price)
-        bayse_order_id = order.get("id") or order.get("orderId") or order.get("order_id")
+        bayse_order_id = order_id
+        actual_ngn = shares_filled * filled_price * multiplier
 
         spot_vs_thresh = 0.0
         if market and market.get("threshold") and feeds.spot.get(sig.asset):
@@ -373,7 +382,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             chat_id=chat_id, strategy=sig.strategy, asset=sig.asset,
             timeframe=sig.timeframe, outcome=sig.outcome, outcome_id=sig.outcome_id,
             market_id=sig.market_id, event_id=sig.event_id, order_id=bayse_order_id,
-            entry_price=filled_price, amount_ngn=amount, certainty=sig.certainty,
+            entry_price=filled_price, amount_ngn=actual_ngn, certainty=sig.certainty,
             secs_to_close=market["secs_to_close"] if market else 0,
             spot_vs_threshold_pct=spot_vs_thresh,
             momentum_at_entry=sig.momentum_at_entry,
@@ -381,7 +390,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             edge_at_entry=sig.edge_at_entry,
             realized_vol_at_entry=sig.realized_vol_at_entry,
             market_price_at_entry=sig.market_price,
-            slippage_ngn=((filled_price / sig.market_price) - 1.0) * amount if sig.market_price > 0 else 0,
+            slippage_ngn=((filled_price / sig.market_price) - 1.0) * actual_ngn if sig.market_price > 0 else 0,
             poly_price_at_entry=await comparative_analysis.get_comparative_price(sig.asset, market.get("threshold", 0)) if market else None,
             engine=engine,
             execution_style=execution_style
@@ -391,12 +400,12 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         risk.add_position(sig.market_id, {
             "trade_id": trade_id, "event_id": sig.event_id,
             "outcome": sig.outcome, "outcome_id": sig.outcome_id,
-            "entry_price": filled_price, "amount_ngn": amount,
+            "entry_price": filled_price, "amount_ngn": actual_ngn,
             "strategy": sig.strategy, "asset": sig.asset, "timeframe": sig.timeframe,
         })
 
         if _tg_app:
-            await telegram_bot.notify_trade(_tg_app, chat_id, sig, amount)
+            await telegram_bot.notify_trade(_tg_app, chat_id, sig, actual_ngn)
 
     except Exception as e:
         log.error(f"[{chat_id}] order failed {sig.market_id}: {e}")

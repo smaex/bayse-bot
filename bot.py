@@ -650,8 +650,12 @@ async def main():
         
     async def _lock_heartbeat():
         while True:
-            database.heartbeat_singleton_lock()
             await asyncio.sleep(30)
+            still_held = await asyncio.to_thread(database.heartbeat_singleton_lock)
+            if not still_held:
+                log.critical("🚨 GHOST SHIELD: We lost the singleton lock to another process! Self-terminating immediately.")
+                import os
+                os._exit(1)
     asyncio.create_task(_lock_heartbeat())
 
     # Telegram
