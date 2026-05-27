@@ -1,8 +1,0 @@
-run = "python bot.py"
-entrypoint = "bot.py"
-
-[nix]
-channel = "stable-23_11"
-
-[deployment]
-run = ["sh", "-c", "python bot.py"]
