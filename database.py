@@ -225,6 +225,21 @@ def init_db():
                 cur.execute("ALTER TABLE users ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at::TIMESTAMPTZ")
             except: pass
             
+            # Migration: Rename legacy columns to new schema
+            legacy_renames = [
+                "ALTER TABLE users RENAME COLUMN user_id TO chat_id",
+                "ALTER TABLE users RENAME COLUMN id TO chat_id",
+                "ALTER TABLE users RENAME COLUMN api_key TO pub_enc",
+                "ALTER TABLE users RENAME COLUMN public_key TO pub_enc",
+                "ALTER TABLE users RENAME COLUMN api_secret TO sec_enc",
+                "ALTER TABLE users RENAME COLUMN secret_key TO sec_enc",
+            ]
+            for query in legacy_renames:
+                try:
+                    cur.execute(query)
+                except Exception:
+                    pass
+            
             # Migration: Add is_active column if missing
             try:
                 cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active INTEGER DEFAULT 1")
