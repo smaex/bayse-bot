@@ -222,8 +222,11 @@ def init_db():
                 )
             """)
             try:
+                cur.execute("SAVEPOINT sp_time")
                 cur.execute("ALTER TABLE users ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at::TIMESTAMPTZ")
-            except: pass
+                cur.execute("RELEASE SAVEPOINT sp_time")
+            except:
+                cur.execute("ROLLBACK TO SAVEPOINT sp_time")
             
             # Migration: Rename legacy columns to new schema
             legacy_renames = [
@@ -234,16 +237,21 @@ def init_db():
                 "ALTER TABLE users RENAME COLUMN api_secret TO sec_enc",
                 "ALTER TABLE users RENAME COLUMN secret_key TO sec_enc",
             ]
-            for query in legacy_renames:
+            for i, query in enumerate(legacy_renames):
                 try:
+                    cur.execute(f"SAVEPOINT sp_ren_{i}")
                     cur.execute(query)
+                    cur.execute(f"RELEASE SAVEPOINT sp_ren_{i}")
                 except Exception:
-                    pass
+                    cur.execute(f"ROLLBACK TO SAVEPOINT sp_ren_{i}")
             
             # Migration: Add is_active column if missing
             try:
+                cur.execute("SAVEPOINT sp_act")
                 cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active INTEGER DEFAULT 1")
+                cur.execute("RELEASE SAVEPOINT sp_act")
             except Exception as e:
+                cur.execute("ROLLBACK TO SAVEPOINT sp_act")
                 log.debug(f"Users migration skip: {e}")
             
             cur.execute("""
