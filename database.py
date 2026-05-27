@@ -224,6 +224,13 @@ def init_db():
             try:
                 cur.execute("ALTER TABLE users ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at::TIMESTAMPTZ")
             except: pass
+            
+            # Migration: Add is_active column if missing
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active INTEGER DEFAULT 1")
+            except Exception as e:
+                log.debug(f"Users migration skip: {e}")
+            
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_lock (
                     lock_id    TEXT PRIMARY KEY,
