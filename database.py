@@ -405,7 +405,20 @@ def heartbeat_singleton_lock() -> bool:
         log.error(f"Error sending heartbeat for singleton lock: {e}")
         return True
     return False
-
+def release_singleton_lock() -> bool:
+    """
+    Forcefully releases the MASTER lock regardless of owner.
+    Returns True if a lock was deleted, False otherwise.
+    """
+    try:
+        with _cx() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM bot_lock WHERE lock_id = 'MASTER'")
+                conn.commit()
+                return cur.rowcount > 0
+    except Exception as e:
+        log.error(f"Error releasing singleton lock: {e}")
+    return False
 
 # ── Users ─────────────────────────────────────────────────────────────────────
 

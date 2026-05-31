@@ -639,6 +639,7 @@ async def main():
     # ── GHOST SHIELD: Singleton Lock ──
     # During Render deploys, a new instance may start before the old one dies.
     # We wait up to 300s (5 min) for the old instance to release the lock/go stale.
+    database.release_singleton_lock()
     max_wait = 300
     waited = 0
     while not database.acquire_singleton_lock():
