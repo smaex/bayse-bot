@@ -90,6 +90,8 @@ class HardenedWebsocketPool:
                             key = self.dedup_key_fn(msg)
                             if not key:
                                 # If it doesn't represent a standard price tick, pass to handler directly
+                                # Also log it so we can see if it's an error message from the exchange
+                                log.debug(f"HardenedWS Pool: Connection {conn_id} non-tick msg: {msg}")
                                 self.message_handler(msg)
                                 continue
                                 
@@ -116,6 +118,9 @@ class HardenedWebsocketPool:
                                         
                             # Dispatch to message handler
                             self.message_handler(msg)
+                            
+                    log.warning(f"HardenedWS Pool: Connection {conn_id} stream ended gracefully. Reconnecting in 2s...")
+                    await asyncio.sleep(2.0)
                             
             except asyncio.CancelledError:
                 log.info(f"HardenedWS Pool: Connection {conn_id} cancelled.")
