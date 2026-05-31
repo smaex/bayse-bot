@@ -101,7 +101,12 @@ class BayseClient:
                     try:
                         error_data = await r.json()
                         log.error(f"API Error {r.status} on {path}: {error_data}")
-                    except:
+                        msg = error_data.get("message")
+                        if msg:
+                            raise ValueError(msg)
+                    except Exception as e:
+                        if isinstance(e, ValueError):
+                            raise e
                         text = await r.text()
                         log.error(f"API Error {r.status} on {path}: {text}")
                 r.raise_for_status()
