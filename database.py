@@ -420,6 +420,32 @@ def release_singleton_lock() -> bool:
         log.error(f"Error releasing singleton lock: {e}")
     return False
 
+def force_acquire_singleton_lock() -> bool:
+    """Forcefully acquire the MASTER lock for this process.
+    Used during startup after releasing any stale lock.
+    Returns True on success, False otherwise.
+    """
+    import os
+    pid = os.getpid()
+    try:
+        with _cx() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO bot_lock (lock_id, process_id, updated_at)
+                    VALUES ('MASTER', %s, CURRENT_TIMESTAMP)
+                    ON CONFLICT (lock_id) DO UPDATE SET
+                        process_id = %s,
+                        updated_at = CURRENT_TIMESTAMP;
+                    """,
+                    (pid, pid),
+                )
+                conn.commit()
+                return True
+    except Exception as e:
+        log.error(f"Error force-acquiring singleton lock: {e}")
+        return False
+
 # ── Users ─────────────────────────────────────────────────────────────────────
 
 def add_user(chat_id: str, public_key: str, secret_key: str) -> dict:
