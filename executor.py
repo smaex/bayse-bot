@@ -332,11 +332,6 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         limit_price = min(sig.market_price * (1.0 + adaptive_slip), max_allowed_price)
 
     execution_style = "MAKER" if is_maker else "TAKER"
-    log.info(
-        f"[{chat_id}] PLACING {sig.strategy} | {sig.asset} ({engine} {execution_style}) "
-        f"price={sig.market_price:.3f} limit={limit_price:.3f} slip={adaptive_slip:.2%} "
-        f"certainty={sig.certainty:.0%} ₦{amount:,.0f}"
-    )
 
     try:
         # ── Slippage Shield (Alpha Capture Phase) ──
@@ -384,6 +379,12 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
                 f"Will pick this market again when capital grows."
             )
             return
+
+        log.info(
+            f"[{chat_id}] PLACING {sig.strategy} | {sig.asset} ({engine} {execution_style}) "
+            f"price={sig.market_price:.3f} limit={limit_price:.3f} slip={adaptive_slip:.2%} "
+            f"certainty={sig.certainty:.0%} ₦{amount:,.0f}"
+        )
 
         resp = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
