@@ -646,10 +646,10 @@ async def main():
         if waited >= max_wait:
             log.critical(f"🚨 GHOST SHIELD: Could not acquire lock after {max_wait}s. Terminating.")
             return
-                database.release_singleton_lock()
+        # redundant release removed
         if waited % 30 == 0:
             log.info(f"⏳ GHOST SHIELD: Another instance is active. Standing by... ({waited}s)")
-# duplicate log removed
+        # duplicate log removed
         await asyncio.sleep(5)
         waited += 5
     
