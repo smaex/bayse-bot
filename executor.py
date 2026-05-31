@@ -100,6 +100,7 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
         risk.unlock_market(sig.market_id)
 
 async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, free_cash):
+    mode     = settings.get("mode", "balanced")
     min_t    = settings.get("mintrade", 100)
     max_t    = settings.get("maxtrade", 5_000)   # BUG-FIX: was 500,000 (way too high)
     max_exp  = settings.get("maxexposure", 20.0) / 100.0
