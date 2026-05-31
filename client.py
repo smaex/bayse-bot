@@ -135,13 +135,6 @@ class BayseClient:
         data = await self._get(f"/v1/pm/events/series/{series_slug}/lean-events", auth="public")
         return data if isinstance(data, list) else data.get("events", [])
 
-    async def get_quote(self, event_id: str, market_id: str, outcome_id: str,
-                        side: str, amount: float, currency: str = "NGN") -> dict:
-        return await self._post(
-            f"/v1/pm/events/{event_id}/markets/{market_id}/quote",
-            {"outcomeId": outcome_id, "side": side, "amount": amount, "currency": currency},
-        )
-
     async def get_trades(self, market_id: str = None, limit: int = 50) -> dict:
         params = {"limit": limit}
         if market_id:

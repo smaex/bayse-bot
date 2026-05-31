@@ -489,6 +489,10 @@ async def _scan_loop():
         try:
             active_markets = await scanner.scan_all(_scan_client)
             telegram_bot._active_markets = active_markets
+            # BUG-FIX: Keep executor's market list in sync after every rescan.
+            # Previously executor.init_executor was only called at startup, leaving
+            # the executor with the original empty list after the first scan.
+            executor.init_executor(active_markets, _tg_app)
             log.info(f"Rescanned: {len(active_markets)} markets")
             feeds.restart_bayse_feed(active_markets, _on_market_update)
             
@@ -745,6 +749,9 @@ async def main():
     if _scan_client:
         active_markets = await scanner.scan_all(_scan_client)
         telegram_bot._active_markets = active_markets
+        # BUG-FIX: Update executor after initial scan — at startup the scan returns
+        # an empty list, so executor must be re-initialised with actual markets.
+        executor.init_executor(active_markets, _tg_app)
         log.info(f"Initial scan: {len(active_markets)} markets")
         feeds.restart_bayse_feed(active_markets, _on_market_update)
         asyncio.create_task(scanner.discover_series(_scan_client))
@@ -776,7 +783,8 @@ async def _update_dashboard_stats():
                 balance = 0
                 try:
                     balance = await client.get_balance_ngn()
-                except: pass
+                except Exception as e:
+                    log.debug(f"Dashboard balance fetch failed for {cid}: {e}")
                 
                 user_stats.append({
                     "id": f"{cid[:4]}...{cid[-4:]}" if len(cid) > 8 else cid,

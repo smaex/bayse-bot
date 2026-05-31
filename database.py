@@ -32,10 +32,10 @@ DEFAULT_SETTINGS: dict = {
     "assets":           ["BTC", "ETH", "SOL"],
     "timeframes":       ["5min", "15min", "1h"],
     "strategies":       ["SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN", "MARKET_BIAS"],
-    "risk_pct":         3.0,
+    "risk_pct":         2.0,   # BUG-FIX: was 3.0 — capped at 2% by safety migration anyway
     "mintrade":         100,
-    "maxtrade":         500_000,
-    "maxexposure":      30.0,
+    "maxtrade":         5_000, # BUG-FIX: was 500,000 (₦500k!). Now ₦5,000 max per trade.
+    "maxexposure":      20.0,  # BUG-FIX: was 30.0 — safety migration forced 20%, align default
     "daily_multiplier": 10,
     "daily_target_ngn": 0,
     "paused":           False,

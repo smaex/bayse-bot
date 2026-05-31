@@ -93,12 +93,14 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
         risk.unlock_market(sig.market_id)
 
 async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, free_cash):
-    mode = settings.get("mode", "balanced")
+    mode     = settings.get("mode", "balanced")
     min_t    = settings.get("mintrade", 100)
-    max_t    = settings.get("maxtrade", 500_000)
-    max_exp  = settings.get("maxexposure", 30.0) / 100.0
+    max_t    = settings.get("maxtrade", 5_000)   # BUG-FIX: was 500,000 (way too high)
+    max_exp  = settings.get("maxexposure", 20.0) / 100.0
     learned  = settings.get("learned", {})
     mult     = learned.get("size_multipliers", {}).get(sig.strategy, 1.0)
+    # User's configured risk % per trade (capped at 5% for safety)
+    user_risk_pct = min(settings.get("risk_pct", 2.0), 5.0) / 100.0
 
     # ── Trailing Profit Shield (Strict Mode) ──
     if risk.is_in_strict_mode():
@@ -108,26 +110,29 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             return
 
     # ── Conviction Sizing (Tiered Risk) ──────────────────────────────────────
-    # Scales risk based on certainty: 1% (Low) -> 4% (High)
+    # Scales risk based on certainty tiers, anchored to user's risk_pct setting.
+    # e.g. if risk_pct=2%: Low=1%, Mid=2%, High=3%, Top=4%
     if sig.certainty >= 0.90:
-        base_pct = 0.04
+        tier_mult = 2.0   # 4% at 2% risk_pct
     elif sig.certainty >= 0.70:
-        base_pct = 0.03
+        tier_mult = 1.5   # 3% at 2% risk_pct
     elif sig.certainty >= 0.55:
-        base_pct = 0.02
+        tier_mult = 1.0   # 2% at 2% risk_pct
     else:
-        base_pct = 0.01  # Minimum (0.45 - 0.55 range)
+        tier_mult = 0.5   # 1% at 2% risk_pct
+
+    base_pct = user_risk_pct * tier_mult
 
     # Apply external multipliers (FX factor, ML learned multipliers)
     fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
     raw_pct = base_pct * mult * fx_factor
 
     # ── Conviction Booster (Extreme Certainty) ──
+    # BUG-FIX: Reduced from 2.0x to 1.5x — prevents doubling into hard cap
     if sig.certainty >= 0.95:
-        conviction_mult = 2.0  # Slightly more conservative than 5x with new tiered base
+        conviction_mult = 1.5
         raw_pct *= conviction_mult
         log.info(f"[{chat_id}] 🔥 CONVICTION BOOSTER: Boosting size by {conviction_mult}x (Certainty {sig.certainty:.0%})")
-
 
     # ── Alpha Decay Shield (Anti-Bleed) ──
     # If the edge magnitude is shrinking over the last 10 trades, reduce size.
@@ -144,28 +149,54 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
 
     # ── Micro-Account Handling (For ₦2,000 starts) ─────────────────────────
     if equity < 3000:
-        # On tiny accounts, we can't trade < ₦100. 
+        # On tiny accounts, we can't trade < ₦100.
         # We force ₦100 but keep the strategy conviction filters.
         amount = 100.0
         log.info(f"[{chat_id}] Micro-Account Mode: forcing ₦100 minimum viable size")
     else:
-        amount  = equity * min(raw_pct, 0.10)
-        amount  = max(min_t, min(max_t, amount))
+        # BUG-FIX: Cap raw_pct at user_risk_pct * 3 (max 3x tier ceiling), not 10%
+        capped_pct = min(raw_pct, user_risk_pct * 3.0)
+        amount     = equity * capped_pct
+        # Respect user's mintrade/maxtrade as authoritative boundaries first.
+        amount     = max(min_t, min(max_t, amount))
 
-    hard_cap = max(100.0, equity * 0.08)
+    # ── Hard Safety Cap (5% equity) ──
+    # The real ceiling is the LOWER of (5% equity) and the user's maxtrade.
+    # - If user set maxtrade=₦2,000 and 5% equity=₦10,000 → ceiling is ₦2,000.
+    # - If user set maxtrade=₦50,000 and 5% equity=₦5,000 → ceiling is ₦5,000.
+    # This way the user's maxtrade is always respected and is never bypassed.
+    system_cap = max(100.0, equity * 0.05)
+    hard_cap   = min(system_cap, max_t)
+
     if amount > hard_cap:
+        cap_reason = "user maxtrade cap" if hard_cap < system_cap else "5% equity cap"
         log.info(
-            f"[{chat_id}] ⚖️ HARD CAP CLAMP: Scaling ₦{amount:,.0f} down to 8% cap (₦{hard_cap:,.0f})."
+            f"[{chat_id}] ⚖️ HARD CAP CLAMP: Scaling ₦{amount:,.0f} → ₦{hard_cap:,.0f} ({cap_reason})."
         )
         amount = hard_cap
 
-    if amount < 100.0:
-        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Final amount ₦{amount:,.0f} < ₦100 minimum.")
+    log.info(
+        f"[{chat_id}] 📐 SIZING | equity=₦{equity:,.0f} risk_pct={user_risk_pct:.1%} "
+        f"tier_mult={tier_mult:.1f}x base={base_pct:.2%} raw={raw_pct:.2%} "
+        f"final=₦{amount:,.0f} hard_cap=₦{hard_cap:,.0f} "
+        f"mintrade=₦{min_t:,.0f} maxtrade=₦{max_t:,.0f} mult={mult:.2f} fx={fx_factor:.1f}"
+    )
+
+    # Skip if below the effective minimum — the higher of ₦100 or user's mintrade.
+    # This catches cases where the hard cap brought the amount below the user's floor.
+    effective_minimum = max(100.0, min_t)
+    if amount < effective_minimum:
+        log.info(
+            f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — "
+            f"Final ₦{amount:,.0f} is below effective minimum ₦{effective_minimum:,.0f} "
+            f"(mintrade=₦{min_t:,.0f})."
+        )
         return
 
     if amount > free_cash:
         log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Insufficient free cash (Need ₦{amount:,.0f}, Have ₦{free_cash:,.0f})")
         return
+
 
     # ── Safety Guardrails (Alpha Resurrection) ──
     # 1. Global Price Cap: Never buy above 0.80 (Downside is 4x upside)
@@ -187,12 +218,17 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
     
     # ── Discovery Probe ──
     is_probe = False
-    # Probes: Small trades (₦100) to collect data even if certainty is modest (0.35+)
+    # Probes: Small trades to collect data even if certainty is modest (0.35+)
     # This keeps the bot 'in the game' without risking the bankroll.
+    # BUG-FIX: Respect user's mintrade — if mintrade > ₦100, skip probe rather than
+    # violate the user's minimum bet size configuration.
     if sig.certainty >= 0.35 and sig.certainty < sig.mode_floor:
-        is_probe = True
-        amount = 100.0
-        log.info(f"[{chat_id}] DISCOVERY PROBE: Sizing down to ₦100 for Bayesian data collection.")
+        if min_t <= 100.0:
+            is_probe = True
+            amount = 100.0
+            log.info(f"[{chat_id}] DISCOVERY PROBE: Sizing down to ₦100 for Bayesian data collection.")
+        else:
+            log.info(f"[{chat_id}] DISCOVERY PROBE skipped — mintrade=₦{min_t:,.0f} > ₦100 probe size.")
 
     if not is_probe and ev < 0.05:
         log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Insufficient EV ({ev:+.1%})")
@@ -303,6 +339,14 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         if avg_slip > 0.015:
             log.warning(f"[{chat_id}] SLIPPAGE SHIELD ACTIVE: Reducing size for {sig.asset} ({avg_slip:.1%} avg slip)")
             amount = amount * 0.5
+            # BUG-FIX: Re-check mintrade after slippage shield halves amount.
+            # Without this, a trade can proceed below the user's minimum bet size.
+            if amount < effective_minimum:
+                log.info(
+                    f"[{chat_id}] SKIPPED after slippage shield — "
+                    f"halved amount ₦{amount:,.0f} < mintrade ₦{min_t:,.0f}."
+                )
+                return
 
         # Place the order
         # AMM usually requires MARKET + maxSlippage. CLOB can take LIMIT.
@@ -341,12 +385,17 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             if chase_price > limit_price:
                 log.info(f"[{chat_id}] CLOB CHASE: First order missed. Retrying at {chase_price:.3f}")
                 chase_shares = amount / (chase_price * multiplier)
-                resp = await client.place_order(
-                    event_id=sig.event_id, market_id=sig.market_id,
-                    outcome_id=sig.outcome_id, side="BUY", amount=chase_shares,
-                    order_type="LIMIT", price=chase_price, currency=CURRENCY,
-                )
-                order = resp.get("order", resp)
+                try:
+                    resp = await client.place_order(
+                        event_id=sig.event_id, market_id=sig.market_id,
+                        outcome_id=sig.outcome_id, side="BUY", amount=chase_shares,
+                        order_type="LIMIT", price=chase_price, currency=CURRENCY,
+                    )
+                except Exception as e:
+                    log.debug(f"[{chat_id}] CLOB CHASE order failed at {chase_price:.3f}: {e}")
+                    # Fall through — shares_filled stays 0, zero-fill path handles it below
+                else:
+                    order = resp.get("order", resp)
                 shares_filled = float(
                     order.get("filledSize") or
                     order.get("shares") or 
@@ -404,11 +453,23 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             "strategy": sig.strategy, "asset": sig.asset, "timeframe": sig.timeframe,
         })
 
-        if _tg_app:
-            await telegram_bot.notify_trade(_tg_app, chat_id, sig, actual_ngn)
-
     except Exception as e:
-        log.error(f"[{chat_id}] order failed {sig.market_id}: {e}")
+        log.error(f"[{chat_id}] order failed {sig.market_id}: {e}", exc_info=True)
+        return
+
+    # ── BUG-FIX: Notification is OUTSIDE the order try/except ──
+    # Previously, if notify_trade() threw (e.g. Markdown parse error from special
+    # chars in sig.reason), the exception was silently swallowed as "order failed".
+    # Now it has its own isolated try/except with a clear error log.
+    if _tg_app:
+        try:
+            # notify_trade() handles Markdown sanitization and plain-text fallback internally.
+            await telegram_bot.notify_trade(_tg_app, chat_id, sig, actual_ngn)
+            log.info(f"[{chat_id}] ✅ Notification sent for {sig.strategy} {sig.asset} ₦{actual_ngn:,.0f}")
+        except Exception as notify_err:
+            log.error(f"[{chat_id}] ❌ NOTIFICATION FAILED for {sig.strategy} {sig.asset}: {notify_err}", exc_info=True)
+    else:
+        log.warning(f"[{chat_id}] ⚠️ _tg_app is None — notification skipped. Bot may not have initialized Telegram correctly.")
 
 async def execute_arb(chat_id, sig, client, equity, free_cash, settings):
     """Executes a market-neutral arbitrage"""
@@ -425,7 +486,9 @@ async def execute_arb(chat_id, sig, client, equity, free_cash, settings):
         
         quote = await client.get_quote(sig.event_id, sig.market_id, market["yes_id"], "BUY", amount_yes, CURRENCY)
         if float(quote.get("sharesMatched", 0)) <= 0: return
-    except Exception: return
+    except Exception as e:
+        log.debug(f"[{chat_id}] ARB pre-flight quote failed for {sig.market_id}: {e}")
+        return
 
     yes_ok = False; yes_shares = 0
     try:

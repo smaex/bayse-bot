@@ -905,12 +905,38 @@ async def notify_trade(app, cid: str, sig, amount: float):
         header = f"🎯 *Converged Trade* ({sig.strategy} + {' + '.join(converged)})"
     else:
         header = f"🔔 *Trade* ({sig.strategy})"
-    await send_message(
-        app, cid,
-        f"{header}\n{sig.asset} {sig.timeframe}\n"
-        f"{icon} {sig.outcome} | ₦{amount:,.0f} @ {sig.certainty:.0%}\n_{sig.reason}_",
-        parse_mode="Markdown",
+
+    # BUG-FIX: Sanitize sig.reason for Markdown — special chars like _, *, `, [
+    # inside reason strings cause Telegram to throw a parse error, which was
+    # silently swallowed by the outer except and lost the notification entirely.
+    raw_reason = getattr(sig, "reason", "") or ""
+    safe_reason = (
+        raw_reason
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+        .replace("[", "\\[")
     )
+
+    msg = (
+        f"{header}\n{sig.asset} {sig.timeframe}\n"
+        f"{icon} {sig.outcome} | ₦{amount:,.0f} @ {sig.certainty:.0%}\n_{safe_reason}_"
+    )
+
+    try:
+        await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+    except Exception as e:
+        log.warning(f"notify_trade Markdown failed ({e}) — retrying as plain text")
+        # Fallback: send without Markdown formatting so the notification always gets through
+        plain = (
+            f"{'🎯 Converged Trade' if converged else '🔔 Trade'} ({sig.strategy})\n"
+            f"{sig.asset} {sig.timeframe}\n"
+            f"{icon} {sig.outcome} | ₦{amount:,.0f} @ {sig.certainty:.0%}\n{raw_reason}"
+        )
+        try:
+            await app.bot.send_message(chat_id=cid, text=plain)
+        except Exception as e2:
+            log.error(f"notify_trade plain-text fallback also failed: {e2}")
 
 
 async def notify_win(app, cid: str, _mid: str, asset: str, tf: str, strat: str, pnl: float):
