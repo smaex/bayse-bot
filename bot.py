@@ -691,9 +691,8 @@ async def main():
             await _tg_app.updater.start_polling(drop_pending_updates=True)
             break 
         except Exception as e:
-            if "Conflict" in str(e):
-                log.warning("Telegram Conflict: Another instance is polling. Waiting 30s for ghost to die...")
-                await asyncio.sleep(30)
+                await _tg_app.updater.stop()
+                break
             else:
                 log.error(f"Telegram Polling Error: {e}")
                 break
