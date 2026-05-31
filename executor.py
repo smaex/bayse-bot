@@ -490,7 +490,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         # Parse the NGN minimum from the error message and cache it for this
         # market so future attempts skip pre-flight without hitting the API.
         # Example message: "Minimum buy amount is NGN 500.00."
-        min_match = re.search(r'Minimum buy amount is [A-Z]+ ([\d,.]+)', err_str)
+        min_match = re.search(r'Minimum buy amount is [A-Z]+ ([\d,]+(?:\.\d+)?)', err_str)
         if min_match:
             market_min = float(min_match.group(1).replace(',', ''))
             _market_min_cache[sig.market_id] = market_min
