@@ -163,10 +163,11 @@ class BayseClient:
 
     async def get_quote(self, event_id: str, market_id: str, outcome_id: str,
                         side: str, amount: float, currency: str = "NGN") -> dict:
-        return await self._get(
+        return await self._post(
             f"/v1/pm/events/{event_id}/markets/{market_id}/quote",
-            params={"outcomeId": outcome_id, "side": side, "amount": amount, "currency": currency}
+            body={"outcomeId": outcome_id, "side": side, "amount": amount, "currency": currency}
         )
+
 
     async def place_order(self, event_id: str, market_id: str, outcome_id: str,
                           side: str, amount: float, order_type: str = "MARKET",
@@ -190,7 +191,7 @@ class BayseClient:
         )
 
     async def batch_place_orders(self, orders: list) -> dict:
-        """Place up to 50 CLOB orders in a single round-trip."""
+        """Place up to 20 CLOB orders in a single round-trip."""
         await self._write_rl.acquire()
         session = await self._session_get()
         body_str = json.dumps({"orders": orders}, separators=(",", ":"))

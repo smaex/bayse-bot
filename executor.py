@@ -149,8 +149,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
 
     # ── Micro-Account Handling (For ₦2,000 starts) ─────────────────────────
     if equity < 3000:
-        # On tiny accounts, we can't trade < ₦100.
-        # We force ₦100 but keep the strategy conviction filters.
+        # On tiny accounts, we force a ₦100 minimum viable size.
         amount = 100.0
         log.info(f"[{chat_id}] Micro-Account Mode: forcing ₦100 minimum viable size")
     else:
@@ -355,7 +354,19 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         multiplier = 100.0 if CURRENCY == "NGN" else 1.0
         order_amount = amount
         if final_order_type == "LIMIT":
+            min_shares = 100.0
             order_amount = amount / (limit_price * multiplier)
+            if order_amount < min_shares:
+                needed_ngn = min_shares * limit_price * multiplier
+                # To protect capital, only scale up if it doesn't exceed 25% of equity (and respects hard cap)
+                max_allowed_for_scaling = min(hard_cap, equity * 0.25)
+                if needed_ngn <= max_allowed_for_scaling and needed_ngn <= free_cash:
+                    log.info(f"[{chat_id}] CLOB SIZING: Scaling up LIMIT order from {order_amount:.2f} to {min_shares:.2f} shares (₦{amount:,.0f} → ₦{needed_ngn:,.0f}) to meet exchange minimum.")
+                    amount = needed_ngn
+                    order_amount = min_shares
+                else:
+                    log.info(f"[{chat_id}] SKIPPED — CLOB LIMIT order requires {min_shares:.2f} shares (₦{needed_ngn:,.0f}), which exceeds safety limit (₦{max_allowed_for_scaling:,.0f}) or free cash.")
+                    return
             
         resp = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
@@ -385,6 +396,9 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             if chase_price > limit_price:
                 log.info(f"[{chat_id}] CLOB CHASE: First order missed. Retrying at {chase_price:.3f}")
                 chase_shares = amount / (chase_price * multiplier)
+                if chase_shares < 100.0:
+                    chase_shares = 100.0
+                    log.info(f"[{chat_id}] CLOB CHASE SIZING: Scaling chase shares to 100.0 to meet exchange minimum.")
                 try:
                     resp = await client.place_order(
                         event_id=sig.event_id, market_id=sig.market_id,
