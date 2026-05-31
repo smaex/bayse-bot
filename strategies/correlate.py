@@ -17,7 +17,8 @@ class CorrelateStrategy(BaseStrategy):
 
     async def evaluate(self, market: dict, learned: dict, state: any, spot_price: float = None) -> Optional[TradeSignal]:
         asset = market["asset"]
-        if asset not in {"BTC", "ETH", "SOL"} or asset == "BTC":
+        # CORRELATE trades ETH/SOL when BTC moves — skip BTC itself (it's the leader)
+        if asset not in {"ETH", "SOL"}:
             return None
 
         tf = market["timeframe"]
@@ -74,7 +75,7 @@ class CorrelateStrategy(BaseStrategy):
         if market_price >= ev_ceiling: return None
 
         # 7. Sizing
-        size = kelly_size(w_est, market_price, fee_rate, asset=asset, learned=learned, strategy_name="CORRELATE")
+        size = kelly_size(w_est, market_price, fee_rate, asset=asset, state=state, learned=learned, strategy_name="CORRELATE")
 
         return TradeSignal(
             strategy="CORRELATE",

@@ -72,9 +72,15 @@ class MarketBiasStrategy(BaseStrategy):
             if 0.47 <= opening_yes <= 0.53:
                 utc_hour = datetime.now(timezone.utc).hour
                 if utc_hour in [12, 14, 15, 19]:
-                    outcome = "YES"
-                    outcome_id = market["yes_id"]
-                    market_price = market["yes_price"]
+                    # BUG-FIX: Pick the current favorite, not always YES
+                    if opening_yes >= 0.50:
+                        outcome = "YES"
+                        outcome_id = market["yes_id"]
+                        market_price = market["yes_price"]
+                    else:
+                        outcome = "NO"
+                        outcome_id = market["no_id"]
+                        market_price = market["no_price"]
                     
                     if utc_hour == 15:
                         win_prob = 0.82
@@ -85,7 +91,7 @@ class MarketBiasStrategy(BaseStrategy):
                         
                     size_pct = kelly_size(win_prob, market_price, fee_rate=0.02, asset=asset, learned=learned, strategy_name="MARKET_BIAS")
                     
-                    log.info(f"Market Bias: Hour Bias triggered on {asset} ({mid}) at hour {utc_hour} UTC. Outcome: YES, win_prob={win_prob}")
+                    log.info(f"Market Bias: Hour Bias triggered on {asset} ({mid}) at hour {utc_hour} UTC. Outcome: {outcome}, win_prob={win_prob}")
                     return TradeSignal(
                         strategy="MARKET_BIAS",
                         event_id=market["event_id"],
@@ -102,6 +108,7 @@ class MarketBiasStrategy(BaseStrategy):
                         title=market["title"]
                     )
                     
+
         # 3. Tie-Breaker Bias
         # Active in final 30 seconds if distance from threshold is extremely small (< 0.01%)
         if secs_to_close <= 30:

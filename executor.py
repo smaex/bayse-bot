@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from typing import Optional
 import database
@@ -21,6 +22,12 @@ _FX_ASSETS = ["EURUSD", "GBPUSD", "EURGBP", "XAUUSD"]
 # Stores the detected engine type per market_id so we only probe the order
 # book ONCE per market, not on every trade attempt.
 _market_engine_cache: dict[str, str] = {}  # market_id → "AMM" | "CLOB"
+
+# ── Per-market minimum order size cache ───────────────────────────────────────
+# When a market rejects an order with "Minimum buy amount is NGN X", we cache
+# that X here. Future orders on the same market are pre-flight checked so we
+# never hit the API unnecessarily. ₦100 trades still work on all other markets.
+_market_min_cache: dict[str, float] = {}  # market_id → min NGN required
 
 
 async def _infer_engine(client, market: dict, timeout_ms: int = 300) -> str:
@@ -93,7 +100,6 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
         risk.unlock_market(sig.market_id)
 
 async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, free_cash):
-    mode     = settings.get("mode", "balanced")
     min_t    = settings.get("mintrade", 100)
     max_t    = settings.get("maxtrade", 5_000)   # BUG-FIX: was 500,000 (way too high)
     max_exp  = settings.get("maxexposure", 20.0) / 100.0
@@ -368,6 +374,16 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
                     log.info(f"[{chat_id}] SKIPPED — CLOB LIMIT order requires {min_shares:.2f} shares (₦{needed_ngn:,.0f}), which exceeds safety limit (₦{max_allowed_for_scaling:,.0f}) or free cash.")
                     return
             
+        # ── Pre-flight: check cached market minimum before hitting the API ──
+        cached_min = _market_min_cache.get(sig.market_id, 0.0)
+        if cached_min > 0 and amount < cached_min:
+            log.info(
+                f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — "
+                f"Market requires ₦{cached_min:,.0f} minimum (cached). Our ₦{amount:,.0f} is too small. "
+                f"Will pick this market again when capital grows."
+            )
+            return
+
         resp = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=sig.outcome_id, side="BUY", amount=order_amount,
@@ -468,7 +484,22 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         })
 
     except Exception as e:
-        log.error(f"[{chat_id}] order failed {sig.market_id}: {e}", exc_info=True)
+        err_str = str(e)
+        # ── Graceful Skip: Exchange minimum buy amount enforcement ──
+        # Parse the NGN minimum from the error message and cache it for this
+        # market so future attempts skip pre-flight without hitting the API.
+        # Example message: "Minimum buy amount is NGN 500.00."
+        min_match = re.search(r'Minimum buy amount is [A-Z]+ ([\d,.]+)', err_str)
+        if min_match:
+            market_min = float(min_match.group(1).replace(',', ''))
+            _market_min_cache[sig.market_id] = market_min
+            log.info(
+                f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — "
+                f"Market {sig.market_id} enforces ₦{market_min:,.0f} minimum (now cached). "
+                f"Our ₦{amount:,.0f} is too small — will try other markets."
+            )
+        else:
+            log.error(f"[{chat_id}] order failed {sig.market_id}: {e}", exc_info=True)
         return
 
     # ── BUG-FIX: Notification is OUTSIDE the order try/except ──

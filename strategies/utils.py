@@ -58,7 +58,7 @@ def regime_score(asset: str, state: any) -> float:
     """Continuous Bayesian Hidden Markov Model (HMM) proxy indicating trend probability (0.0 to 1.0)."""
     if not hasattr(state, 'price_history'):
         return 0.5
-    hist = list(state.price_history.get(asset, []))
+    hist = list(state.price_history.get(asset, []))  # deque → list so [-n:] slice works
     n = min(len(hist), 60)
     if n < 10:
         return 0.5
@@ -169,8 +169,9 @@ def realized_correlation(asset1: str, asset2: str, state: any) -> float:
     """Calculates Pearson correlation coefficient between two assets over recent history."""
     if not hasattr(state, 'price_history'):
         return 0.0
-    hist1 = state.price_history.get(asset1, [])
-    hist2 = state.price_history.get(asset2, [])
+    # Convert to list — price_history values may be deque which doesn't support [-n:] slicing
+    hist1 = list(state.price_history.get(asset1, []))
+    hist2 = list(state.price_history.get(asset2, []))
     
     n = min(len(hist1), len(hist2), 60)
     if n < 10:
