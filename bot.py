@@ -648,7 +648,7 @@ async def main():
         
     async def _lock_heartbeat():
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
             still_held = await asyncio.to_thread(database.heartbeat_singleton_lock)
             if not still_held:
                 log.critical("🚨 GHOST SHIELD: We lost the singleton lock to another process! Self-terminating immediately.")
