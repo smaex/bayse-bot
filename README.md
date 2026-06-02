@@ -108,8 +108,8 @@ See [SETUP.md](SETUP.md) for full detailed instructions.
 - **Max drawdown stop**: trading pauses automatically at 20% loss from peak balance
 - **Position exposure cap**: never deploys more than 30% of bankroll simultaneously
 - **Per-trade cap**: maximum 3% of bankroll per trade (Kelly-conservative)
-- **Minimum trade**: ₦100 (configurable)
-- **Maximum trade**: ₦500,000 (configurable)
+- **Minimum trade**: ₦100 (Bayse platform minimum — configurable)
+- **Maximum trade**: ₦5,000 default (configurable via `/set maxtrade`)
 - **Fee drag**: ~1–1.8% effective per trade (lower than the displayed 4% base rate)
 
 ---

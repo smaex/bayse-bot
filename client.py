@@ -196,7 +196,9 @@ class BayseClient:
         )
 
     async def batch_place_orders(self, orders: list) -> dict:
-        """Place up to 20 CLOB orders in a single round-trip."""
+        """Place up to 20 CLOB orders in a single round-trip.
+        Note: Bayse v0.1.13 reduced batch cap from 50 → 20 (breaking change).
+        Caller must ensure len(orders) <= 20 or the API returns 400 BAD_REQUEST."""
         await self._write_rl.acquire()
         session = await self._session_get()
         body_str = json.dumps({"orders": orders}, separators=(",", ":"))

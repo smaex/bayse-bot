@@ -611,8 +611,17 @@ async def _heartbeat_eval_loop():
             await asyncio.sleep(5)
             if not active_markets:
                 continue
-                
-            users = await asyncio.to_thread(database.get_all_active)
+
+            # BUG-FIX: Use cached user list instead of hitting DB every 5 seconds.
+            # The 30s housekeeping loop keeps _active_users_cache fresh. Bypassing it
+            # was creating 12 unnecessary DB reads/minute, hammering the connection pool.
+            global _active_users_cache, _active_users_cache_time
+            now = time.time()
+            if not _active_users_cache or (now - _active_users_cache_time) > _ACTIVE_USERS_CACHE_TTL:
+                _active_users_cache = await asyncio.to_thread(database.get_all_active)
+                _active_users_cache_time = now
+            users = _active_users_cache
+
             for user in users:
                 # Run evaluation without a specific trigger asset (full scan)
                 asyncio.create_task(_evaluate_single_user(user, penalty=0.0))

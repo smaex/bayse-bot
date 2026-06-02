@@ -649,7 +649,7 @@ _MODES = {
             "timeframes":       ["5min", "15min", "1h"],
             "strategies":       ["SNIPE", "ARB", "CORRELATE", "NEWS", "POLY_EDGE", "FRONTRUN"],
             "risk_pct":         3.0,
-            "mintrade":         200,
+            "mintrade":         100,  # BUG-FIX: was 200. Bayse platform minimum is ₦100.
             "maxexposure":      35.0,
             "daily_multiplier": 20,
         },
@@ -672,7 +672,7 @@ _MODES = {
             "timeframes":       config.ALL_TIMEFRAMES,
             "strategies":       ["SNIPE", "ARB", "CORRELATE", "NEWS", "POLY_EDGE", "FRONTRUN"],
             "risk_pct":         5.0,
-            "mintrade":         500,
+            "mintrade":         100,  # BUG-FIX: was 500. Bayse platform minimum is ₦100.
             "maxexposure":      50.0,
             "daily_multiplier": 50,
         },
@@ -847,7 +847,7 @@ async def _settings_text(cid: str) -> str:
         f"Strategies:   {s.get('strategies')}\n"
         f"Risk/trade:   {s.get('risk_pct', 3)}%\n"
         f"Min trade:    ₦{s.get('mintrade', 100):,.0f}\n"
-        f"Max trade:    ₦{s.get('maxtrade', 500000):,.0f}\n"
+        f"Max trade:    ₦{s.get('maxtrade', 5_000):,.0f}\n"
         f"Max exposure: {s.get('maxexposure', 30)}%\n"
         f"Daily target: {tgt}\n"
         f"Status:       {'⏸ Paused' if s.get('paused') else '🟢 Active'}"
