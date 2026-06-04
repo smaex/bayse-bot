@@ -11,6 +11,12 @@ class PolyEdgeStrategy(BaseStrategy):
 
     async def evaluate(self, market: dict, learned: dict, state: any, spot_price: float = None) -> Optional[TradeSignal]:
         asset = market["asset"]
+        tf = market.get("timeframe", "")
+
+        # Limit Poly comparison to 15min and 1h markets
+        if tf not in {"15min", "1h"}:
+            return None
+
         import comparative_analysis
         
         quality = comparative_analysis.get_edge_quality(asset)
@@ -44,16 +50,19 @@ class PolyEdgeStrategy(BaseStrategy):
         
         depth = quality.get("depth_usd", 0)
         if 0 < depth < 200: size_pct *= 0.5
+
+        # Dynamic Certainty based on edge size (instead of hardcoded 0.90)
+        certainty = min(0.50 + edge * 4.0, 0.88)
         
         return TradeSignal(
             strategy="POLY_EDGE",
             event_id=market["event_id"],
             market_id=market["market_id"],
             asset=asset,
-            timeframe=market["timeframe"],
+            timeframe=tf,
             outcome=outcome,
             outcome_id=outcome_id,
-            certainty=0.90,
+            certainty=certainty,
             win_prob=w_est,
             market_price=market_price,
             size_pct=size_pct,

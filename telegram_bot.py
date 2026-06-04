@@ -377,7 +377,6 @@ async def cmd_settings(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid  = str(update.effective_chat.id)
     args = update.message.text.split()[1:]
-    if len(args) < 2:
         await update.message.reply_text(
             "*Usage:*\n"
             "`/set assets BTC ETH SOL`\n"
@@ -388,7 +387,8 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             "`/set maxtrade 50000`\n"
             "`/set maxexposure 25`\n"
             "`/set dailymultiplier 50`\n"
-            "`/set dailytarget 5000`",
+            "`/set dailytarget 5000`\n"
+            "`/set copytrade 0x...` or `/set copytrade off`",
             parse_mode="Markdown",
         )
         return
@@ -399,7 +399,7 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 
     ASSETS     = {"BTC", "ETH", "SOL", "BNB", "EURUSD", "GBPUSD", "USDJPY", "EURJPY", "GBPJPY", "EURGBP", "XAUUSD"}
     TIMEFRAMES = {"5min", "15min", "1h", "6h", "1d"}
-    STRATEGIES = {"SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN", "MARKET_BIAS"}
+    STRATEGIES = {"SNIPE", "CORRELATE", "ARB", "NEWS", "POLY_EDGE", "FRONTRUN", "MARKET_BIAS", "POLY_COPY"}
 
     if key == "assets":
         bad = [v for v in vals if v.upper() not in ASSETS]
@@ -418,7 +418,7 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     elif key == "strategies":
         bad = [v for v in vals if v.upper() not in STRATEGIES]
         if bad:
-            await update.message.reply_text(f"Unknown: {bad}. Valid: SNIPE CORRELATE ARB NEWS POLY_EDGE FRONTRUN MARKET_BIAS"); return
+            await update.message.reply_text(f"Unknown: {bad}. Valid: SNIPE CORRELATE ARB NEWS POLY_EDGE FRONTRUN MARKET_BIAS POLY_COPY"); return
         s["strategies"] = [v.upper() for v in vals]
         msg = f"Strategies: {s['strategies']}"
 
@@ -471,6 +471,22 @@ async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             msg = f"Daily target: ₦{amt:,.0f} absolute"
         except ValueError:
             await update.message.reply_text("Enter a number."); return
+
+    elif key == "copytrade":
+        val = vals[0].lower().strip()
+        if val == "off":
+            s["poly_copy_enabled"] = False
+            s["poly_copy_wallet"] = ""
+            msg = "Polymarket copy-trading disabled"
+        else:
+            if not val.startswith("0x") or len(val) < 40:
+                await update.message.reply_text("Please provide a valid Ethereum wallet address starting with 0x."); return
+            s["poly_copy_enabled"] = True
+            s["poly_copy_wallet"] = val
+            # Automatically add POLY_COPY to strategies if not present
+            if "POLY_COPY" not in s.get("strategies", []):
+                s.setdefault("strategies", []).append("POLY_COPY")
+            msg = f"Polymarket copy-trading enabled for wallet {val}"
 
     else:
         await update.message.reply_text(f"Unknown setting `{key}`.", parse_mode="Markdown"); return
@@ -594,13 +610,13 @@ _MODES = {
             "• *Engine Logic*: Requires 2+ models to agree\n"
             "• *Slippage Guard*: 0.2% limit\n"
             "• *Risk per Trade*: 0.5%\n"
-            "• *Markets*: 1h, 6h, 1d (no noise)\n"
+            "• *Markets*: 15min + 1h (High certainty only)\n"
             "• *Assets*: Low-vol (FX & BTC only)"
         ),
         "settings": {
             "mode":             "safe",
             "assets":           ["BTC", "EURUSD", "GBPUSD", "USDJPY", "EURJPY", "GBPJPY", "EURGBP", "XAUUSD"],
-            "timeframes":       ["1h", "6h", "1d"],
+            "timeframes":       ["15min", "1h"],   # Added 15min per user request — safe-guarded by 0.65 entry guard
             "strategies":       ["SNIPE", "ARB", "POLY_EDGE", "FRONTRUN"],
             "risk_pct":         0.5,
             "mintrade":         100,
@@ -617,13 +633,13 @@ _MODES = {
             "• *Engine Logic*: Standard 5-model blend\n"
             "• *Slippage Guard*: 0.5% limit\n"
             "• *Risk per Trade*: 1.5%\n"
-            "• *Markets*: All timeframes\n"
+            "• *Markets*: 15min + 1h (best edge profile)\n"
             "• *Assets*: Full Universe"
         ),
         "settings": {
             "mode":             "balanced",
             "assets":           config.ALL_ASSETS,
-            "timeframes":       ["15min", "1h", "6h"],
+            "timeframes":       ["15min", "1h"],   # PRIMARY FOCUS: 15min is the sweet spot
             "strategies":       ["SNIPE", "ARB", "CORRELATE", "POLY_EDGE", "FRONTRUN"],
             "risk_pct":         1.5,
             "mintrade":         100,
@@ -663,16 +679,16 @@ _MODES = {
             "• *Engine Logic*: Raw EV (no guards)\n"
             "• *Slippage Guard*: 2.5% limit\n"
             "• *Risk per Trade*: 5.0%\n"
-            "• *Markets*: All timeframes\n"
+            "• *Markets*: 5min + 15min + 1h\n"
             "• *Assets*: Full Universe"
         ),
         "settings": {
             "mode":             "full_send",
             "assets":           config.ALL_ASSETS,
-            "timeframes":       config.ALL_TIMEFRAMES,
+            "timeframes":       ["5min", "15min", "1h"],  # Removed 6h/1d — long markets have no fast edge
             "strategies":       ["SNIPE", "ARB", "CORRELATE", "NEWS", "POLY_EDGE", "FRONTRUN"],
             "risk_pct":         5.0,
-            "mintrade":         100,  # BUG-FIX: was 500. Bayse platform minimum is ₦100.
+            "mintrade":         100,
             "maxexposure":      50.0,
             "daily_multiplier": 50,
         },
@@ -839,6 +855,11 @@ async def _settings_text(cid: str) -> str:
     abs_ = s.get("daily_target_ngn", 0)
     tgt  = f"₦{abs_:,.0f} (fixed)" if abs_ > 0 else f"{mult}% of starting balance"
     mode_name = _mode_label(s.get("mode", "balanced"))
+    copytrade_status = "Disabled"
+    if s.get("poly_copy_enabled"):
+        wallet = s.get("poly_copy_wallet", "")
+        copytrade_status = f"🪞 Copying {wallet[:8]}...{wallet[-6:]}" if len(wallet) > 14 else "Enabled"
+
     return (
         "⚙️ *Settings*\n\n"
         f"Mode:         {mode_name}\n"
@@ -850,6 +871,7 @@ async def _settings_text(cid: str) -> str:
         f"Max trade:    ₦{s.get('maxtrade', 5_000):,.0f}\n"
         f"Max exposure: {s.get('maxexposure', 30)}%\n"
         f"Daily target: {tgt}\n"
+        f"Copytrade:    {copytrade_status}\n"
         f"Status:       {'⏸ Paused' if s.get('paused') else '🟢 Active'}"
     )
 
@@ -898,13 +920,18 @@ async def send_message(app: Application, chat_id: str, text: str, **kwargs):
         log.warning(f"Telegram send failed → {chat_id}: {e}")
 
 
-async def notify_trade(app, cid: str, sig, amount: float):
+async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM", execution_style: str = "TAKER"):
     icon = "⬆️" if "YES" in sig.outcome.upper() or "UP" in sig.outcome.upper() else "⬇️"
     converged = getattr(sig, "converged_with", [])
     if converged:
         header = f"🎯 *Converged Trade* ({sig.strategy} + {' + '.join(converged)})"
     else:
         header = f"🔔 *Trade* ({sig.strategy})"
+
+    # Engine label: shows AMM·TAKER or CLOB·MAKER in every notification
+    engine_icon = "🏦" if engine == "AMM" else "📊"
+    style_label = "MAKER" if execution_style == "MAKER" else "TAKER"
+    engine_label = f"{engine_icon} {engine}·{style_label}"
 
     # BUG-FIX: Sanitize sig.reason for Markdown — special chars like _, *, `, [
     # inside reason strings cause Telegram to throw a parse error, which was

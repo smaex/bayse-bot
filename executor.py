@@ -29,6 +29,14 @@ _market_engine_cache: dict[str, str] = {}  # market_id → "AMM" | "CLOB"
 # never hit the API unnecessarily. ₦100 trades still work on all other markets.
 _market_min_cache: dict[str, float] = {}  # market_id → min NGN required
 
+# ── Per-market trade cooldown cache ───────────────────────────────────────────
+# After any successful trade on a market, that market is cooled down for 60s.
+# This prevents the heartbeat + spot evaluation loops from re-entering the same
+# market multiple times in a minute. Without this, 3 concurrent loops can each
+# fire evaluate_trade() before any of them completes and adds a position.
+_trade_cooldown: dict[str, float] = {}  # market_id → timestamp of last trade
+TRADE_COOLDOWN_SEC = 60  # seconds between trades on the same market
+
 
 async def _infer_engine(client, market: dict, timeout_ms: int = 300) -> str:
     """
@@ -91,6 +99,18 @@ async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     # ── Already in Position Check ──
     if risk.already_in(sig.market_id):
         log.debug(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Already in position or pending.")
+        return
+
+    # ── Per-Market Trade Cooldown ──
+    # Prevents the 5s heartbeat + per-tick spot loops from re-entering the same
+    # market repeatedly. AMM MARKET orders on Bayse often return no fill details,
+    # causing the bot to think the trade failed and try again immediately.
+    last_trade_time = _trade_cooldown.get(sig.market_id, 0.0)
+    if time.time() - last_trade_time < TRADE_COOLDOWN_SEC:
+        log.debug(
+            f"[{chat_id}] COOLDOWN {sig.strategy} | {sig.asset} {sig.timeframe} — "
+            f"Last trade was {time.time()-last_trade_time:.0f}s ago (cooldown={TRADE_COOLDOWN_SEC}s)"
+        )
         return
 
     risk.lock_market(sig.market_id)
@@ -360,14 +380,21 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             order_amount = amount / (limit_price * multiplier)
             if order_amount < min_shares:
                 needed_ngn = min_shares * limit_price * multiplier
-                # To protect capital, only scale up if it doesn't exceed 25% of equity (and respects hard cap)
-                max_allowed_for_scaling = min(hard_cap, equity * 0.25)
+                # ── CLOB Scale-Up Hard Cap ──
+                # Never allow the min-share scaler to inflate an order more than
+                # 3× the original sizing intent. On low-price markets (e.g. ₦8.9/share),
+                # the math produces ₦89,000 from a ₦100 intent — catastrophic.
+                # Cap: at most 3× the amount OR 3× mintrade, whichever is larger.
+                max_allowed_for_scaling = min(
+                    hard_cap,
+                    max(amount * 3.0, effective_minimum * 3.0)  # 3× cap, never more
+                )
                 if needed_ngn <= max_allowed_for_scaling and needed_ngn <= free_cash:
                     log.info(f"[{chat_id}] CLOB SIZING: Scaling up LIMIT order from {order_amount:.2f} to {min_shares:.2f} shares (₦{amount:,.0f} → ₦{needed_ngn:,.0f}) to meet exchange minimum.")
                     amount = needed_ngn
                     order_amount = min_shares
                 else:
-                    log.info(f"[{chat_id}] SKIPPED — CLOB LIMIT order requires {min_shares:.2f} shares (₦{needed_ngn:,.0f}), which exceeds safety limit (₦{max_allowed_for_scaling:,.0f}) or free cash.")
+                    log.info(f"[{chat_id}] SKIPPED — CLOB LIMIT order requires {min_shares:.2f} shares (₦{needed_ngn:,.0f}), exceeds 3× cap (₦{max_allowed_for_scaling:,.0f}) or free cash.")
                     return
             
         # ── Pre-flight: check cached market minimum before hitting the API ──
@@ -447,9 +474,28 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             log.info(f"[{chat_id}] Order {order_id} has no explicit fill qty in response, assuming success.")
             shares_filled = amount / (filled_price * multiplier)
 
+        # ── AMM Zero-Fill Assumption (CRITICAL BUG FIX) ──
+        # Bayse AMM MARKET orders frequently return a success HTTP 200 with NO
+        # fill details (no filledSize, no orderId, no shares). Under the old logic,
+        # this caused `return` here — before risk.add_position() — so the market
+        # was never locked. The 5s heartbeat would then re-enter the same market
+        # up to 12 times per minute, spending ₦600+ in 60 seconds.
+        #
+        # Fix: If no exception was thrown (order didn't 400/500), the order DID go
+        # through on Bayse's side regardless of the empty response. We estimate the
+        # shares from our known intent amount and treat it as a success.
         if shares_filled <= 0:
-            log.info(f"[{chat_id}] {sig.asset} order not filled (price moved away). Response: {resp}")
-            return
+            if final_order_type == "MARKET":
+                # AMM success with no fill details — estimate from our intent
+                shares_filled = amount / (filled_price * multiplier)
+                log.warning(
+                    f"[{chat_id}] ⚠️ AMM ZERO-FILL ASSUMPTION: {sig.asset} order returned no fill data "
+                    f"but did not throw. Assuming ₦{amount:,.0f} filled at {filled_price:.4f}. "
+                    f"Response: {resp}"
+                )
+            else:
+                log.info(f"[{chat_id}] {sig.asset} CLOB order not filled (price moved away). Response: {resp}")
+                return
 
         bayse_order_id = order_id
         actual_ngn = shares_filled * filled_price * multiplier
@@ -485,6 +531,15 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             "strategy": sig.strategy, "asset": sig.asset, "timeframe": sig.timeframe,
         })
 
+        # ── Set Trade Cooldown ── prevents re-entry for 60s after any successful trade
+        _trade_cooldown[sig.market_id] = time.time()
+
+        log.info(
+            f"[{chat_id}] 💰 TRADE EXECUTED | {sig.strategy} {sig.asset} {sig.timeframe} "
+            f"{sig.outcome} @ {filled_price:.4f} | ₦{actual_ngn:,.0f} | "
+            f"engine={engine} style={execution_style} | trade_id={trade_id}"
+        )
+
     except Exception as e:
         err_str = str(e)
         # ── Graceful Skip: Exchange minimum buy amount enforcement ──
@@ -511,7 +566,8 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
     if _tg_app:
         try:
             # notify_trade() handles Markdown sanitization and plain-text fallback internally.
-            await telegram_bot.notify_trade(_tg_app, chat_id, sig, actual_ngn)
+            # engine + execution_style are passed so the notification shows "AMM·TAKER" or "CLOB·MAKER"
+            await telegram_bot.notify_trade(_tg_app, chat_id, sig, actual_ngn, engine=engine, execution_style=execution_style)
             log.info(f"[{chat_id}] ✅ Notification sent for {sig.strategy} {sig.asset} ₦{actual_ngn:,.0f}")
         except Exception as notify_err:
             log.error(f"[{chat_id}] ❌ NOTIFICATION FAILED for {sig.strategy} {sig.asset}: {notify_err}", exc_info=True)

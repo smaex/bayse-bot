@@ -18,14 +18,21 @@ class FrontrunStrategy(BaseStrategy):
 
     async def evaluate(self, market: dict, learned: dict, state: any, spot_price: float = None) -> Optional[TradeSignal]:
         asset = market["asset"]
-        
+        tf = market.get("timeframe", "")
+
+        # Only run frontrunning latency arbitrage on fast short timeframes
+        if tf not in {"5min", "15min"}:
+            return None
+
+        # Only frontrun when close to expiration (last 15 minutes) where latency matters most
+        secs = market.get("secs_to_close", 0)
+        if secs > 900 or secs < 0:
+            return None
+
         # 1. Get Latency Bias (Oracle vs Bayse)
         # Positive = Oracle is HIGHER than Bayse (Bullish for YES)
         # Negative = Oracle is LOWER than Bayse (Bearish for NO)
         bayse_p = market["yes_price"] # Assuming yes_price represents the 'fair' price on AMM
-        # Wait, for AMM, price is outcome1Price (Yes). 
-        # If Oracle BTC is 80,000 and Bayse threshold is 79,000, Yes should be 1.0.
-        # This strategy is better applied to the UNDERLYING price gap.
         
         oracle_p, oracle_t = feeds_direct.get_direct_price(asset)
         if not oracle_p or (feeds_direct.time.time() - oracle_t > 5):
@@ -65,18 +72,21 @@ class FrontrunStrategy(BaseStrategy):
             
         log.info(f"🔥 FRONTRUN TRIGGER | {asset} | Bias: {bias:+.4%} | Target: {outcome}")
 
+        # Dynamic Sizing: scale size based on bias, max 3% to protect account
+        size_pct = min(0.01 + abs(bias) * 5.0, 0.03)
+
         return TradeSignal(
             strategy="FRONTRUN",
             event_id=market["event_id"],
             market_id=market["market_id"],
             asset=asset,
-            timeframe=market["timeframe"],
+            timeframe=tf,
             outcome=outcome,
             outcome_id=market["yes_id"] if outcome == "YES" else market["no_id"],
             certainty=certainty,
             win_prob=0.80, # Hardcoded high prob for latency arb
             market_price=market_price,
-            size_pct=0.05, # Fixed 5% size for frontrunning
+            size_pct=size_pct,
             reason=f"Latency Gap {bias:+.2%}",
             title=market["title"]
         )

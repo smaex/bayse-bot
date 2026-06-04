@@ -270,3 +270,9 @@ else:
     WS_WARMUP_DELTA_LIMIT = 0.0020  # 0.20%
     WS_MIN_TICKS_WINDOW = 3
     WS_MAX_TICK_JUMP_PCT= 0.0005  # 0.05%
+
+# ── Polymarket Copy-Trading ──────────────────────────────────────────────────
+POLY_COPY_ENABLED = False
+POLY_COPY_WALLET = ""
+POLY_COPY_COOLDOWN_SEC = 300
+

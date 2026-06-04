@@ -30,6 +30,7 @@ import recorder
 import config
 import feeds_direct
 import comparative_analysis
+import polymarket_copytrade
 from risk import RiskManager
 from client import BayseClient
 from config import (
@@ -602,19 +603,17 @@ async def _self_ping_loop():
 
 async def _heartbeat_eval_loop():
     """
-    World-Class Heartbeat: Evaluates all markets for all users every 5 seconds.
+    World-Class Heartbeat: Evaluates all markets for all users every 30 seconds.
     Ensures we never miss a window even if price moves slowly.
     """
-    log.info("🚀 Heartbeat Evaluation Loop started (5s interval)")
+    log.info("🚀 Heartbeat Evaluation Loop started (30s interval)")
     while True:
         try:
-            await asyncio.sleep(5)
+            await asyncio.sleep(30)
             if not active_markets:
                 continue
 
-            # BUG-FIX: Use cached user list instead of hitting DB every 5 seconds.
-            # The 30s housekeeping loop keeps _active_users_cache fresh. Bypassing it
-            # was creating 12 unnecessary DB reads/minute, hammering the connection pool.
+            # BUG-FIX: Use cached user list instead of hitting DB every 30 seconds.
             global _active_users_cache, _active_users_cache_time
             now = time.time()
             if not _active_users_cache or (now - _active_users_cache_time) > _ACTIVE_USERS_CACHE_TTL:
@@ -627,6 +626,64 @@ async def _heartbeat_eval_loop():
                 asyncio.create_task(_evaluate_single_user(user, penalty=0.0))
         except Exception as e:
             log.error(f"Heartbeat loop error: {e}")
+
+
+async def _polymarket_copytrade_loop():
+    """
+    Polymarket Copy-Trading: Scans the configured copy-trade wallets for active
+    users and mirrors their positions onto equivalent Bayse markets.
+    """
+    log.info("🚀 Polymarket Copy-Trading Loop started (60s interval)")
+
+    while True:
+        try:
+            await asyncio.sleep(60)
+            if not active_markets:
+                continue
+
+            # Fetch active users from cache
+            global _active_users_cache, _active_users_cache_time
+            now = time.time()
+            if not _active_users_cache or (now - _active_users_cache_time) > _ACTIVE_USERS_CACHE_TTL:
+                _active_users_cache = await asyncio.to_thread(database.get_all_active)
+                _active_users_cache_time = now
+            users = _active_users_cache
+
+            for user in users:
+                settings = user.get("settings", {})
+                if not settings.get("poly_copy_enabled") or not settings.get("poly_copy_wallet"):
+                    continue
+
+                chat_id = user["chat_id"]
+                risk = _user_risks.get(chat_id)
+                client = _user_clients.get(chat_id)
+                if not risk or not client or settings.get("paused"):
+                    continue
+
+                wallet = settings["poly_copy_wallet"]
+                # Poll Polymarket for signals
+                signals = await polymarket_copytrade.get_copy_signals(wallet, active_markets)
+                if not signals:
+                    continue
+
+                # Refresh cash balance if necessary
+                try:
+                    free_cash = risk.current_free_cash
+                    if free_cash <= 0:
+                        free_cash = await client.get_balance_ngn()
+                        risk.current_free_cash = free_cash
+                    equity = free_cash + risk.deployed()
+                except Exception as e:
+                    log.error(f"[{chat_id}] Copy-trading balance check failed: {e}")
+                    continue
+
+                for sig in signals:
+                    log.info(f"[{chat_id}] 🪞 Copy-trade signal received: {sig.asset} {sig.timeframe} {sig.outcome}")
+                    asyncio.create_task(executor.execute_trade(chat_id, sig, client, risk, settings, equity, free_cash))
+
+        except Exception as e:
+            log.error(f"Copy-trading loop error: {e}", exc_info=True)
+
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
@@ -728,6 +785,7 @@ async def main():
     asyncio.create_task(_scan_loop())
     asyncio.create_task(_update_dashboard_stats())
     asyncio.create_task(_polymarket_polling_loop())
+    asyncio.create_task(_polymarket_copytrade_loop())
     from strategies.optimizer import optimizer
     asyncio.create_task(optimizer.schedule_loop())
 
