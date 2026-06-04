@@ -377,6 +377,7 @@ async def cmd_settings(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_set(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid  = str(update.effective_chat.id)
     args = update.message.text.split()[1:]
+    if len(args) < 2:
         await update.message.reply_text(
             "*Usage:*\n"
             "`/set assets BTC ETH SOL`\n"
