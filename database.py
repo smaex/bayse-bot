@@ -353,7 +353,14 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS config (
+                    key        TEXT PRIMARY KEY,
+                    value      TEXT NOT NULL
+                )
+            """)
         conn.commit()
+
     log.info("Database ready (PostgreSQL, pooled connections)")
 
 def acquire_singleton_lock() -> bool:
@@ -792,9 +799,14 @@ def get_recent_trades(days: int = 7) -> list:
 def save_optimized_params(params: dict):
     """Save winning parameters from nightly optimization."""
     # We'll store this in a 'global_config' table or as a special user record
-    # For now, we'll queue it to the batch worker for a generic key-value store
-    query = "UPSERT INTO config (key, value) VALUES (%s, %s)"
+    query = """
+        INSERT INTO config (key, value)
+        VALUES (%s, %s)
+        ON CONFLICT (key)
+        DO UPDATE SET value = EXCLUDED.value
+    """
     _db_queue.put((query, ("optimized_params", json.dumps(params))))
+
 
 def get_recent_streak(chat_id: str, strategy: str, asset: str, timeframe: str, limit: int = 5) -> list[int]:
     """Returns the 'won' status of the last N trades for a specific combo."""

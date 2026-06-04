@@ -649,21 +649,24 @@ async def _polymarket_copytrade_loop():
                 _active_users_cache_time = now
             users = _active_users_cache
 
-            for user in users:
-                settings = user.get("settings", {})
-                if not settings.get("poly_copy_enabled") or not settings.get("poly_copy_wallet"):
-                    continue
+            copy_users = [u for u in users if u.get("settings", {}).get("poly_copy_enabled") and u.get("settings", {}).get("poly_copy_wallet")]
+            log.info(f"🔄 CopyTrade poll: {len(users)} active users | {len(copy_users)} with copytrade enabled")
 
+            for user in copy_users:
+                settings = user.get("settings", {})
                 chat_id = user["chat_id"]
                 risk = _user_risks.get(chat_id)
                 client = _user_clients.get(chat_id)
                 if not risk or not client or settings.get("paused"):
+                    log.warning(f"[{chat_id}] CopyTrade: skipping — no risk/client or paused")
                     continue
 
                 wallet = settings["poly_copy_wallet"]
+                log.info(f"[{chat_id}] 🪞 CopyTrade: polling Polymarket wallet {wallet[:10]}...")
                 # Poll Polymarket for signals
                 signals = await polymarket_copytrade.get_copy_signals(wallet, active_markets)
                 if not signals:
+                    log.info(f"[{chat_id}] CopyTrade: no matching signals from Polymarket this tick")
                     continue
 
                 # Refresh cash balance if necessary

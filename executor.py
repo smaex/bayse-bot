@@ -370,33 +370,15 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
                 return
 
         # Place the order
-        # AMM usually requires MARKET + maxSlippage. CLOB can take LIMIT.
+        # AMM: MARKET order with maxSlippage. CLOB: LIMIT order at specified price.
+        # IMPORTANT (per Bayse API docs): `amount` is always in NGN notional value.
+        # The API calculates shares internally. We do NOT convert amount to shares.
+        # The platform enforces its own ₦100 minimum — no share-count minimum on our side.
         final_order_type = "LIMIT" if engine == "CLOB" else "MARKET"
-        
+        order_amount = amount  # NGN notional — sent as-is to the API
+        # multiplier is used for reverse-calculating shares from NGN fills in response parsing
         multiplier = 100.0 if CURRENCY == "NGN" else 1.0
-        order_amount = amount
-        if final_order_type == "LIMIT":
-            min_shares = 100.0
-            order_amount = amount / (limit_price * multiplier)
-            if order_amount < min_shares:
-                needed_ngn = min_shares * limit_price * multiplier
-                # ── CLOB Scale-Up Hard Cap ──
-                # Never allow the min-share scaler to inflate an order more than
-                # 3× the original sizing intent. On low-price markets (e.g. ₦8.9/share),
-                # the math produces ₦89,000 from a ₦100 intent — catastrophic.
-                # Cap: at most 3× the amount OR 3× mintrade, whichever is larger.
-                max_allowed_for_scaling = min(
-                    hard_cap,
-                    max(amount * 3.0, effective_minimum * 3.0)  # 3× cap, never more
-                )
-                if needed_ngn <= max_allowed_for_scaling and needed_ngn <= free_cash:
-                    log.info(f"[{chat_id}] CLOB SIZING: Scaling up LIMIT order from {order_amount:.2f} to {min_shares:.2f} shares (₦{amount:,.0f} → ₦{needed_ngn:,.0f}) to meet exchange minimum.")
-                    amount = needed_ngn
-                    order_amount = min_shares
-                else:
-                    log.info(f"[{chat_id}] SKIPPED — CLOB LIMIT order requires {min_shares:.2f} shares (₦{needed_ngn:,.0f}), exceeds 3× cap (₦{max_allowed_for_scaling:,.0f}) or free cash.")
-                    return
-            
+
         # ── Pre-flight: check cached market minimum before hitting the API ──
         cached_min = _market_min_cache.get(sig.market_id, 0.0)
         if cached_min > 0 and amount < cached_min:
@@ -440,14 +422,10 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             chase_price = min(limit_price * 1.002, max_allowed_price)
             if chase_price > limit_price:
                 log.info(f"[{chat_id}] CLOB CHASE: First order missed. Retrying at {chase_price:.3f}")
-                chase_shares = amount / (chase_price * multiplier)
-                if chase_shares < 100.0:
-                    chase_shares = 100.0
-                    log.info(f"[{chat_id}] CLOB CHASE SIZING: Scaling chase shares to 100.0 to meet exchange minimum.")
                 try:
                     resp = await client.place_order(
                         event_id=sig.event_id, market_id=sig.market_id,
-                        outcome_id=sig.outcome_id, side="BUY", amount=chase_shares,
+                        outcome_id=sig.outcome_id, side="BUY", amount=amount,
                         order_type="LIMIT", price=chase_price, currency=CURRENCY,
                     )
                 except Exception as e:
