@@ -21,6 +21,11 @@ class FrontrunStrategy(BaseStrategy):
         tf = market.get("timeframe", "")
         secs = market.get("secs_to_close", 0)
 
+        # FRONTRUN only runs on short candles (5‑min or 15‑min)
+        # The whitelist lives in config.FRONTRUN_ALLOWED_TFS. If the list is empty, all timeframes are allowed.
+        if config.FRONTRUN_ALLOWED_TFS and tf not in config.FRONTRUN_ALLOWED_TFS:
+            return None
+
         # FrontRun is pure latency arbitrage — exploits oracle vs Bayse price lag.
         # It works on ANY timeframe as long as there is time left for the trade to resolve.
         # Minimum 60 seconds needed to place and have the order settle.
@@ -82,6 +87,16 @@ class FrontrunStrategy(BaseStrategy):
 
         # Dynamic Sizing: scale size based on bias, max 3% to protect account
         size_pct = min(0.01 + abs(bias) * 5.0, 0.03)
+        # Enforce a configurable minimum trade size (default ₦100)
+        MIN_TRADE_NAIRA = getattr(config, "FRONTRUN_MIN_TRADE_NAIRA", 100.0)
+        # Convert the Naira floor to a percentage of current free cash (risk.current_free_cash will be injected at execution time)
+        # size_pct is a fraction of equity; we ensure it’s at least the floor expressed as a fraction.
+        # The executor will clamp to the global hard‑cap, so this never exceeds allowed exposure.
+        try:
+            free_cash = risk.current_free_cash  # risk is injected at execution; safe fallback if unavailable
+        except Exception:
+            free_cash = 1.0
+        size_pct = max(size_pct, MIN_TRADE_NAIRA / max(1.0, free_cash))
 
         return TradeSignal(
             strategy="FRONTRUN",

@@ -110,7 +110,8 @@ ALL_TIMEFRAMES = ["5min", "15min", "1h", "6h", "1d"]
 # Per-timeframe entry windows: each timeframe has its own optimal entry point.
 # Short timeframes move fast — enter late when signal is strong.
 # Long timeframes need early entry to catch markets before they fully price in.
-SNIPE_ENTRY_WINDOWS = {
+FRONTRUN_ALLOWED_TFS = {"5min", "15min"}  # Only run FRONTRUN on 5‑min and 15‑min markets
+FRONTRUN_MIN_TRADE_NAIRA = int(os.getenv("FRONTRUN_MIN_TRADE_NAIRA", "100"))  # Minimum trade size for FRONTRUN (default ₦100)
     "5min":  300,    # full 5min window — evaluate the entire candle
     "15min": 900,    # full 15min window
     "1h":    3000,   # last 50 min (was 40 min)

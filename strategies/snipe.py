@@ -51,7 +51,8 @@ class SnipeStrategy(BaseStrategy):
         rv = realized_vol_hourly(asset, state)
         if secs < 300: rv *= (1.0 + 0.5 * ((300 - secs) / 210.0))
         
-        w_est = win_probability(distance_pct, secs, asset, sigma_override=rv)
+        w_est_raw = win_probability(distance_pct, secs, asset, sigma_override=rv)
+        w_est = w_est_raw if direction == "YES" else 1.0 - w_est_raw
         base = probability_to_certainty(w_est)
         
         mom = momentum_score(asset, direction, state)
