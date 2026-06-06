@@ -81,6 +81,16 @@ class MarketBiasStrategy(BaseStrategy):
                         outcome = "NO"
                         outcome_id = market["no_id"]
                         market_price = market["no_price"]
+                        
+                    # Distance & Time Check (Don't buy doomed markets)
+                    from strategies.utils import win_probability
+                    if market.get("threshold") and spot_price and secs_to_close > 0:
+                        dist_pct = (spot_price - market["threshold"]) / market["threshold"]
+                        prob = win_probability(dist_pct, secs_to_close, asset)
+                        if outcome == "YES" and prob < 0.05:
+                            return None
+                        if outcome == "NO" and prob > 0.95:
+                            return None
                     
                     if utc_hour == 15:
                         win_prob = 0.82

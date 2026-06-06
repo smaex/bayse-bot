@@ -33,6 +33,16 @@ class NewsStrategy(BaseStrategy):
         market_price = market["yes_price"] if direction_raw == "YES" else market["no_price"]
         if market_price > config.NEWS_MAX_MARKET_PRICE: return None
 
+        # 1.5. Distance & Time Check (Don't buy doomed markets)
+        from strategies.utils import win_probability
+        if market.get("threshold") and spot_price and secs > 0:
+            dist_pct = (spot_price - market["threshold"]) / market["threshold"]
+            prob = win_probability(dist_pct, secs, asset)
+            if direction_raw == "YES" and prob < 0.05:
+                return None  # Mathematically impossible to win YES
+            if direction_raw == "NO" and prob > 0.95:
+                return None  # Mathematically impossible to win NO
+
         # 2. Regime & Momentum
         regime = regime_score(asset, state)
         if regime < config.NEWS_MIN_REGIME: return None

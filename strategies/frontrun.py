@@ -59,6 +59,16 @@ class FrontrunStrategy(BaseStrategy):
         if not direction:
             return None
             
+        # 2.5. Distance & Time Check (Don't buy doomed markets)
+        from strategies.utils import win_probability
+        if market.get("threshold") and spot_price and secs > 0:
+            dist_pct = (spot_price - market["threshold"]) / market["threshold"]
+            prob = win_probability(dist_pct, secs, asset)
+            if outcome == "YES" and prob < 0.05:
+                return None  # Mathematically impossible to win YES
+            if outcome == "NO" and prob > 0.95:
+                return None  # Mathematically impossible to win NO
+            
         # 3. Certainty: Scale with bias strength
         certainty = min(0.50 + abs(bias) * 100, 0.99)
         

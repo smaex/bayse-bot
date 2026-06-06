@@ -422,7 +422,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             currency=CURRENCY,
             time_in_force=time_in_force
         )
-        order = resp.get("order", resp)
+        order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
         # Robust share/quantity detection across different API versions
         shares_filled = float(
             order.get("filledSize") or
@@ -451,7 +451,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
                     log.debug(f"[{chat_id}] CLOB CHASE order failed at {chase_price:.3f}: {e}")
                     # Fall through — shares_filled stays 0, zero-fill path handles it below
                 else:
-                    order = resp.get("order", resp)
+                    order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
                 shares_filled = float(
                     order.get("filledSize") or
                     order.get("shares") or 
@@ -527,6 +527,9 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             "entry_price": filled_price, "amount_ngn": actual_ngn,
             "strategy": sig.strategy, "asset": sig.asset, "timeframe": sig.timeframe,
         })
+        
+        # Prevent artificial equity inflation during the 30s heartbeat cache window
+        risk.current_free_cash -= actual_ngn
 
         # ── Set Trade Cooldown ── prevents re-entry for 60s after any successful trade
         _trade_cooldown[sig.market_id] = time.time()
