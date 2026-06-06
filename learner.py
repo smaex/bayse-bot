@@ -77,10 +77,13 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         
         counts[strat] = total
 
-        if total < 5:
+        if total < 10:
             continue
 
-        expected_wr = 0.90 if strat == "SNIPE" else 0.60
+        # Realistic win-rate targets for a prediction market edge:
+        # SNIPE: 65% (needs to beat 50/50 with fees — 65% is genuinely strong)
+        # Others: 55% (any positive edge above random)
+        expected_wr = 0.65 if strat == "SNIPE" else 0.55
         
         if total >= 5:
             # p-value: probability of observing 'wins' or fewer if the true win rate was 'expected_wr'
@@ -110,18 +113,17 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         # Strategy-specific threshold tuning
         if strat == "SNIPE" and win_rate is not None:
             cur = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
-            if win_rate < 0.88:
-                new = min(round(cur + 0.05, 2), 0.98)
+            # Only raise the bar if win rate is genuinely bad (<50%)
+            # Only lower the bar when edge is proven solid (>70%)
+            # Cap certainty at 0.70 — raising beyond 0.70 starves the bot of trades
+            if win_rate < 0.50:
+                new = min(round(cur + 0.03, 2), 0.70)  # small raise, hard cap at 0.70
                 learned["snipe_min_certainty"] = new
-                changes.append(f"🎯 SNIPE certainty raised AGGRESSIVELY {cur} → {new}")
-            elif win_rate < 0.92:
-                new = min(round(cur + 0.02, 2), 0.98)
+                changes.append(f"🎯 SNIPE certainty raised {cur} → {new} (WR={win_rate:.0%})")
+            elif win_rate > 0.70 and cur > 0.45:
+                new = max(round(cur - 0.02, 2), 0.45)  # slowly relax when edge is confirmed
                 learned["snipe_min_certainty"] = new
-                changes.append(f"🎯 SNIPE certainty raised {cur} → {new}")
-            elif win_rate > 0.96 and cur > 0.75:
-                new = max(round(cur - 0.01, 2), 0.75)
-                learned["snipe_min_certainty"] = new
-                changes.append(f"🎯 SNIPE certainty lowered {cur} → {new}")
+                changes.append(f"🎯 SNIPE certainty lowered {cur} → {new} (WR={win_rate:.0%})")
 
         elif strat == "CORRELATE" and win_rate is not None:
             cur = learned.get("correlation_threshold", config.CORRELATION_THRESHOLD)
@@ -160,12 +162,12 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         pnl = combo.get("total_pnl") or 0
         
         # We will adjust the cert_mults for this specific combo
-        expected_wr = 0.90 if combo['strategy'] == "SNIPE" else 0.60
+        expected_wr = 0.65 if combo['strategy'] == "SNIPE" else 0.55
         wins = int(wr * total)
         p_value = binomial_cdf(wins, total, expected_wr)
         
         c_mult = cert_mults.get(key, 1.0)
-        if total >= 5 and p_value < 0.05 and pnl < 0:
+        if total >= 10 and p_value < 0.05 and pnl < 0:
             c_mult = max(0.1, c_mult - 0.50) # Massive penalty for broken combo
             warnings.append(
                 f"🔴 SELF-CORRECT: {key} certainty penalized (-50%) — "

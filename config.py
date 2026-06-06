@@ -111,9 +111,9 @@ ALL_TIMEFRAMES = ["5min", "15min", "1h", "6h", "1d"]
 # Short timeframes move fast — enter late when signal is strong.
 # Long timeframes need early entry to catch markets before they fully price in.
 SNIPE_ENTRY_WINDOWS = {
-    "5min":  270,    # last 4.5 min (widened for early entry)
-    "15min": 720,    # last 12 min (widened to beat market repricing)
-    "1h":    2400,   # last 40 min (widened to beat market repricing)
+    "5min":  300,    # full 5min window — evaluate the entire candle
+    "15min": 900,    # full 15min window
+    "1h":    3000,   # last 50 min (was 40 min)
     "6h":    7200,   # last 2 hours
     "1d":    21600,  # last 6 hours
 }

@@ -38,7 +38,7 @@ class SnipeStrategy(BaseStrategy):
         entry_window = config.SNIPE_ENTRY_WINDOWS.get(tf)
         if asset in config.FX_SESSION_UTC and tf == "1h": entry_window = config.FX_ENTRY_WINDOW_1H
         if entry_window is None or secs > entry_window or secs < 0: return None
-        if mode != "full_send" and secs < 90: return None
+        if mode != "full_send" and secs < 30: return None  # allow late entry — price is most certain near close
 
         threshold = market.get("threshold")
         live_spot = spot_price if spot_price is not None else feeds.spot.get(asset)
@@ -85,7 +85,8 @@ class SnipeStrategy(BaseStrategy):
                 return None
 
             if velocity < -config.SNIPE_VELOCITY_VETO: return None
-            if mom < -0.7 and base < 0.55: return None
+            # NOTE: momentum veto removed — composite score already penalises negative momentum.
+            # Blocking NO trades in bearish momentum was eliminating the most profitable setups.
 
         if asset in config.FX_SESSION_UTC and regime < config.FX_MIN_REGIME: return None
 

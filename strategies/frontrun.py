@@ -19,14 +19,12 @@ class FrontrunStrategy(BaseStrategy):
     async def evaluate(self, market: dict, learned: dict, state: any, spot_price: float = None) -> Optional[TradeSignal]:
         asset = market["asset"]
         tf = market.get("timeframe", "")
-
-        # Only run frontrunning latency arbitrage on fast short timeframes
-        if tf not in {"5min", "15min"}:
-            return None
-
-        # Only frontrun when close to expiration (last 15 minutes) where latency matters most
         secs = market.get("secs_to_close", 0)
-        if secs > 900 or secs < 0:
+
+        # FrontRun is pure latency arbitrage — exploits oracle vs Bayse price lag.
+        # It works on ANY timeframe as long as there is time left for the trade to resolve.
+        # Minimum 60 seconds needed to place and have the order settle.
+        if secs < 60 or secs < 0:
             return None
 
         # 1. Get Latency Bias (Oracle vs Bayse)

@@ -225,8 +225,9 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
 
 
     # ── Safety Guardrails (Alpha Resurrection) ──
-    # 1. Global Price Cap: Never buy above 0.80 (Downside is 4x upside)
-    MAX_ENTRY_PRICE = 0.80
+    # 1. Global Price Cap: Never buy above 0.88 (leaves min 12% return potential after fees).
+    # Raised from 0.80 — the EV formula below is the real protection against bad-value entries.
+    MAX_ENTRY_PRICE = 0.88
     if sig.market_price > MAX_ENTRY_PRICE:
         log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Price {sig.market_price:.2f} above safety cap {MAX_ENTRY_PRICE}")
         return
@@ -244,19 +245,17 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
     
     # ── Discovery Probe ──
     is_probe = False
-    # Probes: Small trades to collect data even if certainty is modest (0.35+)
-    # This keeps the bot 'in the game' without risking the bankroll.
-    # BUG-FIX: Respect user's mintrade — if mintrade > ₦100, skip probe rather than
-    # violate the user's minimum bet size configuration.
+    # Probes: Small trades to collect data even if certainty is modest (0.35+).
+    # Always execute probes at ₦100 — this is the primary way a new account builds
+    # Bayesian trade history so the learner can optimise.
     if sig.certainty >= 0.35 and sig.certainty < sig.mode_floor:
-        if min_t <= 100.0:
-            is_probe = True
-            amount = 100.0
-            log.info(f"[{chat_id}] DISCOVERY PROBE: Sizing down to ₦100 for Bayesian data collection.")
-        else:
-            log.info(f"[{chat_id}] DISCOVERY PROBE skipped — mintrade=₦{min_t:,.0f} > ₦100 probe size.")
+        is_probe = True
+        amount = 100.0
+        log.info(f"[{chat_id}] DISCOVERY PROBE: Sizing down to ₦100 for Bayesian data collection.")
 
-    if not is_probe and ev < 0.05:
+    # EV threshold: 1% minimum (was 5% — too strict with 4% fee markets).
+    # Real protection is Kelly sizing + win probability, not a high EV floor.
+    if not is_probe and ev < 0.01:
         log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Insufficient EV ({ev:+.1%})")
         return
 
@@ -296,7 +295,10 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
     _oracle_fresh = _oracle_age < 5.0  # only trust oracle signal if data is <5s old
     
     _is_fx = sig.asset in _FX_ASSETS
-    latency_threshold = 0.0 if _is_fx else 0.0015  # 0.15% for crypto, skip for FX
+    # Threshold raised from 0.15% → 0.30%. The HardenedWS Layer 3 Guard already rejects
+    # ticks that deviate >0.15% from baseline, so the bot's spot feed is already smoothed.
+    # We only hard-block on genuinely extreme divergences (>0.30%) where real slippage risk exists.
+    latency_threshold = 0.0 if _is_fx else 0.0030  # 0.30% for crypto, skip for FX
     
     if not _is_fx and _oracle_fresh and latency_threshold > 0:
         if sig.outcome == "YES" and bias < -latency_threshold:
@@ -333,7 +335,13 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
     is_maker = False
     time_in_force = "FAK"
 
-    if engine == "CLOB" and vol_mult <= 2.5:
+    # ── Micro-Account TAKER Override ──
+    # For accounts under ₦5,000, always use TAKER (MARKET on AMM, immediate LIMIT on CLOB).
+    # Maker orders post at a discount and may never fill before market close on small accounts.
+    # Once equity grows above ₦5,000, the bot will begin using CLOB MAKER orders to save fees.
+    _use_maker_eligible = equity >= 5000
+
+    if _use_maker_eligible and engine == "CLOB" and vol_mult <= 2.5:
         normalized_threshold = 0.005 * vol_mult
         low_momentum  = abs(sig.momentum_at_entry) < normalized_threshold
         high_conviction = sig.certainty >= 0.75  # High-conviction → post limit, save fee

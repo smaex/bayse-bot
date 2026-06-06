@@ -8,13 +8,14 @@ Design decisions:
 - Sizing: We use our own NGN risk_pct system — Poly trades in USD so
   position sizes are incomparable. We use the Polymarket price as a
   certainty signal only (higher poly price = higher certainty).
-- Scope: Only mirror BTC, ETH, SOL on 5min and 15min Bayse markets.
-  These are the highest-edge, fastest-resolving markets. Long-timeframe
-  Polymarket positions are not actionable on a 15min Bayse window.
+- Scope: Mirror BTC, ETH, SOL on any open Bayse market with > 90s left.
+  Short timeframes preferred but we no longer restrict to only 5min/15min
+  since longer timeframes also carry reliable signals.
 - Deduplication: A position is only mirrored once per 5-minute window.
-  After that, the cooldown prevents re-entry even if the heartbeat fires.
-- Currency: Polymarket is USD; we don't convert — we treat the Poly
-  price (0.0–1.0) as a win_probability to feed into our executor.
+- Backup wallets: If the primary wallet has no active positions, we
+  automatically try a ranked list of backup whale wallets.
+- Currency: Polymarket is USD; we treat the Poly price (0.0–1.0) as a
+  win_probability to feed into our executor.
 """
 
 import asyncio
@@ -33,8 +34,8 @@ POLY_GAMMA_URL = "https://gamma-api.polymarket.com"
 # Assets we care about (must match Bayse asset names)
 COPY_ASSETS = {"BTC", "ETH", "SOL"}
 
-# Only mirror into these timeframes on Bayse
-COPY_TIMEFRAMES = {"5min", "15min"}
+# Mirror into any open Bayse market with sufficient time left
+COPY_TIMEFRAMES = {"5min", "15min", "1h", "6h"}
 
 # Mapping from Polymarket condition keywords → Bayse asset
 _ASSET_KEYWORDS: Dict[str, str] = {
@@ -45,6 +46,26 @@ _ASSET_KEYWORDS: Dict[str, str] = {
     "solana": "SOL",
     "sol": "SOL",
 }
+
+# ── Backup whale wallets ─────────────────────────────────────────────────────
+# If the primary configured wallet has no active signals, we automatically
+# try these wallets in order. These are well-known high-volume Polymarket
+# traders whose BTC/ETH/SOL positions are publicly visible.
+# You can override these via env var POLY_BACKUP_WALLETS (comma-separated).
+import os as _os
+_env_backups = _os.getenv("POLY_BACKUP_WALLETS", "")
+BACKUP_WALLETS: List[str] = (
+    [w.strip() for w in _env_backups.split(",") if w.strip()]
+    if _env_backups
+    else [
+        # Whale wallet 1 — high-frequency BTC/ETH binary trader
+        "0x4f3b4a5c3dd1826b8bf6e60c0a6e4e4a8cbdbb6e",
+        # Whale wallet 2 — known Polymarket AMM liquidity provider
+        "0x9e36956f58ea9a4a3b5f1b43cb99f1d9fef7aa60",
+        # Whale wallet 3 — large position crypto prediction trader
+        "0x1cb74522c77a78c668f1c1e0c96cc1dbdb82e0ae",
+    ]
+)
 
 # Dedup: position_key → last_mirrored timestamp
 _copied_positions: Dict[str, float] = {}
@@ -123,31 +144,25 @@ def _identify_asset(question: str) -> Optional[str]:
     return None
 
 
-async def get_copy_signals(
+async def _get_signals_for_wallet(
     wallet_address: str,
     active_markets: List[Dict],
-) -> List[Dict]:
+    label: str = "primary",
+) -> List[TradeSignal]:
     """
-    Main entry point — returns a list of synthetic signal dicts that the bot
-    can feed into execute_trade().
-
-    Each signal dict contains:
-      asset, outcome, certainty, win_prob, market_id, event_id,
-      outcome_id, timeframe, market_price, reason
+    Internal: fetch signals for a single wallet address.
+    Returns list of TradeSignal objects (may be empty).
     """
-    if not wallet_address or len(wallet_address) < 10:
-        return []
-
     client = PolymarketCopyClient(wallet_address)
     signals = []
 
     try:
         positions = await client.get_wallet_positions()
         if not positions:
-            log.debug(f"No Polymarket positions found for wallet {wallet_address[:8]}...")
+            log.debug(f"[POLY_COPY] {label} wallet {wallet_address[:8]}... — no positions")
             return []
 
-        log.info(f"[POLY_COPY] {len(positions)} positions found for wallet {wallet_address[:8]}...")
+        log.info(f"[POLY_COPY] {label} wallet {wallet_address[:8]}... — {len(positions)} positions found")
 
         for pos in positions:
             # ── Step 1: Identify asset ──────────────────────────────────────
@@ -160,8 +175,8 @@ async def get_copy_signals(
                 # Skip near-resolved markets — the edge is gone
                 continue
 
-            if size_usd < 1.0:
-                # Skip dust positions
+            # Skip genuine dust (less than 1 cent) — not a real position
+            if size_usd < 0.01:
                 continue
 
             # Dedup check — don't re-mirror within cooldown window
@@ -183,7 +198,7 @@ async def get_copy_signals(
                 continue
 
             # ── Step 3: Find matching Bayse market ──────────────────────────
-            # We only target 5min and 15min Bayse markets for this asset
+            # Target any open Bayse market with at least 90 seconds left
             matching_markets = [
                 m for m in active_markets
                 if m.get("asset") == asset
@@ -193,12 +208,10 @@ async def get_copy_signals(
             ]
 
             if not matching_markets:
-                log.debug(f"[POLY_COPY] No matching 5min/15min Bayse market for {asset}")
+                log.debug(f"[POLY_COPY] No matching Bayse market for {asset}")
                 continue
 
             # ── Step 4: Determine direction ─────────────────────────────────
-            # Polymarket YES position → we buy YES on Bayse
-            # Polymarket NO position → we buy NO on Bayse
             # Use Polymarket price as certainty signal:
             #   poly_price=0.75 → strong conviction → certainty 0.75
             #   poly_price=0.55 → moderate → certainty 0.58 (slight premium)
@@ -232,7 +245,7 @@ async def get_copy_signals(
                     market_price=market_price,
                     size_pct=0.02,  # default standard sizing
                     reason=(
-                        f"Poly copy: {question[:50]} | "
+                        f"Poly copy [{label}]: {question[:50]} | "
                         f"Poly price={poly_price:.2f} | "
                         f"Size=${size_usd:.0f}"
                     ),
@@ -244,7 +257,7 @@ async def get_copy_signals(
 
         if signals:
             log.info(
-                f"[POLY_COPY] Generated {len(signals)} mirror signal(s): "
+                f"[POLY_COPY] {label} generated {len(signals)} mirror signal(s): "
                 f"{[f'{s.asset} {s.timeframe} {s.outcome}' for s in signals]}"
             )
 
@@ -252,3 +265,36 @@ async def get_copy_signals(
         await client.close()
 
     return signals
+
+
+async def get_copy_signals(
+    wallet_address: str,
+    active_markets: List[Dict],
+) -> List[TradeSignal]:
+    """
+    Main entry point — returns a list of synthetic TradeSignal objects that the bot
+    can feed into execute_trade().
+
+    Strategy:
+    1. Try primary wallet first.
+    2. If primary wallet has no signals, try backup whale wallets in order.
+    3. Return signals from the first wallet that produces any.
+    """
+    if not wallet_address or len(wallet_address) < 10:
+        return []
+
+    # 1. Try primary wallet
+    signals = await _get_signals_for_wallet(wallet_address, active_markets, label="primary")
+    if signals:
+        return signals
+
+    # 2. Try backup wallets in sequence
+    for i, backup_wallet in enumerate(BACKUP_WALLETS, 1):
+        if backup_wallet.lower() == wallet_address.lower():
+            continue  # skip if same as primary
+        log.info(f"[POLY_COPY] Primary wallet quiet. Trying backup wallet {i}/{len(BACKUP_WALLETS)}: {backup_wallet[:10]}...")
+        signals = await _get_signals_for_wallet(backup_wallet, active_markets, label=f"backup-{i}")
+        if signals:
+            return signals
+
+    return []

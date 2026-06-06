@@ -71,7 +71,7 @@ _ACTIVE_USERS_CACHE_TTL = 30.0  # seconds
 # Minimum change to be considered a deposit/withdrawal (not just trade P&L noise)
 _BALANCE_EVENT_MIN_NGN = 200
 _BALANCE_EVENT_MIN_PCT = 0.05   # 5% of balance
-_MIN_VIABLE_BALANCE    = 1_000  # Bayse minimum trade is ₦100; need ₦1k+ to trade safely
+_MIN_VIABLE_BALANCE    = 500  # Bayse minimum trade is ₦100; need ₦500+ for viable 5-trade buffer
 
 
 def _get_client(user: dict) -> BayseClient:
