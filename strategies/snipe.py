@@ -101,7 +101,10 @@ class SnipeStrategy(BaseStrategy):
         # Conviction Boost: if flips <= 1 and well into the candle (elapsed > 90s)
         if secs < 210 and flips <= 1:
             composite = min(composite + 0.10, 0.99)
-            log.info(f"Snipe Conviction Boost: market {market_id} is highly stable ({flips} flips). Boosted composite to {composite:.2f}")
+            if composite >= 0.30:  # Only log INFO if it will actually pass the floor
+                log.info(f"Snipe Conviction Boost: market {market_id} is highly stable ({flips} flips). Boosted composite to {composite:.2f}")
+            else:
+                log.debug(f"Snipe Conviction Boost: market {market_id} is highly stable ({flips} flips). Boosted composite to {composite:.2f}")
 
         # 6. Macro Bias
         biases = feeds_direct.get_macro_bias()

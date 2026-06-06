@@ -178,7 +178,12 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
     if equity < 3000:
         # On tiny accounts, we force a ₦100 minimum viable size.
         amount = 100.0
-        log.info(f"[{chat_id}] Micro-Account Mode: forcing ₦100 minimum viable size")
+        cached_min = _market_min_cache.get(sig.market_id, 0.0)
+        if cached_min > amount:
+            amount = cached_min
+            log.info(f"[{chat_id}] Micro-Account Mode: scaling up to ₦{amount:,.0f} to meet explicit market minimum")
+        else:
+            log.info(f"[{chat_id}] Micro-Account Mode: forcing ₦100 minimum viable size")
     else:
         # BUG-FIX: Cap raw_pct at user_risk_pct * 3 (max 3x tier ceiling), not 10%
         capped_pct = min(raw_pct, user_risk_pct * 3.0)
@@ -259,7 +264,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Insufficient EV ({ev:+.1%})")
         return
 
-    if not risk.can_trade(equity, amount, max_exp):
+    if equity >= 3000 and not risk.can_trade(equity, amount, max_exp):
         log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Risk limit or max exposure reached")
         return
 
@@ -536,10 +541,19 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         if min_match:
             market_min = float(min_match.group(1).replace(',', ''))
             _market_min_cache[sig.market_id] = market_min
+            
+            # Auto-retry immediately with the new minimum if we have enough cash
+            # Only retry if the new minimum is strictly greater than what we just tried
+            if market_min > amount and market_min <= free_cash and (equity < 3000 or risk.can_trade(equity, market_min, settings.get("maxexposure", 20.0)/100.0)):
+                log.info(f"[{chat_id}] 🔄 AUTO-RETRY {sig.strategy} | {sig.asset} — Scaling up to ₦{market_min:,.0f} to meet explicit market minimum.")
+                import asyncio
+                asyncio.create_task(execute_trade(chat_id, sig, client, risk, settings, equity, free_cash))
+                return
+                
             log.info(
                 f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — "
                 f"Market {sig.market_id} enforces ₦{market_min:,.0f} minimum (now cached). "
-                f"Our ₦{amount:,.0f} is too small — will try other markets."
+                f"Our ₦{amount:,.0f} is too small and we cannot scale up."
             )
         else:
             log.error(f"[{chat_id}] order failed {sig.market_id}: {e}", exc_info=True)

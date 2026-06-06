@@ -401,8 +401,18 @@ async def tiingo_fx_rest_fallback():
                                 ticker = item.get("ticker", "").lower()
                                 asset = _FX_SYMBOLS.get(ticker)
                                 if asset:
-                                    # Tiingo Top API returns bid/ask
-                                    mid = (float(item["bid"]) + float(item["ask"])) / 2
+                                    # Tiingo /tiingo/fx/top REST API returns bidPrice/askPrice
+                                    # (NOT bid/ask — that was the WS format)
+                                    bid_p = item.get("bidPrice") or item.get("bid")
+                                    ask_p = item.get("askPrice") or item.get("ask")
+                                    if not bid_p or not ask_p:
+                                        # mid price fallback if bid/ask absent
+                                        mid = item.get("midPrice") or item.get("mid")
+                                        if not mid:
+                                            continue
+                                        mid = float(mid)
+                                    else:
+                                        mid = (float(bid_p) + float(ask_p)) / 2
                                     _, last_t = get_direct_price(asset)
                                     if time.time() - last_t > 15:
                                         direct_spot[asset] = {"price": mid, "time": time.time()}
