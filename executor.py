@@ -546,7 +546,6 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
             # Only retry if the new minimum is strictly greater than what we just tried
             if market_min > amount and market_min <= free_cash and (equity < 3000 or risk.can_trade(equity, market_min, settings.get("maxexposure", 20.0)/100.0)):
                 log.info(f"[{chat_id}] 🔄 AUTO-RETRY {sig.strategy} | {sig.asset} — Scaling up to ₦{market_min:,.0f} to meet explicit market minimum.")
-                import asyncio
                 asyncio.create_task(execute_trade(chat_id, sig, client, risk, settings, equity, free_cash))
                 return
                 

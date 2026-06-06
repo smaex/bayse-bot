@@ -743,8 +743,8 @@ async def main():
     # Forcing a webhook kills all other active 'getUpdates' (polling) sessions immediately
     log.info("Telegram: NUCLEAR KICK — Purging ghost instances via webhook reset...")
     try:
-        # Use a validly-formatted URL to pass Telegram's validation
-        await _tg_app.bot.set_webhook(url="https://bayse-bot-ghost-kick.render.com/unused")
+        # Use a validly-resolving URL to pass Telegram's validation and successfully kick ghost pollers
+        await _tg_app.bot.set_webhook(url="https://google.com/unused-webhook-kick")
         await asyncio.sleep(5)
         await _tg_app.bot.delete_webhook(drop_pending_updates=True)
         log.info("Telegram: Ghost instances purged successfully.")
