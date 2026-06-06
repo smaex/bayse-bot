@@ -199,7 +199,10 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
     system_cap = max(100.0, equity * 0.05)
     hard_cap   = min(system_cap, max_t)
 
-    if amount > hard_cap:
+    # Micro accounts explicitly overriding to the market minimum bypass the hard cap
+    if equity < 3000 and amount == _market_min_cache.get(sig.market_id, 0.0):
+        pass
+    elif amount > hard_cap:
         cap_reason = "user maxtrade cap" if hard_cap < system_cap else "5% equity cap"
         log.info(
             f"[{chat_id}] ⚖️ HARD CAP CLAMP: Scaling ₦{amount:,.0f} → ₦{hard_cap:,.0f} ({cap_reason})."
@@ -364,6 +367,9 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
     if not is_maker:
         limit_price = min(sig.market_price * (1.0 + adaptive_slip), max_allowed_price)
 
+    # The Bayse API enforces a strict maximum of 3 decimal places for price
+    limit_price = round(limit_price, 3)
+
     execution_style = "MAKER" if is_maker else "TAKER"
 
     try:
@@ -432,7 +438,7 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         # ── Order Chaser (CLOB only) ──
         # If CLOB and zero fill, try one more time at a slightly more aggressive price (if still profitable)
         if engine == "CLOB" and not is_maker and shares_filled <= 0:
-            chase_price = min(limit_price * 1.002, max_allowed_price)
+            chase_price = round(min(limit_price * 1.002, max_allowed_price), 3)
             if chase_price > limit_price:
                 log.info(f"[{chat_id}] CLOB CHASE: First order missed. Retrying at {chase_price:.3f}")
                 try:
