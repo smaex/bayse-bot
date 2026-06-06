@@ -968,12 +968,14 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM", e
 
 
 async def notify_win(app, cid: str, _mid: str, asset: str, tf: str, strat: str, pnl: float):
-    await send_message(app, cid, f"✅ *WIN* — {strat} {asset} {tf}\n+₦{pnl:,.2f}", parse_mode="Markdown")
+    safe_strat = strat.replace("_", "\\_") if strat else "UNKNOWN"
+    await send_message(app, cid, f"✅ *WIN* — {safe_strat} {asset} {tf}\n+₦{pnl:,.2f}", parse_mode="Markdown")
 
 
 async def notify_loss(app, cid: str, _mid: str, asset: str, tf: str, strat: str, pnl: float):
-    loss_amt = -abs(pnl)  # ensure negative regardless of how the API returned it
-    await send_message(app, cid, f"❌ *LOSS* — {strat} {asset} {tf}\n₦{loss_amt:,.2f}", parse_mode="Markdown")
+    loss_amt = -abs(pnl) if pnl is not None else 0.0 # ensure negative regardless of how the API returned it
+    safe_strat = strat.replace("_", "\\_") if strat else "UNKNOWN"
+    await send_message(app, cid, f"❌ *LOSS* — {safe_strat} {asset} {tf}\n₦{loss_amt:,.2f}", parse_mode="Markdown")
 
 
 async def notify_drawdown(app, cid: str, balance: float, peak: float, dd: float):
