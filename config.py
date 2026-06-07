@@ -120,6 +120,19 @@ FRONTRUN_ENTRY_WINDOWS = {
     "1d":    21600,  # last 6 hours
 }
 
+# FRONTRUN configuration thresholds
+FRONTRUN_BIAS_TRIGGER = float(os.getenv("FRONTRUN_BIAS_TRIGGER", "0.002"))  # 0.20% bias trigger (20 bps)
+
+# SNIPE entry windows per timeframe (seconds remaining in candle for evaluation)
+SNIPE_ENTRY_WINDOWS = {
+    "5min": 300,
+    "15min": 900,
+    "1h": 1800,
+    "6h": 7200,
+    "1d": 21600,
+}
+
+
 # DO NOT buy if the price is already this high.
 # Prevents buying "certain wins" that actually lose money after fees (e.g. 0.98 price).
 SNIPE_MAX_MARKET_PRICE = 0.90

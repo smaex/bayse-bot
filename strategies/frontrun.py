@@ -50,7 +50,7 @@ class FrontrunStrategy(BaseStrategy):
         bias = (oracle_p - bayse_spot) / bayse_spot
         
         # 2. Threshold: Lowered for Alpha Resurrection (8 bps)
-        trigger = 0.0008 
+        trigger = config.FRONTRUN_BIAS_TRIGGER
         
         direction = None
         outcome = None
