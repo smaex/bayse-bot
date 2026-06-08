@@ -330,6 +330,8 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
     else:
         engine = "AMM"  # no market object at all — safe fallback
 
+    log.debug(f"[{chat_id}] Engine determined: {engine}")
+
     # ── Hybrid Maker/Taker Routing ──
     # CLOB markets: we can post a LIMIT order (maker) instead of immediately
     # taking liquidity. Makers pay no fee and get better fill prices.
@@ -368,9 +370,10 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
         limit_price = min(sig.market_price * (1.0 + adaptive_slip), max_allowed_price)
 
     # The Bayse API enforces a strict maximum of 3 decimal places for price
-    limit_price = round(limit_price, 3)
-
     execution_style = "MAKER" if is_maker else "TAKER"
+    log.debug(f"[{chat_id}] Execution style: {execution_style}")
+
+
 
     try:
         # ── Slippage Shield (Alpha Capture Phase) ──
