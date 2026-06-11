@@ -1,17 +1,16 @@
 """
-Market scanner.
-
-Fetches all active BTC/ETH/SOL markets across all timeframes,
-enriches them with full event details (market IDs, outcome IDs, threshold),
-and returns them ready for the strategy engine.
+Market scanner — fetches all active markets, enriches with full event details.
+Always requests prices in NGN.
 """
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Optional
+
 from client import BayseClient
-from config import SERIES, ALL_TIMEFRAMES, ASSET_ORACLE, ALL_ASSETS
+from config import SERIES, ALL_TIMEFRAMES, ASSET_ORACLE, ALL_ASSETS, CURRENCY
 
 log = logging.getLogger(__name__)
 
@@ -43,26 +42,46 @@ def _seconds_to_open(opening_date: str) -> float:
     return (dt - _now_utc()).total_seconds()
 
 
-async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: str) -> Optional[dict]:
-    """Fetch full event details to get marketId, outcomeIds, threshold, prices."""
-    event_id = lean_event.get("id")
-    if not event_id:
-        return None
+def _parse_threshold_from_title(title: str) -> Optional[float]:
+    """
+    Fallback: parse the threshold price from the market title.
+    Handles patterns like:
+      "Will BTC be above 67,432.15 at..."
+      "Will BTC close above $67432?"
+    """
+    patterns = [
+        r'(?:above|below|at)\s+\$?([\d,]+\.?\d*)',
+        r'\$?([\d,]{4,}\.?\d*)',  # any 4+ digit number (likely a price)
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, title, re.IGNORECASE)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                if val > 0.01:  # sanity check — not a probability
+                    return val
+            except (ValueError, AttributeError):
+                continue
+    return None
 
+
+async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: str) -> Optional[dict]:
+    event_id     = lean_event.get("id")
     closing_date = lean_event.get("closingDate", "")
     opening_date = lean_event.get("openingDate", lean_event.get("startDate", ""))
 
-    secs_to_close = _seconds_to_close(closing_date)
-    secs_to_open = _seconds_to_open(opening_date)
-
-    # Skip already closed or not yet open (beyond 5 windows ahead)
-    if secs_to_close < 0:
+    if not event_id:
         return None
-    if secs_to_open > 0:
-        return None  # not open yet
+
+    secs_to_close = _seconds_to_close(closing_date)
+    secs_to_open  = _seconds_to_open(opening_date)
+
+    if secs_to_close < 0 or secs_to_open > 0:
+        return None
 
     try:
-        full = await client.get_event(event_id)
+        # Always request in NGN so prices come back in the correct currency
+        full = await client.get_event(event_id, currency=CURRENCY)
     except Exception as e:
         log.debug(f"Failed to enrich {event_id}: {e}")
         return None
@@ -70,127 +89,66 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
     markets = full.get("markets", [])
     if not markets:
         return None
-
     market = markets[0]
-    threshold = full.get("eventThreshold") or market.get("marketThreshold")
-    yes_id = market.get("outcome1Id")    # "Up" or "Yes" outcome
-    no_id = market.get("outcome2Id")     # "Down" or "No" outcome
-    yes_label = market.get("outcome1Label", "Up")   # "Up" or "Yes"
-    no_label = market.get("outcome2Label", "Down")  # "Down" or "No"
+
+    # ── Threshold (opening spot price) ──────────────────────────────────────
+    # Try every known field name, then fall back to parsing the title.
+    threshold = (
+        full.get("eventThreshold")
+        or full.get("threshold")
+        or full.get("openingPrice")
+        or market.get("marketThreshold")
+        or market.get("threshold")
+        or market.get("openingPrice")
+        or _parse_threshold_from_title(full.get("title", ""))
+    )
+    if threshold is not None:
+        threshold = float(threshold)
+
     market_id = market.get("id")
-    fee_pct = float(market.get("feePercentage", 4)) / 100
+    yes_id    = market.get("outcome1Id")
+    no_id     = market.get("outcome2Id")
 
     if not market_id or not yes_id or not no_id:
         return None
 
-    # Reject markets with missing prices — 0.5/0.5 default would cause false ARB signals
     raw_yes = market.get("outcome1Price")
     raw_no  = market.get("outcome2Price")
     if raw_yes is None or raw_no is None:
         return None
+
     yes_price = float(raw_yes)
     no_price  = float(raw_no)
 
-    # Reject markets with zero prices or missing threshold — likely broken or closed
-    if yes_price <= 0 or no_price <= 0 or not threshold:
+    if yes_price <= 0 or no_price <= 0:
         return None
 
+    fee_pct = float(market.get("feePercentage", 2)) / 100
+
     return {
-        "event_id": event_id,
-        "market_id": market_id,
-        "asset": asset,
-        "timeframe": timeframe,
-        "title": full.get("title", ""),
-        "threshold": threshold,         # opening Binance price = resolution reference
-        "yes_id": yes_id,
-        "no_id": no_id,
-        "yes_label": yes_label,
-        "no_label": no_label,
-        "yes_price": yes_price,
-        "no_price": no_price,
-        "fee_rate": fee_pct,            # base fee rate (e.g. 0.04)
+        "event_id":    event_id,
+        "market_id":   market_id,
+        "asset":       asset,
+        "timeframe":   timeframe,
+        "title":       full.get("title", ""),
+        "threshold":   threshold,       # opening price — may be None on non-threshold markets
+        "yes_id":      yes_id,
+        "no_id":       no_id,
+        "yes_label":   market.get("outcome1Label", "YES"),
+        "no_label":    market.get("outcome2Label", "NO"),
+        "yes_price":   yes_price,
+        "no_price":    no_price,
+        "fee_rate":    fee_pct,
         "opening_date": opening_date,
         "closing_date": closing_date,
-        "resolution_date": full.get("resolutionDate", ""),
         "secs_to_close": secs_to_close,
-        "status": full.get("status", "open"),
-        "engine": full.get("engine", "AMM"),
-        "oracle": ASSET_ORACLE.get(asset, "BINANCE"),
-        "series_slug": full.get("seriesSlug", ""),
+        "status":      full.get("status", "open"),
+        "engine":      full.get("engine") or market.get("engine", "AMM"),
+        "oracle":      ASSET_ORACLE.get(asset, "BINANCE"),
     }
 
 
-async def discover_series(client: BayseClient) -> None:
-    """
-    Fetch all open events from the Bayse API and log every unique series slug found.
-    Run once on startup to discover FX/commodity slugs for config.py.
-    
-    v2: Now also categorizes by asset type and provides actionable recommendations.
-    """
-    slugs: dict[str, int] = {}  # slug → count of open events
-    page = 1
-    while True:
-        try:
-            data    = await client.list_events(page=page, limit=50)
-            events  = data if isinstance(data, list) else data.get("events", data.get("data", []))
-            if not events:
-                break
-            for ev in events:
-                slug = ev.get("seriesSlug") or ev.get("series") or ""
-                if slug:
-                    slugs[slug] = slugs.get(slug, 0) + 1
-            pagination = data.get("pagination", {}) if isinstance(data, dict) else {}
-            if page >= pagination.get("lastPage", 1):
-                break
-            page += 1
-        except Exception as e:
-            log.warning(f"discover_series page {page}: {e}")
-            break
-
-    if slugs:
-        log.info("═══ Available series slugs on Bayse ══════════════════════")
-        
-        # Categorize slugs
-        crypto_slugs = {s: c for s, c in slugs.items() if s.startswith("crypto-")}
-        fx_slugs = {s: c for s, c in slugs.items() if s.startswith("fx-")}
-        commodity_slugs = {s: c for s, c in slugs.items() if s.startswith("commodity-")}
-        other_slugs = {s: c for s, c in slugs.items() 
-                       if not s.startswith(("crypto-", "fx-", "commodity-"))}
-        
-        if crypto_slugs:
-            log.info("  🪙 CRYPTO:")
-            for slug, count in sorted(crypto_slugs.items()):
-                in_config = "✅" if any(slug in tf.values() for tf in SERIES.values()) else "❌ NOT TRACKED"
-                log.info(f"    {slug}  ({count} open) {in_config}")
-        
-        if fx_slugs:
-            log.info("  💱 FX:")
-            for slug, count in sorted(fx_slugs.items()):
-                in_config = "✅" if any(slug in tf.values() for tf in SERIES.values()) else "❌ NOT TRACKED"
-                log.info(f"    {slug}  ({count} open) {in_config}")
-        
-        if commodity_slugs:
-            log.info("  🥇 COMMODITIES:")
-            for slug, count in sorted(commodity_slugs.items()):
-                in_config = "✅" if any(slug in tf.values() for tf in SERIES.values()) else "❌ NOT TRACKED"
-                log.info(f"    {slug}  ({count} open) {in_config}")
-        
-        if other_slugs:
-            log.info("  ❓ OTHER:")
-            for slug, count in sorted(other_slugs.items()):
-                log.info(f"    {slug}  ({count} open)")
-        
-        total_tracked = sum(1 for s in slugs if any(s in tf.values() for tf in SERIES.values()))
-        log.info(f"  SUMMARY: {len(slugs)} total series | {total_tracked} tracked | "
-                 f"{len(slugs) - total_tracked} untracked")
-        log.info("══════════════════════════════════════════════════════════")
-    else:
-        log.warning("discover_series: no slugs found — check API connectivity")
-
-
-
 async def scan_all(client: BayseClient) -> list[dict]:
-    """Fetch all currently open markets across all assets and timeframes."""
     tasks = []
     for asset, timeframes in SERIES.items():
         if asset not in ALL_ASSETS:
@@ -209,13 +167,43 @@ async def scan_all(client: BayseClient) -> list[dict]:
     return markets
 
 
-async def _scan_series(client: BayseClient, asset: str, timeframe: str, slug: str) -> list[dict]:
+async def _scan_series(client: BayseClient, asset: str, tf: str, slug: str) -> list[dict]:
     try:
         lean_events = await client.get_series_events(slug)
     except Exception as e:
-        log.warning(f"Failed to fetch series {slug}: {e}")
+        log.warning(f"Series {slug} fetch failed: {e}")
         return []
+    tasks    = [_enrich(client, ev, asset, tf) for ev in lean_events]
+    enriched = await asyncio.gather(*tasks, return_exceptions=True)
+    return [m for m in enriched if isinstance(m, dict)]
 
-    enrich_tasks = [_enrich(client, ev, asset, timeframe) for ev in lean_events]
-    enriched = await asyncio.gather(*enrich_tasks, return_exceptions=True)
-    return [m for m in enriched if isinstance(m, dict) and m is not None]
+
+async def discover_series(client: BayseClient) -> None:
+    """Log every series slug on Bayse — run once on startup."""
+    slugs: dict[str, int] = {}
+    page = 1
+    while True:
+        try:
+            data   = await client.list_events(page=page, limit=50)
+            events = data if isinstance(data, list) else data.get("events", data.get("data", []))
+            if not events:
+                break
+            for ev in events:
+                slug = ev.get("seriesSlug") or ev.get("series") or ""
+                if slug:
+                    slugs[slug] = slugs.get(slug, 0) + 1
+            pagination = data.get("pagination", {}) if isinstance(data, dict) else {}
+            if page >= pagination.get("lastPage", 1):
+                break
+            page += 1
+        except Exception as e:
+            log.warning(f"discover_series page {page}: {e}")
+            break
+
+    if slugs:
+        log.info("Available Bayse series slugs:")
+        for slug, count in sorted(slugs.items()):
+            tracked = any(slug in tf.values() for tf in SERIES.values())
+            log.info(f"  {'✅' if tracked else '❌'} {slug} ({count} open)")
+    else:
+        log.warning("discover_series: no slugs found")
