@@ -514,3 +514,43 @@ def save_quant_state(asset: str, state: dict):
 def load_quant_states() -> dict[str, dict]:
     rows = _fetch_all("SELECT asset, state_json FROM quant_state")
     return {r["asset"]: json.loads(r["state_json"]) for r in rows}
+
+
+def get_alpha_trend(chat_id: str, strategy: str, asset: str, days: int = 7) -> float:
+    """
+    Returns a 0.0–1.0 multiplier reflecting recent strategy/asset performance.
+    1.0 = performing normally, <0.85 = underperforming, triggers size reduction.
+    Based on win rate over last `days` days vs expected baseline.
+    Returns 1.0 (no penalty) if fewer than 5 resolved trades exist.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        row = _fetch_one("""
+            SELECT
+                COUNT(*)                                        AS total,
+                SUM(CASE WHEN won = 1 THEN 1 ELSE 0 END)       AS wins
+            FROM trades
+            WHERE chat_id = %s
+              AND strategy = %s
+              AND asset    = %s
+              AND won IS NOT NULL
+              AND created_at > %s::TIMESTAMPTZ
+        """, (chat_id, strategy, asset, cutoff))
+
+        if not row or int(row.get("total") or 0) < 5:
+            return 1.0   # not enough data — no penalty
+
+        total    = int(row["total"])
+        wins     = int(row.get("wins") or 0)
+        win_rate = wins / total
+
+        expected = 0.65 if strategy == "SNIPE" else 0.55
+
+        if win_rate >= expected:
+            return 1.0
+        # Linear decay: at 0% win rate → 0.5 multiplier, at expected → 1.0
+        return max(0.5, win_rate / expected)
+
+    except Exception as e:
+        log.debug(f"get_alpha_trend error: {e}")
+        return 1.0
