@@ -38,7 +38,6 @@ async def full_report(client: BayseClient, chat_id: str | None = None) -> str:
 
     realized_pnl = float(pnl_data.get("realizedPnl", 0) or pnl_data.get("pnl", 0))
 
-    # Pull per-strategy stats from our own database (last 30 days)
     stats_rows = await asyncio.to_thread(database.recent_stats, chat_id, days=30) if chat_id else []
     all_time   = await asyncio.to_thread(database.all_time_stats, chat_id) if chat_id else {}
     recent     = await asyncio.to_thread(database.recent_trades, chat_id, limit=5) if chat_id else []
@@ -60,9 +59,9 @@ async def full_report(client: BayseClient, chat_id: str | None = None) -> str:
         ]
         return "\n".join(lines)
 
-    wins     = all_time.get("wins", 0)
-    losses   = all_time.get("losses", 0)
-    win_rate = all_time.get("win_rate", 0)
+    wins      = all_time.get("wins", 0)
+    losses    = all_time.get("losses", 0)
+    win_rate  = all_time.get("win_rate", 0)
     total_pnl = all_time.get("total_pnl", 0)
 
     lines += [
@@ -78,10 +77,10 @@ async def full_report(client: BayseClient, chat_id: str | None = None) -> str:
     if recent_resolved:
         wins_only = [t["pnl_ngn"] for t in recent_resolved if t["won"] == 1]
         loss_only = [abs(t["pnl_ngn"]) for t in recent_resolved if t["won"] == 0]
-        avg_win = sum(wins_only) / len(wins_only) if wins_only else 0
-        avg_loss = sum(loss_only) / len(loss_only) if loss_only else 0
-        rr_ratio = avg_win / avg_loss if avg_loss > 0 else 0
-        
+        avg_win   = sum(wins_only) / len(wins_only) if wins_only else 0
+        avg_loss  = sum(loss_only) / len(loss_only) if loss_only else 0
+        rr_ratio  = avg_win / avg_loss if avg_loss > 0 else 0
+
         lines += [
             "⚖️ *Risk-Reward (last 5 resolved)*",
             f"   Avg Win: ₦{avg_win:,.0f}  |  Avg Loss: ₦{avg_loss:,.0f}",
@@ -90,64 +89,45 @@ async def full_report(client: BayseClient, chat_id: str | None = None) -> str:
         ]
 
     # ── Per-strategy breakdown ────────────────────────────────────────────────
-    if stats_rows:
-        by_strategy: dict[str, dict] = {}
-        for r in stats_rows:
-            s = r["strategy"] or "UNKNOWN"
-            if s not in by_strategy:
-                by_strategy[s] = {"total": 0, "wins": 0, "pnl": 0.0}
-            by_strategy[s]["total"] += r["total"]
-            by_strategy[s]["wins"]  += r["wins"] or 0
-            by_strategy[s]["pnl"]   += r["total_pnl"] or 0.0
+    by_strategy: dict[str, dict] = {}
+    by_asset:    dict[str, dict] = {}
+    by_tf:       dict[str, dict] = {}
 
+    for r in stats_rows:
+        for key, bucket in [
+            (r["strategy"] or "UNKNOWN", by_strategy),
+            (r["asset"]    or "?",       by_asset),
+            (r["timeframe"]or "?",       by_tf),
+        ]:
+            if key not in bucket:
+                bucket[key] = {"total": 0, "wins": 0, "pnl": 0.0}
+            bucket[key]["total"] += r["total"]
+            bucket[key]["wins"]  += r["wins"] or 0
+            bucket[key]["pnl"]   += r["total_pnl"] or 0.0
+
+    if by_strategy:
         lines.append("📋 *Strategy Breakdown (last 30 days)*")
         for strat, d in sorted(by_strategy.items()):
-            wr  = d["wins"] / d["total"] if d["total"] else 0
-            lines.append(
-                f"   *{strat}*: {d['total']} trades, {wr:.0%} WR, ₦{d['pnl']:+,.0f}"
-            )
+            wr = d["wins"] / d["total"] if d["total"] else 0
+            lines.append(f"   *{strat}*: {d['total']} trades, {wr:.0%} WR, ₦{d['pnl']:+,.0f}")
         lines.append("")
 
-    # ── Per-asset breakdown ───────────────────────────────────────────────────
-    if stats_rows:
-        by_asset: dict[str, dict] = {}
-        for r in stats_rows:
-            a = r["asset"] or "?"
-            if a not in by_asset:
-                by_asset[a] = {"total": 0, "wins": 0, "pnl": 0.0}
-            by_asset[a]["total"] += r["total"]
-            by_asset[a]["wins"]  += r["wins"] or 0
-            by_asset[a]["pnl"]   += r["total_pnl"] or 0.0
-
+    if by_asset:
         lines.append("🪙 *Asset Breakdown (last 30 days)*")
         for asset, d in sorted(by_asset.items()):
             wr = d["wins"] / d["total"] if d["total"] else 0
-            lines.append(
-                f"   *{asset}*: {d['total']} trades, {wr:.0%} WR, ₦{d['pnl']:+,.0f}"
-            )
+            lines.append(f"   *{asset}*: {d['total']} trades, {wr:.0%} WR, ₦{d['pnl']:+,.0f}")
         lines.append("")
 
-    # ── Per-timeframe breakdown ───────────────────────────────────────────────
-    if stats_rows:
-        by_tf: dict[str, dict] = {}
-        for r in stats_rows:
-            tf = r["timeframe"] or "?"
-            if tf not in by_tf:
-                by_tf[tf] = {"total": 0, "wins": 0, "pnl": 0.0}
-            by_tf[tf]["total"] += r["total"]
-            by_tf[tf]["wins"]  += r["wins"] or 0
-            by_tf[tf]["pnl"]   += r["total_pnl"] or 0.0
-
+    if by_tf:
         lines.append("⏱ *Timeframe Breakdown (last 30 days)*")
         for tf, d in sorted(by_tf.items()):
             wr = d["wins"] / d["total"] if d["total"] else 0
-            lines.append(
-                f"   *{tf}*: {d['total']} trades, {wr:.0%} WR, ₦{d['pnl']:+,.0f}"
-            )
+            lines.append(f"   *{tf}*: {d['total']} trades, {wr:.0%} WR, ₦{d['pnl']:+,.0f}")
         lines.append("")
 
     # ── Fee drag ─────────────────────────────────────────────────────────────
-    avg_fee_drag = _estimate_fee_drag(stats_rows)
+    avg_fee_drag = 0.04 * 0.50 * 0.50  # ~1% at mid-market
     lines += [
         "💸 *Fee Analysis*",
         f"   Estimated fee drag: {avg_fee_drag:.2%} per trade",
@@ -155,32 +135,11 @@ async def full_report(client: BayseClient, chat_id: str | None = None) -> str:
         "",
     ]
 
-    # ── Execution & Comparative Analysis ─────────────────────────────────────
-    if recent:
-        filled_trades = [t for t in recent if t.get("market_price_at_entry") is not None]
-        if filled_trades:
-            avg_slip = sum((t["entry_price"] - t["market_price_at_entry"]) / t["market_price_at_entry"] for t in filled_trades) / len(filled_trades)
-            avg_poly_diff = 0.0
-            poly_count = 0
-            for t in filled_trades:
-                if t.get("poly_price_at_entry"):
-                    # Edge: how much 'cheaper' our entry was than Poly (as a % of market price)
-                    avg_poly_diff += (t["poly_price_at_entry"] - t["market_price_at_entry"]) / t["market_price_at_entry"]
-                    poly_count += 1
-            
-            lines += [
-                "🔬 *Execution & Market Intel*",
-                f"   Avg Slippage: {avg_slip:+.2%}",
-            ]
-            if poly_count > 0:
-                lines.append(f"   Avg Edge vs Poly: {avg_poly_diff/poly_count:+.2%}")
-            lines.append("")
-
     # ── Recent trades ─────────────────────────────────────────────────────────
     if recent:
         lines.append("🕐 *Last 5 Trades*")
         for t in recent:
-            result = "✅" if t.get("won") == 1 else ("❌" if t.get("won") == 0 else "⏳")
+            result  = "✅" if t.get("won") == 1 else ("❌" if t.get("won") == 0 else "⏳")
             pnl_str = f"₦{t['pnl_ngn']:+,.0f}" if t.get("pnl_ngn") is not None else "pending"
             lines.append(
                 f"   {result} {t.get('strategy','?')} {t.get('asset','?')} "
@@ -188,46 +147,34 @@ async def full_report(client: BayseClient, chat_id: str | None = None) -> str:
             )
         lines.append("")
 
-    # ── Recommendations ───────────────────────────────────────────────────────
-    lines += _recommendations(win_rate, total, total_pnl, by_strategy if stats_rows else {}, by_asset if stats_rows else {})
-
+    lines += _recommendations(win_rate, total, total_pnl, by_strategy, by_asset)
     return "\n".join(lines)
 
 
-def _estimate_fee_drag(stats_rows: list) -> float:
-    if not stats_rows:
-        return 0.02
-    # Average price across rows not available — use default variance model at p=0.50
-    return 0.04 * 0.50 * 0.50  # = 1%
-
-
-def _recommendations(win_rate: float, total: int, total_pnl: float, by_strategy: dict, by_asset: dict) -> list[str]:
+def _recommendations(win_rate, total, total_pnl, by_strategy, by_asset) -> list[str]:
     lines = ["💡 *Recommendations*"]
 
-    # Strategy-specific recommendations
     snipe = by_strategy.get("SNIPE", {})
     if snipe.get("total", 0) >= 10:
         wr = snipe["wins"] / snipe["total"]
         if wr < 0.88:
-            lines.append(f"   ⚠️ SNIPE WR too low ({wr:.0%}). Needs >87% to be profitable. Selective mode active.")
+            lines.append(f"   ⚠️ SNIPE WR too low ({wr:.0%}). Needs >87% to be profitable.")
 
     if total < 10:
-        lines.append("   - Need 30+ trades for statistical significance (keep running)")
+        lines.append("   Need 30+ trades for statistical significance.")
     elif win_rate >= 0.85 and total_pnl > 0:
-        lines.append("   - Strong performance. Risk-Reward is healthy.")
+        lines.append("   Strong performance. Risk-Reward is healthy.")
     elif total_pnl < 0:
-        lines.append("   - In drawdown. The bot is now in 'Selective' mode to protect capital.")
+        lines.append("   In drawdown. Bot is in Selective mode to protect capital.")
 
-    # Flag any strategy with a losing record
     for strat, d in by_strategy.items():
         if d["total"] >= 5 and d["pnl"] < 0:
             wr = d["wins"] / d["total"]
-            lines.append(f"   ⚠️ {strat} strategy losing (₦{d['pnl']:+,.0f}, {wr:.0%} WR) — consider disabling")
+            lines.append(f"   ⚠️ {strat} losing (₦{d['pnl']:+,.0f}, {wr:.0%} WR) — consider /set strategies")
 
-    # Flag any asset with a losing record
     for asset, d in by_asset.items():
         if d["total"] >= 5 and d["pnl"] < 0:
             wr = d["wins"] / d["total"]
-            lines.append(f"   ⚠️ {asset} asset losing (₦{d['pnl']:+,.0f}, {wr:.0%} WR) — consider disabling: /set assets BTC SOL")
+            lines.append(f"   ⚠️ {asset} losing (₦{d['pnl']:+,.0f}, {wr:.0%} WR) — consider /set assets")
 
     return lines
