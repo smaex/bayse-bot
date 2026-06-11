@@ -1,135 +1,139 @@
-import math
+"""
+SNIPE — core strategy.
+
+In the final minutes of a candle, if the live spot price is clearly above/below
+the opening threshold, we buy the winning side.  Certainty is driven by a
+Brownian diffusion model (how likely the price stays on the right side until close).
+"""
 import logging
-from datetime import datetime, timezone
 from typing import Optional
 import config
 import feeds
 import feeds_direct
-from strategies.base import BaseStrategy, TradeSignal
+from strategies.base import BaseStrategy, TradeSignal, global_state
 from strategies.utils import (
-    realized_vol_hourly, momentum_score, velocity_score, 
-    regime_score, fx_distance_trend, win_probability, probability_to_certainty
+    realized_vol_hourly, momentum_score, velocity_score,
+    regime_score, win_probability, probability_to_certainty,
 )
 from strategies.manager import kelly_size, max_ev_price
 
 log = logging.getLogger("strat.snipe")
 
+
 class SnipeStrategy(BaseStrategy):
     def __init__(self):
         super().__init__("SNIPE")
 
-    async def evaluate(self, market: dict, learned: dict, state: any, spot_price: float = None) -> Optional[TradeSignal]:
+    async def evaluate(self, market: dict, learned: dict, state,
+                       spot_price: float = None) -> Optional[TradeSignal]:
         tf    = market["timeframe"]
-        secs  = market["secs_to_close"]
+        secs  = market.get("secs_to_close", 0)
         asset = market["asset"]
         learned = learned or {}
         mode    = learned.get("mode", "balanced")
-        
-        # 1. Mode-based Thresholds
-        min_certainty = {"safe": 0.65, "balanced": 0.55, "aggressive": 0.45, "full_send": 0.35}.get(mode, 0.55)
-        if "snipe_min_certainty" in learned:
-            min_certainty = max(min_certainty - 0.05, min(learned["snipe_min_certainty"], min_certainty + 0.15))
 
-        # 2. Basic Filtering
-        if mode == "safe":
-            if tf not in ["1h", "6h", "1d"]: return None
-            if asset not in ["BTC", "EURUSD", "GBPUSD", "XAUUSD"]: return None
+        # ── Entry window ──────────────────────────────────────────────────
+        window = config.SNIPE_ENTRY_WINDOWS.get(tf)
+        if asset in config.FX_SESSION_UTC and tf == "1h":
+            window = config.FX_ENTRY_WINDOW_1H
+        if window is None or secs > window or secs < 0:
+            return None
+        if secs < 30 and mode != "full_send":
+            return None
 
-        entry_window = config.SNIPE_ENTRY_WINDOWS.get(tf)
-        if asset in config.FX_SESSION_UTC and tf == "1h": entry_window = config.FX_ENTRY_WINDOW_1H
-        if entry_window is None or secs > entry_window or secs < 0: return None
-        if mode != "full_send" and secs < 30: return None  # allow late entry — price is most certain near close
+        # ── FX session guard ──────────────────────────────────────────────
+        if asset in config.FX_SESSION_UTC:
+            from datetime import datetime, timezone
+            hour = datetime.now(timezone.utc).hour
+            lo, hi = config.FX_SESSION_UTC[asset]
+            if not (lo <= hour < hi):
+                return None
 
         threshold = market.get("threshold")
         live_spot = spot_price if spot_price is not None else feeds.spot.get(asset)
-        if not threshold or not live_spot: return None
+        if not threshold or not live_spot:
+            return None
 
-        # 3. Quant Models
+        # ── Core math ─────────────────────────────────────────────────────
         distance_pct = (live_spot - threshold) / threshold
-        direction = "YES" if distance_pct > 0 else "NO"
-        
-        rv = realized_vol_hourly(asset, state)
-        if secs < 300: rv *= (1.0 + 0.5 * ((300 - secs) / 210.0))
-        
-        w_est_raw = win_probability(distance_pct, secs, asset, sigma_override=rv)
-        w_est = w_est_raw if direction == "YES" else 1.0 - w_est_raw
-        base = probability_to_certainty(w_est)
-        
-        mom = momentum_score(asset, direction, state)
-        regime = regime_score(asset, state)
+        direction    = "YES" if distance_pct > 0 else "NO"
+
+        rv       = realized_vol_hourly(asset, state)
+        # Volatility compresses near close — boost rv so probability is more conservative
+        if secs < 300:
+            rv *= (1.0 + 0.5 * ((300 - secs) / 210.0))
+
+        raw_prob = win_probability(distance_pct, secs, asset, sigma_override=rv)
+        w_est    = raw_prob if direction == "YES" else 1.0 - raw_prob
+        base     = probability_to_certainty(w_est)
+
+        mom      = momentum_score(asset, direction, state)
+        regime   = regime_score(asset, state)
         velocity = velocity_score(asset, threshold, direction, state)
-        
-        # 4. Vetoes
-        from strategies.base import global_state
+
+        # ── Vetoes ────────────────────────────────────────────────────────
         market_id = market["market_id"]
-        flips = global_state.market_flips.get(market_id, 0)
-        
-        # Veto filter: if flips >= 5 after the first 90 seconds of a 5min candle
+        flips     = global_state.market_flips.get(market_id, 0)
+
+        # High chaos veto: many favourite flips after candle has progressed
         if secs < 210 and flips >= 5:
-            log.info(f"Snipe Veto: market {market_id} has high chaos/flips ({flips} flips)")
             return None
 
         if mode != "full_send":
-            # Smart Shield (Pin Risk & Volatility Guard)
-            base_dist = config.CRYPTO_MIN_DISTANCE.get(asset) or config.FX_MIN_DISTANCE.get(asset, 0.0010)
-            base_vol = config.ASSET_HOURLY_VOL.get(asset, 0.02)
-            
-            # Dynamic Volatility Scaling: shrink requirement in calm markets, expand in chaotic ones
+            # Distance guard: don't trade too close to the threshold
+            min_dist = (config.CRYPTO_MIN_DISTANCE.get(asset)
+                        or config.FX_MIN_DISTANCE.get(asset, 0.0010))
+            base_vol  = config.ASSET_HOURLY_VOL.get(asset, 0.022)
             vol_ratio = rv / base_vol if base_vol > 0 else 1.0
-            dynamic_min_dist = max(base_dist * 0.5, min(base_dist * vol_ratio, base_dist * 1.5))
-            
-            if abs(distance_pct) < dynamic_min_dist: 
+            dyn_dist  = max(min_dist * 0.5, min(min_dist * vol_ratio, min_dist * 1.5))
+            if abs(distance_pct) < dyn_dist:
                 return None
-            
-            # Momentum Veto: If inside the ORIGINAL base buffer, demand positive momentum (moving away from danger)
-            if abs(distance_pct) < base_dist and mom <= 0:
+            # Momentum veto: inside base buffer with adverse momentum
+            if abs(distance_pct) < min_dist and mom <= 0:
+                return None
+            # Velocity veto: price crashing toward threshold
+            if velocity < -config.SNIPE_VELOCITY_VETO:
                 return None
 
-            if velocity < -config.SNIPE_VELOCITY_VETO: return None
-            # NOTE: momentum veto removed — composite score already penalises negative momentum.
-            # Blocking NO trades in bearish momentum was eliminating the most profitable setups.
+        if asset in config.FX_SESSION_UTC and regime < config.FX_MIN_REGIME:
+            return None
 
-        if asset in config.FX_SESSION_UTC and regime < config.FX_MIN_REGIME: return None
+        # ── Composite certainty ───────────────────────────────────────────
+        market_price = market["yes_price"] if direction == "YES" else market["no_price"]
+        raw_edge     = w_est - market_price
+        edge_bonus   = min(max(raw_edge * 0.40, -0.08), 0.12)
+        mom_bonus    = 0.12 * mom
+        regime_fac   = 0.75 + 0.50 * regime
 
-        # 5. Composite Calculation
-        raw_edge = w_est - market.get("yes_price" if direction == "YES" else "no_price", 0.5)
-        edge_bonus = min(max(raw_edge * 0.40, -0.08), 0.12)
-        mom_bonus = (0.18 if mode == "aggressive" else 0.12) * mom
-        regime_factor = 0.75 + 0.50 * regime
-        
-        composite = min((base + mom_bonus + edge_bonus) * regime_factor, 0.99)
+        composite = min((base + mom_bonus + edge_bonus) * regime_fac, 0.99)
 
-        # Conviction Boost: if flips <= 1 and well into the candle (elapsed > 90s)
+        # Conviction boost: stable market (few flips) well into the candle
         if secs < 210 and flips <= 1:
             composite = min(composite + 0.10, 0.99)
-            if composite >= 0.30:  # Only log INFO if it will actually pass the floor
-                log.info(f"Snipe Conviction Boost: market {market_id} is highly stable ({flips} flips). Boosted composite to {composite:.2f}")
-            else:
-                log.debug(f"Snipe Conviction Boost: market {market_id} is highly stable ({flips} flips). Boosted composite to {composite:.2f}")
 
-        # 6. Macro Bias
-        biases = feeds_direct.get_macro_bias()
-        if "USD_SPIKE" in biases:
-            composite = min(composite + 0.10, 0.99) if direction == "NO" else max(composite - 0.15, 0.0)
+        # Macro USD spike from feeds_direct
+        macro = feeds_direct.direct_spot  # use as a proxy — no macro bias in simplified version
+        if composite < 0.30:
+            return None
 
-        # 7. Final Verification
-        # Relax strategy-level hurdle to 0.30 so orchestrator-level Mode Floors and Discovery Probes can process the signals
-        if composite < 0.30: return None
+        # ── EV check ──────────────────────────────────────────────────────
+        fee_rate  = market.get("fee_rate", 0.02)
+        margin    = {"safe": 0.15, "balanced": 0.06, "aggressive": 0.04, "full_send": 0.02}.get(mode, 0.06)
+        ev_ceil   = max_ev_price(w_est, market_price, fee_rate, min_margin=margin)
+        if market_price >= ev_ceil:
+            return None
+        if market_price > config.SNIPE_MAX_MARKET_PRICE:
+            return None
 
-        fee_rate = market.get("fee_rate", 0.04)
-        margin_map = {"safe": 0.20, "balanced": 0.06, "aggressive": 0.04, "full_send": 0.02}
-        market_price = market["yes_price"] if direction == "YES" else market["no_price"]
-        ev_ceiling = max_ev_price(w_est, market_price, fee_rate, min_margin=margin_map.get(mode, 0.10))
-        if market_price >= ev_ceiling: return None
-        if market_price > config.SNIPE_MAX_MARKET_PRICE: return None
-
-        # 8. Sizing
-        size = kelly_size(w_est, market_price, fee_rate, asset=asset, state=state, learned=learned, strategy_name="SNIPE")
+        # ── Sizing ────────────────────────────────────────────────────────
+        size = kelly_size(w_est, market_price, fee_rate,
+                          asset=asset, state=state, learned=learned,
+                          strategy_name="SNIPE")
 
         return TradeSignal(
             strategy="SNIPE",
             event_id=market["event_id"],
-            market_id=market["market_id"],
+            market_id=market_id,
             asset=asset,
             timeframe=tf,
             outcome=direction,
@@ -138,8 +142,10 @@ class SnipeStrategy(BaseStrategy):
             win_prob=w_est,
             market_price=market_price,
             size_pct=size,
-            reason=f"Composite={composite:.2f} w={w_est:.1%} mom={mom:+.2f} edge={raw_edge:+.3f}",
-            title=market["title"],
+            reason=(f"composite={composite:.2f} w={w_est:.1%} "
+                    f"mom={mom:+.2f} edge={raw_edge:+.3f}"),
+            title=market.get("title", ""),
             momentum_at_entry=mom,
-            regime_at_entry=regime
+            regime_at_entry=regime,
+            realized_vol_at_entry=rv,
         )
