@@ -40,6 +40,10 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+# ── Ghost killer — must run before Telegram polling starts ────────────────────
+import ghost_kill
+ghost_kill.kill_ghosts()
+
 log = logging.getLogger("bot")
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -491,7 +495,7 @@ async def main():
 
     async def _lock_heartbeat():
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(12)
             if not await asyncio.to_thread(database.heartbeat_singleton_lock):
                 log.critical("Lost singleton lock — self-terminating.")
                 os._exit(1)
@@ -510,7 +514,7 @@ async def main():
     # Kill ghost Telegram polling sessions
     try:
         await _tg_app.bot.set_webhook(url="https://google.com/unused-kick")
-        await asyncio.sleep(5)
+        await asyncio.sleep(12)
         await _tg_app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         log.warning(f"Telegram ghost kick: {e}")
