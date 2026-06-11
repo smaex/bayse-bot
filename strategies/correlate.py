@@ -1,8 +1,8 @@
 """
 CORRELATE — BTC lead-lag signal.
 
-BTC often reprices before ETH/SOL adjust.  When BTC's market price moves
-≥0.35%, we trade ETH or SOL in the same direction within 3 minutes.
+BTC often reprices before ETH/SOL adjust. When BTC's market price moves
+>=0.35%, we trade ETH or SOL in the same direction within 3 minutes.
 """
 import time
 import logging
@@ -26,16 +26,14 @@ class CorrelateStrategy(BaseStrategy):
                        spot_price: float = None) -> Optional[TradeSignal]:
         asset = market["asset"]
         if asset not in {"ETH", "SOL"}:
-            return None   # CORRELATE only trades the followers, not BTC itself
+            return None
 
         tf        = market["timeframe"]
         threshold = config.CORRELATION_THRESHOLD
 
-        # Check BTC spot move
         spot_move, spot_dir = btc_spot_move_pct(config.CORRELATION_WINDOW_SEC, state=state)
 
         if spot_move < threshold:
-            # Fallback to market-price signal
             sig_time = getattr(state, "btc_signal_time", {}).get(tf)
             if not sig_time:
                 return None
@@ -44,8 +42,8 @@ class CorrelateStrategy(BaseStrategy):
                 return None
             if getattr(state, "btc_signal_move", {}).get(tf, 0.0) < threshold:
                 return None
-            direction  = getattr(state, "btc_signal_direction", {}).get(tf)
-            freshness  = 1.0 - (age / config.CORRELATION_WINDOW_SEC)
+            direction = getattr(state, "btc_signal_direction", {}).get(tf)
+            freshness = 1.0 - (age / config.CORRELATION_WINDOW_SEC)
         else:
             direction = spot_dir
             freshness = 1.0
@@ -53,12 +51,10 @@ class CorrelateStrategy(BaseStrategy):
         if not direction:
             return None
 
-        # Time guard — need enough candle left for the move to play out
         secs = market.get("secs_to_close", 0)
         if secs < 300:
             return None
 
-        # Target alignment guard — don't buy YES if spot already below threshold
         tgt_thresh = market.get("threshold")
         tgt_spot   = spot_price if spot_price is not None else feeds.spot.get(asset)
         if tgt_thresh and tgt_spot:
@@ -80,16 +76,19 @@ class CorrelateStrategy(BaseStrategy):
         if mom < -0.4:
             return None
 
-        certainty = min(config.CORRELATE_BASE_CERTAINTY * freshness * (1.0 + 0.20 * mom), 0.99)
-        w_est     = certainty_to_prob(certainty)
-        fee_rate  = market.get("fee_rate", 0.02)
-        ev_ceil   = max_ev_price(w_est, mkt_price, fee_rate)
+        certainty = min(
+            config.CORRELATE_BASE_CERTAINTY * freshness * (1.0 + 0.20 * mom), 0.99
+        )
+        w_est    = certainty_to_prob(certainty)
+        fee_rate = market.get("fee_rate", 0.02)
+        ev_ceil  = max_ev_price(w_est, mkt_price, fee_rate)
         if mkt_price >= ev_ceil:
             return None
 
-        size = kelly_size(w_est, mkt_price, fee_rate,
-                          asset=asset, state=state, learned=learned,
-                          strategy_name="CORRELATE")
+        raw_edge = w_est - mkt_price
+        size     = kelly_size(w_est, mkt_price, fee_rate,
+                              asset=asset, state=state, learned=learned,
+                              strategy_name="CORRELATE")
 
         return TradeSignal(
             strategy="CORRELATE",
@@ -107,4 +106,5 @@ class CorrelateStrategy(BaseStrategy):
             title=market.get("title", ""),
             momentum_at_entry=mom,
             regime_at_entry=regime,
+            edge_at_entry=raw_edge,
         )
