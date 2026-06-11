@@ -19,16 +19,14 @@ class RiskManager:
         self.daily_realized_pnl: float = 0.0
         self.last_reset_date: str = ""
         self.probation_trades_left: int = 0
-        self.pending_markets: set[str] = set() # market_id lock during execution
+        self.pending_markets: set[str] = set()  # market_id lock during execution
 
     @property
     def target_hit(self) -> bool:
-        """Returns True if the daily profit target has been reached."""
         return self.daily_target > 0 and self.peak_balance >= self.daily_target
 
     @property
     def max_drawdown_hit(self) -> bool:
-        """Returns True if the bot is currently paused due to drawdown."""
         return self.paused
 
     def update_peak(self, balance: float):
@@ -36,7 +34,6 @@ class RiskManager:
             self.peak_balance = balance
 
     def reset_daily_if_needed(self):
-        """Reset daily PnL tracker at midnight UTC."""
         import datetime
         today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         if self.last_reset_date != today:
@@ -45,7 +42,6 @@ class RiskManager:
             self.last_reset_date = today
 
     def update_balance(self, balance: float):
-        """Unified update for peak tracking and drawdown checks."""
         self.update_peak(balance)
         self.check_drawdown(balance)
 
@@ -80,10 +76,7 @@ class RiskManager:
         return True
 
     def is_in_strict_mode(self) -> bool:
-        """
-        Returns True if we have hit 80% of our daily target.
-        In strict mode, we only take 'God Tier' signals.
-        """
+        """Returns True if we have hit 80% of our daily target — only take high-conviction signals."""
         self.reset_daily_if_needed()
         if self.daily_target > 0:
             if self.daily_realized_pnl >= self.daily_target * 0.8:
@@ -96,7 +89,6 @@ class RiskManager:
     def add_pnl(self, pnl: float):
         self.daily_realized_pnl += pnl
         if pnl < 0:
-            # Entering probation after a loss: next 2 trades are at 25% size
             self.probation_trades_left = 2
             log.warning(f"Risk Manager: Entering PROBATION for next 2 trades after loss of ₦{abs(pnl):,.0f}")
         elif pnl > 0 and self.probation_trades_left > 0:
