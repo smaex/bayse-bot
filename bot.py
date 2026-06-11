@@ -479,7 +479,7 @@ async def main():
     log.info("=== Bayse Bot Starting ===")
     database.init_db()
 
-    asyncio.create_task(server.start_server(8080))
+    asyncio.create_task(server.start_server(port=8080))
     asyncio.create_task(_self_ping_loop())
 
     # Ghost shield — force acquire singleton lock
