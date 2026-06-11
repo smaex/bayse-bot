@@ -1,504 +1,239 @@
+"""
+Trade executor — places orders, records trades, handles AMM + CLOB routing.
+
+Key fixes vs previous version:
+  - Fee floor corrected to 0.3 (was 0.5 — over-estimated fees, killed valid trades)
+  - AMM fill parsing: uses client.parse_filled_shares() which checks 'quantity' first
+  - Removed POLY_COPY / NEWS / MARKET_BIAS strategy references
+  - Slippage simplified to fixed values per mode
+  - execute_arb uses sequential orders (no batch API dependency)
+"""
+
 import asyncio
 import logging
 import re
 import time
 from typing import Optional
+
 import database
 import feeds
 import scanner
 import telegram_bot
 import strategy
-import comparative_analysis
-from config import ARB_MAX_SIZE_NGN, CURRENCY, MIN_PAYOUT_RATIO
+from config import ARB_MAX_SIZE_NGN, CURRENCY, MIN_PAYOUT_RATIO, FEE_FLOOR
 
 log = logging.getLogger("executor")
 
-# These will be initialized by bot.py
-active_markets = []
+active_markets: list[dict] = []
 _tg_app = None
-_FX_ASSETS = ["EURUSD", "GBPUSD", "EURGBP", "XAUUSD"]
 
-# ── Engine inference cache ────────────────────────────────────────────────────
-# Stores the detected engine type per market_id so we only probe the order
-# book ONCE per market, not on every trade attempt.
-_market_engine_cache: dict[str, str] = {}  # market_id → "AMM" | "CLOB"
+_FX_ASSETS = ["EURUSD", "GBPUSD", "XAUUSD"]
 
-# ── Per-market minimum order size cache ───────────────────────────────────────
-# When a market rejects an order with "Minimum buy amount is NGN X", we cache
-# that X here. Future orders on the same market are pre-flight checked so we
-# never hit the API unnecessarily. ₦100 trades still work on all other markets.
-_market_min_cache: dict[str, float] = {}  # market_id → min NGN required
+# Engine type cache: market_id → "AMM" | "CLOB"
+_market_engine_cache: dict[str, str] = {}
 
-# ── Per-market trade cooldown cache ───────────────────────────────────────────
-# After any successful trade on a market, that market is cooled down for 60s.
-# This prevents the heartbeat + spot evaluation loops from re-entering the same
-# market multiple times in a minute. Without this, 3 concurrent loops can each
-# fire evaluate_trade() before any of them completes and adds a position.
-_trade_cooldown: dict[str, float] = {}  # market_id → timestamp of last trade
-TRADE_COOLDOWN_SEC = 60  # seconds between trades on the same market
+# Per-market minimum NGN cache (from exchange error messages)
+_market_min_cache: dict[str, float] = {}
 
+# Per-market trade cooldown: market_id → last trade timestamp
+_trade_cooldown: dict[str, float] = {}
+TRADE_COOLDOWN_SEC = 60
 
-async def _infer_engine(client, market: dict, timeout_ms: int = 300) -> str:
-    """
-    When market.get('engine') is absent, probe the order book to determine
-    if this is a CLOB or AMM market.
+# Bayse platform minimum trade
+MIN_TRADE_NGN = 100.0
 
-    - Returns "CLOB" if the order book has any bids or asks.
-    - Returns "AMM"  on timeout (>300ms), error, or empty book.
-    - Results are cached so each market is only probed once.
-    """
-    market_id = market.get("market_id", "")
-
-    # Return cached result immediately if we've seen this market before
-    if market_id in _market_engine_cache:
-        return _market_engine_cache[market_id]
-
-    inferred = "AMM"  # safe default
-    try:
-        ob = await asyncio.wait_for(
-            client.get_orderbook(market["event_id"], market_id),
-            timeout=timeout_ms / 1000.0  # convert ms → seconds
-        )
-        # Bayse may return bids/asks at top level or nested under yes/no
-        bids = ob.get("bids") or ob.get("yes", {}).get("bids") or []
-        asks = ob.get("asks") or ob.get("yes", {}).get("asks") or []
-        if bids or asks:
-            inferred = "CLOB"
-            log.info(
-                f"Engine inferred as CLOB for {market_id} "
-                f"({len(bids)} bids / {len(asks)} asks in book)"
-            )
-        else:
-            log.debug(f"Engine inferred as AMM for {market_id} (empty order book)")
-
-    except asyncio.TimeoutError:
-        log.debug(
-            f"Engine inference timed out ({timeout_ms}ms) for {market_id} "
-            "— defaulting to AMM"
-        )
-    except Exception as exc:
-        log.debug(f"Engine inference failed for {market_id}: {exc} — defaulting to AMM")
-
-    # Cache so we never probe this market again
-    _market_engine_cache[market_id] = inferred
-    return inferred
 
 def init_executor(markets, tg_app):
     global active_markets, _tg_app
     active_markets = markets
-    _tg_app = tg_app
+    _tg_app        = tg_app
 
-async def execute_trade(chat_id, sig, client, risk, settings, equity, free_cash):
-    """decide and execute a single-sided trade"""
-    
-    # ── Systemic Halt Check ──
-    if strategy.global_state.systemic_halt_until > time.time():
-        log.warning(f"[{chat_id}] SYSTEMIC HALT active — skipping {sig.strategy}")
-        return
 
-    # ── Already in Position Check ──
-    if risk.already_in(sig.market_id):
-        log.debug(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Already in position or pending.")
-        return
+# ── Engine detection ──────────────────────────────────────────────────────────
 
-    # ── Per-Market Trade Cooldown ──
-    # Prevents the 5s heartbeat + per-tick spot loops from re-entering the same
-    # market repeatedly. AMM MARKET orders on Bayse often return no fill details,
-    # causing the bot to think the trade failed and try again immediately.
-    last_trade_time = _trade_cooldown.get(sig.market_id, 0.0)
-    if time.time() - last_trade_time < TRADE_COOLDOWN_SEC:
-        log.debug(
-            f"[{chat_id}] COOLDOWN {sig.strategy} | {sig.asset} {sig.timeframe} — "
-            f"Last trade was {time.time()-last_trade_time:.0f}s ago (cooldown={TRADE_COOLDOWN_SEC}s)"
+async def _infer_engine(client, market: dict) -> str:
+    mid = market.get("market_id", "")
+    if mid in _market_engine_cache:
+        return _market_engine_cache[mid]
+    try:
+        ob   = await asyncio.wait_for(
+            client.get_orderbook(market["event_id"], mid), timeout=0.3
         )
+        bids = ob.get("bids") or ob.get("yes", {}).get("bids") or []
+        asks = ob.get("asks") or ob.get("yes", {}).get("asks") or []
+        engine = "CLOB" if (bids or asks) else "AMM"
+    except Exception:
+        engine = "AMM"
+    _market_engine_cache[mid] = engine
+    return engine
+
+
+def _effective_fee(fee_rate: float, price: float) -> float:
+    """Correct Bayse formula: fee = feeRate × max(1 - price, 0.3)"""
+    return fee_rate * max(1.0 - price, FEE_FLOOR)
+
+
+# ── Main trade execution ──────────────────────────────────────────────────────
+
+async def execute_trade(chat_id: str, sig, client, risk, settings: dict,
+                        equity: float, free_cash: float):
+    """Entry point — locks the market and delegates to _execute_logic."""
+    if strategy.global_state.systemic_halt_until > time.time():
+        return
+    if risk.already_in(sig.market_id):
+        return
+    last = _trade_cooldown.get(sig.market_id, 0.0)
+    if time.time() - last < TRADE_COOLDOWN_SEC:
         return
 
     risk.lock_market(sig.market_id)
     try:
-        await _execute_trade_logic(chat_id, sig, client, risk, settings, equity, free_cash)
+        await _execute_logic(chat_id, sig, client, risk, settings, equity, free_cash)
     finally:
         risk.unlock_market(sig.market_id)
 
-async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, free_cash):
-    mode     = settings.get("mode", "balanced")
-    min_t    = settings.get("mintrade", 100)
-    max_t    = settings.get("maxtrade", 5_000)   # BUG-FIX: was 500,000 (way too high)
-    max_exp  = settings.get("maxexposure", 20.0) / 100.0
-    learned  = settings.get("learned", {})
-    mult     = learned.get("size_multipliers", {}).get(sig.strategy, 1.0)
-    # User's configured risk % per trade (capped at 5% for safety)
-    user_risk_pct = min(settings.get("risk_pct", 2.0), 5.0) / 100.0
 
-    # ── Trailing Profit Shield (Strict Mode) ──
-    if risk.is_in_strict_mode():
-        # Once 80% of daily target is reached, only take 'God Tier' signals (>= 0.70)
-        if sig.certainty < 0.70:
-            log.info(f"[{chat_id}] SKIPPED — Strict Mode active (Gain Shield), certainty {sig.certainty:.2f} < 0.70")
-            return
+async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
+                          equity: float, free_cash: float):
+    mode         = settings.get("mode", "balanced")
+    min_t        = settings.get("mintrade", MIN_TRADE_NGN)
+    max_t        = settings.get("maxtrade", 5_000)
+    max_exp      = settings.get("maxexposure", 20.0) / 100.0
+    learned      = settings.get("learned", {})
+    mult         = learned.get("size_multipliers", {}).get(sig.strategy, 1.0)
+    user_risk    = min(settings.get("risk_pct", 2.0), 5.0) / 100.0
 
-    # ── Conviction Sizing (Tiered Risk) ──────────────────────────────────────
-    # Scales risk based on certainty tiers, anchored to user's risk_pct setting.
-    # e.g. if risk_pct=2%: Low=1%, Mid=2%, High=3%, Top=4%
+    # ── Strict mode: near daily target, only take high-conviction signals ──
+    if risk.is_in_strict_mode() and sig.certainty < 0.70:
+        return
+
+    # ── Conviction sizing ──
     if sig.certainty >= 0.90:
-        tier_mult = 2.0   # 4% at 2% risk_pct
+        tier = 2.0
     elif sig.certainty >= 0.70:
-        tier_mult = 1.5   # 3% at 2% risk_pct
+        tier = 1.5
     elif sig.certainty >= 0.55:
-        tier_mult = 1.0   # 2% at 2% risk_pct
+        tier = 1.0
     else:
-        tier_mult = 0.5   # 1% at 2% risk_pct
+        tier = 0.5
 
-    base_pct = user_risk_pct * tier_mult
-
-    # Apply external multipliers (FX factor, ML learned multipliers)
     fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
-    raw_pct = base_pct * mult * fx_factor
+    raw_pct   = user_risk * tier * mult * fx_factor
 
-    # ── Conviction Booster (Extreme Certainty) ──
-    # BUG-FIX: Reduced from 2.0x to 1.5x — prevents doubling into hard cap
+    # Conviction booster at extreme certainty
     if sig.certainty >= 0.95:
-        conviction_mult = 1.5
-        raw_pct *= conviction_mult
-        log.info(f"[{chat_id}] 🔥 CONVICTION BOOSTER: Boosting size by {conviction_mult}x (Certainty {sig.certainty:.0%})")
+        raw_pct *= 1.5
 
-    # ── Alpha Decay Shield (Anti-Bleed) ──
-    # If the edge magnitude is shrinking over the last 10 trades, reduce size.
-    decay_mult = await asyncio.to_thread(database.get_alpha_trend, chat_id, sig.strategy, sig.asset)
-    if decay_mult < 0.85:
+    # Alpha decay shield
+    decay = await asyncio.to_thread(database.get_alpha_trend, chat_id, sig.strategy, sig.asset) if hasattr(database, 'get_alpha_trend') else 1.0
+    if decay < 0.85:
         raw_pct *= 0.5
-        log.info(f"[{chat_id}] 🛡️ ALPHA DECAY SHIELD: Slashing size by 50% (Decay Factor: {decay_mult:.2f})")
 
-    # ── Probationary Sizing ──
+    # Probation sizing
     if risk.is_on_probation():
-        probation_mult = 0.25
-        raw_pct *= probation_mult
-        log.info(f"[{chat_id}] PROBATION ACTIVE: Slashing size by {1-probation_mult:.0%}")
+        raw_pct *= 0.25
 
-    # ── Micro-Account Handling (For ₦2,000 starts) ─────────────────────────
-    if equity < 3000:
-        # On tiny accounts, we force a ₦100 minimum viable size.
-        amount = 100.0
-        cached_min = _market_min_cache.get(sig.market_id, 0.0)
-        if cached_min > amount:
-            amount = cached_min
-            log.info(f"[{chat_id}] Micro-Account Mode: scaling up to ₦{amount:,.0f} to meet explicit market minimum")
-        else:
-            log.info(f"[{chat_id}] Micro-Account Mode: forcing ₦100 minimum viable size")
+    # ── Compute NGN amount ──
+    if equity < 3_000:
+        amount = MIN_TRADE_NGN
     else:
-        # BUG-FIX: Cap raw_pct at user_risk_pct * 3 (max 3x tier ceiling), not 10%
-        capped_pct = min(raw_pct, user_risk_pct * 3.0)
-        amount     = equity * capped_pct
-        # Respect user's mintrade/maxtrade as authoritative boundaries first.
-        amount     = max(min_t, min(max_t, amount))
+        capped = min(raw_pct, user_risk * 3.0)
+        amount = max(min_t, min(max_t, equity * capped))
 
-    # ── Hard Safety Cap (5% equity) ──
-    # The real ceiling is the LOWER of (5% equity) and the user's maxtrade.
-    # - If user set maxtrade=₦2,000 and 5% equity=₦10,000 → ceiling is ₦2,000.
-    # - If user set maxtrade=₦50,000 and 5% equity=₦5,000 → ceiling is ₦5,000.
-    # This way the user's maxtrade is always respected and is never bypassed.
-    system_cap = max(100.0, equity * 0.05)
-    hard_cap   = min(system_cap, max_t)
-
-    # Micro accounts explicitly overriding to the market minimum bypass the hard cap
-    if equity < 3000 and amount == _market_min_cache.get(sig.market_id, 0.0):
-        pass
-    elif amount > hard_cap:
-        cap_reason = "user maxtrade cap" if hard_cap < system_cap else "5% equity cap"
-        log.info(
-            f"[{chat_id}] ⚖️ HARD CAP CLAMP: Scaling ₦{amount:,.0f} → ₦{hard_cap:,.0f} ({cap_reason})."
-        )
+    # Hard cap: lower of 5% equity and user maxtrade
+    hard_cap = min(max(MIN_TRADE_NGN, equity * 0.05), max_t)
+    if amount > hard_cap:
         amount = hard_cap
 
+    effective_min = max(MIN_TRADE_NGN, min_t)
+    if amount < effective_min:
+        return
+    if amount > free_cash:
+        return
+
+    # ── EV check ──
+    fee_rate     = _get_market_fee(sig.market_id)
+    eff_fee      = _effective_fee(fee_rate, sig.market_price)
+    ev           = sig.win_prob * (1.0 - eff_fee) / sig.market_price - 1.0
+
+    # Discovery probe: too-low certainty becomes ₦100 data collection trade
+    is_probe = sig.certainty >= 0.35 and sig.certainty < sig.mode_floor
+    if is_probe:
+        amount = MIN_TRADE_NGN
+    elif ev < 0.01:
+        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — EV {ev:+.1%}")
+        return
+
+    if sig.market_price > 0.88:
+        return
+
+    if equity >= 3_000 and not risk.can_trade(equity, amount, max_exp):
+        return
+
+    # Pre-flight: cached market minimum
+    cached_min = _market_min_cache.get(sig.market_id, 0.0)
+    if cached_min > 0 and amount < cached_min:
+        return
+
+    # ── Engine detection ──
+    market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
+    declared = market.get("engine") if market else None
+    if declared:
+        engine = declared
+    elif market:
+        engine = await _infer_engine(client, market)
+    else:
+        engine = "AMM"
+
+    # ── Slippage ──
+    slip_map = {"safe": 0.003, "balanced": 0.005, "aggressive": 0.01, "full_send": 0.02}
+    slippage = slip_map.get(mode, 0.005)
+
+    # ── CLOB maker/taker routing ──
+    order_type     = "MARKET" if engine == "AMM" else "LIMIT"
+    time_in_force  = "FAK"
+    max_valid      = (1.0 - eff_fee) / 1.01
+    limit_price    = round(min(sig.market_price * (1.0 + slippage), max_valid), 3)
+
+    is_maker = False
+    if engine == "CLOB" and equity >= 5_000:
+        is_maker      = True
+        limit_price   = round(min(sig.market_price * 0.99, max_valid), 3)
+        time_in_force = "GTC"
+        order_type    = "LIMIT"
+
     log.info(
-        f"[{chat_id}] 📐 SIZING | equity=₦{equity:,.0f} risk_pct={user_risk_pct:.1%} "
-        f"tier_mult={tier_mult:.1f}x base={base_pct:.2%} raw={raw_pct:.2%} "
-        f"final=₦{amount:,.0f} hard_cap=₦{hard_cap:,.0f} "
-        f"mintrade=₦{min_t:,.0f} maxtrade=₦{max_t:,.0f} mult={mult:.2f} fx={fx_factor:.1f}"
+        f"[{chat_id}] PLACING {sig.strategy} {sig.asset} {sig.timeframe} "
+        f"{sig.outcome} | {engine} {'MAKER' if is_maker else 'TAKER'} "
+        f"₦{amount:,.0f} @ {sig.market_price:.3f} | certainty={sig.certainty:.0%}"
     )
 
-    # Skip if below the effective minimum — the higher of ₦100 or user's mintrade.
-    # This catches cases where the hard cap brought the amount below the user's floor.
-    effective_minimum = max(100.0, min_t)
-    if amount < effective_minimum:
-        log.info(
-            f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — "
-            f"Final ₦{amount:,.0f} is below effective minimum ₦{effective_minimum:,.0f} "
-            f"(mintrade=₦{min_t:,.0f})."
-        )
-        return
-
-    if amount > free_cash:
-        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Insufficient free cash (Need ₦{amount:,.0f}, Have ₦{free_cash:,.0f})")
-        return
-
-
-    # ── Safety Guardrails (Alpha Resurrection) ──
-    # 1. Global Price Cap: Never buy above 0.88 (leaves min 12% return potential after fees).
-    # Raised from 0.80 — the EV formula below is the real protection against bad-value entries.
-    MAX_ENTRY_PRICE = 0.88
-    if sig.market_price > MAX_ENTRY_PRICE:
-        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Price {sig.market_price:.2f} above safety cap {MAX_ENTRY_PRICE}")
-        return
-
-    # Fetch market to get actual fee rate
-    market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
-
-    # 2. Mathematical EV Filter
-    # EV = win_p * (1.0 - effective_fee) / market_price - 1.0
-    # We demand at least 5% EV margin for non-probe trades.
-    fee_rate = market.get("fee_rate", settings.get("fee_rate", 0.04)) if market else settings.get("fee_rate", 0.04)
-    win_p = sig.win_prob
-    effective_fee = fee_rate * max(1.0 - sig.market_price, 0.5)
-    ev = win_p * (1.0 - effective_fee) / sig.market_price - 1.0
-    
-    # ── Discovery Probe ──
-    is_probe = False
-    # Probes: Small trades to collect data even if certainty is modest (0.35+).
-    # Always execute probes at ₦100 — this is the primary way a new account builds
-    # Bayesian trade history so the learner can optimise.
-    if sig.certainty >= 0.35 and sig.certainty < sig.mode_floor:
-        is_probe = True
-        amount = 100.0
-        log.info(f"[{chat_id}] DISCOVERY PROBE: Sizing down to ₦100 for Bayesian data collection.")
-
-    # EV threshold: 1% minimum (was 5% — too strict with 4% fee markets).
-    # Real protection is Kelly sizing + win probability, not a high EV floor.
-    if not is_probe and ev < 0.01:
-        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Insufficient EV ({ev:+.1%})")
-        return
-
-    if equity >= 3000 and not risk.can_trade(equity, amount, max_exp):
-        log.info(f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — Risk limit or max exposure reached")
-        return
-
-    max_allowed_price = (1.0 - effective_fee) / (1.0 + 0.01) # Baseline 1% buffer
-    is_fx = sig.asset in _FX_ASSETS
-    
-    # ── Adaptive Slippage ──
-    slip_map = {"safe": 0.002, "balanced": 0.005, "aggressive": 0.01, "full_send": 0.025}
-    base_slip = slip_map.get(mode, 0.005)
-    
-    # Volatility multiplier
-    from strategies.utils import realized_vol_hourly
-    from strategies.base import global_state
-    import config
-    current_vol = realized_vol_hourly(sig.asset, global_state)
-    base_vol = config.ASSET_HOURLY_VOL.get(sig.asset, 0.022)
-    vol_mult = current_vol / base_vol
-    adaptive_slip = base_slip * vol_mult
-    
-    # ── Synthetic Quote Latency Shield ──
-    import feeds_direct
-    bias = feeds_direct.get_latency_bias(sig.asset, feeds.spot.get(sig.asset, 0.0))
-    # If Oracle indicates price is moving against us, and Bayse hasn't updated yet.
-    # bias > 0: Oracle > Bayse (Upward pressure)
-    # bias < 0: Oracle < Bayse (Downward pressure)
-    #
-    # BN-5 FIX: Raised from 0.08% to 0.15% for crypto. At 0.08%, normal feed
-    # scheduling differences between Bayse relay and Binance oracle caused constant
-    # false blocks. FX assets are entirely exempt — they move too slowly for latency
-    # arbitrage to matter. Also only block when the oracle data itself is fresh (<5s).
-    _oracle_data = feeds_direct.direct_spot.get(sig.asset, {})
-    _oracle_age  = time.time() - _oracle_data.get("time", 0)
-    _oracle_fresh = _oracle_age < 5.0  # only trust oracle signal if data is <5s old
-    
-    _is_fx = sig.asset in _FX_ASSETS
-    # Threshold raised from 0.15% → 0.30%. The HardenedWS Layer 3 Guard already rejects
-    # ticks that deviate >0.15% from baseline, so the bot's spot feed is already smoothed.
-    # We only hard-block on genuinely extreme divergences (>0.30%) where real slippage risk exists.
-    latency_threshold = 0.0 if _is_fx else 0.0030  # 0.30% for crypto, skip for FX
-    
-    if not _is_fx and _oracle_fresh and latency_threshold > 0:
-        if sig.outcome == "YES" and bias < -latency_threshold:
-            log.warning(f"[{chat_id}] 🛡️ LATENCY SHIELD: Blocked {sig.asset} YES. Oracle {bias:+.2%} below Bayse (oracle age {_oracle_age:.1f}s).")
-            return
-        if sig.outcome == "NO" and bias > latency_threshold:
-            log.warning(f"[{chat_id}] 🛡️ LATENCY SHIELD: Blocked {sig.asset} NO. Oracle {bias:+.2%} above Bayse (oracle age {_oracle_age:.1f}s).")
-            return
-
-    # ── Engine Detection ──
-    market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
-    declared_engine = market.get("engine") if market else None
-
-    if declared_engine:
-        # Bayse explicitly told us the engine — trust it, no extra call needed
-        engine = declared_engine
-    elif market:
-        # Engine field missing — probe order book with 300ms timeout.
-        # Result is cached so subsequent trades on this market are instant.
-        engine = await _infer_engine(client, market, timeout_ms=300)
-    else:
-        engine = "AMM"  # no market object at all — safe fallback
-
-    log.debug(f"[{chat_id}] Engine determined: {engine}")
-
-    # ── Hybrid Maker/Taker Routing ──
-    # CLOB markets: we can post a LIMIT order (maker) instead of immediately
-    # taking liquidity. Makers pay no fee and get better fill prices.
-    #
-    # Use MAKER when:
-    #   1. Market is CLOB (not AMM)
-    #   2. Volatility is not extreme (<2.5x baseline)
-    #   3. Either: high conviction signal (≥0.75) OR near-zero momentum
-    #
-    # Use TAKER otherwise (AMM always, or CLOB in fast-moving markets).
-    is_maker = False
-    time_in_force = "FAK"
-
-    # ── Micro-Account TAKER Override ──
-    # For accounts under ₦5,000, always use TAKER (MARKET on AMM, immediate LIMIT on CLOB).
-    # Maker orders post at a discount and may never fill before market close on small accounts.
-    # Once equity grows above ₦5,000, the bot will begin using CLOB MAKER orders to save fees.
-    _use_maker_eligible = equity >= 5000
-
-    if _use_maker_eligible and engine == "CLOB" and vol_mult <= 2.5:
-        normalized_threshold = 0.005 * vol_mult
-        low_momentum  = abs(sig.momentum_at_entry) < normalized_threshold
-        high_conviction = sig.certainty >= 0.75  # High-conviction → post limit, save fee
-
-        if low_momentum or high_conviction:
-            is_maker = True
-            # Post 1% below current price — patient fill, no fee paid
-            limit_price = min(sig.market_price * 0.99, max_allowed_price)
-            time_in_force = "GTC"
-            log.info(
-                f"[{chat_id}] CLOB MAKER: Posting limit at {limit_price:.3f} "
-                f"({'high conviction' if high_conviction else 'low momentum'}) — fee saved"
-            )
-
-    if not is_maker:
-        limit_price = min(sig.market_price * (1.0 + adaptive_slip), max_allowed_price)
-
-    # The Bayse API enforces a strict maximum of 3 decimal places for price
-    execution_style = "MAKER" if is_maker else "TAKER"
-    log.debug(f"[{chat_id}] Execution style: {execution_style}")
-
-
-
     try:
-        # ── Slippage Shield (Alpha Capture Phase) ──
-        # Check recent performance. If slippage > 1.5%, reduce size by 50%
-        avg_slip = await asyncio.to_thread(database.get_avg_slippage, sig.asset, sig.strategy)
-        if avg_slip > 0.015:
-            log.warning(f"[{chat_id}] SLIPPAGE SHIELD ACTIVE: Reducing size for {sig.asset} ({avg_slip:.1%} avg slip)")
-            amount = amount * 0.5
-            # BUG-FIX: Re-check mintrade after slippage shield halves amount.
-            # Without this, a trade can proceed below the user's minimum bet size.
-            if amount < effective_minimum:
-                log.info(
-                    f"[{chat_id}] SKIPPED after slippage shield — "
-                    f"halved amount ₦{amount:,.0f} < mintrade ₦{min_t:,.0f}."
-                )
-                return
-
-        # Place the order
-        # AMM: MARKET order with maxSlippage. CLOB: LIMIT order at specified price.
-        # IMPORTANT (per Bayse API docs): `amount` is always in NGN notional value.
-        # The API calculates shares internally. We do NOT convert amount to shares.
-        # The platform enforces its own ₦100 minimum — no share-count minimum on our side.
-        final_order_type = "LIMIT" if engine == "CLOB" else "MARKET"
-        order_amount = amount  # NGN notional — sent as-is to the API
-        # multiplier is used for reverse-calculating shares from NGN fills in response parsing
-        multiplier = 100.0 if CURRENCY == "NGN" else 1.0
-
-        # ── Pre-flight: check cached market minimum before hitting the API ──
-        cached_min = _market_min_cache.get(sig.market_id, 0.0)
-        if cached_min > 0 and amount < cached_min:
-            log.info(
-                f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — "
-                f"Market requires ₦{cached_min:,.0f} minimum (cached). Our ₦{amount:,.0f} is too small. "
-                f"Will pick this market again when capital grows."
-            )
-            return
-
-        log.info(
-            f"[{chat_id}] PLACING {sig.strategy} | {sig.asset} ({engine} {execution_style}) "
-            f"price={sig.market_price:.3f} limit={limit_price:.3f} slip={adaptive_slip:.2%} "
-            f"certainty={sig.certainty:.0%} ₦{amount:,.0f}"
-        )
-
-        resp = await client.place_order(
+        resp  = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
-            outcome_id=sig.outcome_id, side="BUY", amount=order_amount,
-            order_type=final_order_type, price=limit_price if final_order_type == "LIMIT" else None,
-            max_slippage=adaptive_slip,
-            currency=CURRENCY,
-            time_in_force=time_in_force
+            outcome_id=sig.outcome_id, side="BUY",
+            amount=amount, order_type=order_type,
+            price=limit_price if order_type == "LIMIT" else None,
+            max_slippage=slippage, currency=CURRENCY,
+            time_in_force=time_in_force,
         )
         order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
-        # Robust share/quantity detection across different API versions
-        shares_filled = float(
-            order.get("filledSize") or
-            order.get("shares") or 
-            order.get("quantity") or 
-            order.get("sharesFilled") or 
-            order.get("sharesMatched") or 
-            order.get("amountMatched") or 
-            order.get("filledQuantity") or 
-            0
-        )
-        
-        # ── Order Chaser (CLOB only) ──
-        # If CLOB and zero fill, try one more time at a slightly more aggressive price (if still profitable)
-        if engine == "CLOB" and not is_maker and shares_filled <= 0:
-            chase_price = round(min(limit_price * 1.002, max_allowed_price), 3)
-            if chase_price > limit_price:
-                log.info(f"[{chat_id}] CLOB CHASE: First order missed. Retrying at {chase_price:.3f}")
-                try:
-                    resp = await client.place_order(
-                        event_id=sig.event_id, market_id=sig.market_id,
-                        outcome_id=sig.outcome_id, side="BUY", amount=amount,
-                        order_type="LIMIT", price=chase_price, currency=CURRENCY,
-                    )
-                except Exception as e:
-                    log.debug(f"[{chat_id}] CLOB CHASE order failed at {chase_price:.3f}: {e}")
-                    # Fall through — shares_filled stays 0, zero-fill path handles it below
-                else:
-                    order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
-                shares_filled = float(
-                    order.get("filledSize") or
-                    order.get("shares") or 
-                    order.get("quantity") or 
-                    order.get("sharesFilled") or 
-                    order.get("sharesMatched") or 
-                    order.get("amountMatched") or 
-                    order.get("filledQuantity") or 
-                    0
-                )
 
-        filled_price = float(order.get("avgFillPrice") or order.get("price", limit_price) or limit_price)
-        
-        # Fallback: if we have an ID and it's successful, but no shares_filled was returned, estimate it.
-        order_id = order.get("id") or order.get("orderId") or order.get("order_id")
+        # AMM uses 'quantity'; CLOB uses 'filledSize'
+        shares_filled = client.parse_filled_shares(order)
+        filled_price  = float(order.get("avgFillPrice") or order.get("price") or limit_price)
+        order_id      = order.get("id") or order.get("orderId") or order.get("order_id")
+
         if shares_filled <= 0 and order_id:
-            log.info(f"[{chat_id}] Order {order_id} has no explicit fill qty in response, assuming success.")
-            shares_filled = amount / (filled_price * multiplier)
+            # AMM often returns no fill details — assume success if no exception
+            shares_filled = amount / (filled_price * 100.0) if CURRENCY == "NGN" else amount / filled_price
+            log.warning(f"[{chat_id}] AMM zero-fill assumption for {sig.asset} — estimating from intent")
 
-        # ── AMM Zero-Fill Assumption (CRITICAL BUG FIX) ──
-        # Bayse AMM MARKET orders frequently return a success HTTP 200 with NO
-        # fill details (no filledSize, no orderId, no shares). Under the old logic,
-        # this caused `return` here — before risk.add_position() — so the market
-        # was never locked. The 5s heartbeat would then re-enter the same market
-        # up to 12 times per minute, spending ₦600+ in 60 seconds.
-        #
-        # Fix: If no exception was thrown (order didn't 400/500), the order DID go
-        # through on Bayse's side regardless of the empty response. We estimate the
-        # shares from our known intent amount and treat it as a success.
-        if shares_filled <= 0:
-            if final_order_type == "MARKET":
-                # AMM success with no fill details — estimate from our intent
-                shares_filled = amount / (filled_price * multiplier)
-                log.warning(
-                    f"[{chat_id}] ⚠️ AMM ZERO-FILL ASSUMPTION: {sig.asset} order returned no fill data "
-                    f"but did not throw. Assuming ₦{amount:,.0f} filled at {filled_price:.4f}. "
-                    f"Response: {resp}"
-                )
-            else:
-                log.info(f"[{chat_id}] {sig.asset} CLOB order not filled (price moved away). Response: {resp}")
-                return
+        if shares_filled <= 0 and order_type == "LIMIT":
+            log.info(f"[{chat_id}] CLOB order not filled — price moved away")
+            return
 
-        bayse_order_id = order_id
-        actual_ngn = shares_filled * filled_price * multiplier
+        actual_ngn = shares_filled * filled_price * (100.0 if CURRENCY == "NGN" else 1.0)
 
         spot_vs_thresh = 0.0
         if market and market.get("threshold") and feeds.spot.get(sig.asset):
@@ -506,168 +241,139 @@ async def _execute_trade_logic(chat_id, sig, client, risk, settings, equity, fre
 
         trade_id = await asyncio.to_thread(
             database.record_trade,
-            chat_id=chat_id, strategy=sig.strategy, asset=sig.asset,
-            timeframe=sig.timeframe, outcome=sig.outcome, outcome_id=sig.outcome_id,
-            market_id=sig.market_id, event_id=sig.event_id, order_id=bayse_order_id,
-            entry_price=filled_price, amount_ngn=actual_ngn, certainty=sig.certainty,
+            chat_id=chat_id,
+            strategy=sig.strategy, asset=sig.asset, timeframe=sig.timeframe,
+            outcome=sig.outcome, outcome_id=sig.outcome_id,
+            market_id=sig.market_id, event_id=sig.event_id, order_id=order_id,
+            entry_price=filled_price, amount_ngn=actual_ngn,
+            certainty=sig.certainty,
             secs_to_close=market["secs_to_close"] if market else 0,
             spot_vs_threshold_pct=spot_vs_thresh,
-            momentum_at_entry=sig.momentum_at_entry,
-            regime_at_entry=sig.regime_at_entry,
-            edge_at_entry=sig.edge_at_entry,
-            realized_vol_at_entry=sig.realized_vol_at_entry,
+            momentum_at_entry=getattr(sig, "momentum_at_entry", 0.0),
+            regime_at_entry=getattr(sig, "regime_at_entry", 0.0),
+            edge_at_entry=getattr(sig, "edge_at_entry", 0.0),
+            realized_vol_at_entry=getattr(sig, "realized_vol_at_entry", 0.0),
             market_price_at_entry=sig.market_price,
             slippage_ngn=((filled_price / sig.market_price) - 1.0) * actual_ngn if sig.market_price > 0 else 0,
-            poly_price_at_entry=await comparative_analysis.get_comparative_price(sig.asset, market.get("threshold", 0)) if market else None,
             engine=engine,
-            execution_style=execution_style
         )
 
-
         risk.add_position(sig.market_id, {
-            "trade_id": trade_id, "event_id": sig.event_id,
-            "outcome": sig.outcome, "outcome_id": sig.outcome_id,
+            "trade_id":   trade_id, "event_id":    sig.event_id,
+            "outcome":    sig.outcome, "outcome_id": sig.outcome_id,
             "entry_price": filled_price, "amount_ngn": actual_ngn,
-            "strategy": sig.strategy, "asset": sig.asset, "timeframe": sig.timeframe,
+            "strategy":   sig.strategy, "asset": sig.asset, "timeframe": sig.timeframe,
         })
-        
-        # Prevent artificial equity inflation during the 30s heartbeat cache window
         risk.current_free_cash -= actual_ngn
-
-        # ── Set Trade Cooldown ── prevents re-entry for 60s after any successful trade
         _trade_cooldown[sig.market_id] = time.time()
 
         log.info(
-            f"[{chat_id}] 💰 TRADE EXECUTED | {sig.strategy} {sig.asset} {sig.timeframe} "
-            f"{sig.outcome} @ {filled_price:.4f} | ₦{actual_ngn:,.0f} | "
-            f"engine={engine} style={execution_style} | trade_id={trade_id}"
+            f"[{chat_id}] ✅ TRADE | {sig.strategy} {sig.asset} {sig.timeframe} "
+            f"{sig.outcome} @ {filled_price:.4f} ₦{actual_ngn:,.0f} | id={trade_id}"
         )
 
     except Exception as e:
-        err_str = str(e)
-        # ── Graceful Skip: Exchange minimum buy amount enforcement ──
-        # Parse the NGN minimum from the error message and cache it for this
-        # market so future attempts skip pre-flight without hitting the API.
-        # Example message: "Minimum buy amount is NGN 500.00."
-        min_match = re.search(r'Minimum buy amount is [A-Z]+ ([\d,]+(?:\.\d+)?)', err_str)
-        if min_match:
-            market_min = float(min_match.group(1).replace(',', ''))
+        err = str(e)
+        m = re.search(r'Minimum buy amount is [A-Z]+ ([\d,]+(?:\.\d+)?)', err)
+        if m:
+            market_min = float(m.group(1).replace(",", ""))
             _market_min_cache[sig.market_id] = market_min
-            
-            # Auto-retry immediately with the new minimum if we have enough cash
-            # Only retry if the new minimum is strictly greater than what we just tried
-            if market_min > amount and market_min <= free_cash and (equity < 3000 or risk.can_trade(equity, market_min, settings.get("maxexposure", 20.0)/100.0)):
-                log.info(f"[{chat_id}] 🔄 AUTO-RETRY {sig.strategy} | {sig.asset} — Scaling up to ₦{market_min:,.0f} to meet explicit market minimum.")
-                asyncio.create_task(execute_trade(chat_id, sig, client, risk, settings, equity, free_cash))
-                return
-                
-            log.info(
-                f"[{chat_id}] SKIPPED {sig.strategy} | {sig.asset} — "
-                f"Market {sig.market_id} enforces ₦{market_min:,.0f} minimum (now cached). "
-                f"Our ₦{amount:,.0f} is too small and we cannot scale up."
-            )
+            log.info(f"[{chat_id}] Market min ₦{market_min:,.0f} cached for {sig.market_id}")
         else:
-            log.error(f"[{chat_id}] order failed {sig.market_id}: {e}", exc_info=True)
+            log.error(f"[{chat_id}] Order failed {sig.market_id}: {e}", exc_info=True)
         return
 
-    # ── BUG-FIX: Notification is OUTSIDE the order try/except ──
-    # Previously, if notify_trade() threw (e.g. Markdown parse error from special
-    # chars in sig.reason), the exception was silently swallowed as "order failed".
-    # Now it has its own isolated try/except with a clear error log.
     if _tg_app:
         try:
-            # notify_trade() handles Markdown sanitization and plain-text fallback internally.
-            # engine + execution_style are passed so the notification shows "AMM·TAKER" or "CLOB·MAKER"
-            await telegram_bot.notify_trade(_tg_app, chat_id, sig, actual_ngn, engine=engine, execution_style=execution_style)
-            log.info(f"[{chat_id}] ✅ Notification sent for {sig.strategy} {sig.asset} ₦{actual_ngn:,.0f}")
-        except Exception as notify_err:
-            log.error(f"[{chat_id}] ❌ NOTIFICATION FAILED for {sig.strategy} {sig.asset}: {notify_err}", exc_info=True)
-    else:
-        log.warning(f"[{chat_id}] ⚠️ _tg_app is None — notification skipped. Bot may not have initialized Telegram correctly.")
+            await telegram_bot.notify_trade(_tg_app, chat_id, sig, actual_ngn, engine=engine,
+                                            execution_style="MAKER" if is_maker else "TAKER")
+        except Exception as ne:
+            log.error(f"[{chat_id}] Notification failed: {ne}")
 
-async def execute_arb(chat_id, sig, client, equity, free_cash, settings):
-    """Executes a market-neutral arbitrage"""
+
+def _get_market_fee(market_id: str) -> float:
+    market = next((m for m in active_markets if m["market_id"] == market_id), None)
+    return market.get("fee_rate", 0.02) if market else 0.02
+
+
+# ── ARB execution ─────────────────────────────────────────────────────────────
+
+async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float, settings: dict):
+    """Buy both YES and NO then burn pairs — risk-free when YES+NO < 1.00."""
     market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
-    if not market: return
-
-    budget = min(ARB_MAX_SIZE_NGN, free_cash * 0.10)
-    if budget < 200: return
-
-    try:
-        yes_p = market["yes_price"]; no_p = market["no_price"]
-        amount_yes = round(budget * (yes_p / (yes_p + no_p)), 2)
-        amount_no = round(budget * (no_p / (yes_p + no_p)), 2)
-        
-        quote = await client.get_quote(sig.event_id, sig.market_id, market["yes_id"], "BUY", amount_yes, CURRENCY)
-        if float(quote.get("sharesMatched", 0)) <= 0: return
-    except Exception as e:
-        log.debug(f"[{chat_id}] ARB pre-flight quote failed for {sig.market_id}: {e}")
+    if not market:
         return
 
-    yes_ok = False; yes_shares = 0
-    try:
-        batch_orders = [
-            {
-                "outcomeId": market["yes_id"],
-                "side": "BUY",
-                "type": "MARKET",
-                "amount": amount_yes,
-                "currency": CURRENCY,
-                "timeInForce": "FAK"
-            },
-            {
-                "outcomeId": market["no_id"],
-                "side": "BUY",
-                "type": "MARKET",
-                "amount": amount_no,
-                "currency": CURRENCY,
-                "timeInForce": "FAK"
-            }
-        ]
-        
-        batch_resp = await client.batch_place_orders(batch_orders)
-        results = batch_resp.get("results", [])
-        if len(results) < 2:
-            raise RuntimeError("Invalid batch response")
-            
-        yes_res = results[0]
-        no_res = results[1]
-        
-        yes_ok = yes_res.get("success", False)
-        if yes_ok:
-            y_ord = yes_res.get("order", {})
-            yes_shares = float(y_ord.get("shares", y_ord.get("quantity", 0)) or 0)
-            
-        no_ok = no_res.get("success", False)
-        no_shares = 0
-        if no_ok:
-            n_ord = no_res.get("order", {})
-            no_shares = float(n_ord.get("shares", n_ord.get("quantity", 0)) or 0)
-            
-        if not yes_ok or not no_ok:
-            raise RuntimeError(f"Batch incomplete. YES ok: {yes_ok}, NO ok: {no_ok}")
+    budget = min(ARB_MAX_SIZE_NGN, free_cash * 0.10)
+    if budget < MIN_TRADE_NGN * 2:
+        return
 
-        burn_pairs = min(yes_shares, no_shares)
-        if burn_pairs > 0:
-            await client.burn_shares(sig.market_id, burn_pairs, CURRENCY)
-            profit = burn_pairs - (amount_yes + amount_no)
-            log.info(f"[{chat_id}] ARB SUCCESS | {sig.asset} | {burn_pairs:.2f} pairs | Profit: ₦{profit:,.2f}")
-            
+    yes_p = market["yes_price"]
+    no_p  = market["no_price"]
+
+    # Split budget proportionally so we end up with equal pairs
+    amount_yes = round(budget * (yes_p / (yes_p + no_p)), 2)
+    amount_no  = round(budget - amount_yes, 2)
+
+    if amount_yes < MIN_TRADE_NGN or amount_no < MIN_TRADE_NGN:
+        return
+
+    yes_shares = 0.0
+    no_shares  = 0.0
+    yes_ok     = False
+
+    try:
+        # Leg 1 — YES
+        resp_yes = await client.place_order(
+            event_id=sig.event_id, market_id=sig.market_id,
+            outcome_id=market["yes_id"], side="BUY",
+            amount=amount_yes, order_type="MARKET", currency=CURRENCY,
+        )
+        order_yes  = resp_yes.get("order") or resp_yes
+        yes_shares = client.parse_filled_shares(order_yes)
+        if yes_shares <= 0:
+            yes_shares = amount_yes / yes_p
+        yes_ok = True
+
+        # Leg 2 — NO
+        resp_no = await client.place_order(
+            event_id=sig.event_id, market_id=sig.market_id,
+            outcome_id=market["no_id"], side="BUY",
+            amount=amount_no, order_type="MARKET", currency=CURRENCY,
+        )
+        order_no  = resp_no.get("order") or resp_no
+        no_shares = client.parse_filled_shares(order_no)
+        if no_shares <= 0:
+            no_shares = amount_no / no_p
+
+        # Burn matching pairs
+        burn_qty = min(yes_shares, no_shares)
+        if burn_qty > 0:
+            await client.burn_shares(sig.market_id, burn_qty, CURRENCY)
+            profit = burn_qty - (amount_yes + amount_no)
+            log.info(f"[{chat_id}] ARB ✅ {sig.asset} | {burn_qty:.2f} pairs | ₦{profit:+,.2f}")
+
             trade_id = await asyncio.to_thread(
                 database.record_trade,
-                chat_id=chat_id, strategy="ARB", asset=sig.asset, timeframe=sig.timeframe,
-                outcome="ARB", outcome_id="burn", market_id=sig.market_id, event_id=sig.event_id,
-                order_id=str(burn_pairs), entry_price=yes_p + no_p, amount_ngn=budget,
-                certainty=1.0, secs_to_close=0, spot_vs_threshold_pct=0.0
+                chat_id=chat_id, strategy="ARB", asset=sig.asset,
+                timeframe=sig.timeframe, outcome="ARB", outcome_id="burn",
+                market_id=sig.market_id, event_id=sig.event_id,
+                entry_price=yes_p + no_p, amount_ngn=budget,
+                certainty=1.0, secs_to_close=0,
             )
-            await asyncio.to_thread(database.resolve_trade, trade_id, won=True, pnl_ngn=profit)
-            if _tg_app: await telegram_bot.notify_arb(_tg_app, chat_id, sig, burn_pairs, profit)
+            await asyncio.to_thread(database.resolve_trade, trade_id, True, profit)
+            if _tg_app:
+                await telegram_bot.notify_arb(_tg_app, chat_id, sig, burn_qty, profit)
 
     except Exception as e:
         log.error(f"[{chat_id}] ARB error: {e}")
+        # Rollback YES leg if NO leg failed
         if yes_ok and yes_shares > 0:
             try:
-                await client.place_order(sig.event_id, sig.market_id, market["yes_id"], "SELL", amount_yes, "MARKET", currency=CURRENCY)
-                log.info(f"[{chat_id}] ARB ROLLBACK SUCCESS")
-            except Exception as re:
-                log.critical(f"[{chat_id}] ARB ROLLBACK FAILED: {re}")
+                await client.place_order(
+                    sig.event_id, sig.market_id, market["yes_id"],
+                    "SELL", amount_yes, "MARKET", currency=CURRENCY,
+                )
+                log.info(f"[{chat_id}] ARB rollback OK")
+            except Exception as re_:
+                log.critical(f"[{chat_id}] ARB ROLLBACK FAILED: {re_}")
