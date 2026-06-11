@@ -4,24 +4,22 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # run: pip install -r requirements.txt
+    pass
 
-# ── Server-level credentials (shared across all users) ────────────────────────
-TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")
-ENCRYPTION_KEY  = os.getenv("ENCRYPTION_KEY", "")   # Fernet key — see .env.example
+# ── Credentials ───────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+ENCRYPTION_KEY  = os.getenv("ENCRYPTION_KEY", "")
 
-# ── API ───────────────────────────────────────────────────────────────────────
-BASE_URL = "https://relay.bayse.markets"
-WS_MARKETS_URL = "wss://socket.bayse.markets/ws/v1/markets"
+# ── Bayse API ─────────────────────────────────────────────────────────────────
+BASE_URL        = "https://relay.bayse.markets"
+WS_MARKETS_URL  = "wss://socket.bayse.markets/ws/v1/markets"
 WS_REALTIME_URL = "wss://socket.bayse.markets/ws/v1/realtime"
 
-# ── Oracle Price Feeds ────────────────────────────────────────────────────────
-# All spot prices come from the Bayse realtime WebSocket (wss://socket.bayse.markets/ws/v1/realtime)
-# Crypto: sourced from Binance  |  FX + Gold: sourced from TwelveData
-
-# ── Market Series Slugs ────────────────────────────────────────────────────────
+# ── Market series slugs ───────────────────────────────────────────────────────
+# Only assets confirmed available on the Bayse realtime WS feed:
+#   Binance source  : BTC, ETH, SOL
+#   TwelveData source: XAUUSD, EURUSD, GBPUSD
 SERIES = {
-    # ── Crypto ────────────────────────────────────────────────────────────────
     "BTC": {
         "5min":  "crypto-btc-5min",
         "15min": "crypto-btc-15min",
@@ -43,251 +41,117 @@ SERIES = {
         "6h":    "crypto-sol-6h",
         "1d":    "crypto-sol-1d",
     },
-    "BNB": {
-        "5min":  "crypto-bnb-5min",
-        "15min": "crypto-bnb-15min",
-        "1h":    "crypto-bnb-1h",
-        "6h":    "crypto-bnb-6h",
-        "1d":    "crypto-bnb-1d",
-    },
-    # ── FX (confirmed slugs from live API — 1h only as of 2026-05-09) ─────────
+    # FX — only 1h confirmed on Bayse WS
     "EURUSD": {"1h": "fx-eurusd-1h"},
     "GBPUSD": {"1h": "fx-gbpusd-1h"},
-    "USDJPY": {"1h": "fx-usdjpy-1h"},
-    "EURJPY": {"1h": "fx-eurjpy-1h"},
-    "GBPJPY": {"1h": "fx-gbpjpy-1h"},
-    "EURGBP": {"1h": "fx-eurgbp-1h"},   # derived price: EURUSD / GBPUSD
-    # ── Commodities ────────────────────────────────────────────────────────────
     "XAUUSD": {"1h": "commodity-xauusd-1h"},
 }
 
-# Which oracle each asset uses for resolution
-ASSET_ORACLE = {
-    "BTC": "BINANCE", "ETH": "BINANCE", "SOL": "BINANCE", "BNB": "BINANCE",
-    "EURUSD": "TWELVEDATA", "GBPUSD": "TWELVEDATA", "USDJPY": "TWELVEDATA",
-    "EURJPY": "TWELVEDATA", "GBPJPY": "TWELVEDATA", "EURGBP": "TWELVEDATA", 
-    "XAUUSD": "TWELVEDATA",
-}
-
-# News & sentiment
-NEWSAPI_KEY   = os.getenv("NEWSAPI_KEY", "")  # free at newsapi.org
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-NEWS_POLL_SEC = 900       # poll every 15 minutes — free tier allows 100 requests/day
-NEWS_SENTIMENT_THRESHOLD = 0.80  # only near-unanimous sentiment creates a signal
-NEWS_SIGNAL_DECAY_MIN = 3        # news signal expires after 3 min — stale news is dangerous
-
-# NEWS strategy certainty dampening — VADER scores are NOT win probabilities.
-# A raw VADER compound of 0.80 × 0.55 = effective certainty of 0.44 → win_prob ≈ 70%.
-# Without dampening, 0.80 → certainty 0.80 → win_prob 86% which is wildly overconfident.
-NEWS_CERTAINTY_DAMPEN = 0.55     # multiply VADER strength by this before using as certainty
-NEWS_MAX_MARKET_PRICE  = 0.75    # reject if market already repriced past this
-NEWS_MIN_REGIME        = 0.25    # reject in choppy markets (news shock gets absorbed)
-NEWS_MIN_SECS_LEFT     = 120     # need at least 2 min for news to play out
-NEWS_KELLY_FRACTION    = 0.12    # conservative sizing for sentiment-based signals
-NEWS_REQUIRE_CRYPTO_CATALYST = False  # trade massive macro/global shocks, not just crypto
-
-# Economic calendar events (UTC times — add to this list as needed)
-FOMC_DATES_2026 = [
-    "2026-01-28T19:00:00Z", "2026-03-18T18:00:00Z", "2026-05-06T18:00:00Z",
-    "2026-06-10T18:00:00Z", "2026-07-29T18:00:00Z", "2026-09-16T18:00:00Z",
-    "2026-11-04T19:00:00Z", "2026-12-16T19:00:00Z",
-]
-# CPI drops at 8:30 AM ET = 12:30 UTC (approx monthly)
-CPI_ADVANCE_MINUTES = 2  # enter position 2 min before scheduled release
-
-# ── Trading ───────────────────────────────────────────────────────────────────
-CURRENCY = "NGN"
-
-# ── All possible assets / timeframes (superset — per-user settings stored in DB) ─
-ALL_ASSETS     = [
-    "BTC", "ETH", "SOL", "BNB",
-    "EURUSD", "GBPUSD", "USDJPY", "EURJPY", "GBPJPY", "EURGBP",
-    "XAUUSD"
-]
+# These are the only assets with confirmed real-time price feeds on Bayse.
+# DO NOT add BNB, USDJPY, EURJPY, GBPJPY, EURGBP — they are not on the WS feed.
+ALL_ASSETS     = ["BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "XAUUSD"]
 ALL_TIMEFRAMES = ["5min", "15min", "1h", "6h", "1d"]
 
+ASSET_ORACLE = {
+    "BTC": "BINANCE", "ETH": "BINANCE", "SOL": "BINANCE",
+    "EURUSD": "TWELVEDATA", "GBPUSD": "TWELVEDATA", "XAUUSD": "TWELVEDATA",
+}
+
+# ── Active strategies (only what's implemented and working) ───────────────────
+ACTIVE_STRATEGIES = ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"]
+
+# ── Currency ──────────────────────────────────────────────────────────────────
+CURRENCY = "NGN"
+
 # ── Sniping ───────────────────────────────────────────────────────────────────
-# Per-timeframe entry windows: each timeframe has its own optimal entry point.
-# Short timeframes move fast — enter late when signal is strong.
-# Long timeframes need early entry to catch markets before they fully price in.
-FRONTRUN_ALLOWED_TFS = {"5min", "15min"}  # Only run FRONTRUN on 5‑min and 15‑min markets
-FRONTRUN_MIN_TRADE_NAIRA = int(os.getenv("FRONTRUN_MIN_TRADE_NAIRA", "100"))  # Minimum trade size for FRONTRUN (default ₦100)
-FRONTRUN_ENTRY_WINDOWS = {
-    "5min":  300,    # full 5min window — evaluate the entire candle
-    "15min": 900,    # full 15min window
-    "1h":    3000,   # last 50 min (was 40 min)
-    "6h":    7200,   # last 2 hours
-    "1d":    21600,  # last 6 hours
-}
-
-# FRONTRUN configuration thresholds
-FRONTRUN_BIAS_TRIGGER = float(os.getenv("FRONTRUN_BIAS_TRIGGER", "0.002"))  # 0.20% bias trigger (20 bps)
-
-# SNIPE entry windows per timeframe (seconds remaining in candle for evaluation)
 SNIPE_ENTRY_WINDOWS = {
-    "5min": 300,
+    "5min":  300,
     "15min": 900,
-    "1h": 1800,
-    "6h": 7200,
-    "1d": 21600,
+    "1h":    1800,
+    "6h":    7200,
+    "1d":    21600,
 }
-
-
-# DO NOT buy if the price is already this high.
-# Prevents buying "certain wins" that actually lose money after fees (e.g. 0.98 price).
+SNIPE_MIN_CERTAINTY    = 0.50
 SNIPE_MAX_MARKET_PRICE = 0.90
 
-# Asset hourly volatility (1σ, fractional) — used in diffusion model for win probability.
-# P(win) = Φ( |spot_distance| / (σ_h × √T_hours) )  ← same math as options pricing
-ASSET_HOURLY_VOL = {
-    # Crypto
-    "BTC":    0.018,   # ~1.8% per hour
-    "ETH":    0.022,   # ~2.2% per hour
-    "SOL":    0.028,   # ~2.8% per hour
-    "BNB":    0.025,   # ~2.5% per hour
-    # FX
-    "EURUSD": 0.0006,  # ~0.06% per hour
-    "GBPUSD": 0.0007,  # ~0.07% per hour
-    "USDJPY": 0.0007,  # ~0.07% per hour
-    "EURJPY": 0.0006,  # ~0.06% per hour
-    "GBPJPY": 0.0008,  # ~0.08% per hour
-    "EURGBP": 0.0004,  # ~0.04% per hour
-    # Commodities
-    "XAUUSD": 0.0015,  # ~0.15% per hour
-}
-
-# ── Tiered Certainty (Adaptive Frequency) ───────────────────────────────────
-SNIPE_MIN_CERTAINTY        = 0.45   # global default (Lowered for Conviction Sizing)
-SNIPE_MIN_CERTAINTY_CRYPTO = 0.45   # allow more crypto signals for tiered sizing
-SNIPE_MIN_CERTAINTY_FX     = 0.45   # allow higher frequency for stable FX
-
-# ── FX-specific trading rules ─────────────────────────────────────────────────
-# Only trade FX/Gold during their active market sessions (UTC).
-# Outside these windows, vol is dominated by noise — false breakouts are common.
+# FX-specific
 FX_SESSION_UTC = {
-    "EURUSD": (6, 17),   # London open → NY close
+    "EURUSD": (6, 17),
     "GBPUSD": (6, 17),
-    "USDJPY": (0, 24),   # Tokyo overlap; 24h liquidity is generally fine
-    "EURJPY": (0, 24),
-    "GBPJPY": (0, 24),
-    "EURGBP": (6, 17),
-    "XAUUSD": (8, 20),   # London overlap → NY afternoon
+    "XAUUSD": (8, 20),
 }
-
-# Minimum distance from threshold before entering an FX trade.
-# Set to 1× hourly σ per asset — ensures we have a genuine move, not noise.
 FX_MIN_DISTANCE = {
-    "EURUSD": 0.0006,  # 0.06% — 1σ/hr
-    "GBPUSD": 0.0007,  # 0.07%
-    "USDJPY": 0.0007,
-    "EURJPY": 0.0006,
-    "GBPJPY": 0.0008,
-    "EURGBP": 0.0004,  # 0.04%
-    "XAUUSD": 0.0015,  # 0.15%
+    "EURUSD": 0.0006,
+    "GBPUSD": 0.0007,
+    "XAUUSD": 0.0015,
 }
-
-# Minimum distance for Crypto SNIPE entries to protect against Pin Risk (jumps near expiration).
 CRYPTO_MIN_DISTANCE = {
-    "BTC": 0.0010,  # 0.10%
-    "ETH": 0.0015,  # 0.15%
-    "SOL": 0.0020,  # 0.20%
-    "BNB": 0.0015,
+    "BTC": 0.0010,
+    "ETH": 0.0015,
+    "SOL": 0.0020,
+}
+FX_MIN_REGIME       = 0.30
+FX_ENTRY_WINDOW_1H  = 1200  # last 20 min of the hour
+
+SNIPE_VELOCITY_WINDOW = 60
+SNIPE_VELOCITY_VETO   = 0.40
+
+# ── Correlation ───────────────────────────────────────────────────────────────
+CORRELATION_THRESHOLD     = 0.0035
+CORRELATION_WINDOW_SEC    = 180
+CORRELATE_BASE_CERTAINTY  = 0.55
+CORRELATE_MAX_MARKET_PRICE= 0.65
+CORRELATE_MIN_REGIME      = 0.25
+
+# ── Frontrun ──────────────────────────────────────────────────────────────────
+FRONTRUN_ALLOWED_TFS       = {"5min", "15min"}
+FRONTRUN_BIAS_TRIGGER      = float(os.getenv("FRONTRUN_BIAS_TRIGGER", "0.002"))  # 0.20%
+
+# ── ARB ───────────────────────────────────────────────────────────────────────
+ARB_TRIGGER     = 0.98    # enter when YES+NO ≤ this
+ARB_MAX_SIZE_NGN= 50_000
+
+# ── Fee formula ───────────────────────────────────────────────────────────────
+# Bayse fee formula: fee = feeRate × max(1 - price, 0.3)
+# The floor is 0.3 (NOT 0.5 as previously used in code — that was wrong).
+FEE_FLOOR = 0.3
+
+# ── Risk ─────────────────────────────────────────────────────────────────────
+MAX_DRAWDOWN_STOP      = 0.15
+MAX_PORTFOLIO_EXPOSURE = 0.20
+
+# ── Hourly volatility baselines ───────────────────────────────────────────────
+ASSET_HOURLY_VOL = {
+    "BTC":    0.018,
+    "ETH":    0.022,
+    "SOL":    0.028,
+    "EURUSD": 0.0006,
+    "GBPUSD": 0.0007,
+    "XAUUSD": 0.0015,
 }
 
-# Velocity Guard: Reject if price is crashing toward the threshold too fast.
-# Measures distance change over the last 60 seconds.
-SNIPE_VELOCITY_WINDOW = 60
-SNIPE_VELOCITY_VETO   = 0.40  # reject if 40% of the safety gap is closed in 60s
+# ── Kelly sizing ──────────────────────────────────────────────────────────────
+DYNAMIC_KELLY_MIN = 0.05
+DYNAMIC_KELLY_MAX = 0.40
 
-# FX requires a cleaner trend than crypto — minimum efficiency ratio.
-FX_MIN_REGIME = 0.30   # below this = too choppy to trade FX reliably
+# ── Rate limits ───────────────────────────────────────────────────────────────
+WRITE_RATE_LIMIT      = 15
+READ_RATE_LIMIT       = 25
+SCAN_INTERVAL_SECONDS = 15
 
-# FX entry window: last 20 min of the hour (crypto 1h uses 30 min).
-# More elapsed time = more confirmation the move is real.
-FX_ENTRY_WINDOW_1H = 1200  # seconds (20 min)
+# ── Infra guard ───────────────────────────────────────────────────────────────
+INFRA_STALE_LAG_SEC      = 90.0   # crypto: >90s = hard block
+INFRA_DEGRADED_LAG_SEC   = 30.0   # >30s = apply safety spread
+INFRA_STALE_DIFF_PCT     = 0.0020 # >0.20% price diff = hard block
+INFRA_DEGRADED_DIFF_PCT  = 0.0008 # >0.08% = safety spread
 
-# FX distance trend: reject if price has converged back toward the threshold
-# by more than 1× the minimum distance over the last 10 minutes.
-# Positive trend = move is holding. Negative = price reversing.
-FX_TREND_VETO_MULT = 1.0   # reject if 10-min convergence > FX_MIN_DISTANCE × this
-
-# ── Correlation Signal ─────────────────────────────────────────────────────────
-CORRELATION_THRESHOLD = 0.0035 # BTC spot must move ≥0.35% (lowered to catch standard breakouts)
-CORRELATION_WINDOW_SEC = 180   # signal valid for 3 minutes (edge evaporates fast)
-
-# CORRELATE strategy guards — the target asset may have already followed BTC
-CORRELATE_BASE_CERTAINTY   = 0.40   # base certainty (was 0.60 — too high, caused losses)
-CORRELATE_ALREADY_MOVED    = 0.50   # reject if target moved > 50% of BTC's move
-CORRELATE_MAX_MARKET_PRICE = 0.65   # reject if market already repriced past this
-CORRELATE_MIN_REGIME       = 0.25   # reject choppy target assets
-
-# ── Arbitrage (Mint/Burn) ─────────────────────────────────────────────────────
-ARB_TRIGGER = 0.98           # enter burn arb when YES+NO sum <= this (demands 2% spread, high volume)
-ARB_MAX_SIZE_NGN = 50_000    # max per arb trade
-
-# ── Risk Management ───────────────────────────────────────────────────────────
-BANKROLL_PCT_PER_TRADE = 0.02  # 2% of bankroll per trade (was 3% — too aggressive)
-MAX_PORTFOLIO_EXPOSURE = 0.20  # never have >20% of bankroll in open positions (was 30%)
-MAX_DRAWDOWN_STOP = 0.15       # pause all trading at 15% drawdown (was 20%)
-
-# ── Infra Guard (Data Staleness & Mispricing) ──────────────────────────────────
-# Prevents trading on stale or mispriced relay feeds by comparing to Ground Truth.
-INFRA_STALE_LAG_SEC    = 180.0  # > 180s lag = Hard Block (relaxed for FX feeds)
-INFRA_DEGRADED_LAG_SEC = 30.0   # > 30s lag = 0.1% Safety Spread (was 15s)
-INFRA_STALE_DIFF_PCT   = 0.0020 # > 0.2% price diff = Hard Block
-INFRA_DEGRADED_DIFF_PCT = 0.0008 # > 0.08% price diff = 0.1% Safety Spread
-
-# Systemic Risk: If 3+ assets spike >50% above baseline vol, it's a global shock.
-# Halt all new entries for 60 minutes to let the market settle.
+# ── Systemic risk halt ────────────────────────────────────────────────────────
+SYSTEMIC_RISK_HALT_MINS       = 5
+VOL_SPIKE_THRESHOLD           = 25.0
+CRYPTO_VOL_SPIKE_THRESHOLD    = 100.0
 SYSTEMIC_RISK_COUNT_THRESHOLD = 3
 SYSTEMIC_RISK_VOL_MULT        = 3.0
-SYSTEMIC_RISK_HALT_MINS       = 5
-VOL_SPIKE_THRESHOLD           = 25.0   # trigger halt if variance acceleration > 25.0
-CRYPTO_VOL_SPIKE_THRESHOLD    = 100.0  # extreme fail-safe for crypto only
-DYNAMIC_KELLY_MIN             = 0.05  # floor for kelly sizing in stressed markets
-DYNAMIC_KELLY_MAX             = 0.40  # ceiling for kelly sizing in ideal markets
 
-# Minimum Net Payout: Ensure for every 100 spent, we get at least 108 back (8% net profit).
-# Lowered to capture highly certain setups before they are rejected by EV ceilings.
-MIN_PAYOUT_RATIO = 0.08
-ABSOLUTE_MIN_PAYOUT_RATIO = 0.02
-PROFIT_ALERT_NGN = 20_000      # Telegram alert when unrealized profit hits this
-
-# ── Rate Limiting (stay well under 20 write/sec, 30 read/sec) ─────────────────
-WRITE_RATE_LIMIT = 15          # max write requests/second (buffer below 20)
-READ_RATE_LIMIT = 25           # max read requests/second (buffer below 30)
-SCAN_INTERVAL_SECONDS = 15     # re-scan for new markets every 15s (was 30s)
-
-# ── Hardened WS Pool and Validation ───────────────────────────────────────────
-USE_HARDENED_WS = True
-
-# ── Deployment Environment ─────────────────────────────────────────────────────
-# Set DEPLOYMENT_ENV=vps in your .env file (or VPS shell) when running on a VPS.
-# Render is the default. This flag automatically tunes the WS pool for the
-# lower-latency, more resource-rich VPS environment.
-import os as _os
-DEPLOYMENT_ENV = _os.getenv("DEPLOYMENT_ENV", "render").lower()  # "render" | "vps"
-
-if DEPLOYMENT_ENV == "vps":
-    # VPS Profile — direct network path, dedicated CPU, ~20-50ms API latency
-    WS_POOL_SIZE        = 5       # more parallel connections (Render capped at 3)
-    WS_CULL_INTERVAL_SEC= 5
-    WS_MAX_JITTER_MS    = 8.0    # tighter — VPS latency baseline is low (~8ms)
-    WS_WARMUP_DELTA_LIMIT = 0.0015  # 0.15% — can afford tighter delta guard
-    WS_MIN_TICKS_WINDOW = 4      # require slightly more ticks before trusting feed
-    WS_MAX_TICK_JUMP_PCT= 0.0004  # 0.04% max jump (faster feeds = cleaner data)
-    SCAN_INTERVAL_SECONDS = 10   # scan every 10s on VPS (15s on Render)
-else:
-    # Render Profile — shared CPU, proxied network, ~100-200ms API latency
-    WS_POOL_SIZE        = 3
-    WS_CULL_INTERVAL_SEC= 5
-    WS_MAX_JITTER_MS    = 15.0   # looser — Render relay adds inherent jitter
-    WS_WARMUP_DELTA_LIMIT = 0.0020  # 0.20%
-    WS_MIN_TICKS_WINDOW = 3
-    WS_MAX_TICK_JUMP_PCT= 0.0005  # 0.05%
-
-# ── Polymarket Copy-Trading ──────────────────────────────────────────────────
-POLY_COPY_ENABLED = False
-POLY_COPY_WALLET = ""
-POLY_COPY_COOLDOWN_SEC = 300
-
+# ── Misc ─────────────────────────────────────────────────────────────────────
+MIN_PAYOUT_RATIO   = 0.06
+PROFIT_ALERT_NGN   = 20_000
