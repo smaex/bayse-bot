@@ -1,12 +1,14 @@
 """
 Trade executor — places orders, records trades, handles AMM + CLOB routing.
 
-Key fixes vs previous version:
-  - Fee floor corrected to 0.3 (was 0.5 — over-estimated fees, killed valid trades)
-  - AMM fill parsing: uses client.parse_filled_shares() which checks 'quantity' first
-  - Removed POLY_COPY / NEWS / MARKET_BIAS strategy references
-  - Slippage simplified to fixed values per mode
-  - execute_arb uses sequential orders (no batch API dependency)
+Key fixes:
+  - Fee floor corrected to 0.3 (was 0.5)
+  - Removed CLOB maker/GTC logic — maker orders at 1% below market never fill
+    on prediction markets with fixed expiry. Now uses:
+      AMM  → MARKET order (as before)
+      CLOB → LIMIT at market price with FAK (fills immediately as taker, or cancels cleanly)
+  - Zero-fill assumption only applies to AMM, never to CLOB
+  - AMM fill parsing checks 'quantity' first (AMM field), then 'filledSize' (CLOB field)
 """
 
 import asyncio
@@ -39,7 +41,7 @@ _market_min_cache: dict[str, float] = {}
 _trade_cooldown: dict[str, float] = {}
 TRADE_COOLDOWN_SEC = 60
 
-# Bayse platform minimum trade
+# Bayse platform minimum trade (confirmed ₦100)
 MIN_TRADE_NGN = 100.0
 
 
@@ -57,7 +59,7 @@ async def _infer_engine(client, market: dict) -> str:
         return _market_engine_cache[mid]
     try:
         ob   = await asyncio.wait_for(
-            client.get_orderbook(market["event_id"], mid), timeout=0.3
+            client.get_orderbook(market["event_id"], mid), timeout=0.5
         )
         bids = ob.get("bids") or ob.get("yes", {}).get("bids") or []
         asks = ob.get("asks") or ob.get("yes", {}).get("asks") or []
@@ -69,7 +71,7 @@ async def _infer_engine(client, market: dict) -> str:
 
 
 def _effective_fee(fee_rate: float, price: float) -> float:
-    """Correct Bayse formula: fee = feeRate × max(1 - price, 0.3)"""
+    """Bayse fee formula: fee = feeRate × max(1 - price, 0.3)"""
     return fee_rate * max(1.0 - price, FEE_FLOOR)
 
 
@@ -95,13 +97,13 @@ async def execute_trade(chat_id: str, sig, client, risk, settings: dict,
 
 async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                           equity: float, free_cash: float):
-    mode         = settings.get("mode", "balanced")
-    min_t        = settings.get("mintrade", MIN_TRADE_NGN)
-    max_t        = settings.get("maxtrade", 5_000)
-    max_exp      = settings.get("maxexposure", 20.0) / 100.0
-    learned      = settings.get("learned", {})
-    mult         = learned.get("size_multipliers", {}).get(sig.strategy, 1.0)
-    user_risk    = min(settings.get("risk_pct", 2.0), 5.0) / 100.0
+    mode      = settings.get("mode", "balanced")
+    min_t     = settings.get("mintrade", MIN_TRADE_NGN)
+    max_t     = settings.get("maxtrade", 5_000)
+    max_exp   = settings.get("maxexposure", 20.0) / 100.0
+    learned   = settings.get("learned", {})
+    mult      = learned.get("size_multipliers", {}).get(sig.strategy, 1.0)
+    user_risk = min(settings.get("risk_pct", 2.0), 5.0) / 100.0
 
     # ── Strict mode: near daily target, only take high-conviction signals ──
     if risk.is_in_strict_mode() and sig.certainty < 0.70:
@@ -124,10 +126,13 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     if sig.certainty >= 0.95:
         raw_pct *= 1.5
 
-    # Alpha decay shield
-    decay = await asyncio.to_thread(database.get_alpha_trend, chat_id, sig.strategy, sig.asset) if hasattr(database, 'get_alpha_trend') else 1.0
-    if decay < 0.85:
-        raw_pct *= 0.5
+    # Alpha decay shield — uses hasattr so it degrades gracefully if not in db
+    if hasattr(database, "get_alpha_trend"):
+        decay = await asyncio.to_thread(
+            database.get_alpha_trend, chat_id, sig.strategy, sig.asset
+        )
+        if decay < 0.85:
+            raw_pct *= 0.5
 
     # Probation sizing
     if risk.is_on_probation():
@@ -152,11 +157,11 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         return
 
     # ── EV check ──
-    fee_rate     = _get_market_fee(sig.market_id)
-    eff_fee      = _effective_fee(fee_rate, sig.market_price)
-    ev           = sig.win_prob * (1.0 - eff_fee) / sig.market_price - 1.0
+    fee_rate = _get_market_fee(sig.market_id)
+    eff_fee  = _effective_fee(fee_rate, sig.market_price)
+    ev       = sig.win_prob * (1.0 - eff_fee) / sig.market_price - 1.0
 
-    # Discovery probe: too-low certainty becomes ₦100 data collection trade
+    # Discovery probe: low-certainty signal → tiny ₦100 data collection trade
     is_probe = sig.certainty >= 0.35 and sig.certainty < sig.mode_floor
     if is_probe:
         amount = MIN_TRADE_NGN
@@ -176,7 +181,7 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         return
 
     # ── Engine detection ──
-    market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
+    market   = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
     declared = market.get("engine") if market else None
     if declared:
         engine = declared
@@ -185,26 +190,37 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     else:
         engine = "AMM"
 
-    # ── Slippage ──
-    slip_map = {"safe": 0.003, "balanced": 0.005, "aggressive": 0.01, "full_send": 0.02}
-    slippage = slip_map.get(mode, 0.005)
+    # ── Order routing ─────────────────────────────────────────────────────────
+    #
+    # CRITICAL: Do NOT use GTC LIMIT orders on prediction markets.
+    # A maker bid 1% below market price will NEVER fill before market close.
+    # The order gets submitted → sits open → market closes → full refund.
+    # Net result: zero trade, wasted cooldown, phantom position in DB.
+    #
+    # Correct approach:
+    #   AMM  → MARKET order (AMM prices everything at current curve)
+    #   CLOB → LIMIT at exact market price with FAK
+    #          (crosses the spread immediately as taker, or cancels cleanly)
+    # ─────────────────────────────────────────────────────────────────────────
 
-    # ── CLOB maker/taker routing ──
-    order_type     = "MARKET" if engine == "AMM" else "LIMIT"
-    time_in_force  = "FAK"
-    max_valid      = (1.0 - eff_fee) / 1.01
-    limit_price    = round(min(sig.market_price * (1.0 + slippage), max_valid), 3)
+    slip_map  = {"safe": 0.003, "balanced": 0.005, "aggressive": 0.01, "full_send": 0.02}
+    slippage  = slip_map.get(mode, 0.005)
+    max_valid = (1.0 - eff_fee) / 1.01
 
-    is_maker = False
-    if engine == "CLOB" and equity >= 5_000:
-        is_maker      = True
-        limit_price   = round(min(sig.market_price * 0.99, max_valid), 3)
-        time_in_force = "GTC"
+    if engine == "AMM":
+        order_type    = "MARKET"
+        time_in_force = "FAK"
+        limit_price   = round(min(sig.market_price * (1.0 + slippage), max_valid), 3)
+    else:
+        # CLOB: limit AT market price with FAK so it fills immediately (taker)
+        # or cancels instantly if the book has moved — never lingers as GTC
         order_type    = "LIMIT"
+        time_in_force = "FAK"
+        limit_price   = round(min(sig.market_price * (1.0 + slippage), max_valid), 3)
 
     log.info(
         f"[{chat_id}] PLACING {sig.strategy} {sig.asset} {sig.timeframe} "
-        f"{sig.outcome} | {engine} {'MAKER' if is_maker else 'TAKER'} "
+        f"{sig.outcome} | {engine} {order_type}/{time_in_force} "
         f"₦{amount:,.0f} @ {sig.market_price:.3f} | certainty={sig.certainty:.0%}"
     )
 
@@ -219,19 +235,29 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         )
         order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
 
-        # AMM uses 'quantity'; CLOB uses 'filledSize'
+        # AMM uses 'quantity'; CLOB uses 'filledSize' / 'sharesMatched'
         shares_filled = client.parse_filled_shares(order)
         filled_price  = float(order.get("avgFillPrice") or order.get("price") or limit_price)
         order_id      = order.get("id") or order.get("orderId") or order.get("order_id")
 
-        if shares_filled <= 0 and order_id:
-            # AMM often returns no fill details — assume success if no exception
-            shares_filled = amount / (filled_price * 100.0) if CURRENCY == "NGN" else amount / filled_price
-            log.warning(f"[{chat_id}] AMM zero-fill assumption for {sig.asset} — estimating from intent")
-
-        if shares_filled <= 0 and order_type == "LIMIT":
-            log.info(f"[{chat_id}] CLOB order not filled — price moved away")
-            return
+        if shares_filled <= 0:
+            if engine == "AMM":
+                # AMM rarely returns fill details — estimate from intent if order_id present
+                if order_id:
+                    shares_filled = (
+                        amount / (filled_price * 100.0)
+                        if CURRENCY == "NGN" else amount / filled_price
+                    )
+                    log.warning(f"[{chat_id}] AMM zero-fill estimate for {sig.asset}")
+                else:
+                    log.info(f"[{chat_id}] AMM order rejected — no order_id returned")
+                    return
+            else:
+                # CLOB FAK order didn't cross the spread — book moved, no fill
+                # This is a clean no-trade, cooldown still applies to avoid hammering
+                log.info(f"[{chat_id}] CLOB FAK not filled for {sig.asset} — market moved")
+                _trade_cooldown[sig.market_id] = time.time()
+                return
 
         actual_ngn = shares_filled * filled_price * (100.0 if CURRENCY == "NGN" else 1.0)
 
@@ -254,21 +280,25 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
             edge_at_entry=getattr(sig, "edge_at_entry", 0.0),
             realized_vol_at_entry=getattr(sig, "realized_vol_at_entry", 0.0),
             market_price_at_entry=sig.market_price,
-            slippage_ngn=((filled_price / sig.market_price) - 1.0) * actual_ngn if sig.market_price > 0 else 0,
+            slippage_ngn=(
+                ((filled_price / sig.market_price) - 1.0) * actual_ngn
+                if sig.market_price > 0 else 0
+            ),
             engine=engine,
         )
 
         risk.add_position(sig.market_id, {
-            "trade_id":   trade_id, "event_id":    sig.event_id,
-            "outcome":    sig.outcome, "outcome_id": sig.outcome_id,
+            "trade_id":    trade_id,   "event_id":   sig.event_id,
+            "outcome":     sig.outcome, "outcome_id": sig.outcome_id,
             "entry_price": filled_price, "amount_ngn": actual_ngn,
-            "strategy":   sig.strategy, "asset": sig.asset, "timeframe": sig.timeframe,
+            "strategy":    sig.strategy, "asset":      sig.asset,
+            "timeframe":   sig.timeframe,
         })
         risk.current_free_cash -= actual_ngn
         _trade_cooldown[sig.market_id] = time.time()
 
         log.info(
-            f"[{chat_id}] ✅ TRADE | {sig.strategy} {sig.asset} {sig.timeframe} "
+            f"[{chat_id}] ✅ FILLED | {sig.strategy} {sig.asset} {sig.timeframe} "
             f"{sig.outcome} @ {filled_price:.4f} ₦{actual_ngn:,.0f} | id={trade_id}"
         )
 
@@ -285,8 +315,10 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
 
     if _tg_app:
         try:
-            await telegram_bot.notify_trade(_tg_app, chat_id, sig, actual_ngn, engine=engine,
-                                            execution_style="MAKER" if is_maker else "TAKER")
+            await telegram_bot.notify_trade(
+                _tg_app, chat_id, sig, actual_ngn,
+                engine=engine, execution_style=order_type
+            )
         except Exception as ne:
             log.error(f"[{chat_id}] Notification failed: {ne}")
 
@@ -311,7 +343,6 @@ async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float
     yes_p = market["yes_price"]
     no_p  = market["no_price"]
 
-    # Split budget proportionally so we end up with equal pairs
     amount_yes = round(budget * (yes_p / (yes_p + no_p)), 2)
     amount_no  = round(budget - amount_yes, 2)
 
@@ -324,7 +355,7 @@ async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float
 
     try:
         # Leg 1 — YES
-        resp_yes = await client.place_order(
+        resp_yes   = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["yes_id"], side="BUY",
             amount=amount_yes, order_type="MARKET", currency=CURRENCY,
@@ -336,7 +367,7 @@ async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float
         yes_ok = True
 
         # Leg 2 — NO
-        resp_no = await client.place_order(
+        resp_no   = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["no_id"], side="BUY",
             amount=amount_no, order_type="MARKET", currency=CURRENCY,
@@ -367,7 +398,6 @@ async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float
 
     except Exception as e:
         log.error(f"[{chat_id}] ARB error: {e}")
-        # Rollback YES leg if NO leg failed
         if yes_ok and yes_shares > 0:
             try:
                 await client.place_order(
