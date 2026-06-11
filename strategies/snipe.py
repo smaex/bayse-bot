@@ -58,8 +58,8 @@ class SnipeStrategy(BaseStrategy):
         distance_pct = (live_spot - threshold) / threshold
         direction    = "YES" if distance_pct > 0 else "NO"
 
-        rv       = realized_vol_hourly(asset, state)
-        # Volatility compresses near close — boost rv so probability is more conservative
+        rv = realized_vol_hourly(asset, state)
+        # Vol expands near close — conservative adjustment
         if secs < 300:
             rv *= (1.0 + 0.5 * ((300 - secs) / 210.0))
 
@@ -75,23 +75,20 @@ class SnipeStrategy(BaseStrategy):
         market_id = market["market_id"]
         flips     = global_state.market_flips.get(market_id, 0)
 
-        # High chaos veto: many favourite flips after candle has progressed
+        # High chaos veto: many favourite flips near close
         if secs < 210 and flips >= 5:
             return None
 
         if mode != "full_send":
-            # Distance guard: don't trade too close to the threshold
-            min_dist = (config.CRYPTO_MIN_DISTANCE.get(asset)
-                        or config.FX_MIN_DISTANCE.get(asset, 0.0010))
+            min_dist  = (config.CRYPTO_MIN_DISTANCE.get(asset)
+                         or config.FX_MIN_DISTANCE.get(asset, 0.0010))
             base_vol  = config.ASSET_HOURLY_VOL.get(asset, 0.022)
             vol_ratio = rv / base_vol if base_vol > 0 else 1.0
             dyn_dist  = max(min_dist * 0.5, min(min_dist * vol_ratio, min_dist * 1.5))
             if abs(distance_pct) < dyn_dist:
                 return None
-            # Momentum veto: inside base buffer with adverse momentum
             if abs(distance_pct) < min_dist and mom <= 0:
                 return None
-            # Velocity veto: price crashing toward threshold
             if velocity < -config.SNIPE_VELOCITY_VETO:
                 return None
 
@@ -107,19 +104,18 @@ class SnipeStrategy(BaseStrategy):
 
         composite = min((base + mom_bonus + edge_bonus) * regime_fac, 0.99)
 
-        # Conviction boost: stable market (few flips) well into the candle
+        # Conviction boost: stable market (few flips) late in candle
         if secs < 210 and flips <= 1:
             composite = min(composite + 0.10, 0.99)
 
-        # Macro USD spike from feeds_direct
-        macro = feeds_direct.direct_spot  # use as a proxy — no macro bias in simplified version
         if composite < 0.30:
             return None
 
         # ── EV check ──────────────────────────────────────────────────────
-        fee_rate  = market.get("fee_rate", 0.02)
-        margin    = {"safe": 0.15, "balanced": 0.06, "aggressive": 0.04, "full_send": 0.02}.get(mode, 0.06)
-        ev_ceil   = max_ev_price(w_est, market_price, fee_rate, min_margin=margin)
+        fee_rate = market.get("fee_rate", 0.02)
+        margin   = {"safe": 0.15, "balanced": 0.06,
+                    "aggressive": 0.04, "full_send": 0.02}.get(mode, 0.06)
+        ev_ceil  = max_ev_price(w_est, market_price, fee_rate, min_margin=margin)
         if market_price >= ev_ceil:
             return None
         if market_price > config.SNIPE_MAX_MARKET_PRICE:
@@ -147,5 +143,6 @@ class SnipeStrategy(BaseStrategy):
             title=market.get("title", ""),
             momentum_at_entry=mom,
             regime_at_entry=regime,
+            edge_at_entry=raw_edge,
             realized_vol_at_entry=rv,
         )
