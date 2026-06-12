@@ -207,16 +207,12 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     slippage  = slip_map.get(mode, 0.005)
     max_valid = (1.0 - eff_fee) / 1.01
 
-    if engine == "AMM":
-        order_type    = "MARKET"
-        time_in_force = "FAK"
-        limit_price   = round(min(sig.market_price * (1.0 + slippage), max_valid), 3)
-    else:
-        # CLOB: limit AT market price with FAK so it fills immediately (taker)
-        # or cancels instantly if the book has moved — never lingers as GTC
-        order_type    = "LIMIT"
-        time_in_force = "FAK"
-        limit_price   = round(min(sig.market_price * (1.0 + slippage), max_valid), 3)
+    # Always MARKET orders — AMM always fills, CLOB on Bayse has no book depth
+    # so LIMIT orders (even FAK) find no counterparty and get refunded immediately.
+    # MARKET orders route to the AMM curve which always provides instant liquidity.
+    order_type    = "MARKET"
+    time_in_force = "FAK"
+    limit_price   = round(min(sig.market_price * (1.0 + slippage), max_valid), 3)
 
     log.info(
         f"[{chat_id}] PLACING {sig.strategy} {sig.asset} {sig.timeframe} "
