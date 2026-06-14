@@ -1,8 +1,7 @@
 """
-Telegram bot interface — multi-user setup and control.
-Dead strategies removed from mode presets: NEWS, POLY_EDGE, MARKET_BIAS, POLY_COPY.
-Active strategies: SNIPE, ARB, FRONTRUN, CORRELATE.
-Minimum trade: ₦100 (confirmed Bayse platform minimum).
+Telegram bot — multi-user setup and control.
+Fixes: engine label removed from notifications (always MARKET now),
+       every command logged with chat_id for multi-user observability.
 """
 
 import logging
@@ -27,19 +26,16 @@ _NEED_SECRET = 2
 _setup_state: dict[str, int] = {}
 _temp_pub:    dict[str, str] = {}
 
-_user_clients:  dict = {}
-_user_risks:    dict = {}
-_user_daily:    dict = {}
+_user_clients:   dict = {}
+_user_risks:     dict = {}
+_user_daily:     dict = {}
 _active_markets: list = []
-_start_user_fn = None
+_start_user_fn       = None
 
-# Confirmed valid strategies
 _VALID_STRATEGIES = {"SNIPE", "ARB", "FRONTRUN", "CORRELATE"}
 _VALID_ASSETS     = {"BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "XAUUSD"}
 _VALID_TIMEFRAMES = {"5min", "15min", "1h", "6h", "1d"}
-
-# Bayse platform minimum trade in NGN
-MIN_TRADE_NGN = 100
+MIN_TRADE_NGN     = 100
 
 
 def inject(user_clients, user_risks, user_daily, active_markets, start_user_fn):
@@ -53,24 +49,27 @@ def inject(user_clients, user_risks, user_daily, active_markets, start_user_fn):
 
 def build_app() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start",         cmd_start))
-    app.add_handler(CommandHandler("status",        cmd_status))
-    app.add_handler(CommandHandler("balance",       cmd_balance))
-    app.add_handler(CommandHandler("trades",        cmd_trades))
-    app.add_handler(CommandHandler("markets",       cmd_markets))
-    app.add_handler(CommandHandler("analysis",      cmd_analysis))
-    app.add_handler(CommandHandler("settings",      cmd_settings))
-    app.add_handler(CommandHandler("set",           cmd_set))
-    app.add_handler(CommandHandler("pause",         cmd_pause))
-    app.add_handler(CommandHandler("resume",        cmd_resume))
-    app.add_handler(CommandHandler("mode",          cmd_mode))
-    app.add_handler(CommandHandler("learning",      cmd_learning))
-    app.add_handler(CommandHandler("resetlearning", cmd_resetlearning))
-    app.add_handler(CommandHandler("learnstats",    cmd_learnstats))
-    app.add_handler(CommandHandler("debug",         cmd_debug))
-    app.add_handler(CommandHandler("disconnect",    cmd_disconnect))
-    app.add_handler(CommandHandler("wallet",        cmd_wallet))
-    app.add_handler(CommandHandler("help",          cmd_help))
+    for cmd, fn in [
+        ("start",         cmd_start),
+        ("status",        cmd_status),
+        ("balance",       cmd_balance),
+        ("trades",        cmd_trades),
+        ("markets",       cmd_markets),
+        ("analysis",      cmd_analysis),
+        ("settings",      cmd_settings),
+        ("set",           cmd_set),
+        ("pause",         cmd_pause),
+        ("resume",        cmd_resume),
+        ("mode",          cmd_mode),
+        ("learning",      cmd_learning),
+        ("resetlearning", cmd_resetlearning),
+        ("learnstats",    cmd_learnstats),
+        ("debug",         cmd_debug),
+        ("disconnect",    cmd_disconnect),
+        ("wallet",        cmd_wallet),
+        ("help",          cmd_help),
+    ]:
+        app.add_handler(CommandHandler(cmd, fn))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(error_handler)
@@ -89,6 +88,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
+    log.info(f"[{cid}] /start")
     if await asyncio.to_thread(database.get_user, cid):
         await _main_menu(update)
         return
@@ -133,9 +133,9 @@ async def on_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             if _start_user_fn:
                 await _start_user_fn(cid)
             await msg.delete()
+            log.info(f"[{cid}] New user connected | balance=₦{balance:,.0f}")
             await update.message.reply_text(
                 f"🎉 *Connected!*\n\nBalance: ₦{balance:,.2f}\n\n"
-                f"The bot is now trading. You'll get alerts for every trade.\n"
                 f"Min trade: ₦{MIN_TRADE_NGN} | Default risk: 2% per trade.",
                 parse_mode="Markdown",
             )
@@ -143,6 +143,7 @@ async def on_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             _setup_state[cid] = _NEED_PUBLIC
             await msg.delete()
+            log.warning(f"[{cid}] Connection failed: {e}")
             await update.message.reply_text(f"❌ *Connection failed*\n\n`{e}`\n\nCheck your keys and try /start again.", parse_mode="Markdown")
         return
 
@@ -174,25 +175,35 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Use /start to connect.")
         return
     d = q.data
+    log.info(f"[{cid}] button:{d}")
     if   d == "status":   await q.message.reply_text(await _status_text(cid),   parse_mode="Markdown")
     elif d == "balance":  await q.message.reply_text(await _balance_text(cid),  parse_mode="Markdown")
     elif d == "markets":  await q.message.reply_text(await _markets_text(cid),  parse_mode="Markdown")
     elif d == "settings": await q.message.reply_text(await _settings_text(cid), parse_mode="Markdown")
-    elif d == "pause":    await _set_paused(cid, True);  await q.message.reply_text("⏸ Paused.")
-    elif d == "resume":   await _set_paused(cid, False); await _clear_daily(cid); await q.message.reply_text("▶️ Resumed.")
+    elif d == "pause":
+        await _set_paused(cid, True)
+        log.info(f"[{cid}] PAUSED via button")
+        await q.message.reply_text("⏸ Trading paused.")
+    elif d == "resume":
+        await _set_paused(cid, False)
+        await _clear_daily(cid)
+        log.info(f"[{cid}] RESUMED via button")
+        await q.message.reply_text("▶️ Trading resumed.")
     elif d in _MODES:
-        mode   = _MODES[d]
-        user   = await asyncio.to_thread(database.get_user, cid)
-        s      = user["settings"]
-        s.update(mode["settings"])
+        mode_cfg = _MODES[d]
+        user     = await asyncio.to_thread(database.get_user, cid)
+        s        = user["settings"]
+        s.update(mode_cfg["settings"])
         s["mode"] = d.replace("mode_", "")
         await asyncio.to_thread(database.update_settings, cid, s)
-        await q.message.reply_text(f"{mode['label']} applied. ✅", parse_mode="Markdown")
+        log.info(f"[{cid}] MODE changed to {s['mode']} via button")
+        await q.message.reply_text(f"{mode_cfg['label']} applied. ✅", parse_mode="Markdown")
 
 
 def _guard(fn):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cid = str(update.effective_chat.id)
+        log.info(f"[{cid}] /{fn.__name__.replace('cmd_','')}")
         if not await asyncio.to_thread(database.get_user, cid):
             await update.message.reply_text("Use /start to connect.")
             return
@@ -266,7 +277,7 @@ async def cmd_set(update: Update, _ctx):
         await update.message.reply_text(
             "*Usage:*\n"
             "`/set assets BTC ETH SOL`\n"
-            "`/set timeframes 5min 15min 1h`\n"
+            "`/set timeframes 15min 1h`\n"
             "`/set strategies SNIPE ARB`\n"
             "`/set risk 2`\n"
             "`/set mintrade 100`\n"
@@ -288,19 +299,16 @@ async def cmd_set(update: Update, _ctx):
         if bad:
             await update.message.reply_text(f"Unknown: {bad}\nValid: {', '.join(sorted(_VALID_ASSETS))}"); return
         s["assets"] = [v.upper() for v in vals]; msg = f"Assets: {s['assets']}"
-
     elif key == "timeframes":
         bad = [v for v in vals if v.lower() not in _VALID_TIMEFRAMES]
         if bad:
             await update.message.reply_text(f"Unknown: {bad}\nValid: {', '.join(sorted(_VALID_TIMEFRAMES))}"); return
         s["timeframes"] = [v.lower() for v in vals]; msg = f"Timeframes: {s['timeframes']}"
-
     elif key == "strategies":
         bad = [v for v in vals if v.upper() not in _VALID_STRATEGIES]
         if bad:
             await update.message.reply_text(f"Unknown: {bad}\nValid: {', '.join(sorted(_VALID_STRATEGIES))}"); return
         s["strategies"] = [v.upper() for v in vals]; msg = f"Strategies: {s['strategies']}"
-
     elif key == "risk":
         try:
             pct = float(vals[0])
@@ -308,7 +316,6 @@ async def cmd_set(update: Update, _ctx):
             s["risk_pct"] = pct; msg = f"Risk per trade: {pct}%"
         except ValueError:
             await update.message.reply_text("Risk must be 0.1–10."); return
-
     elif key == "mintrade":
         try:
             amt = float(vals[0])
@@ -317,13 +324,11 @@ async def cmd_set(update: Update, _ctx):
             s["mintrade"] = amt; msg = f"Min trade: ₦{amt:,.0f}"
         except ValueError:
             await update.message.reply_text("Enter a number."); return
-
     elif key == "maxtrade":
         try:
             s["maxtrade"] = float(vals[0]); msg = f"Max trade: ₦{s['maxtrade']:,.0f}"
         except ValueError:
             await update.message.reply_text("Enter a number."); return
-
     elif key == "maxexposure":
         try:
             pct = float(vals[0])
@@ -331,7 +336,6 @@ async def cmd_set(update: Update, _ctx):
             s["maxexposure"] = pct; msg = f"Max exposure: {pct}%"
         except ValueError:
             await update.message.reply_text("Exposure must be 5–100."); return
-
     elif key == "dailymultiplier":
         try:
             m = float(vals[0])
@@ -340,24 +344,25 @@ async def cmd_set(update: Update, _ctx):
             msg = f"Daily target: {m}% of starting balance"
         except ValueError:
             await update.message.reply_text("Enter 1–100."); return
-
     elif key == "dailytarget":
         try:
             s["daily_target_ngn"] = float(vals[0]); s["daily_multiplier"] = 0
             msg = f"Daily target: ₦{s['daily_target_ngn']:,.0f} fixed"
         except ValueError:
             await update.message.reply_text("Enter a number."); return
-
     else:
         await update.message.reply_text(f"Unknown setting `{key}`."); return
 
     s["mode"] = "custom"
     await asyncio.to_thread(database.update_settings, cid, s)
+    log.info(f"[{cid}] /set {key} → {msg}")
     await update.message.reply_text(f"✅ {msg}", parse_mode="Markdown")
 
 @_guard
 async def cmd_pause(update: Update, _ctx):
-    await _set_paused(str(update.effective_chat.id), True)
+    cid = str(update.effective_chat.id)
+    await _set_paused(cid, True)
+    log.info(f"[{cid}] PAUSED via /pause")
     await update.message.reply_text("⏸ Trading paused. /resume to restart.")
 
 @_guard
@@ -369,6 +374,7 @@ async def cmd_resume(update: Update, _ctx):
     if risk:
         risk.paused = False
         risk.peak_balance = 0
+    log.info(f"[{cid}] RESUMED via /resume")
     await update.message.reply_text("▶️ Trading resumed.")
 
 @_guard
@@ -380,11 +386,12 @@ async def cmd_learning(update: Update, _ctx):
 
 @_guard
 async def cmd_resetlearning(update: Update, _ctx):
-    cid = str(update.effective_chat.id)
+    cid  = str(update.effective_chat.id)
     user = await asyncio.to_thread(database.get_user, cid)
-    s = user["settings"]; s["learned"] = {}
+    s    = user["settings"]; s["learned"] = {}
     await asyncio.to_thread(database.update_settings, cid, s)
-    await update.message.reply_text("🔄 Learned settings cleared. Bot will use base config thresholds.")
+    log.info(f"[{cid}] /resetlearning")
+    await update.message.reply_text("🔄 Learned settings cleared.")
 
 @_guard
 async def cmd_learnstats(update: Update, _ctx):
@@ -413,16 +420,22 @@ async def cmd_debug(update: Update, _ctx):
     rel  = [m for m in _active_markets if m.get("asset") in ua and m.get("timeframe") in ut]
     lines.append(f"*Matching your settings:* {len(rel)}")
     for m in rel[:5]:
-        lines.append(f"  {m['asset']} {m['timeframe']} | {int(m.get('secs_to_close',0))}s left | "
-                     f"YES={m.get('yes_price',0):.3f} NO={m.get('no_price',0):.3f} | "
-                     f"threshold={'✅' if m.get('threshold') else '❌ MISSING'}")
+        lines.append(
+            f"  {m['asset']} {m['timeframe']} | "
+            f"{int(m.get('secs_to_close',0))}s left | "
+            f"YES={m.get('yes_price',0):.3f} NO={m.get('no_price',0):.3f} | "
+            f"threshold={'✅' if m.get('threshold') else '❌ MISSING'}"
+        )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 @_guard
 async def cmd_disconnect(update: Update, _ctx):
     cid = str(update.effective_chat.id)
     await asyncio.to_thread(database.deactivate, cid)
-    _user_clients.pop(cid, None); _user_risks.pop(cid, None); _user_daily.pop(cid, None)
+    _user_clients.pop(cid, None)
+    _user_risks.pop(cid, None)
+    _user_daily.pop(cid, None)
+    log.info(f"[{cid}] DISCONNECTED")
     await update.message.reply_text("🔌 Disconnected. Trade history preserved. /start to reconnect.")
 
 async def cmd_help(update: Update, _ctx):
@@ -448,59 +461,42 @@ async def cmd_help(update: Update, _ctx):
 
 
 # ── Mode presets ──────────────────────────────────────────────────────────────
-# Dead strategies (NEWS, POLY_EDGE, MARKET_BIAS, POLY_COPY) removed from all presets.
 
 _MODES = {
     "mode_safe": {
         "label": "🟢 *Safe mode applied.*",
         "settings": {
-            "mode":             "safe",
-            "assets":           ["BTC", "EURUSD", "GBPUSD"],
-            "timeframes":       ["15min", "1h"],
-            "strategies":       ["SNIPE", "ARB"],
-            "risk_pct":         0.5,
-            "mintrade":         MIN_TRADE_NGN,
-            "maxexposure":      15.0,
-            "daily_multiplier": 5,
+            "mode": "safe", "assets": ["BTC", "EURUSD", "GBPUSD"],
+            "timeframes": ["15min", "1h"], "strategies": ["SNIPE", "ARB"],
+            "risk_pct": 0.5, "mintrade": MIN_TRADE_NGN,
+            "maxexposure": 15.0, "daily_multiplier": 5,
         },
     },
     "mode_balanced": {
         "label": "🔵 *Balanced mode applied.*",
         "settings": {
-            "mode":             "balanced",
-            "assets":           ["BTC", "ETH", "SOL"],
-            "timeframes":       ["15min", "1h"],
-            "strategies":       ["SNIPE", "ARB", "FRONTRUN"],
-            "risk_pct":         1.5,
-            "mintrade":         MIN_TRADE_NGN,
-            "maxexposure":      20.0,
-            "daily_multiplier": 10,
+            "mode": "balanced", "assets": ["BTC", "ETH", "SOL"],
+            "timeframes": ["15min", "1h"], "strategies": ["SNIPE", "ARB", "FRONTRUN"],
+            "risk_pct": 1.5, "mintrade": MIN_TRADE_NGN,
+            "maxexposure": 20.0, "daily_multiplier": 10,
         },
     },
     "mode_aggressive": {
         "label": "🟠 *Aggressive mode applied.*",
         "settings": {
-            "mode":             "aggressive",
-            "assets":           ["BTC", "ETH", "SOL"],
-            "timeframes":       ["5min", "15min", "1h"],
-            "strategies":       ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"],
-            "risk_pct":         3.0,
-            "mintrade":         MIN_TRADE_NGN,
-            "maxexposure":      30.0,
-            "daily_multiplier": 20,
+            "mode": "aggressive", "assets": ["BTC", "ETH", "SOL"],
+            "timeframes": ["5min", "15min", "1h"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"],
+            "risk_pct": 3.0, "mintrade": MIN_TRADE_NGN,
+            "maxexposure": 30.0, "daily_multiplier": 20,
         },
     },
     "mode_degen": {
         "label": "🔴 *Full Send mode applied.*",
         "settings": {
-            "mode":             "full_send",
-            "assets":           ["BTC", "ETH", "SOL"],
-            "timeframes":       ["5min", "15min", "1h"],
-            "strategies":       ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"],
-            "risk_pct":         5.0,
-            "mintrade":         MIN_TRADE_NGN,
-            "maxexposure":      50.0,
-            "daily_multiplier": 50,
+            "mode": "full_send", "assets": ["BTC", "ETH", "SOL"],
+            "timeframes": ["5min", "15min", "1h"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"],
+            "risk_pct": 5.0, "mintrade": MIN_TRADE_NGN,
+            "maxexposure": 50.0, "daily_multiplier": 50,
         },
     },
 }
@@ -509,21 +505,19 @@ _MODES = {
 @_guard
 async def cmd_mode(update: Update, _ctx):
     kb = [
-        [InlineKeyboardButton("🟢 Safe",      callback_data="mode_safe"),
-         InlineKeyboardButton("🔵 Balanced",  callback_data="mode_balanced")],
+        [InlineKeyboardButton("🟢 Safe",       callback_data="mode_safe"),
+         InlineKeyboardButton("🔵 Balanced",   callback_data="mode_balanced")],
         [InlineKeyboardButton("🟠 Aggressive", callback_data="mode_aggressive"),
          InlineKeyboardButton("🔴 Full Send",  callback_data="mode_degen")],
     ]
     await update.message.reply_text(
-        "⚙️ *Choose a Risk Mode*\n\n"
-        "Each mode sets a full recommended config.\n"
-        "Fine-tune individual settings with `/set` afterwards.",
+        "⚙️ *Choose a Risk Mode*\n\nEach mode sets a full recommended config.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
 
-# ── Text builders ──────────────────────────────────────────────────────────────
+# ── Text builders ─────────────────────────────────────────────────────────────
 
 async def _status_text(cid: str) -> str:
     client = _user_clients.get(cid)
@@ -554,7 +548,7 @@ async def _status_text(cid: str) -> str:
         f"Today's profit: ₦{profit:+,.2f}",
     ]
     if target > 0:
-        lines.append(f"Daily target: ₦{target:,.0f} ({min(profit/target*100,100):.0f}% done)")
+        lines.append(f"Daily target: ₦{target:,.0f} ({min(profit/target*100,100) if target else 0:.0f}% done)")
     lines += [
         f"Drawdown from peak: {dd:.1%}",
         f"Open positions: {n_pos} (₦{deployed:,.0f} deployed)",
@@ -594,7 +588,7 @@ async def _markets_text(cid: str) -> str:
         lines.append(
             f"{'🟢' if m.get('status')=='open' else '🔴'} "
             f"{m['asset']} {m['timeframe']} | "
-            f"YES:{m.get('yes_price',0):.3f} NO:{m.get('no_price',0):.3f} | {mins}m"
+            f"YES:{m.get('yes_price',0):.3f} NO:{m.get('no_price',0):.3f} | {mins}m left"
         )
     return "\n".join(lines)
 
@@ -604,7 +598,7 @@ async def _settings_text(cid: str) -> str:
     if not user:
         return "Not connected."
     s   = user["settings"]
-    tgt = f"₦{s['daily_target_ngn']:,.0f}" if s.get("daily_target_ngn",0)>0 else f"{s.get('daily_multiplier',10)}% of balance"
+    tgt = f"₦{s['daily_target_ngn']:,.0f}" if s.get("daily_target_ngn", 0) > 0 else f"{s.get('daily_multiplier',10)}% of balance"
     return (
         "⚙️ *Settings*\n\n"
         f"Mode:         {s.get('mode','balanced')}\n"
@@ -629,7 +623,8 @@ def _calc_target(s: dict, start: float) -> float:
 async def _set_paused(cid: str, paused: bool):
     user = await asyncio.to_thread(database.get_user, cid)
     if user:
-        s = user["settings"]; s["paused"] = paused
+        s = user["settings"]
+        s["paused"] = paused
         await asyncio.to_thread(database.update_settings, cid, s)
 
 
@@ -637,7 +632,7 @@ async def _clear_daily(cid: str):
     _user_daily.pop(cid, None)
 
 
-# ── Notifications ──────────────────────────────────────────────────────────────
+# ── Notifications ─────────────────────────────────────────────────────────────
 
 async def send_message(app: Application, chat_id: str, text: str, **kwargs):
     try:
@@ -646,21 +641,26 @@ async def send_message(app: Application, chat_id: str, text: str, **kwargs):
         log.warning(f"send_message → {chat_id}: {e}")
 
 
-async def notify_trade(app, cid: str, sig, amount: float,
-                       engine: str = "AMM", execution_style: str = "TAKER"):
+async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
+    """
+    Notification shows strategy, direction, amount and certainty.
+    Engine label removed — we always use MARKET orders so it's noise.
+    """
     icon = "⬆️" if sig.outcome.upper() in ("YES", "UP") else "⬇️"
+    # Escape markdown special chars in reason
     safe_reason = (getattr(sig, "reason", "") or "").replace("_", "\\_").replace("*", "\\*")
     msg = (
         f"🔔 *Trade* ({sig.strategy})\n"
         f"{sig.asset} {sig.timeframe}\n"
-        f"{icon} {sig.outcome} | ₦{amount:,.0f} @ {sig.certainty:.0%} | {engine}\n"
+        f"{icon} {sig.outcome} | ₦{amount:,.0f} @ {sig.certainty:.0%}\n"
         f"_{safe_reason}_"
     )
     try:
         await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
     except Exception:
-        plain = f"Trade ({sig.strategy}) {sig.asset} {sig.timeframe} {sig.outcome} ₦{amount:,.0f}"
+        # Fallback — plain text if markdown parsing fails
         try:
+            plain = f"Trade ({sig.strategy}) {sig.asset} {sig.timeframe} {sig.outcome} ₦{amount:,.0f} @ {sig.certainty:.0%}"
             await app.bot.send_message(chat_id=cid, text=plain)
         except Exception as e:
             log.error(f"notify_trade failed: {e}")
@@ -674,8 +674,10 @@ async def notify_loss(app, cid, _mid, asset, tf, strat, pnl):
 
 async def notify_drawdown(app, cid, balance, peak, dd):
     await send_message(app, cid,
-        f"⚠️ *Drawdown — Trading Paused*\n\nPeak: ₦{peak:,.0f} → Now: ₦{balance:,.0f}\n"
-        f"Drawdown: {dd:.1%}\n\n/resume to override.", parse_mode="Markdown")
+        f"⚠️ *Drawdown — Trading Paused*\n\n"
+        f"Peak: ₦{peak:,.0f} → Now: ₦{balance:,.0f}\n"
+        f"Drawdown: {dd:.1%}\n\n/resume to override.",
+        parse_mode="Markdown")
 
 async def notify_arb(app, cid, sig, pairs, profit):
     await send_message(app, cid,
