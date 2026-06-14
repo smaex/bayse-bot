@@ -1,11 +1,13 @@
 """
-Market scanner — fetches all active markets, enriches with full event details.
+Market scanner — fetches active markets, enriches with full event details.
 Always requests prices in NGN.
+Caches last known good markets — survives Bayse API 500 outages.
 """
 
 import asyncio
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -13,6 +15,11 @@ from client import BayseClient
 from config import SERIES, ALL_TIMEFRAMES, ASSET_ORACLE, ALL_ASSETS, CURRENCY
 
 log = logging.getLogger(__name__)
+
+# Cache of last successful scan — used when Bayse returns 500s
+_last_known_markets: list[dict] = []
+_last_known_time:    float      = 0.0
+_CACHE_MAX_AGE_SEC               = 120  # use cache for up to 2 min during outages
 
 
 def _now_utc() -> datetime:
@@ -43,22 +50,16 @@ def _seconds_to_open(opening_date: str) -> float:
 
 
 def _parse_threshold_from_title(title: str) -> Optional[float]:
-    """
-    Fallback: parse the threshold price from the market title.
-    Handles patterns like:
-      "Will BTC be above 67,432.15 at..."
-      "Will BTC close above $67432?"
-    """
     patterns = [
         r'(?:above|below|at)\s+\$?([\d,]+\.?\d*)',
-        r'\$?([\d,]{4,}\.?\d*)',  # any 4+ digit number (likely a price)
+        r'\$?([\d,]{4,}\.?\d*)',
     ]
     for pattern in patterns:
         m = re.search(pattern, title, re.IGNORECASE)
         if m:
             try:
                 val = float(m.group(1).replace(",", ""))
-                if val > 0.01:  # sanity check — not a probability
+                if val > 0.01:
                     return val
             except (ValueError, AttributeError):
                 continue
@@ -80,7 +81,6 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
         return None
 
     try:
-        # Always request in NGN so prices come back in the correct currency
         full = await client.get_event(event_id, currency=CURRENCY)
     except Exception as e:
         log.debug(f"Failed to enrich {event_id}: {e}")
@@ -91,8 +91,6 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
         return None
     market = markets[0]
 
-    # ── Threshold (opening spot price) ──────────────────────────────────────
-    # Try every known field name, then fall back to parsing the title.
     threshold = (
         full.get("eventThreshold")
         or full.get("threshold")
@@ -103,7 +101,10 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
         or _parse_threshold_from_title(full.get("title", ""))
     )
     if threshold is not None:
-        threshold = float(threshold)
+        try:
+            threshold = float(threshold)
+        except (TypeError, ValueError):
+            threshold = None
 
     market_id = market.get("id")
     yes_id    = market.get("outcome1Id")
@@ -131,7 +132,7 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
         "asset":       asset,
         "timeframe":   timeframe,
         "title":       full.get("title", ""),
-        "threshold":   threshold,       # opening price — may be None on non-threshold markets
+        "threshold":   threshold,
         "yes_id":      yes_id,
         "no_id":       no_id,
         "yes_label":   market.get("outcome1Label", "YES"),
@@ -149,6 +150,8 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
 
 
 async def scan_all(client: BayseClient) -> list[dict]:
+    global _last_known_markets, _last_known_time
+
     tasks = []
     for asset, timeframes in SERIES.items():
         if asset not in ALL_ASSETS:
@@ -159,12 +162,42 @@ async def scan_all(client: BayseClient) -> list[dict]:
             tasks.append(_scan_series(client, asset, tf, slug))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    markets = []
+
+    markets    = []
+    all_failed = True
     for r in results:
         if isinstance(r, list):
             markets.extend(r)
-    log.info(f"Scan complete: {len(markets)} active markets")
-    return markets
+            if r:
+                all_failed = False
+        elif isinstance(r, Exception):
+            pass  # individual series errors logged inside _scan_series
+        else:
+            all_failed = False
+
+    if markets:
+        # Good scan — update cache
+        _last_known_markets = markets
+        _last_known_time    = time.time()
+        log.info(f"Scan complete: {len(markets)} active markets")
+        return markets
+
+    # No markets found — check if it's a Bayse outage
+    cache_age = time.time() - _last_known_time
+    if _last_known_markets and cache_age < _CACHE_MAX_AGE_SEC:
+        # Refresh secs_to_close in cached markets so timers stay accurate
+        for m in _last_known_markets:
+            m["secs_to_close"] = _seconds_to_close(m.get("closing_date", ""))
+        valid = [m for m in _last_known_markets if m["secs_to_close"] > 0]
+        if valid:
+            log.warning(
+                f"Bayse API returned 0 markets — using {len(valid)} cached "
+                f"(age {cache_age:.0f}s)"
+            )
+            return valid
+
+    log.info("Scan complete: 0 active markets")
+    return []
 
 
 async def _scan_series(client: BayseClient, asset: str, tf: str, slug: str) -> list[dict]:
@@ -179,7 +212,6 @@ async def _scan_series(client: BayseClient, asset: str, tf: str, slug: str) -> l
 
 
 async def discover_series(client: BayseClient) -> None:
-    """Log every series slug on Bayse — run once on startup."""
     slugs: dict[str, int] = {}
     page = 1
     while True:
