@@ -107,13 +107,10 @@ async def start_user(chat_id: str):
         _scan_client = client
 
     settings = user.get("settings", {})
-    updated  = False
-    if settings.get("risk_pct", 3.0) > 2.0:
-        settings["risk_pct"] = 2.0;   updated = True
-    if settings.get("maxexposure", 30.0) > 20.0:
-        settings["maxexposure"] = 20.0; updated = True
-    if updated:
-        asyncio.create_task(asyncio.to_thread(database.update_settings, chat_id, settings))
+    # Do NOT silently cap risk_pct / maxexposure on restart.
+    # Previously this overrode aggressive/full_send mode settings on every deploy,
+    # locking users at 2% risk regardless of what they chose via /mode or /set.
+    # Hard safety rails live in executor (_execute_logic caps at 5%) and risk.py.
 
     risk = _get_risk(chat_id)
     if not risk.open_positions:
@@ -338,6 +335,7 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
     try:
         all_signals = []
         evaluated   = 0
+        skipped_no_spot = 0
         for market in active_markets:
             if market.get("status") != "open":
                 continue
@@ -350,11 +348,24 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
             if strategy.is_halted(market["asset"]):
                 continue
             evaluated += 1
-            sigs = await strategies.evaluate_all(market, learned, strategy.global_state)
+            # Pass spot price explicitly — one consistent value per eval cycle
+            spot_price = feeds.spot.get(market["asset"])
+            if not spot_price:
+                skipped_no_spot += 1
+            sigs = await strategies.evaluate_all(
+                market, learned, strategy.global_state, spot_price=spot_price
+            )
             all_signals.extend(sigs)
 
         if all_signals:
             log.info(f"[{chat_id}] {len(all_signals)} signal(s) from {evaluated} markets evaluated")
+        elif evaluated > 0:
+            # Always log when markets exist but no signals — critical for debugging
+            spot_summary = {a: round(feeds.spot[a], 2) for a in user_assets if feeds.spot.get(a)}
+            log.info(
+                f"[{chat_id}] 0 signals | {evaluated} markets evaluated | "
+                f"no_spot={skipped_no_spot} | spot={spot_summary}"
+            )
 
         final = strategies.merge_signals(all_signals, strategy.global_state)
         for sig in final:
@@ -392,6 +403,12 @@ def _refresh_timers():
 def _on_spot_price(asset: str, price: float):
     lag = feeds_direct.check_lag(asset, price)
     if lag["status"] == "stale":
+        # Oracle is stale but Bayse relay is live — still update history and
+        # evaluate. Strategies use feeds.spot (relay price) directly; we just
+        # skip the oracle-cross-check here. Blocking evaluations entirely when
+        # the oracle is temporarily offline caused 4-hour trading blackouts.
+        strategy.update_price_history(asset, price)
+        asyncio.create_task(_evaluate_all_users_for_asset(asset, penalty=0.0))
         return
     penalty = 0.0010 if lag["status"] == "degraded" else 0.0
     strategy.update_price_history(asset, lag["price"])
