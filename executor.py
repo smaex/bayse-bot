@@ -163,10 +163,13 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     if is_probe:
         amount = MIN_TRADE_NGN
     elif ev < 0.01:
-        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — EV {ev:+.1%}")
+        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — EV {ev:+.1%} (market_price={sig.market_price:.3f} win_prob={sig.win_prob:.2%})")
         return
 
-    if sig.market_price > 0.88:
+    # Ceiling must match SNIPE_MAX_MARKET_PRICE (0.90) — was 0.88 which killed
+    # valid signals that already passed SNIPE's own EV gate at prices 0.88-0.90.
+    if sig.market_price > 0.90:
+        log.debug(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — market_price {sig.market_price:.3f} > 0.90 ceiling")
         return
 
     if equity >= 3_000 and not risk.can_trade(equity, amount, max_exp):
