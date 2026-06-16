@@ -52,7 +52,7 @@ class CorrelateStrategy(BaseStrategy):
             return None
 
         secs = market.get("secs_to_close", 0)
-        if secs < 300:
+        if secs < 120:  # was 300 — 5min was too restrictive; 2min still gives edge time to play out
             return None
 
         tgt_thresh = market.get("threshold")
