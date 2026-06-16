@@ -97,7 +97,7 @@ SNIPE_VELOCITY_WINDOW = 60
 SNIPE_VELOCITY_VETO   = 0.40
 
 # ── Correlation ───────────────────────────────────────────────────────────────
-CORRELATION_THRESHOLD     = 0.0035
+CORRELATION_THRESHOLD     = 0.0020  # 0.20% — was 0.35%, BTC rarely moves that much in 3 min
 CORRELATION_WINDOW_SEC    = 180
 CORRELATE_BASE_CERTAINTY  = 0.55
 CORRELATE_MAX_MARKET_PRICE= 0.65
@@ -105,7 +105,7 @@ CORRELATE_MIN_REGIME      = 0.25
 
 # ── Frontrun ──────────────────────────────────────────────────────────────────
 FRONTRUN_ALLOWED_TFS       = {"5min", "15min"}
-FRONTRUN_BIAS_TRIGGER      = float(os.getenv("FRONTRUN_BIAS_TRIGGER", "0.002"))  # 0.20%
+FRONTRUN_BIAS_TRIGGER      = float(os.getenv("FRONTRUN_BIAS_TRIGGER", "0.0005"))  # 0.05% — real relay lag is 50-150ms ≈ 0.03-0.05% BTC move
 
 # ── ARB ───────────────────────────────────────────────────────────────────────
 ARB_TRIGGER     = 0.98    # enter when YES+NO ≤ this
@@ -140,10 +140,12 @@ READ_RATE_LIMIT       = 25
 SCAN_INTERVAL_SECONDS = 15
 
 # ── Infra guard ───────────────────────────────────────────────────────────────
-INFRA_STALE_LAG_SEC      = 90.0   # crypto: >90s = hard block
-INFRA_DEGRADED_LAG_SEC   = 30.0   # >30s = apply safety spread
-INFRA_STALE_DIFF_PCT     = 0.0020 # >0.20% price diff = hard block
-INFRA_DEGRADED_DIFF_PCT  = 0.0008 # >0.08% = safety spread
+INFRA_STALE_LAG_SEC      = 120.0  # crypto: >120s of no oracle data = hard block
+INFRA_DEGRADED_LAG_SEC   = 45.0   # >45s = apply safety spread
+INFRA_STALE_DIFF_PCT     = 0.0080 # >0.80% price diff = genuinely broken feed
+INFRA_DEGRADED_DIFF_PCT  = 0.0015 # >0.15% = safety spread (was 0.08% — too tight)
+# NOTE: 0.20% divergence is a FRONTRUN opportunity, not a stale feed.
+# Old 0.0020 stale threshold blocked evaluations exactly when FRONTRUN should fire.
 
 # ── Systemic risk halt ────────────────────────────────────────────────────────
 SYSTEMIC_RISK_HALT_MINS       = 5
