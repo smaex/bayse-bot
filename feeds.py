@@ -83,7 +83,12 @@ async def realtime_feed(on_price=None):
                                 on_price(asset, float(price))
         except Exception as e:
             log.warning(f"Realtime feed error: {e}. Reconnect in {backoff}s")
-            spot.clear()
+            # DO NOT clear spot prices on disconnect.
+            # Strategies use feeds.spot.get(asset) — clearing it silences every
+            # strategy (SNIPE, FRONTRUN, CORRELATE all return None without a
+            # live price) for the entire backoff period (up to 60s per cycle).
+            # Instead, prices age naturally; strategies that need freshness can
+            # check feeds_direct for oracle confirmation.
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
