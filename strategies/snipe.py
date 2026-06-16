@@ -78,6 +78,14 @@ class SnipeStrategy(BaseStrategy):
 
         threshold = market.get("threshold")
         live_spot = spot_price if spot_price is not None else feeds.spot.get(asset)
+        if not live_spot and asset not in config.FX_SESSION_UTC:
+            # Fallback to Binance oracle during Bayse relay startup / reconnect gaps.
+            # Only crypto — FX oracle (TwelveData) has different timing guarantees.
+            import time as _t
+            import feeds_direct as _fd
+            oracle_p, oracle_t = _fd.get_direct_price(asset)
+            if oracle_p and (_t.time() - oracle_t) < 30:
+                live_spot = oracle_p
         if not threshold or not live_spot:
             return None
 
