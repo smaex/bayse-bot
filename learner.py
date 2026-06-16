@@ -228,7 +228,11 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         c           = cmults.get(strat, 1.0)
 
         if p_value < 0.05:
-            c = max(0.1, c - 0.25)
+            # Penalty: reduce certainty multiplier by 0.20 (was 0.25).
+            # Floor raised from 0.10 → 0.40: at 0.10, a 0.80 certainty signal
+            # becomes 0.08 — below the 0.35 discovery floor — bot goes silent.
+            # At 0.40 floor, same signal becomes 0.32 — still gets probe trades through.
+            c = max(0.40, c - 0.20)
             warnings.append(f"⚠️ {strat} certainty penalised (p={p_value:.3f})")
         elif win_rate is not None and win_rate >= expected_wr:
             c = min(1.5, c + 0.10)
@@ -238,7 +242,7 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         if win_rate is not None:
             if win_rate >= 0.75:   m = min(3.0, m + 0.25)
             elif win_rate >= 0.60: m = min(1.5, m + 0.10)
-            elif win_rate < 0.55:  m = max(0.10, m - 0.25)
+            elif win_rate < 0.55:  m = max(0.25, m - 0.20)  # was max(0.10, m-0.25)
         mults[strat] = round(m, 2)
 
         # SNIPE threshold tuning
@@ -266,8 +270,8 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         cv     = cmults.get(key, 1.0)
 
         if total >= 10 and pv < 0.05 and pnl < 0:
-            cv = max(0.1, cv - 0.50)
-            warnings.append(f"🔴 SELF-CORRECT: {key} penalised (-50%) — p={pv:.3f}")
+            cv = max(0.40, cv - 0.35)  # was max(0.1, cv-0.50) — 0.10 floor silences combos permanently
+            warnings.append(f"🔴 SELF-CORRECT: {key} penalised (-35%) — p={pv:.3f}")
         elif pv > 0.20 and wr >= exp_wr:
             cv = min(1.5, cv + 0.20)
         cmults[key] = round(cv, 2)
