@@ -33,9 +33,9 @@ class FrontrunStrategy(BaseStrategy):
         if secs < 60:
             return None
 
-        # Oracle price must be fresh (< 5 seconds old)
+        # Oracle price must be fresh (< 10 seconds old)
         oracle_p, oracle_t = feeds_direct.get_direct_price(asset)
-        if not oracle_p or (time.time() - oracle_t > 5.0):
+        if not oracle_p or (time.time() - oracle_t > 10.0):
             return None
 
         bayse_spot = feeds.spot.get(asset)
