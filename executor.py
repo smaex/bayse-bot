@@ -90,11 +90,15 @@ def _effective_fee(fee_rate: float, price: float) -> float:
 async def execute_trade(chat_id: str, sig, client, risk, settings: dict,
                         equity: float, free_cash: float):
     if strategy.global_state.systemic_halt_until > time.time():
+        log.debug(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — systemic halt active")
         return
     if risk.already_in(sig.market_id):
+        log.debug(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — already in/pending on {sig.market_id}")
         return
     last = _trade_cooldown.get(sig.market_id, 0.0)
-    if time.time() - last < TRADE_COOLDOWN_SEC:
+    remaining = TRADE_COOLDOWN_SEC - (time.time() - last)
+    if remaining > 0:
+        log.debug(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — cooldown {remaining:.0f}s left on {sig.market_id}")
         return
 
     risk.lock_market(sig.market_id)
@@ -115,6 +119,7 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     user_risk = min(settings.get("risk_pct", 2.0), 5.0) / 100.0
 
     if risk.is_in_strict_mode() and sig.certainty < 0.70:
+        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — strict mode (near daily target), certainty {sig.certainty:.0%} < 70%")
         return
 
     # ── Conviction sizing ──────────────────────────────────────────────────
@@ -152,6 +157,10 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
 
     effective_min = max(MIN_TRADE_NGN, min_t)
     if amount < effective_min or amount > free_cash:
+        log.info(
+            f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — amount ₦{amount:,.0f} "
+            f"outside bounds (min=₦{effective_min:,.0f}, free_cash=₦{free_cash:,.0f})"
+        )
         return
 
     # ── EV check ───────────────────────────────────────────────────────────
@@ -169,15 +178,38 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     # Ceiling must match SNIPE_MAX_MARKET_PRICE (0.90) — was 0.88 which killed
     # valid signals that already passed SNIPE's own EV gate at prices 0.88-0.90.
     if sig.market_price > 0.90:
-        log.debug(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — market_price {sig.market_price:.3f} > 0.90 ceiling")
+        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — market_price {sig.market_price:.3f} > 0.90 ceiling")
         return
 
     if equity >= 3_000 and not risk.can_trade(equity, amount, max_exp):
+        log.info(
+            f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — exposure cap "
+            f"(deployed=₦{risk.deployed():,.0f}, +₦{amount:,.0f} > {max_exp:.0%} of ₦{equity:,.0f})"
+        )
         return
 
+    # ── Market-specific minimum ───────────────────────────────────────────
+    # CRITICAL FIX: previously this silently returned forever with NO log and
+    # NO cooldown — once a market's real Bayse minimum exceeded our computed
+    # amount, every future signal for that market_id died instantly and
+    # invisibly, in a tight infinite retry loop (signal fires every ~1s,
+    # dies silently, fires again). This was very likely why trades stopped
+    # entirely for hours despite signals firing continuously.
     cached_min = _market_min_cache.get(sig.market_id, 0.0)
     if cached_min > 0 and amount < cached_min:
-        return
+        if cached_min <= max_t and cached_min <= free_cash:
+            log.info(
+                f"[{chat_id}] BUMP {sig.strategy} {sig.asset} order ₦{amount:,.0f} → "
+                f"₦{cached_min:,.0f} (Bayse market minimum)"
+            )
+            amount = cached_min
+        else:
+            log.info(
+                f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — market min ₦{cached_min:,.0f} "
+                f"exceeds max_trade(₦{max_t:,.0f}) or free_cash(₦{free_cash:,.0f})"
+            )
+            _trade_cooldown[sig.market_id] = time.time()  # prevent infinite tight retry loop
+            return
 
     # ── Engine detection ───────────────────────────────────────────────────
     market   = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
@@ -252,6 +284,10 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
             log.info(f"[{chat_id}] Market min ₦{market_min:,.0f} cached for {sig.market_id}")
         else:
             log.error(f"[{chat_id}] Order failed {sig.market_id}: {e}", exc_info=True)
+        # Always set cooldown on failure — prevents an infinite tight retry
+        # loop hammering the same broken market every tick (this was the
+        # root cause of trades silently dying for hours with no visible error).
+        _trade_cooldown[sig.market_id] = time.time()
         return
 
     # ── Notify FIRST — trade has happened on Bayse ────────────────────────
@@ -319,10 +355,29 @@ def _get_market_fee(market_id: str) -> float:
 async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float, settings: dict):
     market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
     if not market:
+        log.debug(f"[{chat_id}] ARB SKIP {sig.asset} — market {sig.market_id} not found in active list")
         return
 
-    budget = min(ARB_MAX_SIZE_NGN, free_cash * 0.10)
+    last = _trade_cooldown.get(sig.market_id, 0.0)
+    if time.time() - last < TRADE_COOLDOWN_SEC:
+        return
+
+    # ARB is risk-free (mint/burn — guaranteed profit, no directional exposure),
+    # so it deserves a much higher allocation than directional strategies.
+    # Old 10% fraction made ARB mathematically dead below ~₦2,000 free cash
+    # (budget never cleared the 2x MIN_TRADE_NGN floor needed for both legs),
+    # silently and permanently disabling ARB for smaller accounts with no log.
+    budget = min(ARB_MAX_SIZE_NGN, free_cash * 0.30)
     if budget < MIN_TRADE_NGN * 2:
+        # Try harder before giving up — ARB has zero directional risk,
+        # so using most of free_cash here is safe if it clears the floor.
+        budget = min(free_cash * 0.90, MIN_TRADE_NGN * 2.5)
+    if budget < MIN_TRADE_NGN * 2:
+        log.info(
+            f"[{chat_id}] ARB SKIP {sig.asset} — free_cash ₦{free_cash:,.0f} too small "
+            f"for the ₦{MIN_TRADE_NGN*2:,.0f} two-leg minimum"
+        )
+        _trade_cooldown[sig.market_id] = time.time()
         return
 
     yes_p = market["yes_price"]
@@ -332,6 +387,11 @@ async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float
     amount_no  = round(budget - amount_yes, 2)
 
     if amount_yes < MIN_TRADE_NGN or amount_no < MIN_TRADE_NGN:
+        log.info(
+            f"[{chat_id}] ARB SKIP {sig.asset} — leg sizes too small "
+            f"(yes=₦{amount_yes:,.0f} no=₦{amount_no:,.0f}, min=₦{MIN_TRADE_NGN:,.0f})"
+        )
+        _trade_cooldown[sig.market_id] = time.time()
         return
 
     yes_shares = 0.0
@@ -390,3 +450,9 @@ async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float
                 log.info(f"[{chat_id}] ARB rollback OK")
             except Exception as re_:
                 log.critical(f"[{chat_id}] ARB ROLLBACK FAILED: {re_}")
+
+    finally:
+        # Always set cooldown — prevents the same infinite tight retry loop
+        # bug as the directional executor (no cooldown meant the same ARB
+        # signal could re-fire every tick with no log trace).
+        _trade_cooldown[sig.market_id] = time.time()
