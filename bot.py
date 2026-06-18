@@ -199,7 +199,14 @@ async def _user_loop(chat_id: str):
                 day["start_balance"] = equity
                 settings["daily_state"] = day
                 await asyncio.to_thread(database.update_settings, chat_id, settings)
-                risk.peak_balance  = equity
+                # CRITICAL: do NOT reset risk.peak_balance here.
+                # This heuristic cannot distinguish a genuine user withdrawal from a
+                # sudden trading loss (e.g. an ARB burn failure). Every time it
+                # misfired on a loss, it reset peak_balance down to the post-loss
+                # balance, making drawdown = 0% instantly and waving the bot back
+                # into full-strength trading right after losing ~30% of capital.
+                # The drawdown peak must only ever be touched by update_peak()
+                # (which only increases it) or by an explicit user /resume.
                 _user_daily[chat_id] = day
                 if _tg_app:
                     await telegram_bot.send_message(
@@ -370,7 +377,7 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
         final = strategies.merge_signals(all_signals, strategy.global_state)
         for sig in final:
             if sig.strategy == "ARB":
-                await executor.execute_arb(chat_id, sig, client, equity, free_cash, settings)
+                await executor.execute_arb(chat_id, sig, client, risk, equity, free_cash, settings)
             else:
                 await executor.execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     except Exception as e:
