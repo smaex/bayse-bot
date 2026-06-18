@@ -352,16 +352,38 @@ def _get_market_fee(market_id: str) -> float:
 
 # ── ARB execution ─────────────────────────────────────────────────────────────
 
-async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float, settings: dict):
+async def execute_arb(chat_id: str, sig, client, risk, equity: float, free_cash: float, settings: dict):
     market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
     if not market:
         log.debug(f"[{chat_id}] ARB SKIP {sig.asset} — market {sig.market_id} not found in active list")
         return
 
+    # CRITICAL FIX: ARB previously had NO real lock, only a cooldown timestamp
+    # set at the very end of the function. Two overlapping evaluation triggers
+    # (price tick + heartbeat + market update all fire independently) could
+    # both pass the cooldown check and call execute_arb concurrently on the
+    # SAME market before either had set the cooldown — racing on the same
+    # capital and shares. This produced "you do not have enough shares for
+    # this trade" on the burn, then an "insufficient shares balance" failure
+    # on the rollback too, because both legs got bought twice while only one
+    # set of shares actually existed. This lock makes ARB execution mutually
+    # exclusive per-market, exactly like execute_trade already does.
+    if risk.already_in(sig.market_id):
+        log.debug(f"[{chat_id}] ARB SKIP {sig.asset} — already in/pending on {sig.market_id}")
+        return
     last = _trade_cooldown.get(sig.market_id, 0.0)
     if time.time() - last < TRADE_COOLDOWN_SEC:
         return
 
+    risk.lock_market(sig.market_id)
+    try:
+        await _execute_arb_logic(chat_id, sig, client, market, free_cash)
+    finally:
+        risk.unlock_market(sig.market_id)
+        _trade_cooldown[sig.market_id] = time.time()
+
+
+async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash: float):
     # ARB is risk-free (mint/burn — guaranteed profit, no directional exposure),
     # so it deserves a much higher allocation than directional strategies.
     # Old 10% fraction made ARB mathematically dead below ~₦2,000 free cash
@@ -377,7 +399,6 @@ async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float
             f"[{chat_id}] ARB SKIP {sig.asset} — free_cash ₦{free_cash:,.0f} too small "
             f"for the ₦{MIN_TRADE_NGN*2:,.0f} two-leg minimum"
         )
-        _trade_cooldown[sig.market_id] = time.time()
         return
 
     yes_p = market["yes_price"]
@@ -391,8 +412,12 @@ async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float
             f"[{chat_id}] ARB SKIP {sig.asset} — leg sizes too small "
             f"(yes=₦{amount_yes:,.0f} no=₦{amount_no:,.0f}, min=₦{MIN_TRADE_NGN:,.0f})"
         )
-        _trade_cooldown[sig.market_id] = time.time()
         return
+
+    # Explicit slippage cap — must match the conservative estimate formula
+    # below, so the "worst case" we calculate for is the same worst case
+    # Bayse's API actually enforces.
+    arb_slippage = 0.03
 
     yes_shares = 0.0
     no_shares  = 0.0
@@ -403,22 +428,33 @@ async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["yes_id"], side="BUY",
             amount=amount_yes, order_type="MARKET", currency=CURRENCY,
+            max_slippage=arb_slippage,
         )
         order_yes  = resp_yes.get("order") or resp_yes
         yes_shares = client.parse_filled_shares(order_yes)
         if yes_shares <= 0:
-            yes_shares = amount_yes / yes_p
+            # CRITICAL FIX: previously used amount/yes_p — an optimistic estimate
+            # that ignores AMM price impact/slippage. If the real fill price was
+            # worse than quoted (which it usually is for any size on an AMM),
+            # this estimate OVERSTATES actual shares received. Burning more
+            # shares than we actually hold is exactly what caused "you do not
+            # have enough shares for this trade". Using price*(1+max_slippage)
+            # as the denominator guarantees this estimate is a LOWER bound on
+            # actual shares received (assuming Bayse honors max_slippage),
+            # leaving a small unburned residual instead of a hard failure.
+            yes_shares = amount_yes / (yes_p * (1.0 + arb_slippage))
         yes_ok = True
 
         resp_no = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["no_id"], side="BUY",
             amount=amount_no, order_type="MARKET", currency=CURRENCY,
+            max_slippage=arb_slippage,
         )
         order_no  = resp_no.get("order") or resp_no
         no_shares = client.parse_filled_shares(order_no)
         if no_shares <= 0:
-            no_shares = amount_no / no_p
+            no_shares = amount_no / (no_p * (1.0 + arb_slippage))
 
         burn_qty = min(yes_shares, no_shares)
         if burn_qty > 0:
@@ -441,18 +477,39 @@ async def execute_arb(chat_id: str, sig, client, equity: float, free_cash: float
 
     except Exception as e:
         log.error(f"[{chat_id}] ARB error: {e}")
+        rollback_ok = False
         if yes_ok and yes_shares > 0:
             try:
                 await client.place_order(
                     sig.event_id, sig.market_id, market["yes_id"],
                     "SELL", amount_yes, "MARKET", currency=CURRENCY,
                 )
+                rollback_ok = True
                 log.info(f"[{chat_id}] ARB rollback OK")
             except Exception as re_:
                 log.critical(f"[{chat_id}] ARB ROLLBACK FAILED: {re_}")
 
-    finally:
-        # Always set cooldown — prevents the same infinite tight retry loop
+        # CRITICAL FIX: a failed burn/rollback previously vanished completely —
+        # nothing was ever written to the trades table, so the loss never
+        # showed up in /trades, /analysis, or the learner's win-rate math.
+        # Real money was spent on both legs; record it as a loss so it's
+        # visible and the learner can actually account for it.
+        try:
+            trade_id = await asyncio.to_thread(
+                database.record_trade,
+                chat_id=chat_id, strategy="ARB", asset=sig.asset,
+                timeframe=sig.timeframe, outcome="ARB", outcome_id="burn_failed",
+                market_id=sig.market_id, event_id=sig.event_id,
+                entry_price=_safe_float(yes_p + no_p),
+                amount_ngn=_safe_float(amount_yes + amount_no),
+                certainty=1.0, secs_to_close=0,
+            )
+            # Best-effort loss estimate: full cost if rollback failed too,
+            # else just the rollback's own slippage cost (small, unknown — log only).
+            est_loss = -(amount_yes + amount_no) if not rollback_ok else 0.0
+            await asyncio.to_thread(database.resolve_trade, trade_id, False, est_loss)
+        except Exception as db_err:
+            log.error(f"[{chat_id}] ARB failure could not even be recorded to DB: {db_err}")
         # bug as the directional executor (no cooldown meant the same ARB
         # signal could re-fire every tick with no log trace).
         _trade_cooldown[sig.market_id] = time.time()
