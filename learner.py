@@ -228,11 +228,18 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         c           = cmults.get(strat, 1.0)
 
         if p_value < 0.05:
-            # Penalty: reduce certainty multiplier by 0.20 (was 0.25).
-            # Floor raised from 0.10 → 0.40: at 0.10, a 0.80 certainty signal
-            # becomes 0.08 — below the 0.35 discovery floor — bot goes silent.
-            # At 0.40 floor, same signal becomes 0.32 — still gets probe trades through.
-            c = max(0.40, c - 0.20)
+            # FLOOR RAISED 0.40 → 0.85: certainty_multipliers should never be
+            # able to gate a strategy out of existence — that job belongs to
+            # size_multipliers (floored at 0.25 below), which throttles
+            # position SIZE, not whether a signal is allowed to fire at all.
+            # The old 0.40 floor created a structural asymmetry: ARB's
+            # certainty starts at a hardcoded 1.0, so 1.0*0.40=0.40 still
+            # clears the 0.35 discovery floor — ARB was immune. SNIPE's raw
+            # certainty typically runs 0.50-0.85, so the same 0.40 multiplier
+            # could push it to 0.20-0.34 — below the floor, silencing SNIPE
+            # for days while ARB kept trading. At 0.85 the multiplier is a
+            # gentle nudge, not a gate.
+            c = max(0.85, c - 0.20)
             warnings.append(f"⚠️ {strat} certainty penalised (p={p_value:.3f})")
         elif win_rate is not None and win_rate >= expected_wr:
             c = min(1.5, c + 0.10)
@@ -270,7 +277,7 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         cv     = cmults.get(key, 1.0)
 
         if total >= 10 and pv < 0.05 and pnl < 0:
-            cv = max(0.40, cv - 0.35)  # was max(0.1, cv-0.50) — 0.10 floor silences combos permanently
+            cv = max(0.85, cv - 0.35)  # same architectural fix as the per-strategy floor above
             warnings.append(f"🔴 SELF-CORRECT: {key} penalised (-35%) — p={pv:.3f}")
         elif pv > 0.20 and wr >= exp_wr:
             cv = min(1.5, cv + 0.20)
