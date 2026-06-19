@@ -159,6 +159,7 @@ async def _main_menu(update: Update):
          InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
         [InlineKeyboardButton("⏸ Pause",    callback_data="pause"),
          InlineKeyboardButton("▶️ Resume",   callback_data="resume")],
+        [InlineKeyboardButton("🔄 Reset Learning", callback_data="resetlearning")],
     ]
     await update.message.reply_text(
         "🤖 *Bayse Bot — Active*",
@@ -189,6 +190,12 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         await _clear_daily(cid)
         log.info(f"[{cid}] RESUMED via button")
         await q.message.reply_text("▶️ Trading resumed.")
+    elif d == "resetlearning":
+        user = await asyncio.to_thread(database.get_user, cid)
+        s    = user["settings"]; s["learned"] = {}
+        await asyncio.to_thread(database.update_settings, cid, s)
+        log.info(f"[{cid}] /resetlearning via button")
+        await q.message.reply_text("🔄 Learned settings cleared.")
     elif d in _MODES:
         mode_cfg = _MODES[d]
         user     = await asyncio.to_thread(database.get_user, cid)
@@ -467,7 +474,9 @@ _MODES = {
         "label": "🟢 *Safe mode applied.*",
         "settings": {
             "mode": "safe", "assets": ["BTC", "EURUSD", "GBPUSD"],
-            "timeframes": ["15min", "1h"], "strategies": ["SNIPE", "ARB"],
+            # 1h kept only for FX (EURUSD/GBPUSD only exist at 1h granularity,
+            # and ARB can still work there). 5min added for the BTC leg.
+            "timeframes": ["5min", "15min", "1h"], "strategies": ["SNIPE", "ARB"],
             "risk_pct": 0.5, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 15.0, "daily_multiplier": 5,
         },
@@ -476,7 +485,11 @@ _MODES = {
         "label": "🔵 *Balanced mode applied.*",
         "settings": {
             "mode": "balanced", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["15min", "1h"], "strategies": ["SNIPE", "ARB", "FRONTRUN"],
+            # Pure fast-cycle focus — dropped 1h. SNIPE/FRONTRUN/CORRELATE are
+            # all hard-restricted to 5min/15min in code now; this just keeps
+            # the user-level filter consistent so ARB doesn't waste cycles
+            # scanning 1h candles this account isn't otherwise using.
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN"],
             "risk_pct": 1.5, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 20.0, "daily_multiplier": 10,
         },
@@ -485,7 +498,7 @@ _MODES = {
         "label": "🟠 *Aggressive mode applied.*",
         "settings": {
             "mode": "aggressive", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min", "1h"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"],
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"],
             "risk_pct": 3.0, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 30.0, "daily_multiplier": 20,
         },
@@ -494,7 +507,7 @@ _MODES = {
         "label": "🔴 *Full Send mode applied.*",
         "settings": {
             "mode": "full_send", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min", "1h"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"],
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"],
             "risk_pct": 5.0, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 50.0, "daily_multiplier": 50,
         },
