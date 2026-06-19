@@ -1,14 +1,16 @@
 """
-SNIPE — core strategy.
+SNIPE — near-close certainty trading.
 
-Key fix: time-dependent minimum distance.
-The old flat 0.10% distance filter was blocking ~50% of valid entry windows.
-BTC cannot move $12 in 30 seconds. BTC cannot move $25 in 60 seconds.
-The minimum distance shrinks as time runs out — mathematically correct
-Brownian motion behavior. EV check still gates every trade.
+Fires when spot price has clearly crossed the market threshold within the
+entry window and Brownian motion probability gives meaningful edge.
+
+All rejection reasons are now logged at INFO level so we can see exactly
+why a market doesn't qualify — previously all returns were silent and
+invisible in the log stream.
 """
 import logging
 import math
+import time
 from typing import Optional
 
 import config
@@ -22,29 +24,27 @@ from strategies.manager import kelly_size, max_ev_price
 
 log = logging.getLogger("strat.snipe")
 
+# SNIPE is hard-restricted to fast-cycle crypto markets only. 1h/1d candles
+# don't fit a "trade every 5-15 minutes" cadence, and FX assets only exist
+# on the 1h timeframe in config.SERIES — so this restriction also makes
+# SNIPE crypto-only (BTC/ETH/SOL) by construction. FRONTRUN already had
+# this same restriction (config.FRONTRUN_ALLOWED_TFS); CORRELATE now does too.
+ALLOWED_TFS = {"5min", "15min"}
+
+# Suppress per-market rejection spam outside the entry window.
+# Only log rejections when secs_to_close is within 2× the entry window.
+_LOG_WITHIN_FACTOR = 2.0
+
 
 def _time_adjusted_min_dist(base_dist: float, secs: float) -> float:
     """
-    Scale minimum distance with time remaining.
-
-    Rationale: at 300s left, BTC could move 0.52% (σ√t at 1.8% hourly).
-    At 60s left, it can only move ~0.23%. At 30s, ~0.16%.
-    So the minimum "safe" distance shrinks as close approaches.
-
-    Formula: min_dist × sqrt(secs / entry_window)
-    This matches the Brownian motion scaling — same math as win_probability.
-
-    Examples at base_dist=0.10% for BTC:
-      300s → 0.10%  (full requirement)
-      120s → 0.063% (still strong edge)
-       60s → 0.045% (BTC barely moves this in 60s)
-       30s → 0.032% (near-certain)
+    Scale minimum distance with time remaining (Brownian motion scaling).
+    At 300s: full base_dist required. At 60s: ~45%. At 0s: 0.
     """
-    entry_window = 300.0  # reference window in seconds
+    entry_window = 300.0
     if secs <= 0:
         return 0.0
-    scale = math.sqrt(min(secs, entry_window) / entry_window)
-    return base_dist * scale
+    return base_dist * math.sqrt(min(secs, entry_window) / entry_window)
 
 
 class SnipeStrategy(BaseStrategy):
@@ -53,40 +53,58 @@ class SnipeStrategy(BaseStrategy):
 
     async def evaluate(self, market: dict, learned: dict, state,
                        spot_price: float = None) -> Optional[TradeSignal]:
-        tf    = market["timeframe"]
-        secs  = market.get("secs_to_close", 0)
-        asset = market["asset"]
+        tf      = market["timeframe"]
+        secs    = market.get("secs_to_close", 0)
+        asset   = market["asset"]
+        mkt_id  = market["market_id"]
         learned = learned or {}
         mode    = learned.get("mode", "balanced")
 
-        # ── Entry window ──────────────────────────────────────────────────
+        # ── Hard scope restriction ─────────────────────────────────────────
+        # SNIPE only operates on 5min/15min markets. This is a deliberate
+        # simplification: fast-cycle crypto candles are what give SNIPE its
+        # edge (Brownian-motion math gets noisier over longer windows), and
+        # it removes FX entirely (FX only has 1h granularity in config).
+        if tf not in ALLOWED_TFS:
+            return None
+
+        # ── Entry window check ────────────────────────────────────────────
         window = config.SNIPE_ENTRY_WINDOWS.get(tf)
-        if asset in config.FX_SESSION_UTC and tf == "1h":
-            window = config.FX_ENTRY_WINDOW_1H
-        if window is None or secs > window or secs < 0:
+
+        near_window = window is not None and secs <= window * _LOG_WITHIN_FACTOR
+
+        if window is None:
+            # No entry window configured for this timeframe — skip silently
+            return None
+        if secs < 0:
+            return None
+        if secs > window:
+            # Too early — only log if we are close to window opening
+            if near_window:
+                log.debug(f"SNIPE {asset} {tf} — not yet in window "
+                          f"({secs:.0f}s left, window opens at {window}s)")
             return None
         if secs < 30 and mode != "full_send":
+            log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — too close to close "
+                     f"({secs:.0f}s left, need 30s)")
             return None
 
-        # ── FX session guard ──────────────────────────────────────────────
-        if asset in config.FX_SESSION_UTC:
-            from datetime import datetime, timezone
-            hour = datetime.now(timezone.utc).hour
-            lo, hi = config.FX_SESSION_UTC[asset]
-            if not (lo <= hour < hi):
-                return None
-
+        # ── Price data ────────────────────────────────────────────────────
         threshold = market.get("threshold")
         live_spot = spot_price if spot_price is not None else feeds.spot.get(asset)
-        if not live_spot and asset not in config.FX_SESSION_UTC:
-            # Fallback to Binance oracle during Bayse relay startup / reconnect gaps.
-            # Only crypto — FX oracle (TwelveData) has different timing guarantees.
-            import time as _t
+        if not live_spot:
             import feeds_direct as _fd
             oracle_p, oracle_t = _fd.get_direct_price(asset)
-            if oracle_p and (_t.time() - oracle_t) < 30:
+            if oracle_p and (time.time() - oracle_t) < 30:
                 live_spot = oracle_p
-        if not threshold or not live_spot:
+                log.debug(f"SNIPE {asset} — using oracle fallback price {live_spot}")
+
+        if not threshold:
+            log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — NO THRESHOLD in market data "
+                     f"(scanner did not extract it)")
+            return None
+        if not live_spot:
+            log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no live spot price available")
             return None
 
         # ── Core math ─────────────────────────────────────────────────────
@@ -94,7 +112,6 @@ class SnipeStrategy(BaseStrategy):
         direction    = "YES" if distance_pct > 0 else "NO"
 
         rv = realized_vol_hourly(asset, state)
-        # Vol expands near close — conservative adjustment
         if secs < 300:
             rv *= (1.0 + 0.5 * ((300 - secs) / 210.0))
 
@@ -107,42 +124,44 @@ class SnipeStrategy(BaseStrategy):
         velocity = velocity_score(asset, threshold, direction, state)
 
         # ── Vetoes ────────────────────────────────────────────────────────
-        market_id = market["market_id"]
-        flips     = global_state.market_flips.get(market_id, 0)
+        flips = global_state.market_flips.get(mkt_id, 0)
 
-        # Chaos veto: many favourite flips near close
         if secs < 210 and flips >= 5:
+            log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — chaos veto "
+                     f"({flips} flips in last {secs:.0f}s)")
             return None
 
         if mode != "full_send":
-            # Time-dependent minimum distance — the key fix for trade frequency.
-            # At 300s: full distance required. At 60s: 45% of distance required.
-            # Mathematically correct — BTC physically cannot cross back over in
-            # less time than the distance implies given its actual volatility.
             base_dist = (
                 config.CRYPTO_MIN_DISTANCE.get(asset)
                 or config.FX_MIN_DISTANCE.get(asset, 0.0010)
             )
             dyn_dist = _time_adjusted_min_dist(base_dist, secs)
-
-            # Apply vol scaling on top of time adjustment
             base_vol  = config.ASSET_HOURLY_VOL.get(asset, 0.022)
             vol_ratio = rv / base_vol if base_vol > 0 else 1.0
             dyn_dist  = max(dyn_dist * 0.5, min(dyn_dist * vol_ratio, dyn_dist * 1.5))
 
             if abs(distance_pct) < dyn_dist:
+                log.info(
+                    f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — distance too small "
+                    f"({distance_pct:+.4%} vs min {dyn_dist:.4%} | "
+                    f"spot={live_spot:.2f} threshold={threshold:.2f} secs={secs:.0f})"
+                )
                 return None
 
-            # Momentum veto: inside base buffer with adverse momentum
             if abs(distance_pct) < base_dist and mom <= 0:
+                log.info(
+                    f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — momentum veto "
+                    f"(dist={distance_pct:+.4%} < base {base_dist:.4%}, mom={mom:+.2f})"
+                )
                 return None
 
-            # Velocity veto: price crashing toward threshold
             if velocity < -config.SNIPE_VELOCITY_VETO:
+                log.info(
+                    f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — velocity veto "
+                    f"(velocity={velocity:.2f} < -{config.SNIPE_VELOCITY_VETO})"
+                )
                 return None
-
-        if asset in config.FX_SESSION_UTC and regime < config.FX_MIN_REGIME:
-            return None
 
         # ── Composite certainty ───────────────────────────────────────────
         market_price = market["yes_price"] if direction == "YES" else market["no_price"]
@@ -153,11 +172,14 @@ class SnipeStrategy(BaseStrategy):
 
         composite = min((base + mom_bonus + edge_bonus) * regime_fac, 0.99)
 
-        # Conviction boost: stable market (few flips) late in candle
         if secs < 210 and flips <= 1:
             composite = min(composite + 0.10, 0.99)
 
         if composite < 0.30:
+            log.info(
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — composite too low "
+                f"({composite:.2f} < 0.30 | w={w_est:.1%} dist={distance_pct:+.3%})"
+            )
             return None
 
         # ── EV gate ───────────────────────────────────────────────────────
@@ -165,25 +187,37 @@ class SnipeStrategy(BaseStrategy):
         margin   = {"safe": 0.15, "balanced": 0.06,
                     "aggressive": 0.04, "full_send": 0.02}.get(mode, 0.06)
         ev_ceil  = max_ev_price(w_est, market_price, fee_rate, min_margin=margin)
+
         if market_price >= ev_ceil:
-            return None
-        if market_price > config.SNIPE_MAX_MARKET_PRICE:
+            log.info(
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — EV gate: "
+                f"market_price={market_price:.3f} >= ev_ceil={ev_ceil:.3f} "
+                f"(w={w_est:.1%} margin={margin:.0%})"
+            )
             return None
 
-        # ── Sizing ────────────────────────────────────────────────────────
+        if market_price > config.SNIPE_MAX_MARKET_PRICE:
+            log.info(
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — price ceiling "
+                f"({market_price:.3f} > {config.SNIPE_MAX_MARKET_PRICE})"
+            )
+            return None
+
+        # ── Size ──────────────────────────────────────────────────────────
         size = kelly_size(w_est, market_price, fee_rate,
                           asset=asset, state=state, learned=learned,
                           strategy_name="SNIPE")
 
-        log.debug(
-            f"SNIPE {asset} {tf} | dist={distance_pct:+.3%} dyn_min={dyn_dist:.3%} "
-            f"secs={secs:.0f} w={w_est:.1%} composite={composite:.2f}"
+        log.info(
+            f"SNIPE ✅ {asset} {tf} | dist={distance_pct:+.3%} "
+            f"secs={secs:.0f} w={w_est:.1%} composite={composite:.2f} "
+            f"market_price={market_price:.3f}"
         )
 
         return TradeSignal(
             strategy="SNIPE",
             event_id=market["event_id"],
-            market_id=market_id,
+            market_id=mkt_id,
             asset=asset,
             timeframe=tf,
             outcome=direction,
