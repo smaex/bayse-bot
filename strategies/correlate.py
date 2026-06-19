@@ -17,6 +17,11 @@ from strategies.manager import kelly_size, max_ev_price
 
 log = logging.getLogger("strat.correlate")
 
+# Same fast-cycle restriction as SNIPE and FRONTRUN. CORRELATE's signal decays
+# within CORRELATION_WINDOW_SEC (180s) — evaluating it against a 1h/1d candle
+# whose threshold was set hours ago doesn't fit that decay window at all.
+ALLOWED_TFS = {"5min", "15min"}
+
 
 class CorrelateStrategy(BaseStrategy):
     def __init__(self):
@@ -28,7 +33,10 @@ class CorrelateStrategy(BaseStrategy):
         if asset not in {"ETH", "SOL"}:
             return None
 
-        tf        = market["timeframe"]
+        tf = market["timeframe"]
+        if tf not in ALLOWED_TFS:
+            return None
+
         threshold = config.CORRELATION_THRESHOLD
 
         spot_move, spot_dir = btc_spot_move_pct(config.CORRELATION_WINDOW_SEC, state=state)
