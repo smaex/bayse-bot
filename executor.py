@@ -384,28 +384,38 @@ async def execute_arb(chat_id: str, sig, client, risk, equity: float, free_cash:
 
 
 async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash: float):
-    # ARB is risk-free (mint/burn — guaranteed profit, no directional exposure),
-    # so it deserves a much higher allocation than directional strategies.
-    # Old 10% fraction made ARB mathematically dead below ~₦2,000 free cash
-    # (budget never cleared the 2x MIN_TRADE_NGN floor needed for both legs),
-    # silently and permanently disabling ARB for smaller accounts with no log.
-    budget = min(ARB_MAX_SIZE_NGN, free_cash * 0.30)
-    if budget < MIN_TRADE_NGN * 2:
-        # Try harder before giving up — ARB has zero directional risk,
-        # so using most of free_cash here is safe if it clears the floor.
-        budget = min(free_cash * 0.90, MIN_TRADE_NGN * 2.5)
-    if budget < MIN_TRADE_NGN * 2:
-        log.info(
-            f"[{chat_id}] ARB SKIP {sig.asset} — free_cash ₦{free_cash:,.0f} too small "
-            f"for the ₦{MIN_TRADE_NGN*2:,.0f} two-leg minimum"
-        )
-        return
+    """
+    Safe ARB execution using pre-flight quotes.
 
+    Root cause of ALL previous ARB capital losses: share ESTIMATES (amount/price)
+    were used as the burn quantity. The parse_filled_shares helper was silently
+    reading the NGN amount field ("quantity": 291) as a share count, then trying
+    to burn 291 pairs when only ~3 actual shares existed.
+
+    Fix: call get_quote on BOTH legs before spending any capital. Use the quoted
+    share count (with a 3% safety haircut) as burn_qty — never the order response.
+    Also guard against extreme-price markets (NO < 0.08) where one leg will always
+    be unaffordably small.
+    """
     yes_p = market["yes_price"]
     no_p  = market["no_price"]
 
-    amount_yes = round(budget * (yes_p / (yes_p + no_p)), 2)
-    amount_no  = round(budget - amount_yes, 2)
+    # ── Extreme-price guard ───────────────────────────────────────────────
+    # When one side is priced below 0.08, the proportional budget allocation
+    # produces a leg that will always be below MIN_TRADE_NGN unless you have
+    # ~₦1,250+ free cash. Skip cleanly rather than retrying forever.
+    if min(yes_p, no_p) < 0.08:
+        log.info(
+            f"[{chat_id}] ARB SKIP {sig.asset} — extreme-price market "
+            f"(yes={yes_p:.3f} no={no_p:.3f}), unaffordable with current balance"
+        )
+        return
+
+    # ── Budget allocation ─────────────────────────────────────────────────
+    budget  = min(ARB_MAX_SIZE_NGN, free_cash * 0.30)
+    total_p = yes_p + no_p
+    amount_yes = round(budget * (yes_p / total_p), 2)
+    amount_no  = round(budget * (no_p  / total_p), 2)
 
     if amount_yes < MIN_TRADE_NGN or amount_no < MIN_TRADE_NGN:
         log.info(
@@ -414,71 +424,105 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
         )
         return
 
-    # Explicit slippage cap — must match the conservative estimate formula
-    # below, so the "worst case" we calculate for is the same worst case
-    # Bayse's API actually enforces.
-    arb_slippage = 0.03
-
-    yes_shares = 0.0
-    no_shares  = 0.0
-    yes_ok     = False
-
+    # ── Pre-flight quotes ─────────────────────────────────────────────────
+    # Get EXACT expected share counts from the AMM before spending anything.
     try:
-        resp_yes = await client.place_order(
+        q_yes = await client.get_quote(
+            sig.event_id, sig.market_id, market["yes_id"], "BUY", amount_yes
+        )
+        q_no = await client.get_quote(
+            sig.event_id, sig.market_id, market["no_id"], "BUY", amount_no
+        )
+    except Exception as e:
+        log.warning(f"[{chat_id}] ARB SKIP {sig.asset} — pre-flight quote failed: {e}")
+        return
+
+    def _extract_shares(q: dict) -> float:
+        for field in ("shares", "shareAmount", "numShares", "sharesOut",
+                      "filledShares", "sharesReceived"):
+            v = q.get(field)
+            if v is not None:
+                try:
+                    f = float(v)
+                    if 0 < f < 1e6:
+                        return f
+                except (TypeError, ValueError):
+                    pass
+        return 0.0
+
+    yes_shares_quoted = _extract_shares(q_yes)
+    no_shares_quoted  = _extract_shares(q_no)
+
+    if yes_shares_quoted <= 0 or no_shares_quoted <= 0:
+        # Quote returned no parseable share count — use conservative estimate
+        arb_slip = 0.03
+        yes_shares_quoted = amount_yes / (yes_p * (1.0 + arb_slip))
+        no_shares_quoted  = amount_no  / (no_p  * (1.0 + arb_slip))
+        log.info(
+            f"[{chat_id}] ARB {sig.asset} — quote returned no share count, "
+            f"using conservative estimate (yes={yes_shares_quoted:.2f} no={no_shares_quoted:.2f})"
+        )
+
+    # 3% safety haircut so minor slippage cannot push actual below burn_qty
+    burn_qty = min(yes_shares_quoted, no_shares_quoted) * 0.97
+    profit_est = burn_qty * (1.0 - total_p)
+
+    if profit_est <= 0.01:
+        log.info(
+            f"[{chat_id}] ARB SKIP {sig.asset} — not profitable after haircut "
+            f"(burn={burn_qty:.2f} gap={1.0-total_p:.4f} est=₦{profit_est:.2f})"
+        )
+        return
+
+    log.info(
+        f"[{chat_id}] ARB PLACING {sig.asset} | "
+        f"yes=₦{amount_yes:.0f}({yes_shares_quoted:.2f}sh) "
+        f"no=₦{amount_no:.0f}({no_shares_quoted:.2f}sh) "
+        f"burn={burn_qty:.3f} est_profit=₦{profit_est:.2f}"
+    )
+
+    yes_ok = False
+    try:
+        arb_slip = 0.03
+        await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["yes_id"], side="BUY",
             amount=amount_yes, order_type="MARKET", currency=CURRENCY,
-            max_slippage=arb_slippage,
+            max_slippage=arb_slip,
         )
-        order_yes  = resp_yes.get("order") or resp_yes
-        yes_shares = client.parse_filled_shares(order_yes)
-        if yes_shares <= 0:
-            # CRITICAL FIX: previously used amount/yes_p — an optimistic estimate
-            # that ignores AMM price impact/slippage. If the real fill price was
-            # worse than quoted (which it usually is for any size on an AMM),
-            # this estimate OVERSTATES actual shares received. Burning more
-            # shares than we actually hold is exactly what caused "you do not
-            # have enough shares for this trade". Using price*(1+max_slippage)
-            # as the denominator guarantees this estimate is a LOWER bound on
-            # actual shares received (assuming Bayse honors max_slippage),
-            # leaving a small unburned residual instead of a hard failure.
-            yes_shares = amount_yes / (yes_p * (1.0 + arb_slippage))
         yes_ok = True
 
-        resp_no = await client.place_order(
+        await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["no_id"], side="BUY",
             amount=amount_no, order_type="MARKET", currency=CURRENCY,
-            max_slippage=arb_slippage,
+            max_slippage=arb_slip,
         )
-        order_no  = resp_no.get("order") or resp_no
-        no_shares = client.parse_filled_shares(order_no)
-        if no_shares <= 0:
-            no_shares = amount_no / (no_p * (1.0 + arb_slippage))
 
-        burn_qty = min(yes_shares, no_shares)
-        if burn_qty > 0:
-            await client.burn_shares(sig.market_id, burn_qty, CURRENCY)
-            profit = burn_qty - (amount_yes + amount_no)
-            log.info(f"[{chat_id}] ARB ✅ {sig.asset} | {burn_qty:.2f} pairs | ₦{profit:+,.2f}")
+        # Use pre-quoted burn_qty — NOT parse_filled_shares from the order
+        # response (that field returned NGN amounts, not share counts, and
+        # was the direct cause of all previous "not enough shares" failures).
+        await client.burn_shares(sig.market_id, burn_qty, CURRENCY)
+        profit = burn_qty * (1.0 - total_p)
+        log.info(f"[{chat_id}] ARB ✅ {sig.asset} | {burn_qty:.3f} pairs | ₦{profit:+,.2f}")
 
-            trade_id = await asyncio.to_thread(
-                database.record_trade,
-                chat_id=chat_id, strategy="ARB", asset=sig.asset,
-                timeframe=sig.timeframe, outcome="ARB", outcome_id="burn",
-                market_id=sig.market_id, event_id=sig.event_id,
-                entry_price=_safe_float(yes_p + no_p),
-                amount_ngn=_safe_float(budget),
-                certainty=1.0, secs_to_close=0,
-            )
-            await asyncio.to_thread(database.resolve_trade, trade_id, True, profit)
-            if _tg_app:
-                await telegram_bot.notify_arb(_tg_app, chat_id, sig, burn_qty, profit)
+        trade_id = await asyncio.to_thread(
+            database.record_trade,
+            chat_id=chat_id, strategy="ARB", asset=sig.asset,
+            timeframe=sig.timeframe, outcome="ARB", outcome_id="burn",
+            market_id=sig.market_id, event_id=sig.event_id,
+            entry_price=_safe_float(total_p),
+            amount_ngn=_safe_float(amount_yes + amount_no),
+            certainty=1.0, secs_to_close=0,
+        )
+        await asyncio.to_thread(database.resolve_trade, trade_id, True, profit)
+        if _tg_app:
+            await telegram_bot.notify_arb(_tg_app, chat_id, sig, burn_qty, profit)
 
     except Exception as e:
         log.error(f"[{chat_id}] ARB error: {e}")
         rollback_ok = False
-        if yes_ok and yes_shares > 0:
+        if yes_ok:
             try:
                 await client.place_order(
                     sig.event_id, sig.market_id, market["yes_id"],
@@ -489,27 +533,17 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
             except Exception as re_:
                 log.critical(f"[{chat_id}] ARB ROLLBACK FAILED: {re_}")
 
-        # CRITICAL FIX: a failed burn/rollback previously vanished completely —
-        # nothing was ever written to the trades table, so the loss never
-        # showed up in /trades, /analysis, or the learner's win-rate math.
-        # Real money was spent on both legs; record it as a loss so it's
-        # visible and the learner can actually account for it.
         try:
             trade_id = await asyncio.to_thread(
                 database.record_trade,
                 chat_id=chat_id, strategy="ARB", asset=sig.asset,
                 timeframe=sig.timeframe, outcome="ARB", outcome_id="burn_failed",
                 market_id=sig.market_id, event_id=sig.event_id,
-                entry_price=_safe_float(yes_p + no_p),
+                entry_price=_safe_float(total_p),
                 amount_ngn=_safe_float(amount_yes + amount_no),
                 certainty=1.0, secs_to_close=0,
             )
-            # Best-effort loss estimate: full cost if rollback failed too,
-            # else just the rollback's own slippage cost (small, unknown — log only).
             est_loss = -(amount_yes + amount_no) if not rollback_ok else 0.0
             await asyncio.to_thread(database.resolve_trade, trade_id, False, est_loss)
         except Exception as db_err:
-            log.error(f"[{chat_id}] ARB failure could not even be recorded to DB: {db_err}")
-        # bug as the directional executor (no cooldown meant the same ARB
-        # signal could re-fire every tick with no log trace).
-        _trade_cooldown[sig.market_id] = time.time()
+            log.error(f"[{chat_id}] ARB failure could not be recorded: {db_err}")
