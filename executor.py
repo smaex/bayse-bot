@@ -352,34 +352,37 @@ def _get_market_fee(market_id: str) -> float:
 
 # ── ARB execution ─────────────────────────────────────────────────────────────
 
+# ARB gets its OWN lock namespace, independent of risk.pending_markets/
+# open_positions. Those are shared by SNIPE/FRONTRUN/CORRELATE for directional
+# exposure tracking — but ARB's mint/burn arbitrage doesn't economically
+# conflict with a directional position on the same market (different
+# mechanism, genuinely risk-free, no shared capital accounting). Sharing the
+# lock meant ARB was almost permanently starved out: confirmed in production,
+# 40 consecutive "already in/pending" skips and zero actual attempts in one
+# session, simply because SNIPE had open positions on the same BTC/ETH/SOL
+# markets ARB also targets. ARB only needs protection against racing against
+# ITSELF (the original concurrent-execution bug from session 2).
+_arb_pending: set[str] = set()
+
+
 async def execute_arb(chat_id: str, sig, client, risk, equity: float, free_cash: float, settings: dict):
     market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
     if not market:
         log.debug(f"[{chat_id}] ARB SKIP {sig.asset} — market {sig.market_id} not found in active list")
         return
 
-    # CRITICAL FIX: ARB previously had NO real lock, only a cooldown timestamp
-    # set at the very end of the function. Two overlapping evaluation triggers
-    # (price tick + heartbeat + market update all fire independently) could
-    # both pass the cooldown check and call execute_arb concurrently on the
-    # SAME market before either had set the cooldown — racing on the same
-    # capital and shares. This produced "you do not have enough shares for
-    # this trade" on the burn, then an "insufficient shares balance" failure
-    # on the rollback too, because both legs got bought twice while only one
-    # set of shares actually existed. This lock makes ARB execution mutually
-    # exclusive per-market, exactly like execute_trade already does.
-    if risk.already_in(sig.market_id):
-        log.info(f"[{chat_id}] ARB SKIP {sig.asset} — already in/pending on {sig.market_id}")
+    if sig.market_id in _arb_pending:
+        log.info(f"[{chat_id}] ARB SKIP {sig.asset} — already pending on {sig.market_id}")
         return
     last = _trade_cooldown.get(sig.market_id, 0.0)
     if time.time() - last < TRADE_COOLDOWN_SEC:
         return
 
-    risk.lock_market(sig.market_id)
+    _arb_pending.add(sig.market_id)
     try:
         await _execute_arb_logic(chat_id, sig, client, market, free_cash)
     finally:
-        risk.unlock_market(sig.market_id)
+        _arb_pending.discard(sig.market_id)
         _trade_cooldown[sig.market_id] = time.time()
 
 
