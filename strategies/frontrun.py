@@ -50,6 +50,16 @@ class FrontrunStrategy(BaseStrategy):
 
         outcome = "YES" if bias > 0 else "NO"
 
+        # Market data-quality guard — same fix as SNIPE. YES+NO should sum
+        # close to 1.0 in any valid, liquid binary market.
+        price_sum = market.get("yes_price", 0) + market.get("no_price", 0)
+        if not (0.90 <= price_sum <= 1.05):
+            log.info(
+                f"FRONTRUN {asset} — bad market data "
+                f"(yes={market.get('yes_price',0):.3f} no={market.get('no_price',0):.3f})"
+            )
+            return None
+
         # Don't enter if the market is already doomed
         if market.get("threshold") and spot_price and secs > 0:
             dist_pct = (spot_price - market["threshold"]) / market["threshold"]
