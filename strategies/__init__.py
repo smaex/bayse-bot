@@ -63,15 +63,29 @@ async def evaluate_all(
                 sig.reason   += f" | MULT(x{final_mult:.2f})"
 
             # Mode floor
+            # 'custom' previously fell through to the 0.48 default (same as
+            # 'balanced') even though a user actively customizing settings
+            # is presumably more engaged/risk-tolerant than a brand-new
+            # balanced-mode default. Given it anyway, set explicitly to 0.42.
             mode       = learned.get("mode", "balanced")
-            mode_floor = {"safe": 0.60, "balanced": 0.48, "aggressive": 0.40, "full_send": 0.32}.get(mode, 0.48)
+            mode_floor = {
+                "safe": 0.60, "balanced": 0.48, "aggressive": 0.40,
+                "full_send": 0.32, "custom": 0.42,
+            }.get(mode, 0.48)
 
             # Pantry raid (trading drought)
             if learned.get("pantry_raid_active"):
                 mode_floor -= 0.10
 
-            # Discovery probes: allow low-certainty signals through as tiny ₦100 trades
-            discovery_floor = 0.35
+            # Discovery probes: allow low-certainty signals through as tiny ₦100 trades.
+            # Lowered 0.35 -> 0.32. This does NOT bypass the EV/Kelly gate inside
+            # each strategy (snipe.py/correlate.py/frontrun.py already require
+            # positive expected value after fees before ever returning a signal)
+            # — it only controls whether a genuine-but-modest edge gets any
+            # trade at all versus being silenced. Worst case is a ₦100 probe
+            # on a thinner edge; the strategy math has already confirmed it's
+            # still +EV before this floor is even checked.
+            discovery_floor = 0.32
 
             if sig.certainty >= mode_floor or sig.certainty >= discovery_floor:
                 sig.mode_floor = mode_floor
