@@ -199,12 +199,39 @@ class BayseClient:
         for asset in assets:
             currency = (asset.get("currency") or asset.get("symbol") or "").upper()
             if currency == "NGN":
-                for field in ("availableBalance", "available", "balance", "total"):
+                # CRITICAL: only trust availableBalance/available — these are
+                # the SAME concept (free, uncommitted cash), just possibly
+                # different field names across API versions. balance/total
+                # likely include funds locked in open positions, which is a
+                # DIFFERENT quantity entirely. Mixing them caused repeated
+                # false "deposit"/"withdrawal" detection: whenever
+                # availableBalance was transiently absent (e.g. right after
+                # placing an order, or simply because all cash was deployed
+                # in open positions — this account regularly has 2-3 open
+                # SNIPE positions), the old code fell through to
+                # balance/total and returned a larger number that included
+                # locked funds, registering as a fake deposit. The next
+                # correct read then looked like a withdrawal, and the false
+                # "deposit" had already inflated risk.peak_balance, causing
+                # a false drawdown-stop on the very next real reading.
+                for field in ("availableBalance", "available"):
                     v = asset.get(field)
-                    if v is not None and float(v) > 0:
+                    if v is not None:
                         return float(v)
-                v = asset.get("availableBalance")
-                return float(v) if v is not None else 0.0
+                # Field genuinely absent (not just zero) — only NOW fall
+                # back to a different field, and log it clearly so this
+                # is visible rather than silently trusting a possibly
+                # wrong number.
+                for field in ("balance", "total"):
+                    v = asset.get(field)
+                    if v is not None:
+                        log.warning(
+                            f"get_balance_ngn: availableBalance/available "
+                            f"missing from API response, falling back to "
+                            f"'{field}'={v} — this may include locked funds"
+                        )
+                        return float(v)
+                return 0.0
         return 0.0
 
     async def get_pnl(self) -> dict:
