@@ -80,19 +80,6 @@ FX_SESSION_UTC = {
     "GBPUSD": (6, 17),
     "XAUUSD": (8, 20),
 }
-FX_MIN_DISTANCE = {
-    "EURUSD": 0.0006,
-    "GBPUSD": 0.0007,
-    "XAUUSD": 0.0015,
-}
-CRYPTO_MIN_DISTANCE = {
-    "BTC": 0.0010,
-    "ETH": 0.0015,
-    "SOL": 0.0020,
-}
-FX_MIN_REGIME       = 0.30
-FX_ENTRY_WINDOW_1H  = 1200  # last 20 min of the hour
-
 SNIPE_VELOCITY_WINDOW = 60
 SNIPE_VELOCITY_VETO   = 0.40
 
