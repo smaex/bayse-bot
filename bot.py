@@ -242,6 +242,14 @@ async def _user_loop(chat_id: str):
         day    = _daily(chat_id, equity, settings)
         profit = equity - day["start_balance"]
         target = _daily_target(settings, day["start_balance"])
+
+        # Sync ground-truth values onto risk so is_in_strict_mode() actually
+        # works. risk.daily_target was never assigned anywhere before this —
+        # it stayed at its 0.0 default permanently, silently disabling the
+        # "tighten up near daily target" safety check with no error at all.
+        risk.daily_target      = target
+        risk.daily_realized_pnl = profit
+
         if target > 0 and profit >= target and not day["target_hit"]:
             day["target_hit"] = True
             settings["daily_state"] = day
@@ -444,7 +452,25 @@ def _on_market_update(market_id: str, prices: dict):
         return
     asset = market.get("asset", "")
     if asset == "BTC":
+        # Uses the OLD (pre-update) yes_price as the move-detection baseline —
+        # this must happen BEFORE we write the new price below.
         strategy.record_btc_move(market, prices.get("yes", market["yes_price"]))
+
+    # CRITICAL: actually commit the live price update. Previously this never
+    # happened — active_markets' yes_price/no_price were only ever refreshed
+    # by the next REST scan (every 15s), meaning every strategy was reading
+    # stale prices for EV/edge calculations on every tick except the one
+    # right after a scan. This is the live source of truth; commit it.
+    new_yes = prices.get("yes")
+    new_no  = prices.get("no")
+    if new_yes is not None and new_no is not None:
+        ny, nn = float(new_yes), float(new_no)
+        if 0.90 <= (ny + nn) <= 1.05:
+            market["yes_price"] = ny
+            market["no_price"]  = nn
+        # else: malformed tick, leave the last-known-good price in place
+        # rather than poisoning the market dict with a bad data point.
+
     asyncio.create_task(_evaluate_all_users_for_asset(asset, penalty=0.0))
 
 
