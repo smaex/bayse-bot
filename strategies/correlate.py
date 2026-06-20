@@ -73,6 +73,14 @@ class CorrelateStrategy(BaseStrategy):
         outcome_id = market["yes_id"] if outcome == "YES" else market["no_id"]
         mkt_price  = market["yes_price"] if outcome == "YES" else market["no_price"]
 
+        # Market data-quality guard — same fix as SNIPE/FRONTRUN. The
+        # existing CORRELATE_MAX_MARKET_PRICE check only catches the high
+        # extreme; a broken/dead-liquidity market priced near zero would
+        # sail through that check and look like a false "great deal".
+        price_sum = market.get("yes_price", 0) + market.get("no_price", 0)
+        if not (0.90 <= price_sum <= 1.05):
+            return None
+
         if mkt_price > config.CORRELATE_MAX_MARKET_PRICE:
             return None
 
