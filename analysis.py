@@ -127,10 +127,23 @@ async def full_report(client: BayseClient, chat_id: str | None = None) -> str:
         lines.append("")
 
     # ── Fee drag ─────────────────────────────────────────────────────────────
-    avg_fee_drag = 0.04 * 0.50 * 0.50  # ~1% at mid-market
+    # Previously a hardcoded constant (0.04*0.50*0.50 = exactly 1.00%,
+    # always, regardless of what was actually traded). Now computed from
+    # real recent entry prices, using the same fee formula validated
+    # elsewhere in the codebase (config.FEE_FLOOR).
+    import config as _cfg
+    DEFAULT_FEE_RATE = 0.02  # matches the fallback used throughout executor/strategies
+    entry_prices = [t["entry_price"] for t in recent_resolved if t.get("entry_price")]
+    if entry_prices:
+        avg_price = sum(entry_prices) / len(entry_prices)
+        avg_fee_drag = DEFAULT_FEE_RATE * max(1.0 - avg_price, _cfg.FEE_FLOOR)
+        fee_note = f"(based on {len(entry_prices)} recent trades, avg entry {avg_price:.2f})"
+    else:
+        avg_fee_drag = DEFAULT_FEE_RATE * 0.5  # no data yet — rough mid-market estimate
+        fee_note = "(estimate — no resolved trades yet to calculate from)"
     lines += [
         "💸 *Fee Analysis*",
-        f"   Estimated fee drag: {avg_fee_drag:.2%} per trade",
+        f"   Estimated fee drag: {avg_fee_drag:.2%} per trade {fee_note}",
         f"   Break-even accuracy needed: {50 + avg_fee_drag * 100:.1f}%+",
         "",
     ]
