@@ -23,7 +23,15 @@ class RiskManager:
 
     @property
     def target_hit(self) -> bool:
-        return self.daily_target > 0 and self.peak_balance >= self.daily_target
+        # BUG FIX: this previously compared self.peak_balance (absolute
+        # account balance, e.g. ₦857) against self.daily_target (a PROFIT
+        # target, e.g. ₦85.70 — 10% of starting balance). Absolute balance
+        # will almost always exceed a modest profit target for any funded
+        # account, so this returned True almost immediately once
+        # daily_target was ever set to a nonzero value — silently blocking
+        # every future evaluation for the rest of the day. Compare PROFIT
+        # against the PROFIT target instead.
+        return self.daily_target > 0 and self.daily_realized_pnl >= self.daily_target
 
     @property
     def max_drawdown_hit(self) -> bool:
