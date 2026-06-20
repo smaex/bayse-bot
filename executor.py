@@ -90,15 +90,15 @@ def _effective_fee(fee_rate: float, price: float) -> float:
 async def execute_trade(chat_id: str, sig, client, risk, settings: dict,
                         equity: float, free_cash: float):
     if strategy.global_state.systemic_halt_until > time.time():
-        log.debug(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — systemic halt active")
+        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — systemic halt active")
         return
     if risk.already_in(sig.market_id):
-        log.debug(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — already in/pending on {sig.market_id}")
+        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — already in/pending on {sig.market_id}")
         return
     last = _trade_cooldown.get(sig.market_id, 0.0)
     remaining = TRADE_COOLDOWN_SEC - (time.time() - last)
     if remaining > 0:
-        log.debug(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — cooldown {remaining:.0f}s left on {sig.market_id}")
+        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — cooldown {remaining:.0f}s left on {sig.market_id}")
         return
 
     risk.lock_market(sig.market_id)
@@ -369,7 +369,7 @@ async def execute_arb(chat_id: str, sig, client, risk, equity: float, free_cash:
     # set of shares actually existed. This lock makes ARB execution mutually
     # exclusive per-market, exactly like execute_trade already does.
     if risk.already_in(sig.market_id):
-        log.debug(f"[{chat_id}] ARB SKIP {sig.asset} — already in/pending on {sig.market_id}")
+        log.info(f"[{chat_id}] ARB SKIP {sig.asset} — already in/pending on {sig.market_id}")
         return
     last = _trade_cooldown.get(sig.market_id, 0.0)
     if time.time() - last < TRADE_COOLDOWN_SEC:
@@ -385,25 +385,30 @@ async def execute_arb(chat_id: str, sig, client, risk, equity: float, free_cash:
 
 async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash: float):
     """
-    Safe ARB execution using pre-flight quotes.
+    Safe ARB execution — units-correct, no speculative quote-guessing.
 
-    Root cause of ALL previous ARB capital losses: share ESTIMATES (amount/price)
-    were used as the burn quantity. The parse_filled_shares helper was silently
-    reading the NGN amount field ("quantity": 291) as a share count, then trying
-    to burn 291 pairs when only ~3 actual shares existed.
+    THE BUG THIS REPLACES: Bayse's contract size is ₦100 per share — proven
+    by execute_trade's own working formula `shares = amount/(price*100)`
+    and its inverse `ngn = shares*price*100`. The previous ARB rewrite called
+    a get_quote() endpoint and guessed at field names ("shares", "shareAmount",
+    etc.); when none matched, it fell back to `amount/(price*(1+slippage))` —
+    missing the ÷100 entirely. That produced share counts 100x too large
+    (₦140 spent registered as "276 shares" instead of the real ~2.76),
+    so burn_qty was 100x inflated and burning failed every time with
+    "not enough shares" — exactly the error seen twice in production.
 
-    Fix: call get_quote on BOTH legs before spending any capital. Use the quoted
-    share count (with a 3% safety haircut) as burn_qty — never the order response.
-    Also guard against extreme-price markets (NO < 0.08) where one leg will always
-    be unaffordably small.
+    FIX: drop the quote calls (they were guessing at an undocumented schema
+    and added latency for zero verified benefit — simpler is more reliable
+    here). Use the SAME proven formula as the rest of the codebase, with a
+    conservative slippage haircut so the estimate is always a lower bound
+    on actual shares received.
     """
     yes_p = market["yes_price"]
     no_p  = market["no_price"]
 
     # ── Extreme-price guard ───────────────────────────────────────────────
-    # When one side is priced below 0.08, the proportional budget allocation
-    # produces a leg that will always be below MIN_TRADE_NGN unless you have
-    # ~₦1,250+ free cash. Skip cleanly rather than retrying forever.
+    # Below 0.08, the proportional budget split makes one leg unaffordable
+    # at MIN_TRADE_NGN regardless of budget size at this account's balance.
     if min(yes_p, no_p) < 0.08:
         log.info(
             f"[{chat_id}] ARB SKIP {sig.asset} — extreme-price market "
@@ -424,66 +429,40 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
         )
         return
 
-    # ── Pre-flight quotes ─────────────────────────────────────────────────
-    # Get EXACT expected share counts from the AMM before spending anything.
-    try:
-        q_yes = await client.get_quote(
-            sig.event_id, sig.market_id, market["yes_id"], "BUY", amount_yes
-        )
-        q_no = await client.get_quote(
-            sig.event_id, sig.market_id, market["no_id"], "BUY", amount_no
-        )
-    except Exception as e:
-        log.warning(f"[{chat_id}] ARB SKIP {sig.asset} — pre-flight quote failed: {e}")
-        return
+    # ── Share estimate — units-correct ────────────────────────────────────
+    # shares = NGN_amount / (price * 100). This is the proven contract-size
+    # convention already used by execute_trade. A 3% slippage haircut on
+    # the price (worst-case actual fill) makes this a conservative LOWER
+    # bound on actual shares received, so burn_qty can never exceed real
+    # holdings.
+    arb_slip = 0.03
+    yes_shares = amount_yes / (yes_p * 100.0 * (1.0 + arb_slip))
+    no_shares  = amount_no  / (no_p  * 100.0 * (1.0 + arb_slip))
 
-    def _extract_shares(q: dict) -> float:
-        for field in ("shares", "shareAmount", "numShares", "sharesOut",
-                      "filledShares", "sharesReceived"):
-            v = q.get(field)
-            if v is not None:
-                try:
-                    f = float(v)
-                    if 0 < f < 1e6:
-                        return f
-                except (TypeError, ValueError):
-                    pass
-        return 0.0
+    burn_qty   = min(yes_shares, no_shares)
+    # Profit formula (units-verified): burning N pairs returns N*₦100 face
+    # value; cost was the sum of both legs. profit = N*(1-total_p)*100.
+    profit_est = burn_qty * (1.0 - total_p) * 100.0
 
-    yes_shares_quoted = _extract_shares(q_yes)
-    no_shares_quoted  = _extract_shares(q_no)
-
-    if yes_shares_quoted <= 0 or no_shares_quoted <= 0:
-        # Quote returned no parseable share count — use conservative estimate
-        arb_slip = 0.03
-        yes_shares_quoted = amount_yes / (yes_p * (1.0 + arb_slip))
-        no_shares_quoted  = amount_no  / (no_p  * (1.0 + arb_slip))
+    # Require a meaningful profit, not just >0 — each attempt risks real
+    # slippage and places two live orders, so a fractional-naira "profit"
+    # isn't worth the operational risk.
+    if profit_est < 2.0:
         log.info(
-            f"[{chat_id}] ARB {sig.asset} — quote returned no share count, "
-            f"using conservative estimate (yes={yes_shares_quoted:.2f} no={no_shares_quoted:.2f})"
-        )
-
-    # 3% safety haircut so minor slippage cannot push actual below burn_qty
-    burn_qty = min(yes_shares_quoted, no_shares_quoted) * 0.97
-    profit_est = burn_qty * (1.0 - total_p)
-
-    if profit_est <= 0.01:
-        log.info(
-            f"[{chat_id}] ARB SKIP {sig.asset} — not profitable after haircut "
-            f"(burn={burn_qty:.2f} gap={1.0-total_p:.4f} est=₦{profit_est:.2f})"
+            f"[{chat_id}] ARB SKIP {sig.asset} — profit too thin after haircut "
+            f"(burn={burn_qty:.3f} gap={1.0-total_p:.4f} est=₦{profit_est:.2f})"
         )
         return
 
     log.info(
         f"[{chat_id}] ARB PLACING {sig.asset} | "
-        f"yes=₦{amount_yes:.0f}({yes_shares_quoted:.2f}sh) "
-        f"no=₦{amount_no:.0f}({no_shares_quoted:.2f}sh) "
+        f"yes=₦{amount_yes:.0f}({yes_shares:.3f}sh) "
+        f"no=₦{amount_no:.0f}({no_shares:.3f}sh) "
         f"burn={burn_qty:.3f} est_profit=₦{profit_est:.2f}"
     )
 
     yes_ok = False
     try:
-        arb_slip = 0.03
         await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["yes_id"], side="BUY",
@@ -499,11 +478,12 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
             max_slippage=arb_slip,
         )
 
-        # Use pre-quoted burn_qty — NOT parse_filled_shares from the order
-        # response (that field returned NGN amounts, not share counts, and
-        # was the direct cause of all previous "not enough shares" failures).
+        # Burn the conservative estimate — NOT a value parsed from the order
+        # response (that's what caused both previous bugs: the response
+        # field doesn't reliably represent true share count in this unit
+        # convention).
         await client.burn_shares(sig.market_id, burn_qty, CURRENCY)
-        profit = burn_qty * (1.0 - total_p)
+        profit = burn_qty * (1.0 - total_p) * 100.0
         log.info(f"[{chat_id}] ARB ✅ {sig.asset} | {burn_qty:.3f} pairs | ₦{profit:+,.2f}")
 
         trade_id = await asyncio.to_thread(
