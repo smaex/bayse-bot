@@ -32,6 +32,32 @@ def momentum_score(asset: str, direction: str, state) -> float:
     return min(max(signed / 0.001, -1.0), 1.0)
 
 
+def projected_drift_pct(asset: str, secs: float, state) -> float:
+    """
+    Kalman-filter projected price drift over the next `secs` seconds,
+    expressed as a fraction of current price — i.e. the same units as
+    distance_pct in win_probability().
+
+    This is a real drift term for a GBM-with-drift probability estimate,
+    NOT a normalised [-1,1] heuristic score (that's what momentum_score is
+    for, used by CORRELATE). SNIPE uses this raw value to fold momentum
+    directly into its diffusion model rather than bolting it on afterward
+    as a separate additive bonus — the textbook-correct way to incorporate
+    drift into a boundary-crossing probability estimate.
+
+    Returns 0.0 if no Kalman state exists yet for this asset.
+    """
+    if not hasattr(state, "kalman_state"):
+        return 0.0
+    k = state.kalman_state.get(asset)
+    if not k:
+        return 0.0
+    price, velocity = k["x"]
+    if price <= 0:
+        return 0.0
+    return (velocity / price) * secs
+
+
 def velocity_score(asset: str, threshold: float, direction: str, state) -> float:
     """Measures how fast price is heading toward (negative) or away from (positive) threshold."""
     if not hasattr(state, "kalman_state"):
