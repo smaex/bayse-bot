@@ -124,6 +124,23 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
     if yes_price <= 0 or no_price <= 0:
         return None
 
+    # Data-quality guard: YES+NO should sum close to 1.0 in any valid,
+    # liquid binary market. A market priced at e.g. yes=0.030 no=0.020
+    # (sum=0.05) is broken or has effectively zero real liquidity behind
+    # those numbers. Trusting it produces a mathematically "huge edge"
+    # that isn't real — observed directly in production (a strategy
+    # computed 65% true probability vs a 3% "market" price and burned
+    # 50+ evaluation cycles on a market that could never have filled).
+    # Filtering here means every strategy is protected automatically,
+    # not just whichever ones remember to check it themselves.
+    price_sum = yes_price + no_price
+    if not (0.90 <= price_sum <= 1.05):
+        log.debug(
+            f"Skipping {asset} {timeframe} — bad price data "
+            f"(yes={yes_price:.3f} no={no_price:.3f} sum={price_sum:.3f})"
+        )
+        return None
+
     fee_pct = float(market.get("feePercentage", 2)) / 100
 
     return {
