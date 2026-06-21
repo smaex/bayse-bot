@@ -99,13 +99,20 @@ def _detect_resolution(event: dict, trade: dict) -> tuple:
 
 
 async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app=None):
-    """Check unresolved trades every 2 minutes."""
+    """Check unresolved trades every 30 seconds (was 2 minutes).
+
+    Previously only checked trades 6+ minutes old, which created a long
+    window where Bayse's real balance already reflected a trade's
+    resolution while our own risk.deployed() tracking hadn't caught up yet
+    — directly contributing to false deposit/withdrawal detection on 15-min
+    markets where SNIPE often enters in the final seconds before close.
+    """
     import telegram_bot as tgb
 
     while True:
-        await asyncio.sleep(120)
+        await asyncio.sleep(30)
         for chat_id, client in list(user_clients.items()):
-            pending = await asyncio.to_thread(database.get_unresolved, chat_id, older_than_minutes=6)
+            pending = await asyncio.to_thread(database.get_unresolved, chat_id, older_than_minutes=1)
             for trade in pending:
                 try:
                     event   = await client.get_event(trade["event_id"])
