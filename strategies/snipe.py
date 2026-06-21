@@ -151,7 +151,11 @@ class SnipeStrategy(BaseStrategy):
         t       = secs / 3600.0
         sigma_t = rv * (t ** 0.5) if t > 0 else 0.0
 
-        drift = projected_drift_pct(asset, secs, state)
+        # Drift extrapolation horizon capped at 180s (3 min) — see
+        # projected_drift_pct's docstring for the production evidence
+        # behind this. An instantaneous momentum reading shouldn't be
+        # trusted to extrapolate 10-14 minutes forward with full weight.
+        drift = projected_drift_pct(asset, secs, state, horizon_cap=180.0)
         if sigma_t > 0:
             # Cap drift at 2 standard deviations of the diffusion term itself.
             # Without this, a single noisy instantaneous Kalman velocity
