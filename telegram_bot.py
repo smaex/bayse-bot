@@ -537,27 +537,42 @@ async def _status_text(cid: str) -> str:
     if not client:
         return "Still starting up."
     try:
-        balance = await client.get_balance_ngn()
+        free_cash = await client.get_balance_ngn()
     except Exception:
         return "Could not fetch balance."
 
     risk  = _user_risks.get(cid)
     user  = await asyncio.to_thread(database.get_user, cid)
     s     = user["settings"] if user else {}
-    day   = _user_daily.get(cid) or s.get("daily_state", {})
-    profit = balance - day.get("start_balance", balance)
-    target = _calc_target(s, day.get("start_balance", balance))
 
     dd = deployed = 0.0; n_pos = 0
     if risk:
-        dd       = max(0, (risk.peak_balance - balance) / risk.peak_balance) if risk.peak_balance else 0
         n_pos    = len(risk.open_positions)
         deployed = sum(p.get("amount_ngn", 0) for p in risk.open_positions.values())
+
+    # CRITICAL: get_balance_ngn() returns free/uncommitted cash only — it
+    # does NOT include capital currently locked in open positions. But
+    # day["start_balance"] (set in bot.py's _daily()) is always recorded as
+    # full EQUITY (free_cash + deployed). Comparing free cash directly
+    # against an equity baseline understated "today's profit" and
+    # overstated "drawdown from peak" by exactly the deployed amount —
+    # every single time the user checked /status while holding a position,
+    # which based on production logs is most of the time (0-5 open SNIPE
+    # positions is the normal state, not the exception).
+    equity = free_cash + deployed
+
+    day    = _user_daily.get(cid) or s.get("daily_state", {})
+    profit = equity - day.get("start_balance", equity)
+    target = _calc_target(s, day.get("start_balance", equity))
+
+    if risk and risk.peak_balance:
+        dd = max(0, (risk.peak_balance - equity) / risk.peak_balance)
 
     stats = await asyncio.to_thread(database.all_time_stats, cid)
     lines = [
         "📊 *Bot Status*\n",
-        f"Balance: ₦{balance:,.2f}",
+        f"Total equity: ₦{equity:,.2f}",
+        f"Free cash: ₦{free_cash:,.2f}",
         f"Today's profit: ₦{profit:+,.2f}",
     ]
     if target > 0:
