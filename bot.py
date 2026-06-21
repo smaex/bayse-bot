@@ -46,6 +46,7 @@ _user_clients:     dict[str, BayseClient] = {}
 _user_risks:       dict[str, RiskManager] = {}
 _user_daily:       dict[str, dict]        = {}
 _last_balance:     dict[str, float]       = {}
+_pending_balance_event: dict[str, float]  = {}  # chat_id -> suspected new balance, awaiting confirmation
 _low_bal_notified: dict[str, str]         = {}
 _systemic_alert:   dict[str, bool]        = {}
 _scan_client:      BayseClient | None     = None
@@ -178,44 +179,54 @@ async def _user_loop(chat_id: str):
                 f"positions={n_pos} | deployed=₦{deployed:,.0f}"
             )
 
-        # ── Deposit / withdrawal detection ─────────────────────────────────
+        # ── Deposit / withdrawal detection (debounced) ──────────────────────
         last = _last_balance.get(chat_id)
         if last is not None:
             delta     = equity - last
             threshold = max(_BALANCE_EVENT_MIN_NGN, last * _BALANCE_EVENT_MIN_PCT)
-            if delta > threshold:
-                log.info(f"[{chat_id}] DEPOSIT detected +₦{delta:,.0f} | new balance ₦{equity:,.0f}")
-                day = _user_daily.get(chat_id, {})
-                day["start_balance"] = equity
-                settings["daily_state"] = day
-                await asyncio.to_thread(database.update_settings, chat_id, settings)
-                risk.peak_balance  = equity
-                _user_daily[chat_id] = day
-                if _tg_app:
-                    await telegram_bot.notify_deposit_detected(_tg_app, chat_id, delta, "NGN")
-            elif delta < -threshold:
-                log.info(f"[{chat_id}] WITHDRAWAL detected ₦{delta:,.0f} | new balance ₦{equity:,.0f}")
-                day = _user_daily.get(chat_id, {})
-                day["start_balance"] = equity
-                settings["daily_state"] = day
-                await asyncio.to_thread(database.update_settings, chat_id, settings)
-                # CRITICAL: do NOT reset risk.peak_balance here.
-                # This heuristic cannot distinguish a genuine user withdrawal from a
-                # sudden trading loss (e.g. an ARB burn failure). Every time it
-                # misfired on a loss, it reset peak_balance down to the post-loss
-                # balance, making drawdown = 0% instantly and waving the bot back
-                # into full-strength trading right after losing ~30% of capital.
-                # The drawdown peak must only ever be touched by update_peak()
-                # (which only increases it) or by an explicit user /resume.
-                _user_daily[chat_id] = day
-                if _tg_app:
-                    await telegram_bot.send_message(
-                        _tg_app, chat_id,
-                        f"💸 *Withdrawal detected* — ₦{abs(delta):,.0f} removed\n"
-                        f"New balance: ₦{equity:,.2f}",
-                        parse_mode="Markdown",
-                    )
-        _last_balance[chat_id] = equity
+            if abs(delta) > threshold:
+                pending = _pending_balance_event.get(chat_id)
+                if pending is not None and abs(pending - equity) < threshold * 0.5:
+                    # Same large deviation confirmed on a second consecutive
+                    # check (~30s later) — treat as real and act on it.
+                    if delta > 0:
+                        log.info(f"[{chat_id}] DEPOSIT detected +₦{delta:,.0f} | new balance ₦{equity:,.0f}")
+                        day = _user_daily.get(chat_id, {})
+                        day["start_balance"] = equity
+                        settings["daily_state"] = day
+                        await asyncio.to_thread(database.update_settings, chat_id, settings)
+                        risk.peak_balance = equity
+                        _user_daily[chat_id] = day
+                        if _tg_app:
+                            await telegram_bot.notify_deposit_detected(_tg_app, chat_id, delta, "NGN")
+                    else:
+                        log.info(f"[{chat_id}] WITHDRAWAL detected ₦{delta:,.0f} | new balance ₦{equity:,.0f}")
+                        day = _user_daily.get(chat_id, {})
+                        day["start_balance"] = equity
+                        settings["daily_state"] = day
+                        await asyncio.to_thread(database.update_settings, chat_id, settings)
+                        # Do NOT reset risk.peak_balance here — see prior fix notes.
+                        _user_daily[chat_id] = day
+                        if _tg_app:
+                            await telegram_bot.send_message(
+                                _tg_app, chat_id,
+                                f"💸 *Withdrawal detected* — ₦{abs(delta):,.0f} removed\n"
+                                f"New balance: ₦{equity:,.2f}",
+                                parse_mode="Markdown",
+                            )
+                    _pending_balance_event.pop(chat_id, None)
+                    _last_balance[chat_id] = equity
+                else:
+                    # First time seeing this deviation — don't act yet, just
+                    # remember it. _last_balance is deliberately NOT updated
+                    # here, so the next check still compares against the
+                    # last CONFIRMED baseline rather than this unconfirmed one.
+                    _pending_balance_event[chat_id] = equity
+            else:
+                _pending_balance_event.pop(chat_id, None)
+                _last_balance[chat_id] = equity
+        else:
+            _last_balance[chat_id] = equity
 
         # ── Paused check ───────────────────────────────────────────────────
         if settings.get("paused"):
