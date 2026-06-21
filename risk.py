@@ -3,6 +3,7 @@ Risk manager: position sizing, drawdown control, exposure limits.
 """
 
 import logging
+import time
 from config import MAX_DRAWDOWN_STOP, MAX_PORTFOLIO_EXPOSURE
 
 log = logging.getLogger(__name__)
@@ -20,6 +21,7 @@ class RiskManager:
         self.last_reset_date: str = ""
         self.probation_trades_left: int = 0
         self.pending_markets: set[str] = set()  # market_id lock during execution
+        self._dd_breach_since: float = 0.0  # debounce: when the current drawdown breach started
 
     @property
     def target_hit(self) -> bool:
@@ -59,13 +61,25 @@ class RiskManager:
             return True
         dd = (self.peak_balance - balance) / self.peak_balance
         if dd >= MAX_DRAWDOWN_STOP:
-            if not self.paused:
-                log.warning(
-                    f"DRAWDOWN STOP hit: {dd:.1%} from peak ₦{self.peak_balance:,.0f}. "
-                    "All trading paused."
-                )
-            self.paused = True
-            return False
+            if self._dd_breach_since == 0.0:
+                # First time seeing this breach — start the clock but don't
+                # act yet. A single noisy/transient balance reading (seen
+                # repeatedly in production, not fully explained by resolved
+                # trades) can no longer trigger a false pause on its own.
+                self._dd_breach_since = time.time()
+                return not self.paused
+            if time.time() - self._dd_breach_since >= 25:
+                # Breach has persisted across at least one extra check cycle
+                # — this is a real, sustained drawdown, not a blip.
+                if not self.paused:
+                    log.warning(
+                        f"DRAWDOWN STOP hit: {dd:.1%} from peak ₦{self.peak_balance:,.0f}. "
+                        "All trading paused."
+                    )
+                self.paused = True
+            return not self.paused
+        # Drawdown condition no longer true — reset the debounce clock.
+        self._dd_breach_since = 0.0
         if self.paused and dd < MAX_DRAWDOWN_STOP * 0.25:
             log.info(f"Drawdown recovered to {dd:.1%} — resuming trading")
             self.paused = False
