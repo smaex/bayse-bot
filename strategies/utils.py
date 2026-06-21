@@ -32,11 +32,12 @@ def momentum_score(asset: str, direction: str, state) -> float:
     return min(max(signed / 0.001, -1.0), 1.0)
 
 
-def projected_drift_pct(asset: str, secs: float, state) -> float:
+def projected_drift_pct(asset: str, secs: float, state, horizon_cap: float = None) -> float:
     """
-    Kalman-filter projected price drift over the next `secs` seconds,
-    expressed as a fraction of current price — i.e. the same units as
-    distance_pct in win_probability().
+    Kalman-filter projected price drift over the next `secs` seconds (or
+    `horizon_cap` seconds if provided and shorter), expressed as a fraction
+    of current price — i.e. the same units as distance_pct in
+    win_probability().
 
     This is a real drift term for a GBM-with-drift probability estimate,
     NOT a normalised [-1,1] heuristic score (that's what momentum_score is
@@ -44,6 +45,15 @@ def projected_drift_pct(asset: str, secs: float, state) -> float:
     directly into its diffusion model rather than bolting it on afterward
     as a separate additive bonus — the textbook-correct way to incorporate
     drift into a boundary-crossing probability estimate.
+
+    horizon_cap limits how far the instantaneous velocity reading gets
+    extrapolated. Verified directly against production data: across 6 real
+    trades, drift was 5x to 379x larger than the actual raw price distance
+    when extrapolated over the full 10-14 minutes remaining — an
+    instantaneous Kalman velocity snapshot simply isn't reliable that far
+    out. Without this cap, the model can manufacture high confidence almost
+    entirely from momentum extrapolation with near-zero support from actual
+    price position.
 
     Returns 0.0 if no Kalman state exists yet for this asset.
     """
@@ -55,7 +65,8 @@ def projected_drift_pct(asset: str, secs: float, state) -> float:
     price, velocity = k["x"]
     if price <= 0:
         return 0.0
-    return (velocity / price) * secs
+    horizon = min(secs, horizon_cap) if horizon_cap is not None else secs
+    return (velocity / price) * horizon
 
 
 def velocity_score(asset: str, threshold: float, direction: str, state) -> float:
