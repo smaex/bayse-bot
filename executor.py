@@ -432,20 +432,30 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
         )
         return
 
-    # ── Share estimate — units-correct ────────────────────────────────────
-    # shares = NGN_amount / (price * 100). This is the proven contract-size
-    # convention already used by execute_trade. A 3% slippage haircut on
-    # the price (worst-case actual fill) makes this a conservative LOWER
-    # bound on actual shares received, so burn_qty can never exceed real
-    # holdings.
+    # ── Share estimate — CORRECTED contract-size convention ───────────────
+    # Bayse's API just told us directly: burning 2.572 "shares" (computed
+    # via amount/(price*100)) failed with "Minimum burn amount is 100".
+    # Reverse-engineering yes_p/no_p from that failure and testing WITHOUT
+    # the *100 factor gives burn_qty=257.2 — clears the 100 minimum — and
+    # produces virtually the same profit Bayse's numbers implied (₦23.22 vs
+    # ₦23.14 actually logged). Confirmed: shares = amount/price, not
+    # amount/(price*100). The previous fix was wrong and has been silently
+    # making every ARB burn 100x too small since deployment.
     arb_slip = 0.03
-    yes_shares = amount_yes / (yes_p * 100.0 * (1.0 + arb_slip))
-    no_shares  = amount_no  / (no_p  * 100.0 * (1.0 + arb_slip))
+    yes_shares = amount_yes / (yes_p * (1.0 + arb_slip))
+    no_shares  = amount_no  / (no_p  * (1.0 + arb_slip))
 
     burn_qty   = min(yes_shares, no_shares)
-    # Profit formula (units-verified): burning N pairs returns N*₦100 face
-    # value; cost was the sum of both legs. profit = N*(1-total_p)*100.
-    profit_est = burn_qty * (1.0 - total_p) * 100.0
+    profit_est = burn_qty * (1.0 - total_p)
+
+    # Hard floor from Bayse's own stated minimum — confirmed directly from
+    # their API error, not estimated. Check BEFORE spending any money.
+    if burn_qty < 100:
+        log.info(
+            f"[{chat_id}] ARB SKIP {sig.asset} — burn_qty {burn_qty:.1f} below "
+            f"Bayse's minimum burn size of 100 (budget too small for this market's pricing)"
+        )
+        return
 
     # Require a meaningful profit, not just >0 — each attempt risks real
     # slippage and places two live orders, so a fractional-naira "profit"
@@ -486,7 +496,7 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
         # field doesn't reliably represent true share count in this unit
         # convention).
         await client.burn_shares(sig.market_id, burn_qty, CURRENCY)
-        profit = burn_qty * (1.0 - total_p) * 100.0
+        profit = burn_qty * (1.0 - total_p)
         log.info(f"[{chat_id}] ARB ✅ {sig.asset} | {burn_qty:.3f} pairs | ₦{profit:+,.2f}")
 
         trade_id = await asyncio.to_thread(
