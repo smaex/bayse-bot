@@ -172,7 +172,7 @@ class SnipeStrategy(BaseStrategy):
         w_est    = raw_prob if direction == "YES" else 1.0 - raw_prob
         composite = probability_to_certainty(w_est)
 
-        if composite < 0.30:
+        if composite < 0.32:
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — composite too low "
                 f"({composite:.2f} | dist={distance_pct:+.3%} drift={drift:+.3%} "
