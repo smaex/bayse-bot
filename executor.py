@@ -388,23 +388,20 @@ async def execute_arb(chat_id: str, sig, client, risk, equity: float, free_cash:
 
 async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash: float):
     """
-    Safe ARB execution — units-correct, no speculative quote-guessing.
+    Safe ARB execution using a conservative share estimate.
 
-    THE BUG THIS REPLACES: Bayse's contract size is ₦100 per share — proven
-    by execute_trade's own working formula `shares = amount/(price*100)`
-    and its inverse `ngn = shares*price*100`. The previous ARB rewrite called
-    a get_quote() endpoint and guessed at field names ("shares", "shareAmount",
-    etc.); when none matched, it fell back to `amount/(price*(1+slippage))` —
-    missing the ÷100 entirely. That produced share counts 100x too large
-    (₦140 spent registered as "276 shares" instead of the real ~2.76),
-    so burn_qty was 100x inflated and burning failed every time with
-    "not enough shares" — exactly the error seen twice in production.
-
-    FIX: drop the quote calls (they were guessing at an undocumented schema
-    and added latency for zero verified benefit — simpler is more reliable
-    here). Use the SAME proven formula as the rest of the codebase, with a
-    conservative slippage haircut so the estimate is always a lower bound
-    on actual shares received.
+    History (so the next person debugging this has the full picture):
+    contract size was originally assumed to be ₦100/share, which produced
+    share counts 100x too large and caused repeated "not enough shares"
+    burn failures. That assumption was later disproven directly by Bayse's
+    own API: a burn of 2.572 "shares" (computed with the ₦100 assumption)
+    failed with "Minimum burn amount is 100" — a number that only makes
+    sense if 1 share ≈ ₦1, not ₦100. Reverse-engineering the real prices
+    from that failure confirmed it: the ₦1/share convention gives
+    burn_qty=257.2 (clears the minimum) and matches Bayse's own implied
+    profit almost exactly. The formula below uses shares = amount/price
+    (no extra ×100), with a slippage haircut so the estimate stays a
+    conservative lower bound on actual shares received.
     """
     yes_p = market["yes_price"]
     no_p  = market["no_price"]
@@ -441,7 +438,14 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
     # ₦23.14 actually logged). Confirmed: shares = amount/price, not
     # amount/(price*100). The previous fix was wrong and has been silently
     # making every ARB burn 100x too small since deployment.
-    arb_slip = 0.03
+    # Widened from 3% to 8% after direct evidence: a real ₦129/₦121 ARB
+    # attempt with total_p=0.97 still failed "not enough shares" even with
+    # the units-corrected formula and a 3% haircut — actual AMM price
+    # impact on that trade exceeded 3% despite requesting max_slippage=0.03.
+    # ARB has now cost real money 3 times from underestimating execution
+    # risk (each time a different specific cause); widening the margin
+    # itself is the simpler fix versus chasing each new edge case.
+    arb_slip = 0.08
     yes_shares = amount_yes / (yes_p * (1.0 + arb_slip))
     no_shares  = amount_no  / (no_p  * (1.0 + arb_slip))
 
@@ -517,9 +521,17 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
         rollback_ok = False
         if yes_ok:
             try:
+                # Sell slightly less than the original spend (not the full
+                # amount_yes) — if the burn failed because the actual fill
+                # came in worse than our estimate (the confirmed, recurring
+                # cause), selling the FULL original NGN value at the now-
+                # current price could require more shares than we actually
+                # hold, failing the rollback for the same underlying reason
+                # as the burn. This buffer is exactly why "ROLLBACK FAILED:
+                # insufficient shares balance" has shown up repeatedly.
                 await client.place_order(
                     sig.event_id, sig.market_id, market["yes_id"],
-                    "SELL", amount_yes, "MARKET", currency=CURRENCY,
+                    "SELL", amount_yes * 0.90, "MARKET", currency=CURRENCY,
                 )
                 rollback_ok = True
                 log.info(f"[{chat_id}] ARB rollback OK")
