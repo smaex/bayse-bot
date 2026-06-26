@@ -554,3 +554,21 @@ def get_alpha_trend(chat_id: str, strategy: str, asset: str, days: int = 7) -> f
     except Exception as e:
         log.debug(f"get_alpha_trend error: {e}")
         return 1.0
+
+
+def get_daily_resolved_pnl(chat_id: str, date_str: str) -> float:
+    """
+    Query today's resolved PnL directly from the database of resolved trades for a UTC date string.
+    Returns 0.0 if no resolved trades or if sum is null.
+    """
+    try:
+        row = _fetch_one("""
+            SELECT SUM(pnl_ngn) AS pnl
+            FROM trades
+            WHERE chat_id = %s AND won IS NOT NULL
+              AND resolved_at::DATE = %s::DATE
+        """, (chat_id, date_str))
+        return float(row["pnl"] or 0.0) if row else 0.0
+    except Exception as e:
+        log.error(f"get_daily_resolved_pnl error: {e}")
+        return 0.0

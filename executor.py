@@ -68,11 +68,14 @@ async def _infer_engine(client, market: dict) -> str:
     if mid in _market_engine_cache:
         return _market_engine_cache[mid]
     try:
-        ob   = await asyncio.wait_for(
-            client.get_orderbook(market["event_id"], mid), timeout=0.5
+        yes_id = market.get("yes_id") or market.get("outcome1Id")
+        if not yes_id:
+            return "AMM"
+        ob = await asyncio.wait_for(
+            client.get_orderbook(yes_id), timeout=0.5
         )
-        bids = ob.get("bids") or ob.get("yes", {}).get("bids") or []
-        asks = ob.get("asks") or ob.get("yes", {}).get("asks") or []
+        bids = ob.get("bids") or []
+        asks = ob.get("asks") or []
         engine = "CLOB" if (bids or asks) else "AMM"
     except Exception:
         engine = "AMM"
@@ -122,16 +125,19 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — strict mode (near daily target), certainty {sig.certainty:.0%} < 70%")
         return
 
-    # ── Conviction sizing ──────────────────────────────────────────────────
-    if sig.certainty >= 0.90:   tier = 2.0
-    elif sig.certainty >= 0.70: tier = 1.5
-    elif sig.certainty >= 0.55: tier = 1.0
-    else:                       tier = 0.5
+    # ── Sizing (Kelly / Conviction) ────────────────────────────────────────
+    kelly_pct = getattr(sig, "size_pct", 0.0)
+    if kelly_pct > 0.0:
+        raw_pct = kelly_pct * mult
+    else:
+        if sig.certainty >= 0.90:   tier = 2.0
+        elif sig.certainty >= 0.70: tier = 1.5
+        elif sig.certainty >= 0.55: tier = 1.0
+        else:                       tier = 0.5
+        fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
+        raw_pct   = user_risk * tier * mult * fx_factor
 
-    fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
-    raw_pct   = user_risk * tier * mult * fx_factor
-
-    if sig.certainty >= 0.95:
+    if sig.certainty >= 0.95 and kelly_pct == 0.0:
         raw_pct *= 1.5
 
     if hasattr(database, "get_alpha_trend"):
@@ -148,8 +154,10 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     if equity < 3_000:
         amount = MIN_TRADE_NGN
     else:
-        capped = min(raw_pct, user_risk * 3.0)
-        amount = max(min_t, min(max_t, equity * capped))
+        # For Kelly sizing, we don't apply user_risk * 3 cap since Kelly is already capped
+        cap_factor = 1.0 if kelly_pct > 0.0 else (user_risk * 3.0)
+        final_pct = min(raw_pct, cap_factor)
+        amount = max(min_t, min(max_t, equity * final_pct))
 
     hard_cap = min(max(MIN_TRADE_NGN, equity * 0.05), max_t)
     if amount > hard_cap:
@@ -163,22 +171,115 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         )
         return
 
-    # ── EV check ───────────────────────────────────────────────────────────
-    fee_rate = _get_market_fee(sig.market_id)
-    eff_fee  = _effective_fee(fee_rate, sig.market_price)
-    ev       = sig.win_prob * (1.0 - eff_fee) / sig.market_price - 1.0
+    # ── Engine detection ───────────────────────────────────────────────────
+    market   = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
+    declared = market.get("engine") if market else None
+    if declared:
+        engine = declared
+    elif market:
+        engine = await _infer_engine(client, market)
+    else:
+        engine = "AMM"
+
+    # ── EV check with pre-trade Quote ──────────────────────────────────────
+    target_margin = {
+        "safe": 0.15, "balanced": 0.06, "aggressive": 0.04,
+        "full_send": 0.02, "custom": 0.05,
+    }.get(mode, 0.06)
 
     is_probe = sig.certainty >= 0.35 and sig.certainty < sig.mode_floor
     if is_probe:
         amount = MIN_TRADE_NGN
-    elif ev < 0.01:
-        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — EV {ev:+.1%} (market_price={sig.market_price:.3f} win_prob={sig.win_prob:.2%})")
-        return
 
-    # Ceiling must match SNIPE_MAX_MARKET_PRICE (0.90) — was 0.88 which killed
-    # valid signals that already passed SNIPE's own EV gate at prices 0.88-0.90.
-    if sig.market_price > 0.90:
-        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — market_price {sig.market_price:.3f} > 0.90 ceiling")
+    quote_price = sig.market_price
+    if engine == "AMM" and not is_probe:
+        try:
+            quote = await client.get_quote(
+                event_id=sig.event_id, market_id=sig.market_id,
+                outcome_id=sig.outcome_id, side="BUY", amount=amount,
+                currency=CURRENCY
+            )
+            q_price = float(quote.get("price") or sig.market_price)
+            q_qty = float(quote.get("quantity") or 0)
+            q_fee = float(quote.get("fee") or 0)
+            q_cost = float(quote.get("costOfShares") or 0)
+
+            if q_qty > 0 and q_cost > 0:
+                total_cost = q_cost + q_fee
+                quote_price = total_cost / (q_qty * 100.0) if CURRENCY == "NGN" else total_cost / q_qty
+            else:
+                fee_rate = _get_market_fee(sig.market_id)
+                eff_fee = _effective_fee(fee_rate, q_price)
+                quote_price = q_price * (1.0 + eff_fee)
+
+            if quote_price <= 0:
+                log.warning(f"[{chat_id}] Invalid quote price {quote_price} returned. Skipping EV calculation.")
+                return
+            ev = sig.win_prob / quote_price - 1.0
+
+            if ev < target_margin:
+                log.info(f"[{chat_id}] EV {ev:+.1%} too low at size ₦{amount:,.0f} (price={quote_price:.3f}). Scaling down...")
+                scaled_success = False
+                for scale in [0.5, 0.25]:
+                    scaled_amount = max(MIN_TRADE_NGN, round(amount * scale, -2))
+                    if scaled_amount <= MIN_TRADE_NGN or scaled_amount >= amount:
+                        scaled_amount = MIN_TRADE_NGN
+
+                    try:
+                        scaled_quote = await client.get_quote(
+                            event_id=sig.event_id, market_id=sig.market_id,
+                            outcome_id=sig.outcome_id, side="BUY", amount=scaled_amount,
+                            currency=CURRENCY
+                        )
+                        sq_price = float(scaled_quote.get("price") or sig.market_price)
+                        sq_qty = float(scaled_quote.get("quantity") or 0)
+                        sq_fee = float(scaled_quote.get("fee") or 0)
+                        sq_cost = float(scaled_quote.get("costOfShares") or 0)
+
+                        if sq_qty > 0 and sq_cost > 0:
+                            scaled_price = (sq_cost + sq_fee) / (sq_qty * 100.0) if CURRENCY == "NGN" else (sq_cost + sq_fee) / sq_qty
+                        else:
+                            fee_rate = _get_market_fee(sig.market_id)
+                            eff_fee = _effective_fee(fee_rate, sq_price)
+                            scaled_price = sq_price * (1.0 + eff_fee)
+
+                        scaled_ev = sig.win_prob / scaled_price - 1.0
+                        if scaled_ev >= target_margin:
+                            log.info(
+                                f"[{chat_id}] Sizing down success! ₦{amount:,.0f} → ₦{scaled_amount:,.0f} "
+                                f"(EV={scaled_ev:.2%}, price={scaled_price:.3f})"
+                            )
+                            amount = scaled_amount
+                            quote_price = scaled_price
+                            ev = scaled_ev
+                            scaled_success = True
+                            break
+                    except Exception as q_err:
+                        log.debug(f"Sizing down quote failed for size ₦{scaled_amount}: {q_err}")
+
+                if not scaled_success:
+                    log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — no profitable size (quoted_price={quote_price:.3f} EV={ev:.2%})")
+                    return
+        except Exception as e:
+            log.warning(f"[{chat_id}] get_quote failed: {e}. Falling back to estimated EV.")
+            fee_rate = _get_market_fee(sig.market_id)
+            eff_fee  = _effective_fee(fee_rate, sig.market_price)
+            ev = sig.win_prob / (sig.market_price * (1.0 + eff_fee)) - 1.0
+            if ev < target_margin:
+                log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — fallback EV {ev:+.1%} < {target_margin:.0%}")
+                return
+    else:
+        # CLOB or probe (probe EV is ignored/allowed at min size)
+        fee_rate = _get_market_fee(sig.market_id)
+        eff_fee  = _effective_fee(fee_rate, sig.market_price)
+        ev = sig.win_prob / (sig.market_price * (1.0 + eff_fee)) - 1.0
+        if not is_probe and ev < target_margin:
+            log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — EV {ev:+.1%} < {target_margin:.0%}")
+            return
+
+    # Ceiling must match SNIPE_MAX_MARKET_PRICE (0.90)
+    if quote_price > 0.90:
+        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — price {quote_price:.3f} > 0.90 ceiling")
         return
 
     if equity >= 3_000 and not risk.can_trade(equity, amount, max_exp):
@@ -189,12 +290,6 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         return
 
     # ── Market-specific minimum ───────────────────────────────────────────
-    # CRITICAL FIX: previously this silently returned forever with NO log and
-    # NO cooldown — once a market's real Bayse minimum exceeded our computed
-    # amount, every future signal for that market_id died instantly and
-    # invisibly, in a tight infinite retry loop (signal fires every ~1s,
-    # dies silently, fires again). This was very likely why trades stopped
-    # entirely for hours despite signals firing continuously.
     cached_min = _market_min_cache.get(sig.market_id, 0.0)
     if cached_min > 0 and amount < cached_min:
         if cached_min <= max_t and cached_min <= free_cash:
@@ -208,18 +303,8 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                 f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — market min ₦{cached_min:,.0f} "
                 f"exceeds max_trade(₦{max_t:,.0f}) or free_cash(₦{free_cash:,.0f})"
             )
-            _trade_cooldown[sig.market_id] = time.time()  # prevent infinite tight retry loop
+            _trade_cooldown[sig.market_id] = time.time()
             return
-
-    # ── Engine detection ───────────────────────────────────────────────────
-    market   = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
-    declared = market.get("engine") if market else None
-    if declared:
-        engine = declared
-    elif market:
-        engine = await _infer_engine(client, market)
-    else:
-        engine = "AMM"
 
     # ── Always MARKET orders ───────────────────────────────────────────────
     # AMM always fills. Bayse CLOB has no book depth — LIMIT orders
@@ -389,26 +474,12 @@ async def execute_arb(chat_id: str, sig, client, risk, equity: float, free_cash:
 async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash: float):
     """
     Safe ARB execution using a conservative share estimate.
-
-    History (so the next person debugging this has the full picture):
-    contract size was originally assumed to be ₦100/share, which produced
-    share counts 100x too large and caused repeated "not enough shares"
-    burn failures. That assumption was later disproven directly by Bayse's
-    own API: a burn of 2.572 "shares" (computed with the ₦100 assumption)
-    failed with "Minimum burn amount is 100" — a number that only makes
-    sense if 1 share ≈ ₦1, not ₦100. Reverse-engineering the real prices
-    from that failure confirmed it: the ₦1/share convention gives
-    burn_qty=257.2 (clears the minimum) and matches Bayse's own implied
-    profit almost exactly. The formula below uses shares = amount/price
-    (no extra ×100), with a slippage haircut so the estimate stays a
-    conservative lower bound on actual shares received.
+    Fetches quotes for both YES and NO outcomes before trading to guarantee profitability.
     """
     yes_p = market["yes_price"]
     no_p  = market["no_price"]
 
     # ── Extreme-price guard ───────────────────────────────────────────────
-    # Below 0.08, the proportional budget split makes one leg unaffordable
-    # at MIN_TRADE_NGN regardless of budget size at this account's balance.
     if min(yes_p, no_p) < 0.08:
         log.info(
             f"[{chat_id}] ARB SKIP {sig.asset} — extreme-price market "
@@ -429,45 +500,53 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
         )
         return
 
-    # ── Share estimate — CORRECTED contract-size convention ───────────────
-    # Bayse's API just told us directly: burning 2.572 "shares" (computed
-    # via amount/(price*100)) failed with "Minimum burn amount is 100".
-    # Reverse-engineering yes_p/no_p from that failure and testing WITHOUT
-    # the *100 factor gives burn_qty=257.2 — clears the 100 minimum — and
-    # produces virtually the same profit Bayse's numbers implied (₦23.22 vs
-    # ₦23.14 actually logged). Confirmed: shares = amount/price, not
-    # amount/(price*100). The previous fix was wrong and has been silently
-    # making every ARB burn 100x too small since deployment.
-    # Widened from 3% to 8% after direct evidence: a real ₦129/₦121 ARB
-    # attempt with total_p=0.97 still failed "not enough shares" even with
-    # the units-corrected formula and a 3% haircut — actual AMM price
-    # impact on that trade exceeded 3% despite requesting max_slippage=0.03.
-    # ARB has now cost real money 3 times from underestimating execution
-    # risk (each time a different specific cause); widening the margin
-    # itself is the simpler fix versus chasing each new edge case.
-    arb_slip = 0.08
-    yes_shares = amount_yes / (yes_p * (1.0 + arb_slip))
-    no_shares  = amount_no  / (no_p  * (1.0 + arb_slip))
+    # ── Fetch pre-trade quotes ───────────────────────────────────────────
+    try:
+        quote_yes = await client.get_quote(
+            event_id=sig.event_id, market_id=sig.market_id,
+            outcome_id=market["yes_id"], side="BUY", amount=amount_yes,
+            currency=CURRENCY
+        )
+        quote_no = await client.get_quote(
+            event_id=sig.event_id, market_id=sig.market_id,
+            outcome_id=market["no_id"], side="BUY", amount=amount_no,
+            currency=CURRENCY
+        )
+    except Exception as q_err:
+        log.warning(f"[{chat_id}] ARB SKIP {sig.asset} — failed to get pre-trade quotes: {q_err}")
+        return
 
-    burn_qty   = min(yes_shares, no_shares)
-    profit_est = burn_qty * (1.0 - total_p)
+    q_yes_p = float(quote_yes.get("price") or yes_p)
+    q_no_p  = float(quote_no.get("price") or no_p)
+    total_q_p = q_yes_p + q_no_p
 
-    # Hard floor from Bayse's own stated minimum — confirmed directly from
-    # their API error, not estimated. Check BEFORE spending any money.
-    if burn_qty < 100:
+    from config import ARB_TRIGGER
+    if total_q_p > ARB_TRIGGER:
         log.info(
-            f"[{chat_id}] ARB SKIP {sig.asset} — burn_qty {burn_qty:.1f} below "
-            f"Bayse's minimum burn size of 100 (budget too small for this market's pricing)"
+            f"[{chat_id}] ARB SKIP {sig.asset} — sum of quotes {total_q_p:.3f} "
+            f"exceeds trigger {ARB_TRIGGER:.3f} (yes_quote={q_yes_p:.3f} no_quote={q_no_p:.3f})"
         )
         return
 
-    # Require a meaningful profit, not just >0 — each attempt risks real
-    # slippage and places two live orders, so a fractional-naira "profit"
-    # isn't worth the operational risk.
+    # ── Share counts from quotes ──────────────────────────────────────────
+    yes_shares = float(quote_yes.get("quantity") or (amount_yes / q_yes_p))
+    no_shares  = float(quote_no.get("quantity") or (amount_no / q_no_p))
+
+    # Apply 3% safety margin on the burn quantity to ensure we actually hold enough shares
+    burn_qty = min(yes_shares, no_shares) * 0.97
+    profit_est = burn_qty * (1.0 - total_q_p)
+
+    if burn_qty < 100:
+        log.info(
+            f"[{chat_id}] ARB SKIP {sig.asset} — burn_qty {burn_qty:.1f} below "
+            f"minimum burn size of 100"
+        )
+        return
+
     if profit_est < 2.0:
         log.info(
-            f"[{chat_id}] ARB SKIP {sig.asset} — profit too thin after haircut "
-            f"(burn={burn_qty:.3f} gap={1.0-total_p:.4f} est=₦{profit_est:.2f})"
+            f"[{chat_id}] ARB SKIP {sig.asset} — profit too thin "
+            f"(burn={burn_qty:.3f} gap={1.0-total_q_p:.4f} est=₦{profit_est:.2f})"
         )
         return
 
@@ -484,7 +563,7 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["yes_id"], side="BUY",
             amount=amount_yes, order_type="MARKET", currency=CURRENCY,
-            max_slippage=arb_slip,
+            max_slippage=0.015,
         )
         yes_ok = True
 
@@ -492,15 +571,11 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["no_id"], side="BUY",
             amount=amount_no, order_type="MARKET", currency=CURRENCY,
-            max_slippage=arb_slip,
+            max_slippage=0.015,
         )
 
-        # Burn the conservative estimate — NOT a value parsed from the order
-        # response (that's what caused both previous bugs: the response
-        # field doesn't reliably represent true share count in this unit
-        # convention).
         await client.burn_shares(sig.market_id, burn_qty, CURRENCY)
-        profit = burn_qty * (1.0 - total_p)
+        profit = burn_qty * (1.0 - total_q_p)
         log.info(f"[{chat_id}] ARB ✅ {sig.asset} | {burn_qty:.3f} pairs | ₦{profit:+,.2f}")
 
         trade_id = await asyncio.to_thread(
@@ -508,7 +583,7 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
             chat_id=chat_id, strategy="ARB", asset=sig.asset,
             timeframe=sig.timeframe, outcome="ARB", outcome_id="burn",
             market_id=sig.market_id, event_id=sig.event_id,
-            entry_price=_safe_float(total_p),
+            entry_price=_safe_float(total_q_p),
             amount_ngn=_safe_float(amount_yes + amount_no),
             certainty=1.0, secs_to_close=0,
         )
@@ -521,14 +596,6 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
         rollback_ok = False
         if yes_ok:
             try:
-                # Sell slightly less than the original spend (not the full
-                # amount_yes) — if the burn failed because the actual fill
-                # came in worse than our estimate (the confirmed, recurring
-                # cause), selling the FULL original NGN value at the now-
-                # current price could require more shares than we actually
-                # hold, failing the rollback for the same underlying reason
-                # as the burn. This buffer is exactly why "ROLLBACK FAILED:
-                # insufficient shares balance" has shown up repeatedly.
                 await client.place_order(
                     sig.event_id, sig.market_id, market["yes_id"],
                     "SELL", amount_yes * 0.90, "MARKET", currency=CURRENCY,
@@ -544,7 +611,7 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
                 chat_id=chat_id, strategy="ARB", asset=sig.asset,
                 timeframe=sig.timeframe, outcome="ARB", outcome_id="burn_failed",
                 market_id=sig.market_id, event_id=sig.event_id,
-                entry_price=_safe_float(total_p),
+                entry_price=_safe_float(total_q_p),
                 amount_ngn=_safe_float(amount_yes + amount_no),
                 certainty=1.0, secs_to_close=0,
             )

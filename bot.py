@@ -9,6 +9,7 @@ import sys
 import time
 from datetime import date
 
+# pyrefly: ignore [missing-import]
 from aiohttp import web, ClientSession, ClientTimeout
 
 import database
@@ -25,7 +26,9 @@ import config
 import feeds_direct
 from risk import RiskManager
 from client import BayseClient
-from config import TELEGRAM_TOKEN, CURRENCY, SCAN_INTERVAL_SECONDS, SYSTEMIC_RISK_HALT_MINS
+from config import (TELEGRAM_TOKEN, CURRENCY, SCAN_INTERVAL_SECONDS,
+                    SYSTEMIC_RISK_HALT_MINS, EXIT_EV_THRESHOLD, MIN_EXIT_TIME_REMAINING)
+from strategies.utils import win_probability, realized_vol_hourly
 
 logging.basicConfig(
     level=logging.INFO,
@@ -205,7 +208,8 @@ async def _user_loop(chat_id: str):
                         day["start_balance"] = equity
                         settings["daily_state"] = day
                         await asyncio.to_thread(database.update_settings, chat_id, settings)
-                        # Do NOT reset risk.peak_balance here — see prior fix notes.
+                        # Adjust peak_balance to prevent false drawdown pauses on withdrawals
+                        risk.peak_balance = max(0.0, risk.peak_balance + delta)
                         _user_daily[chat_id] = day
                         if _tg_app:
                             await telegram_bot.send_message(
@@ -251,7 +255,9 @@ async def _user_loop(chat_id: str):
 
         # ── Daily target ───────────────────────────────────────────────────
         day    = _daily(chat_id, equity, settings)
-        profit = equity - day["start_balance"]
+        from datetime import datetime, timezone
+        today_utc = datetime.now(timezone.utc).date().isoformat()
+        profit = await asyncio.to_thread(database.get_daily_resolved_pnl, chat_id, today_utc)
         target = _daily_target(settings, day["start_balance"])
 
         # Sync ground-truth values onto risk so is_in_strict_mode() actually
@@ -300,12 +306,166 @@ async def _user_loop(chat_id: str):
         else:
             _systemic_alert[chat_id] = False
 
+        # ── Position Exit / Soft Stop-Loss ──────────────────────────────────
+        try:
+            await _evaluate_and_exit_positions(chat_id, client, risk, settings)
+        except Exception as exit_err:
+            log.error(f"[{chat_id}] Position exit eval error: {exit_err}", exc_info=True)
+
         # ── Refresh user cache ─────────────────────────────────────────────
         global _active_users_cache, _active_users_cache_time
         _active_users_cache      = await asyncio.to_thread(database.get_all_active)
         _active_users_cache_time = time.time()
 
         await _evaluate_single_user(user, penalty=0.0)
+
+
+async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dict):
+    """
+    Soft model-based exit: re-evaluate every open position using the diffusion
+    model's updated win probability. If EV drops below EXIT_EV_THRESHOLD
+    (default -15%), the thesis is mathematically wrong — exit the position.
+
+    This runs every 30s inside _user_loop. It does NOT use a hard price-based
+    stop-loss (that's suboptimal for binary options that settle at 0 or 1).
+    Instead, it compares the model's estimated win probability against the
+    current market price to determine if holding is still +EV.
+    """
+    if not risk.open_positions:
+        return
+    if settings.get("paused"):
+        return
+
+    positions_to_exit = []
+
+    for market_id, pos in list(risk.open_positions.items()):
+        market = next((m for m in active_markets if m["market_id"] == market_id), None)
+        if not market:
+            continue
+
+        secs = market.get("secs_to_close", 0)
+        # Don't try to exit in the final 90 seconds — settlement/oracle resolution
+        # risk makes exit prices unreliable and the market is about to close anyway
+        if secs < MIN_EXIT_TIME_REMAINING:
+            continue
+
+        asset = pos.get("asset", "")
+        outcome = pos.get("outcome", "YES")
+        threshold = market.get("threshold")
+        spot_price = feeds.spot.get(asset)
+
+        if not threshold or not spot_price:
+            continue
+
+        # Re-estimate win probability using the diffusion model
+        dist_pct = (spot_price - threshold) / threshold
+        rv = realized_vol_hourly(asset, strategy.global_state)
+        w_est = win_probability(dist_pct, secs, asset, sigma_override=rv)
+
+        # If we hold NO, our win prob is the probability price stays BELOW threshold
+        if outcome == "NO":
+            w_est = 1.0 - w_est
+
+        # Current market price for our held outcome
+        if outcome == "YES":
+            current_price = market.get("yes_price", 0.5)
+        else:
+            current_price = market.get("no_price", 0.5)
+
+        if current_price <= 0.01:
+            continue  # Price too low to sell meaningfully
+
+        # EV = (expected payout) / (current price to exit) - 1
+        # For holding: we win 1.0 with probability w_est, lose with (1 - w_est)
+        # But we can sell at current_price now. So EV of continuing to hold:
+        ev_hold = w_est / current_price - 1.0
+
+        if ev_hold < EXIT_EV_THRESHOLD:
+            positions_to_exit.append({
+                "market_id": market_id,
+                "pos": pos,
+                "market": market,
+                "w_est": w_est,
+                "current_price": current_price,
+                "ev_hold": ev_hold,
+            })
+
+    # Execute exits
+    for exit_info in positions_to_exit:
+        pos = exit_info["pos"]
+        market = exit_info["market"]
+        market_id = exit_info["market_id"]
+        w_est = exit_info["w_est"]
+        current_price = exit_info["current_price"]
+        ev_hold = exit_info["ev_hold"]
+
+        outcome_id = pos.get("outcome_id", "")
+        event_id = pos.get("event_id", "")
+        amount_ngn = pos.get("amount_ngn", 0)
+        entry_price = pos.get("entry_price", 0)
+
+        if not outcome_id or not event_id:
+            continue
+
+        # Use the original amount as the sell amount (NGN)
+        sell_amount = max(100.0, amount_ngn * 0.95)  # 5% buffer for fees/rounding
+
+        log.info(
+            f"[{chat_id}] EXIT SIGNAL | {pos.get('strategy', '?')} {pos.get('asset', '?')} "
+            f"{pos.get('outcome', '?')} | w_est={w_est:.1%} price={current_price:.3f} "
+            f"EV={ev_hold:+.1%} < {EXIT_EV_THRESHOLD:.0%} | "
+            f"entry={entry_price:.3f} → now={current_price:.3f}"
+        )
+
+        try:
+            resp = await client.place_order(
+                event_id=event_id, market_id=market_id,
+                outcome_id=outcome_id, side="SELL",
+                amount=sell_amount, order_type="MARKET",
+                currency=CURRENCY, max_slippage=0.03,
+            )
+            order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
+            order_id = order.get("id") or order.get("orderId") or order.get("order_id")
+
+            sell_price = float(order.get("avgFillPrice") or order.get("price") or current_price)
+            pnl = (sell_price - entry_price) * (amount_ngn / entry_price) if entry_price > 0 else 0
+
+            log.info(
+                f"[{chat_id}] EXIT FILLED | {pos.get('strategy', '?')} {pos.get('asset', '?')} "
+                f"@ {sell_price:.4f} | PnL ≈ ₦{pnl:+,.0f} | order={order_id}"
+            )
+
+            # Update risk manager
+            risk.remove_position(market_id)
+            risk.add_pnl(pnl)
+
+            # Resolve the trade in DB
+            trade_id = pos.get("trade_id")
+            if trade_id:
+                try:
+                    await asyncio.to_thread(database.resolve_trade, trade_id, pnl > 0, pnl)
+                except Exception as db_err:
+                    log.error(f"[{chat_id}] EXIT DB resolve failed: {db_err}")
+
+            # Notify user
+            if _tg_app:
+                emoji = "🟢" if pnl >= 0 else "🔴"
+                try:
+                    await telegram_bot.send_message(
+                        _tg_app, chat_id,
+                        f"{emoji} *Position Exited (Stop-Loss)*\n"
+                        f"Strategy: {pos.get('strategy', '?')}\n"
+                        f"Asset: {pos.get('asset', '?')} {pos.get('outcome', '')}\n"
+                        f"Entry: {entry_price:.3f} → Exit: {sell_price:.3f}\n"
+                        f"PnL: ₦{pnl:+,.0f}\n"
+                        f"Reason: Model EV dropped to {ev_hold:+.0%} (thesis invalidated)",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            log.error(f"[{chat_id}] EXIT order failed for {market_id}: {e}", exc_info=True)
 
 
 async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: float = 0.0):

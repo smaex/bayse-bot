@@ -142,6 +142,12 @@ class SnipeStrategy(BaseStrategy):
         distance_pct = (live_spot - threshold) / threshold
 
         rv = realized_vol_hourly(asset, state)
+        
+        # Intraday volatility adjustment: US market hours (13:00 - 20:00 UTC) see higher volatility
+        utc_hour = time.gmtime().tm_hour
+        intraday_mult = 1.25 if (13 <= utc_hour <= 20) else 0.90
+        rv *= intraday_mult
+
         if secs < 300:
             # Conservative cushion: real-world resolution/oracle risk spikes
             # in the final seconds in a way the pure sqrt(t) model doesn't
@@ -151,18 +157,12 @@ class SnipeStrategy(BaseStrategy):
         t       = secs / 3600.0
         sigma_t = rv * (t ** 0.5) if t > 0 else 0.0
 
-        # Drift extrapolation horizon capped at 180s (3 min) — see
-        # projected_drift_pct's docstring for the production evidence
-        # behind this. An instantaneous momentum reading shouldn't be
-        # trusted to extrapolate 10-14 minutes forward with full weight.
+        # Drift extrapolation horizon capped at 180s (3 min)
         drift = projected_drift_pct(asset, secs, state, horizon_cap=180.0)
         if sigma_t > 0:
-            # Cap drift at 2 standard deviations of the diffusion term itself.
-            # Without this, a single noisy instantaneous Kalman velocity
-            # reading (e.g. right after a price spike) could dominate the
-            # estimate and produce overconfident certainty that's really
-            # just measurement noise, not genuine sustained momentum.
-            max_drift = 2.0 * sigma_t
+            # Cap drift at 2 standard deviations, but allow a floor of 0.5% movement
+            # so momentum isn't completely suppressed near close.
+            max_drift = max(2.0 * sigma_t, 0.005)
             drift = max(-max_drift, min(drift, max_drift))
 
         adj_distance = distance_pct + drift

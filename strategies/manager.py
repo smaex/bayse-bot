@@ -7,9 +7,8 @@ log = logging.getLogger("strategies.manager")
 
 def _effective_fee(fee_rate: float, market_price: float) -> float:
     """
-    Bayse fee formula: fee = feeRate × max(1 - price, 0.3)
-    The floor is 0.3 — previous code incorrectly used 0.5, which
-    over-estimated fees at high prices and killed profitable trades.
+    Bayse effective fee rate applied to the trade cost:
+    eff_fee_rate = feeRate × max(1 - price, 0.5)
     """
     return fee_rate * max(1.0 - market_price, config.FEE_FLOOR)
 
@@ -25,7 +24,7 @@ def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.02,
       - Dynamic volatility scaling via GARCH
     """
     eff_fee = _effective_fee(fee_rate, market_price)
-    b = (1.0 - eff_fee) / market_price - 1.0
+    b = 1.0 / (market_price * (1.0 + eff_fee)) - 1.0
     if b <= 0:
         return 0.0
 
@@ -68,4 +67,4 @@ def max_ev_price(win_prob: float, market_price: float,
     convexity_factor = 1.0 + skew            # 1.4× at 0.90, 0.6× at 0.10
     dynamic_margin   = max(0.01, min_margin * convexity_factor)
     eff_fee          = _effective_fee(fee_rate, market_price)
-    return win_prob * (1.0 - eff_fee) / (1.0 + dynamic_margin)
+    return win_prob / ((1.0 + dynamic_margin) * (1.0 + eff_fee))

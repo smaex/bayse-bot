@@ -139,12 +139,16 @@ class BayseClient:
         data = await self._get(f"/v1/pm/events/series/{series_slug}/lean-events", auth="public")
         return data if isinstance(data, list) else data.get("events", [])
 
-    async def get_orderbook(self, event_id: str, market_id: str) -> dict:
+    async def get_orderbook(self, outcome_id: str, depth: int = 5, currency: str = CURRENCY) -> dict:
         try:
-            return await self._get(
-                f"/v1/pm/events/{event_id}/markets/{market_id}/orderbook",
+            res = await self._get(
+                "/v1/pm/books",
+                params={"outcomeId[]": outcome_id, "depth": depth, "currency": currency},
                 auth="public",
             )
+            if isinstance(res, list) and len(res) > 0:
+                return res[0]
+            return res if isinstance(res, dict) else {}
         except Exception:
             return {}
 

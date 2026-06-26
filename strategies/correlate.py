@@ -92,10 +92,24 @@ class CorrelateStrategy(BaseStrategy):
         if mom < -0.4:
             return None
 
-        certainty = min(
-            config.CORRELATE_BASE_CERTAINTY * freshness * (1.0 + 0.20 * mom), 0.99
-        )
-        w_est    = certainty_to_prob(certainty)
+        # Fetch actual realized correlation between BTC and the target asset
+        from strategies.utils import realized_correlation
+        import math
+
+        corr = realized_correlation("BTC", asset, state)
+        if corr <= 0:
+            corr = 0.75  # default historical correlation fallback
+
+        # Lead-lag signal strength scaled by lead move, correlation, and momentum
+        strength = spot_move * corr * freshness * (1.0 + 0.20 * mom)
+
+        # Smooth sigmoid mapping (via tanh) to map signal strength to probability
+        # Calibration factor of 300.0 translates a 0.35% move with 0.75 correlation to ~75% win probability
+        w_est = 0.50 + 0.48 * math.tanh(strength * 300.0)
+
+        from strategies.utils import probability_to_certainty
+        certainty = probability_to_certainty(w_est)
+
         fee_rate = market.get("fee_rate", 0.02)
         ev_ceil  = max_ev_price(w_est, mkt_price, fee_rate)
         if mkt_price >= ev_ceil:

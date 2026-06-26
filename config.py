@@ -99,9 +99,14 @@ ARB_TRIGGER     = 0.98    # enter when YES+NO ≤ this
 ARB_MAX_SIZE_NGN= 50_000
 
 # ── Fee formula ───────────────────────────────────────────────────────────────
-# Bayse fee formula: fee = feeRate × max(1 - price, 0.3)
-# The floor is 0.3 (NOT 0.5 as previously used in code — that was wrong).
-FEE_FLOOR = 0.3
+# Bayse fee formula: fee = feeRate × max(1 - price, 0.5)
+# The floor is 0.5 as specified in the Bayse fees documentation.
+FEE_FLOOR = 0.5
+
+# ── Soft Stop-Loss / Exit Strategy ───────────────────────────────────────────
+EXIT_EV_THRESHOLD = -0.15          # Exit if EV drops below -15% (thesis wrong)
+MIN_EXIT_TIME_REMAINING = 90       # Don't try to exit in the final 90 seconds due to settlement risk
+
 
 # ── Risk ─────────────────────────────────────────────────────────────────────
 MAX_DRAWDOWN_STOP      = 0.15

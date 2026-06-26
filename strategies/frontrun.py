@@ -61,23 +61,46 @@ class FrontrunStrategy(BaseStrategy):
             return None
 
         # Don't enter if the market is already doomed
-        if market.get("threshold") and spot_price and secs > 0:
-            dist_pct = (spot_price - market["threshold"]) / market["threshold"]
-            prob = win_probability(dist_pct, secs, asset)
-            if outcome == "YES" and prob < 0.05:
-                return None
-            if outcome == "NO" and prob > 0.95:
-                return None
+        threshold = market.get("threshold")
+        if not threshold:
+            return None
+
+        live_spot = spot_price if spot_price is not None else bayse_spot
+        dist_pct = (live_spot - threshold) / threshold
+        prob = win_probability(dist_pct, secs, asset)
+        if outcome == "YES" and prob < 0.05:
+            return None
+        if outcome == "NO" and prob > 0.95:
+            return None
 
         market_price = market["yes_price"] if outcome == "YES" else market["no_price"]
         if market_price > 0.90:
             return None   # move already priced in
 
-        # Certainty scales with bias strength
-        certainty = min(0.50 + abs(bias) * 100.0, 0.95)
-        size_pct  = min(0.01 + abs(bias) * 5.0, 0.03)
+        # Calculate dynamic win probability based on fresh oracle price
+        oracle_dist = (oracle_p - threshold) / threshold
+        w_oracle = win_probability(oracle_dist, secs, asset)
+        win_prob = w_oracle if outcome == "YES" else 1.0 - w_oracle
 
-        log.info(f"FRONTRUN | {asset} bias={bias:+.3%} → {outcome}")
+        # Import manager utilities
+        from strategies.utils import probability_to_certainty
+        from strategies.manager import kelly_size
+
+        certainty = probability_to_certainty(win_prob)
+        if certainty < 0.35:
+            return None
+
+        # Compute Kelly size
+        fee_rate = market.get("fee_rate", 0.02)
+        size_pct = kelly_size(
+            win_prob, market_price, fee_rate,
+            asset=asset, state=state, learned=learned,
+            strategy_name="FRONTRUN"
+        )
+        if size_pct <= 0:
+            return None
+
+        log.info(f"FRONTRUN | {asset} bias={bias:+.3%} → {outcome} | w_oracle={win_prob:.1%}")
 
         return TradeSignal(
             strategy="FRONTRUN",
@@ -88,7 +111,7 @@ class FrontrunStrategy(BaseStrategy):
             outcome=outcome,
             outcome_id=market["yes_id"] if outcome == "YES" else market["no_id"],
             certainty=certainty,
-            win_prob=0.78,
+            win_prob=win_prob,
             market_price=market_price,
             size_pct=size_pct,
             reason=f"Oracle lag {bias:+.3%}",
