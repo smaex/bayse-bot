@@ -406,8 +406,13 @@ def recent_trades(chat_id: str, limit: int = 10) -> list[dict]:
     """, (chat_id, limit))
 
 
-def recent_stats(chat_id: str, days: int = 30) -> list[dict]:
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+def recent_stats(chat_id: str, days: int = 30, after_dt=None) -> list[dict]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    if after_dt:
+        if after_dt.tzinfo is None:
+            after_dt = after_dt.replace(tzinfo=timezone.utc)
+        cutoff = max(cutoff, after_dt)
+    cutoff_str = cutoff.isoformat()
     rows = _fetch_all("""
         SELECT strategy, asset, timeframe,
                COUNT(*)       AS total,
@@ -419,7 +424,7 @@ def recent_stats(chat_id: str, days: int = 30) -> list[dict]:
           AND created_at > %s::TIMESTAMPTZ
         GROUP BY strategy, asset, timeframe
         ORDER BY strategy, asset, timeframe
-    """, (chat_id, cutoff))
+    """, (chat_id, cutoff_str))
     for r in rows:
         r["win_rate"] = (r["wins"] or 0) / r["total"] if r["total"] else 0.0
     return rows
@@ -440,8 +445,13 @@ def all_time_stats(chat_id: str) -> dict:
     }
 
 
-def get_combo_stats(chat_id: str, days: int = 14) -> list[dict]:
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+def get_combo_stats(chat_id: str, days: int = 14, after_dt=None) -> list[dict]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    if after_dt:
+        if after_dt.tzinfo is None:
+            after_dt = after_dt.replace(tzinfo=timezone.utc)
+        cutoff = max(cutoff, after_dt)
+    cutoff_str = cutoff.isoformat()
     rows = _fetch_all("""
         SELECT strategy, asset, timeframe,
                COUNT(*) AS total, SUM(won) AS wins, SUM(pnl_ngn) AS total_pnl
@@ -451,7 +461,7 @@ def get_combo_stats(chat_id: str, days: int = 14) -> list[dict]:
         GROUP BY strategy, asset, timeframe
         HAVING COUNT(*) >= 3
         ORDER BY SUM(pnl_ngn) ASC
-    """, (chat_id, cutoff))
+    """, (chat_id, cutoff_str))
     for r in rows:
         r["win_rate"] = (r["wins"] or 0) / r["total"] if r["total"] else 0.0
     return rows

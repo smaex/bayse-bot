@@ -213,7 +213,21 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
     cmults  = dict(learned.get("certainty_multipliers", {k: 1.0 for k in config.ACTIVE_STRATEGIES}))
     counts  = {}
 
-    stats    = await asyncio.to_thread(database.recent_stats, chat_id, days=30)
+    # ── Mean-reversion: blend all multipliers 10% back toward default (1.0) ──
+    # Without this, a suppressed strategy generates fewer trades (because it's
+    # suppressed), which means less data to prove recovery, which means the
+    # penalty persists → data starvation death spiral.  A 10% daily blend
+    # gives a half-life of ~7 days: old adjustments naturally lose influence
+    # over 2-3 weeks even without new trades.
+    for k in list(mults.keys()):
+        mults[k] = round(mults[k] * 0.90 + 1.0 * 0.10, 2)
+    for k in list(cmults.keys()):
+        cmults[k] = round(cmults[k] * 0.90 + 1.0 * 0.10, 2)
+
+    reset_str = s.get("reset_learning_at")
+    reset_dt = datetime.fromisoformat(reset_str) if reset_str else None
+
+    stats    = await asyncio.to_thread(database.recent_stats, chat_id, days=30, after_dt=reset_dt)
     changes  = []
     warnings = []
 
@@ -235,35 +249,28 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         c           = cmults.get(strat, 1.0)
 
         if p_value < 0.05:
-            # FLOOR RAISED 0.40 → 0.85: certainty_multipliers should never be
-            # able to gate a strategy out of existence — that job belongs to
-            # size_multipliers (floored at 0.25 below), which throttles
-            # position SIZE, not whether a signal is allowed to fire at all.
-            # The old 0.40 floor created a structural asymmetry: ARB's
-            # certainty starts at a hardcoded 1.0, so 1.0*0.40=0.40 still
-            # clears the 0.35 discovery floor — ARB was immune. SNIPE's raw
-            # certainty typically runs 0.50-0.85, so the same 0.40 multiplier
-            # could push it to 0.20-0.34 — below the floor, silencing SNIPE
-            # for days while ARB kept trading. At 0.85 the multiplier is a
-            # gentle nudge, not a gate.
-            c = max(0.85, c - 0.20)
+            # Certainty multiplier floor at 0.85 — this is a gentle nudge,
+            # not a gate.  Size multipliers handle real throttling.
+            # Symmetric rate: penalty and recovery both ±0.15 so strategies
+            # recover at the same pace they're penalised.
+            c = max(0.85, c - 0.15)
             warnings.append(f"⚠️ {strat} certainty penalised (p={p_value:.3f})")
         elif win_rate is not None and win_rate >= expected_wr:
-            c = min(1.5, c + 0.10)
+            c = min(1.5, c + 0.15)
         cmults[strat] = round(c, 2)
 
         m = mults.get(strat, 1.0)
         if win_rate is not None:
             if win_rate >= 0.75:   m = min(3.0, m + 0.25)
-            elif win_rate >= 0.60: m = min(1.5, m + 0.10)
-            elif win_rate < 0.55:  m = max(0.25, m - 0.20)  # was max(0.10, m-0.25)
+            elif win_rate >= 0.60: m = min(1.5, m + 0.15)
+            elif win_rate < 0.55:  m = max(0.50, m - 0.15)
         mults[strat] = round(m, 2)
 
         # SNIPE threshold tuning
         if strat == "SNIPE" and win_rate is not None:
             cur = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
             if win_rate < 0.50:
-                new = min(round(cur + 0.03, 2), 0.70)
+                new = min(round(cur + 0.02, 2), 0.70)
                 learned["snipe_min_certainty"] = new
                 changes.append(f"🎯 SNIPE certainty raised {cur} → {new}")
             elif win_rate > 0.70 and cur > 0.45:
@@ -272,7 +279,7 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
                 changes.append(f"🎯 SNIPE certainty eased {cur} → {new}")
 
     # Combo-level self-correction
-    combos = await asyncio.to_thread(database.get_combo_stats, chat_id, days=14)
+    combos = await asyncio.to_thread(database.get_combo_stats, chat_id, days=14, after_dt=reset_dt)
     for c in combos:
         key    = f"{c['strategy']}:{c['asset']}:{c['timeframe']}"
         wr     = c["win_rate"]
@@ -284,8 +291,8 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         cv     = cmults.get(key, 1.0)
 
         if total >= 10 and pv < 0.05 and pnl < 0:
-            cv = max(0.85, cv - 0.35)  # same architectural fix as the per-strategy floor above
-            warnings.append(f"🔴 SELF-CORRECT: {key} penalised (-35%) — p={pv:.3f}")
+            cv = max(0.85, cv - 0.25)
+            warnings.append(f"🔴 SELF-CORRECT: {key} penalised (-25%) — p={pv:.3f}")
         elif pv > 0.20 and wr >= exp_wr:
             cv = min(1.5, cv + 0.20)
         cmults[key] = round(cv, 2)

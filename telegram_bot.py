@@ -191,11 +191,14 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         log.info(f"[{cid}] RESUMED via button")
         await q.message.reply_text("▶️ Trading resumed.")
     elif d == "resetlearning":
+        from datetime import datetime, timezone
         user = await asyncio.to_thread(database.get_user, cid)
-        s    = user["settings"]; s["learned"] = {}
+        s    = user["settings"]
+        s["learned"] = {}
+        s["reset_learning_at"] = datetime.now(timezone.utc).isoformat()
         await asyncio.to_thread(database.update_settings, cid, s)
         log.info(f"[{cid}] /resetlearning via button")
-        await q.message.reply_text("🔄 Learned settings cleared.")
+        await q.message.reply_text("🔄 Learned settings cleared and trade history reset.")
     elif d in _MODES:
         mode_cfg = _MODES[d]
         user     = await asyncio.to_thread(database.get_user, cid)
@@ -393,12 +396,15 @@ async def cmd_learning(update: Update, _ctx):
 
 @_guard
 async def cmd_resetlearning(update: Update, _ctx):
+    from datetime import datetime, timezone
     cid  = str(update.effective_chat.id)
     user = await asyncio.to_thread(database.get_user, cid)
-    s    = user["settings"]; s["learned"] = {}
+    s    = user["settings"]
+    s["learned"] = {}
+    s["reset_learning_at"] = datetime.now(timezone.utc).isoformat()
     await asyncio.to_thread(database.update_settings, cid, s)
     log.info(f"[{cid}] /resetlearning")
-    await update.message.reply_text("🔄 Learned settings cleared.")
+    await update.message.reply_text("🔄 Learned settings cleared and trade history reset.")
 
 @_guard
 async def cmd_learnstats(update: Update, _ctx):

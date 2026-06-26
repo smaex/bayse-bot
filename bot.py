@@ -407,8 +407,9 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         if not outcome_id or not event_id:
             continue
 
-        # Use the original amount as the sell amount (NGN)
-        sell_amount = max(100.0, amount_ngn * 0.95)  # 5% buffer for fees/rounding
+        # Calculate the exact number of shares to sell
+        shares_to_sell = amount_ngn / (entry_price * 100.0) if CURRENCY == "NGN" else amount_ngn / entry_price
+        sell_amount = round(shares_to_sell, 4)
 
         log.info(
             f"[{chat_id}] EXIT SIGNAL | {pos.get('strategy', '?')} {pos.get('asset', '?')} "

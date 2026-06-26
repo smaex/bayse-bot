@@ -596,9 +596,12 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
         rollback_ok = False
         if yes_ok:
             try:
+                yes_shares_to_sell = amount_yes / (q_yes_p * 100.0) if CURRENCY == "NGN" else amount_yes / q_yes_p
+                # Sell 95% of the shares to be safe against rounding/slippage
+                yes_shares_to_sell = round(yes_shares_to_sell * 0.95, 4)
                 await client.place_order(
                     sig.event_id, sig.market_id, market["yes_id"],
-                    "SELL", amount_yes * 0.90, "MARKET", currency=CURRENCY,
+                    "SELL", yes_shares_to_sell, "MARKET", currency=CURRENCY,
                 )
                 rollback_ok = True
                 log.info(f"[{chat_id}] ARB rollback OK")
