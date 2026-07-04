@@ -181,6 +181,12 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                         rm.add_pnl(pnl)
                         rm.remove_position(trade["market_id"])
 
+                    # Stamp the resolution time so bot.py's quiet-state guard
+                    # suppresses deposit/withdrawal detection for the next 60 s
+                    # while the exchange balance and risk.deployed() re-sync.
+                    import bot as _bot_mod
+                    _bot_mod._last_resolution_time[chat_id] = __import__("time").time()
+
                     result = "WIN" if won else "LOSS"
                     log.info(
                         f"[{chat_id}] RESOLVED {result} | {trade['strategy']} "
@@ -293,7 +299,9 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         if total >= 10 and pv < 0.05 and pnl < 0:
             cv = max(0.85, cv - 0.25)
             warnings.append(f"🔴 SELF-CORRECT: {key} penalised (-25%) — p={pv:.3f}")
-        elif pv > 0.20 and wr >= exp_wr:
+        elif total >= 5 and pv > 0.20 and wr >= exp_wr:
+            # Require at least 5 trades before boosting a combo to prevent
+            # a 3-win streak on tiny sample from inflating multipliers.
             cv = min(1.5, cv + 0.20)
         cmults[key] = round(cv, 2)
 

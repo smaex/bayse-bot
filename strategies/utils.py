@@ -117,18 +117,104 @@ def regime_score(asset: str, state) -> float:
     return p
 
 
+def _norm_cdf(x: float) -> float:
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
+def gbm_win_probability(
+    spot: float,
+    threshold: float,
+    secs: float,
+    hourly_vol: float,
+    hourly_drift: float = 0.0,
+    horizon_cap: float = 180.0,
+) -> float:
+    """
+    Rigorous GBM boundary-crossing probability — the quant standard for binary
+    prediction-market contracts on a price-vs-threshold outcome.
+
+    Under Geometric Brownian Motion dS = μS dt + σS dW, the probability that
+    the spot price S_T finishes above the threshold K at time T is:
+
+        P(S_T > K) = Φ(d2)
+        d2 = [ln(S/K) + (μ_eff − ½σ²)·T] / (σ·√T)
+
+    where:
+      - ln(S/K)   is the exact log-distance to threshold (vs the linear
+                  approximation (S−K)/K used previously).
+      - μ_eff     is the Kalman drift rate (per hour), dampened so it only
+                  extrapolates over min(secs, horizon_cap) seconds instead of
+                  the full remaining time — prevents a noisy instantaneous
+                  velocity reading from dominating over long horizons.
+      - −½σ²·T   is the Jensen / Itô correction term that GBM requires.
+                  Under log-normal dynamics the *median* path drifts downward
+                  by this amount relative to the mean; omitting it causes the
+                  model to systematically overestimate win probability under
+                  high volatility — which was the primary source of SNIPE losses.
+
+    Returns P(S_T > K) ∈ (0, 1).
+    """
+    if spot <= 0 or threshold <= 0:
+        return 0.5  # degenerate input — no edge claimed
+    if secs <= 0:
+        return 1.0 if spot > threshold else 0.0
+    if hourly_vol <= 0:
+        hourly_vol = config.ASSET_HOURLY_VOL.get("BTC", 0.018)
+
+    t_hours = secs / 3600.0
+
+    # Drift dampening: only extrapolate Kalman velocity over min(secs, cap).
+    # At secs=900 (15 min) with cap=180s, f_drift=0.20 — momentum contributes
+    # only 20% of what an un-capped extrapolation would give, preventing the
+    # instantaneous snapshot from manufacturing false confidence.
+    f_drift      = min(secs, horizon_cap) / secs if secs > 0 else 0.0
+    effective_mu = hourly_drift * f_drift         # still in hourly units
+
+    # GBM d2 numerator
+    log_distance = math.log(spot / threshold)     # exact; ≈ (S−K)/K for small gaps
+    jensen_corr  = -0.5 * (hourly_vol ** 2)       # Itô / Jensen correction
+    drift_term   = (effective_mu + jensen_corr) * t_hours
+
+    denominator  = hourly_vol * math.sqrt(t_hours)
+    if denominator <= 0:
+        return 1.0 if spot > threshold else 0.0
+
+    d2 = (log_distance + drift_term) / denominator
+    return _norm_cdf(d2)
+
+
 def win_probability(dist_pct: float, secs: float, asset: str,
                     sigma_override: float = None) -> float:
-    """Brownian diffusion: P(price stays on correct side until close)."""
+    """
+    Backward-compatible wrapper — used by frontrun.py and the exit evaluator
+    in bot.py, which pass a pre-computed linear distance (S−K)/K and have
+    no Kalman drift available.
+
+    Routes through the GBM formula with zero drift (conservative: no
+    momentum assumption when called without velocity data) so the Jensen
+    correction is still applied, fixing the vol-overestimation bias.
+    Reconstructs spot/threshold from dist_pct as spot = K*(1+dist_pct),
+    so log(spot/threshold) = log(1+dist_pct) ≈ dist_pct for small values
+    but is exact for larger moves.
+    """
     if secs <= 0:
         return 1.0 if dist_pct > 0 else 0.0
     sigma = sigma_override if sigma_override is not None else config.ASSET_HOURLY_VOL.get(asset, 0.022)
-    t     = secs / 3600.0
 
-    def norm_cdf(x):
-        return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+    # Reconstruct exact log-distance from linear approximation.
+    # For |dist_pct| < 5% the difference is negligible; for larger moves
+    # (e.g. +10% away from threshold) the log is materially more accurate.
+    spot      = 1.0 + dist_pct          # normalised: threshold = 1.0
+    threshold = 1.0
 
-    return norm_cdf(dist_pct / (sigma * math.sqrt(t)))
+    return gbm_win_probability(
+        spot=spot,
+        threshold=threshold,
+        secs=secs,
+        hourly_vol=sigma,
+        hourly_drift=0.0,    # no Kalman data available here — zero-drift assumption
+        horizon_cap=0.0,     # irrelevant when drift=0
+    )
 
 
 def btc_spot_move_pct(window_sec: float = 300, state=None) -> tuple:

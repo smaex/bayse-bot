@@ -42,7 +42,12 @@ class FrontrunStrategy(BaseStrategy):
         if not bayse_spot:
             return None
 
-        bias = (oracle_p - bayse_spot) / bayse_spot
+        # BUG FIX: compute live_spot here so the latency-bias comparison uses
+        # the freshest available price, not the (potentially older) cached feed
+        # value. Previously live_spot was defined below and bias was computed
+        # with bayse_spot — defeating the purpose of passing spot_price in.
+        live_spot = spot_price if spot_price is not None else bayse_spot
+        bias = (oracle_p - live_spot) / live_spot
 
         trigger = config.FRONTRUN_BIAS_TRIGGER
         if abs(bias) < trigger:
@@ -65,7 +70,7 @@ class FrontrunStrategy(BaseStrategy):
         if not threshold:
             return None
 
-        live_spot = spot_price if spot_price is not None else bayse_spot
+        # live_spot already defined above — reuse it for threshold distance
         dist_pct = (live_spot - threshold) / threshold
         prob = win_probability(dist_pct, secs, asset)
         if outcome == "YES" and prob < 0.05:
@@ -84,14 +89,25 @@ class FrontrunStrategy(BaseStrategy):
 
         # Import manager utilities
         from strategies.utils import probability_to_certainty
-        from strategies.manager import kelly_size
+        from strategies.manager import kelly_size, max_ev_price
 
         certainty = probability_to_certainty(win_prob)
         if certainty < 0.35:
             return None
 
-        # Compute Kelly size
+        # BUG FIX: explicit positive-EV gate before committing to a Kelly bet.
+        # kelly_size returns 0 for negative-EV signals, but max_ev_price also
+        # catches borderline cases where fees exactly consume the edge.
         fee_rate = market.get("fee_rate", 0.02)
+        ev_ceil = max_ev_price(win_prob, market_price, fee_rate)
+        if market_price >= ev_ceil:
+            log.info(
+                f"FRONTRUN SKIP {asset} {outcome} — market_price {market_price:.3f} "
+                f">= ev_ceil {ev_ceil:.3f} (win_prob={win_prob:.1%})"
+            )
+            return None
+
+        # Compute Kelly size
         size_pct = kelly_size(
             win_prob, market_price, fee_rate,
             asset=asset, state=state, learned=learned,

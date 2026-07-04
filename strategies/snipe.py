@@ -34,7 +34,7 @@ import config
 import feeds
 from strategies.base import BaseStrategy, TradeSignal, global_state
 from strategies.utils import (
-    realized_vol_hourly, projected_drift_pct, win_probability,
+    realized_vol_hourly, gbm_win_probability,
     probability_to_certainty,
 )
 from strategies.manager import kelly_size, max_ev_price
@@ -134,48 +134,56 @@ class SnipeStrategy(BaseStrategy):
             )
             return None
 
-        # ── Core probability model ───────────────────────────────────────
-        # One diffusion model, drift-adjusted. distance_pct is the raw
-        # current gap to threshold; drift is the Kalman-projected move over
-        # the remaining time, folded directly into the same distance term
-        # (proper GBM-with-drift, not a separate post-hoc bonus).
-        distance_pct = (live_spot - threshold) / threshold
+        # ── Core probability model (GBM d2) ─────────────────────────────
+        # Under Geometric Brownian Motion, P(S_T > K) = Φ(d2) where:
+        #   d2 = [ln(S/K) + (μ_eff − ½σ²)·T] / σ√T
+        # This is the standard quant formula for a binary digital call option.
+        # Key improvements over the previous linear heuristic:
+        #   1. Uses ln(S/K) instead of (S−K)/K — exact under log-normal dynamics.
+        #   2. Includes the Itô / Jensen correction −½σ²T — the old model
+        #      systematically overestimated win probability in high-vol regimes.
+        #   3. Drift (μ) is passed in proper hourly units via Kalman velocity,
+        #      dampened over min(secs, 180s) to prevent noise extrapolation.
 
+        # Hourly drift from Kalman filter velocity (price units/sec → hourly rate)
+        kalman = state.kalman_state.get(asset) if hasattr(state, "kalman_state") else None
+        if kalman:
+            k_price, k_velocity = kalman["x"]
+            hourly_drift = (k_velocity / k_price) * 3600.0 if k_price > 0 else 0.0
+        else:
+            hourly_drift = 0.0
+
+        # Realized volatility (GARCH-blended), with two protective adjustments:
+        #   1. Intraday scaling: US market hours see higher vol, so we widen
+        #      the uncertainty band to avoid over-confident entries.
+        #   2. Near-close cushion: oracle/settlement risk spikes in the final
+        #      300 seconds in ways the pure √T model can't capture.
         rv = realized_vol_hourly(asset, state)
-        
-        # Intraday volatility adjustment: US market hours (13:00 - 20:00 UTC) see higher volatility
         utc_hour = time.gmtime().tm_hour
-        intraday_mult = 1.25 if (13 <= utc_hour <= 20) else 0.90
-        rv *= intraday_mult
-
+        rv *= 1.25 if (13 <= utc_hour <= 20) else 0.90
         if secs < 300:
-            # Conservative cushion: real-world resolution/oracle risk spikes
-            # in the final seconds in a way the pure sqrt(t) model doesn't
-            # capture. One simple multiplicative factor, easy to reason about.
             rv *= (1.0 + 0.5 * ((300 - secs) / 210.0))
 
-        t       = secs / 3600.0
-        sigma_t = rv * (t ** 0.5) if t > 0 else 0.0
-
-        # Drift extrapolation horizon capped at 180s (3 min)
-        drift = projected_drift_pct(asset, secs, state, horizon_cap=180.0)
-        if sigma_t > 0:
-            # Cap drift at 2 standard deviations, but allow a floor of 0.5% movement
-            # so momentum isn't completely suppressed near close.
-            max_drift = max(2.0 * sigma_t, 0.005)
-            drift = max(-max_drift, min(drift, max_drift))
-
-        adj_distance = distance_pct + drift
-        direction    = "YES" if adj_distance > 0 else "NO"
-
-        raw_prob = win_probability(adj_distance, secs, asset, sigma_override=rv)
-        w_est    = raw_prob if direction == "YES" else 1.0 - raw_prob
+        w_yes = gbm_win_probability(
+            spot=live_spot,
+            threshold=threshold,
+            secs=secs,
+            hourly_vol=rv,
+            hourly_drift=hourly_drift,
+            horizon_cap=180.0,
+        )
+        # w_yes is P(spot > threshold at close). Derive direction from this.
+        direction = "YES" if w_yes >= 0.50 else "NO"
+        w_est     = w_yes if direction == "YES" else 1.0 - w_yes
         composite = probability_to_certainty(w_est)
+
+        # Retain distance_pct for logging only
+        distance_pct = (live_spot - threshold) / threshold
 
         if composite < 0.32:
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — composite too low "
-                f"({composite:.2f} | dist={distance_pct:+.3%} drift={drift:+.3%} "
+                f"({composite:.2f} | dist={distance_pct:+.3%} drift_h={hourly_drift:+.4f} "
                 f"secs={secs:.0f} w={w_est:.1%})"
             )
             return None
@@ -209,7 +217,7 @@ class SnipeStrategy(BaseStrategy):
                           strategy_name="SNIPE")
 
         log.info(
-            f"SNIPE ✅ {asset} {tf} | dist={distance_pct:+.3%} drift={drift:+.3%} "
+            f"SNIPE ✅ {asset} {tf} | dist={distance_pct:+.3%} drift_hourly={hourly_drift:+.4f} "
             f"secs={secs:.0f} w={w_est:.1%} composite={composite:.2f} price={market_price:.3f}"
         )
 
@@ -226,11 +234,11 @@ class SnipeStrategy(BaseStrategy):
             market_price=market_price,
             size_pct=size,
             reason=(
-                f"dist={distance_pct:+.3%} drift={drift:+.3%} "
+                f"dist={distance_pct:+.3%} drift_h={hourly_drift:+.4f} "
                 f"w={w_est:.1%} composite={composite:.2f} secs={secs:.0f}"
             ),
             title=market.get("title", ""),
-            momentum_at_entry=drift,
+            momentum_at_entry=hourly_drift,
             regime_at_entry=0.0,
             edge_at_entry=w_est - market_price,
             realized_vol_at_entry=rv,

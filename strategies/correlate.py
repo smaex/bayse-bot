@@ -92,13 +92,31 @@ class CorrelateStrategy(BaseStrategy):
         if mom < -0.4:
             return None
 
-        # Fetch actual realized correlation between BTC and the target asset
+        # Fetch actual realized correlation between BTC and the target asset.
+        # BUG FIX: the old code fell back to 0.75 whenever corr <= 0, which
+        # masked two very different situations:
+        #   (a) Insufficient history (<10 ticks) → corr=0.0 from realized_correlation
+        #   (b) BTC and target genuinely moving in opposite directions → corr < 0
+        # Case (b) means the lead-lag thesis fails entirely; overriding with 0.75
+        # forces a trade in the wrong direction. Now we only use the fallback for
+        # case (a) and reject the signal outright for case (b).
         from strategies.utils import realized_correlation
         import math
 
-        corr = realized_correlation("BTC", asset, state)
-        if corr <= 0:
-            corr = 0.75  # default historical correlation fallback
+        _hist_btc = list(state.price_history.get("BTC", [])) if state else []
+        _hist_tgt = list(state.price_history.get(asset, [])) if state else []
+
+        if len(_hist_btc) < 10 or len(_hist_tgt) < 10:
+            # Not enough history yet — use long-run historical default
+            corr = 0.75
+        else:
+            corr = realized_correlation("BTC", asset, state)
+            if corr < 0.40:
+                log.info(
+                    f"CORRELATE SKIP {asset} — weak/negative correlation "
+                    f"(corr={corr:.2f} < 0.40); lead-lag thesis does not hold"
+                )
+                return None
 
         # Lead-lag signal strength scaled by lead move, correlation, and momentum
         strength = spot_move * corr * freshness * (1.0 + 0.20 * mom)

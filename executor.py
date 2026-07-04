@@ -159,15 +159,36 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         final_pct = min(raw_pct, cap_factor)
         amount = max(min_t, min(max_t, equity * final_pct))
 
-    hard_cap = min(max(MIN_TRADE_NGN, equity * 0.05), max_t)
+    # ── Mode-aware per-trade hard ceiling ──────────────────────────────────
+    # Previously locked at equity×5% regardless of mode, which broke
+    # aggressive / full_send users who expect larger position sizes.
+    # Now scales with mode while still respecting the user's maxtrade cap.
+    _mode_cap_pct = {
+        "safe":      0.03,
+        "balanced":  0.05,
+        "aggressive": 0.10,
+        "full_send": 0.20,
+        "custom":    0.10,
+    }.get(mode, 0.05)
+    hard_cap = min(max(MIN_TRADE_NGN, equity * _mode_cap_pct), max_t)
     if amount > hard_cap:
         amount = hard_cap
 
+    # ── Buy-power scale-down ───────────────────────────────────────────────
+    # If calculated amount exceeds available free cash, scale down rather
+    # than rejecting the trade entirely. A smaller edge is still an edge.
+    if amount > free_cash:
+        log.info(
+            f"[{chat_id}] {sig.strategy} {sig.asset} — scaling ₦{amount:,.0f} "
+            f"down to free_cash ₦{free_cash:,.0f}"
+        )
+        amount = free_cash
+
     effective_min = max(MIN_TRADE_NGN, min_t)
-    if amount < effective_min or amount > free_cash:
+    if amount < effective_min:
         log.info(
             f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — amount ₦{amount:,.0f} "
-            f"outside bounds (min=₦{effective_min:,.0f}, free_cash=₦{free_cash:,.0f})"
+            f"below effective min ₦{effective_min:,.0f}"
         )
         return
 
@@ -473,8 +494,10 @@ async def execute_arb(chat_id: str, sig, client, risk, equity: float, free_cash:
 
 async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash: float):
     """
-    Safe ARB execution using a conservative share estimate.
-    Fetches quotes for both YES and NO outcomes before trading to guarantee profitability.
+    Safe ARB execution using actual filled-share counts for burn sizing.
+    Fetches quotes for both YES and NO outcomes before trading to guarantee
+    profitability, then sizes the burn from real order responses (not pre-trade
+    estimates) and rolls back both legs atomically on any failure.
     """
     yes_p = market["yes_price"]
     no_p  = market["no_price"]
@@ -528,51 +551,84 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
         )
         return
 
-    # ── Share counts from quotes ──────────────────────────────────────────
-    yes_shares = float(quote_yes.get("quantity") or (amount_yes / q_yes_p))
-    no_shares  = float(quote_no.get("quantity") or (amount_no / q_no_p))
+    # ── Pre-trade share estimate (for profitability gate only) ──────────────
+    # BUG FIX: in NGN mode 1 share costs price×100 NGN, so the fallback must
+    # divide by 100. The old code divided only by price, producing a share count
+    # 100× too large — burn_shares then failed with "insufficient shares".
+    _sdiv = 100.0 if CURRENCY == "NGN" else 1.0
+    est_yes = float(quote_yes.get("quantity") or (amount_yes / (q_yes_p * _sdiv)))
+    est_no  = float(quote_no.get("quantity")  or (amount_no  / (q_no_p  * _sdiv)))
 
-    # Apply 3% safety margin on the burn quantity to ensure we actually hold enough shares
-    burn_qty = min(yes_shares, no_shares) * 0.97
-    profit_est = burn_qty * (1.0 - total_q_p)
+    est_burn   = min(est_yes, est_no) * 0.97   # pre-trade estimate for go/no-go only
+    profit_est = est_burn * (1.0 - total_q_p)
 
-    if burn_qty < 100:
+    if est_burn < 100:
         log.info(
-            f"[{chat_id}] ARB SKIP {sig.asset} — burn_qty {burn_qty:.1f} below "
-            f"minimum burn size of 100"
+            f"[{chat_id}] ARB SKIP {sig.asset} — est burn {est_burn:.1f} below 100"
         )
         return
 
     if profit_est < 2.0:
         log.info(
             f"[{chat_id}] ARB SKIP {sig.asset} — profit too thin "
-            f"(burn={burn_qty:.3f} gap={1.0-total_q_p:.4f} est=₦{profit_est:.2f})"
+            f"(burn≈{est_burn:.1f} gap={1.0-total_q_p:.4f} est=₦{profit_est:.2f})"
         )
         return
 
     log.info(
         f"[{chat_id}] ARB PLACING {sig.asset} | "
-        f"yes=₦{amount_yes:.0f}({yes_shares:.3f}sh) "
-        f"no=₦{amount_no:.0f}({no_shares:.3f}sh) "
-        f"burn={burn_qty:.3f} est_profit=₦{profit_est:.2f}"
+        f"yes=₦{amount_yes:.0f}(≈{est_yes:.1f}sh) "
+        f"no=₦{amount_no:.0f}(≈{est_no:.1f}sh) "
+        f"est_burn≈{est_burn:.1f} est_profit=₦{profit_est:.2f}"
     )
 
+    # ── Order execution — sized from ACTUAL fills, not quotes ───────────────
+    # BUG FIX: burn qty must come from real filled share counts. AMM slippage
+    # means actual fills can differ from quote estimates; burning the estimate
+    # when actual fills are smaller → "insufficient shares" error.
+    yes_shares_filled = 0.0
+    no_shares_filled  = 0.0
     yes_ok = False
+    no_ok  = False
+
     try:
-        await client.place_order(
+        # Leg 1: YES
+        resp_yes = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["yes_id"], side="BUY",
             amount=amount_yes, order_type="MARKET", currency=CURRENCY,
             max_slippage=0.015,
         )
+        oy = resp_yes.get("order") or resp_yes.get("clobOrder") or resp_yes.get("ammOrder") or resp_yes
+        yes_shares_filled = client.parse_filled_shares(oy)
+        if yes_shares_filled <= 0:
+            fp = float(oy.get("avgFillPrice") or oy.get("price") or q_yes_p)
+            yes_shares_filled = amount_yes / (fp * _sdiv)
+            log.warning(f"[{chat_id}] ARB YES: no filled qty from API, estimated {yes_shares_filled:.2f}sh")
         yes_ok = True
 
-        await client.place_order(
+        # Leg 2: NO
+        resp_no = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["no_id"], side="BUY",
             amount=amount_no, order_type="MARKET", currency=CURRENCY,
             max_slippage=0.015,
         )
+        on_ = resp_no.get("order") or resp_no.get("clobOrder") or resp_no.get("ammOrder") or resp_no
+        no_shares_filled = client.parse_filled_shares(on_)
+        if no_shares_filled <= 0:
+            fp = float(on_.get("avgFillPrice") or on_.get("price") or q_no_p)
+            no_shares_filled = amount_no / (fp * _sdiv)
+            log.warning(f"[{chat_id}] ARB NO: no filled qty from API, estimated {no_shares_filled:.2f}sh")
+        no_ok = True
+
+        # Burn actual filled pairs (subtract tiny epsilon to avoid precision errors)
+        burn_qty = round(min(yes_shares_filled, no_shares_filled) - 0.001, 4)
+        if burn_qty < 1.0:
+            raise ValueError(
+                f"burn_qty {burn_qty:.4f} too small "
+                f"(yes_filled={yes_shares_filled:.2f} no_filled={no_shares_filled:.2f})"
+            )
 
         await client.burn_shares(sig.market_id, burn_qty, CURRENCY)
         profit = burn_qty * (1.0 - total_q_p)
@@ -593,20 +649,53 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
 
     except Exception as e:
         log.error(f"[{chat_id}] ARB error: {e}")
-        rollback_ok = False
-        if yes_ok:
+
+        # ── Atomic dual-leg rollback ──────────────────────────────────────
+        # BUG FIX (old code): rollback only sold YES, leaving unhedged NO
+        # shares if both legs filled but burn failed — that's a directional
+        # bet, not a hedged position.
+        # NEW logic:
+        #   YES-only fill  → sell exactly yes_shares_filled
+        #   Both legs fill → sell BOTH legs to clear all exposure
+        yes_rb = False
+        no_rb  = False
+
+        if yes_ok and not no_ok:
             try:
-                yes_shares_to_sell = amount_yes / (q_yes_p * 100.0) if CURRENCY == "NGN" else amount_yes / q_yes_p
-                # Sell 95% of the shares to be safe against rounding/slippage
-                yes_shares_to_sell = round(yes_shares_to_sell * 0.95, 4)
                 await client.place_order(
                     sig.event_id, sig.market_id, market["yes_id"],
-                    "SELL", yes_shares_to_sell, "MARKET", currency=CURRENCY,
+                    "SELL", round(yes_shares_filled * 0.99, 4), "MARKET", currency=CURRENCY,
                 )
-                rollback_ok = True
-                log.info(f"[{chat_id}] ARB rollback OK")
+                yes_rb = True
+                log.info(f"[{chat_id}] ARB rollback ✅ YES sold ({yes_shares_filled:.3f}sh)")
             except Exception as re_:
-                log.critical(f"[{chat_id}] ARB ROLLBACK FAILED: {re_}")
+                log.critical(f"[{chat_id}] ARB ROLLBACK YES FAILED — manual action needed: {re_}")
+
+        elif yes_ok and no_ok:
+            # Both legs filled but burn failed — must clear both
+            try:
+                await client.place_order(
+                    sig.event_id, sig.market_id, market["yes_id"],
+                    "SELL", round(yes_shares_filled * 0.99, 4), "MARKET", currency=CURRENCY,
+                )
+                yes_rb = True
+                log.info(f"[{chat_id}] ARB rollback ✅ YES sold ({yes_shares_filled:.3f}sh)")
+            except Exception as re_:
+                log.critical(f"[{chat_id}] ARB ROLLBACK YES FAILED — YES exposure remains: {re_}")
+            try:
+                await client.place_order(
+                    sig.event_id, sig.market_id, market["no_id"],
+                    "SELL", round(no_shares_filled * 0.99, 4), "MARKET", currency=CURRENCY,
+                )
+                no_rb = True
+                log.info(f"[{chat_id}] ARB rollback ✅ NO sold ({no_shares_filled:.3f}sh)")
+            except Exception as re_:
+                log.critical(f"[{chat_id}] ARB ROLLBACK NO FAILED — NO exposure remains: {re_}")
+
+        fully_rb = (
+            (yes_ok and not no_ok and yes_rb) or
+            (yes_ok and no_ok and yes_rb and no_rb)
+        )
 
         try:
             trade_id = await asyncio.to_thread(
@@ -618,7 +707,7 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
                 amount_ngn=_safe_float(amount_yes + amount_no),
                 certainty=1.0, secs_to_close=0,
             )
-            est_loss = -(amount_yes + amount_no) if not rollback_ok else 0.0
+            est_loss = 0.0 if fully_rb else -(amount_yes + amount_no)
             await asyncio.to_thread(database.resolve_trade, trade_id, False, est_loss)
         except Exception as db_err:
             log.error(f"[{chat_id}] ARB failure could not be recorded: {db_err}")

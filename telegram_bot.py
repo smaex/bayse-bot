@@ -715,7 +715,7 @@ async def notify_drawdown(app, cid, balance, peak, dd):
 
 async def notify_arb(app, cid, sig, pairs, profit):
     await send_message(app, cid,
-        f"⚖️ *ARB* | {sig.asset} {sig.timeframe}\n{pairs:.0f} pairs → ₦{profit:,.2f}",
+        f"⚖️ *ARB* | {sig.asset} {sig.timeframe}\n{pairs:.3f} pairs → ₦{profit:,.2f}",
         parse_mode="Markdown")
 
 async def notify_deposit_detected(app, cid, amount, currency):

@@ -48,8 +48,9 @@ active_markets:    list[dict]             = []
 _user_clients:     dict[str, BayseClient] = {}
 _user_risks:       dict[str, RiskManager] = {}
 _user_daily:       dict[str, dict]        = {}
-_last_balance:     dict[str, float]       = {}
-_pending_balance_event: dict[str, float]  = {}  # chat_id -> suspected new balance, awaiting confirmation
+_last_balance:          dict[str, float] = {}
+_pending_balance_event: dict[str, float] = {}  # chat_id -> suspected new balance, awaiting confirmation
+_last_resolution_time:  dict[str, float] = {}  # chat_id -> epoch of most recently resolved trade
 _low_bal_notified: dict[str, str]         = {}
 _systemic_alert:   dict[str, bool]        = {}
 _scan_client:      BayseClient | None     = None
@@ -182,55 +183,67 @@ async def _user_loop(chat_id: str):
                 f"positions={n_pos} | deployed=₦{deployed:,.0f}"
             )
 
-        # ── Deposit / withdrawal detection (debounced) ──────────────────────
-        last = _last_balance.get(chat_id)
-        if last is not None:
-            delta     = equity - last
-            threshold = max(_BALANCE_EVENT_MIN_NGN, last * _BALANCE_EVENT_MIN_PCT)
-            if abs(delta) > threshold:
-                pending = _pending_balance_event.get(chat_id)
-                if pending is not None and abs(pending - equity) < threshold * 0.5:
-                    # Same large deviation confirmed on a second consecutive
-                    # check (~30s later) — treat as real and act on it.
-                    if delta > 0:
-                        log.info(f"[{chat_id}] DEPOSIT detected +₦{delta:,.0f} | new balance ₦{equity:,.0f}")
-                        day = _user_daily.get(chat_id, {})
-                        day["start_balance"] = equity
-                        settings["daily_state"] = day
-                        await asyncio.to_thread(database.update_settings, chat_id, settings)
-                        risk.peak_balance = equity
-                        _user_daily[chat_id] = day
-                        if _tg_app:
-                            await telegram_bot.notify_deposit_detected(_tg_app, chat_id, delta, "NGN")
+        # ── Deposit / withdrawal detection (debounced + quiet-state guard) ────
+        # QUIET-STATE GUARD: if any position is open, a market is locked for
+        # execution, or a trade was resolved in the last 60 s, the exchange
+        # balance and our risk.deployed() total are temporarily out of sync.
+        # Acting on a balance change during this window causes false deposit /
+        # withdrawal alerts. We skip this cycle and let everything settle.
+        _recent_resolution = time.time() - _last_resolution_time.get(chat_id, 0.0) < 60
+        _positions_active  = bool(risk.open_positions or risk.pending_markets)
+        if _positions_active or _recent_resolution:
+            # Balance isn't stable yet — don't update the baseline either,
+            # so the comparison stays valid once trading goes quiet.
+            pass
+        else:
+            last = _last_balance.get(chat_id)
+            if last is not None:
+                delta     = equity - last
+                threshold = max(_BALANCE_EVENT_MIN_NGN, last * _BALANCE_EVENT_MIN_PCT)
+                if abs(delta) > threshold:
+                    pending = _pending_balance_event.get(chat_id)
+                    if pending is not None and abs(pending - equity) < threshold * 0.5:
+                        # Same large deviation confirmed on a second consecutive
+                        # check (~30s later) — treat as real and act on it.
+                        if delta > 0:
+                            log.info(f"[{chat_id}] DEPOSIT detected +₦{delta:,.0f} | new balance ₦{equity:,.0f}")
+                            day = _user_daily.get(chat_id, {})
+                            day["start_balance"] = equity
+                            settings["daily_state"] = day
+                            await asyncio.to_thread(database.update_settings, chat_id, settings)
+                            risk.peak_balance = equity
+                            _user_daily[chat_id] = day
+                            if _tg_app:
+                                await telegram_bot.notify_deposit_detected(_tg_app, chat_id, delta, "NGN")
+                        else:
+                            log.info(f"[{chat_id}] WITHDRAWAL detected ₦{delta:,.0f} | new balance ₦{equity:,.0f}")
+                            day = _user_daily.get(chat_id, {})
+                            day["start_balance"] = equity
+                            settings["daily_state"] = day
+                            await asyncio.to_thread(database.update_settings, chat_id, settings)
+                            # Adjust peak_balance to prevent false drawdown pauses on withdrawals
+                            risk.peak_balance = max(0.0, risk.peak_balance + delta)
+                            _user_daily[chat_id] = day
+                            if _tg_app:
+                                await telegram_bot.send_message(
+                                    _tg_app, chat_id,
+                                    f"💸 *Withdrawal detected* — ₦{abs(delta):,.0f} removed\n"
+                                    f"New balance: ₦{equity:,.2f}",
+                                    parse_mode="Markdown",
+                                )
+                        _pending_balance_event.pop(chat_id, None)
+                        _last_balance[chat_id] = equity
                     else:
-                        log.info(f"[{chat_id}] WITHDRAWAL detected ₦{delta:,.0f} | new balance ₦{equity:,.0f}")
-                        day = _user_daily.get(chat_id, {})
-                        day["start_balance"] = equity
-                        settings["daily_state"] = day
-                        await asyncio.to_thread(database.update_settings, chat_id, settings)
-                        # Adjust peak_balance to prevent false drawdown pauses on withdrawals
-                        risk.peak_balance = max(0.0, risk.peak_balance + delta)
-                        _user_daily[chat_id] = day
-                        if _tg_app:
-                            await telegram_bot.send_message(
-                                _tg_app, chat_id,
-                                f"💸 *Withdrawal detected* — ₦{abs(delta):,.0f} removed\n"
-                                f"New balance: ₦{equity:,.2f}",
-                                parse_mode="Markdown",
-                            )
+                        # First time seeing this deviation — don't act yet, just
+                        # remember it. _last_balance is deliberately NOT updated
+                        # here, so the next check still compares against the
+                        # last CONFIRMED baseline rather than this unconfirmed one.
+                        _pending_balance_event[chat_id] = equity
+                else:
                     _pending_balance_event.pop(chat_id, None)
                     _last_balance[chat_id] = equity
-                else:
-                    # First time seeing this deviation — don't act yet, just
-                    # remember it. _last_balance is deliberately NOT updated
-                    # here, so the next check still compares against the
-                    # last CONFIRMED baseline rather than this unconfirmed one.
-                    _pending_balance_event[chat_id] = equity
             else:
-                _pending_balance_event.pop(chat_id, None)
                 _last_balance[chat_id] = equity
-        else:
-            _last_balance[chat_id] = equity
 
         # ── Paused check ───────────────────────────────────────────────────
         if settings.get("paused"):
