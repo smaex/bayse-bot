@@ -22,11 +22,18 @@ class RegimeController:
     def get_multipliers(self, asset: str, state) -> dict:
         r = self.get_regime(asset, state)
         if r == "TREND":
-            return {"TREND": 1.5, "SNIPE": 1.0, "NEWS": 1.2}
+            # Trending market — SNIPE has the most statistical edge here.
+            # FRONTRUN/CORRELATE can participate at full size.
+            return {"TREND": 1.5, "SNIPE": 1.2, "FRONTRUN": 1.0, "CORRELATE": 1.1, "NEWS": 1.2}
         elif r == "CHOP":
-            return {"TREND": 0.5, "SNIPE": 1.2, "NEWS": 0.8}
+            # Choppy market — reduce directional strategies; SNIPE still OK as
+            # it trades near-close with tight time horizon.
+            return {"TREND": 0.5, "SNIPE": 1.0, "FRONTRUN": 0.6, "CORRELATE": 0.7, "NEWS": 0.8}
         else:  # STRESS
-            return {"TREND": 0.2, "SNIPE": 1.5, "NEWS": 2.0}
+            # High-volatility regime. GBM win-prob uncertainty is highest here.
+            # Previously SNIPE was boosted 1.5× in STRESS — backwards logic.
+            # Under high vol the model is LESS reliable, so we shrink positions.
+            return {"TREND": 0.2, "SNIPE": 0.6, "FRONTRUN": 0.4, "CORRELATE": 0.4, "NEWS": 1.5}
 
 
 regime_controller = RegimeController()

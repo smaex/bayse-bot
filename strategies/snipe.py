@@ -180,11 +180,18 @@ class SnipeStrategy(BaseStrategy):
         # Retain distance_pct for logging only
         distance_pct = (live_spot - threshold) / threshold
 
-        if composite < 0.32:
+        # ── Learned certainty gate ─────────────────────────────────────────
+        # The learner dynamically raises/lowers snipe_min_certainty based on
+        # observed win-rate performance. We must apply it here — previously
+        # this value was stored in `learned` but never read in this file.
+        learned_min = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
+        effective_floor = max(config.SNIPE_MIN_CERTAINTY, learned_min)
+
+        if composite < effective_floor:
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — composite too low "
-                f"({composite:.2f} | dist={distance_pct:+.3%} drift_h={hourly_drift:+.4f} "
-                f"secs={secs:.0f} w={w_est:.1%})"
+                f"({composite:.2f} < floor={effective_floor:.2f} | dist={distance_pct:+.3%} "
+                f"drift_h={hourly_drift:+.4f} secs={secs:.0f} w={w_est:.1%})"
             )
             return None
 
@@ -195,9 +202,9 @@ class SnipeStrategy(BaseStrategy):
         market_price = market["yes_price"] if direction == "YES" else market["no_price"]
         fee_rate = market.get("fee_rate", 0.02)
         margin   = {
-            "safe": 0.15, "balanced": 0.06, "aggressive": 0.04,
-            "full_send": 0.02, "custom": 0.05,
-        }.get(mode, 0.06)
+            "safe": 0.15, "balanced": 0.10, "aggressive": 0.05,
+            "full_send": 0.03, "custom": 0.08,
+        }.get(mode, 0.10)
         ev_ceil = max_ev_price(w_est, market_price, fee_rate, min_margin=margin)
 
         if market_price >= ev_ceil:

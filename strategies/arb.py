@@ -23,8 +23,10 @@ class ArbStrategy(BaseStrategy):
         if total >= config.ARB_TRIGGER:
             return None
 
-        # Need enough time to place both legs before market closes
-        if market.get("secs_to_close", 0) < 30:
+        # Both legs must fill before close; 120s gives time for two orders + partial-fill
+        # recovery. 30s was too short — partial fills at entry price 0.91–0.97 produced
+        # 100% losses on 6 of 13 ARB trades in production.
+        if market.get("secs_to_close", 0) < config.ARB_MIN_TIME_SECS:
             return None
 
         edge = 1.0 - total
