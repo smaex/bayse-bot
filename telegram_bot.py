@@ -66,6 +66,7 @@ def build_app() -> Application:
         ("learnstats",    cmd_learnstats),
         ("debug",         cmd_debug),
         ("disconnect",    cmd_disconnect),
+        ("rekey",         cmd_rekey),
         ("wallet",        cmd_wallet),
         ("help",          cmd_help),
     ]:
@@ -89,7 +90,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
     log.info(f"[{cid}] /start")
-    if await asyncio.to_thread(database.get_user, cid):
+    user = await asyncio.to_thread(database.get_user, cid)
+    if user and user.get("is_active"):
         await _main_menu(update)
         return
     _setup_state[cid] = _NEED_PUBLIC
@@ -245,6 +247,17 @@ async def cmd_wallet(update: Update, _ctx):
     if len(text) > 3800:
         text = text[:3800] + "\n…(truncated)"
     await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
+
+@_guard
+async def cmd_rekey(update: Update, _ctx):
+    cid = str(update.effective_chat.id)
+    _setup_state[cid] = _NEED_PUBLIC
+    await update.message.reply_text(
+        "🔑 *Update API Keys*\n\n"
+        "Let's update your Bayse connection.\n"
+        "Please paste your new *Public Key* (starts with `pk_`):",
+        parse_mode="Markdown",
+    )
 
 @_guard
 async def cmd_trades(update: Update, _ctx):
