@@ -140,6 +140,13 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     if sig.certainty >= 0.95 and kelly_pct == 0.0:
         raw_pct *= 1.5
 
+    # ── Intermediate cap BEFORE mode cap ──────────────────────────────────
+    # Without this, kelly_pct × size_multiplier(up to 3×) × certainty_boost(1.5×)
+    # can reach raw_pct=0.45 — the mode cap becomes the ONLY guard.
+    # Capping here at 12% gives the mode cap breathing room and prevents a
+    # runaway learner multiplier from triggering oversized trades.
+    raw_pct = min(raw_pct, 0.12)
+
     if hasattr(database, "get_alpha_trend"):
         decay = await asyncio.to_thread(
             database.get_alpha_trend, chat_id, sig.strategy, sig.asset
@@ -204,9 +211,9 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
 
     # ── EV check with pre-trade Quote ──────────────────────────────────────
     target_margin = {
-        "safe": 0.15, "balanced": 0.06, "aggressive": 0.04,
-        "full_send": 0.02, "custom": 0.05,
-    }.get(mode, 0.06)
+        "safe": 0.15, "balanced": 0.10, "aggressive": 0.05,
+        "full_send": 0.03, "custom": 0.08,
+    }.get(mode, 0.10)
 
     is_probe = sig.certainty >= 0.35 and sig.certainty < sig.mode_floor
     if is_probe:
@@ -568,10 +575,10 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
         )
         return
 
-    if profit_est < 2.0:
+    if profit_est < 20.0:
         log.info(
             f"[{chat_id}] ARB SKIP {sig.asset} — profit too thin "
-            f"(burn≈{est_burn:.1f} gap={1.0-total_q_p:.4f} est=₦{profit_est:.2f})"
+            f"(burn≈{est_burn:.1f} gap={1.0-total_q_p:.4f} est=₦{profit_est:.2f} < ₦20 min)"
         )
         return
 

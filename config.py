@@ -71,8 +71,8 @@ SNIPE_ENTRY_WINDOWS = {
     "6h":    7200,
     "1d":    21600,
 }
-SNIPE_MIN_CERTAINTY    = 0.50
-SNIPE_MAX_MARKET_PRICE = 0.90
+SNIPE_MIN_CERTAINTY    = 0.55   # raised from 0.50 — floor must match learner target of 0.70
+SNIPE_MAX_MARKET_PRICE = 0.75   # lowered from 0.90; at 0.90 win pays only ₦11/₦100, at 0.75 pays ₦33/₦100 (needs ~60% WR to profit)
 
 # FX-specific
 FX_SESSION_UTC = {
@@ -95,8 +95,9 @@ FRONTRUN_ALLOWED_TFS       = {"5min", "15min"}
 FRONTRUN_BIAS_TRIGGER      = float(os.getenv("FRONTRUN_BIAS_TRIGGER", "0.0005"))  # 0.05% — real relay lag is 50-150ms ≈ 0.03-0.05% BTC move
 
 # ── ARB ───────────────────────────────────────────────────────────────────────
-ARB_TRIGGER     = 0.98    # enter when YES+NO ≤ this
-ARB_MAX_SIZE_NGN= 50_000
+ARB_TRIGGER      = 0.94    # tightened from 0.98 — 6% edge needed to survive partial fills + fees
+ARB_MIN_TIME_SECS = 120    # raised from 30s — need time for both legs to fill safely
+ARB_MAX_SIZE_NGN  = 50_000
 
 # ── Fee formula ───────────────────────────────────────────────────────────────
 # Bayse fee formula: fee = feeRate × max(1 - price, 0.5)

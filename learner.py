@@ -267,8 +267,8 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
 
         m = mults.get(strat, 1.0)
         if win_rate is not None:
-            if win_rate >= 0.75:   m = min(3.0, m + 0.25)
-            elif win_rate >= 0.60: m = min(1.5, m + 0.15)
+            if win_rate >= 0.75:   m = min(1.5, m + 0.25)  # cap lowered from 3.0 — 1.5x is sufficient reward
+            elif win_rate >= 0.60: m = min(1.3, m + 0.15)  # cap lowered from 1.5
             elif win_rate < 0.55:  m = max(0.50, m - 0.15)
         mults[strat] = round(m, 2)
 
@@ -299,9 +299,7 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         if total >= 10 and pv < 0.05 and pnl < 0:
             cv = max(0.85, cv - 0.25)
             warnings.append(f"🔴 SELF-CORRECT: {key} penalised (-25%) — p={pv:.3f}")
-        elif total >= 5 and pv > 0.20 and wr >= exp_wr:
-            # Require at least 5 trades before boosting a combo to prevent
-            # a 3-win streak on tiny sample from inflating multipliers.
+        elif total >= 10 and pv > 0.20 and wr >= exp_wr:  # raised from 5 — 10 trades min for boost
             cv = min(1.5, cv + 0.20)
         cmults[key] = round(cv, 2)
 
