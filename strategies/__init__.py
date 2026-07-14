@@ -1,27 +1,39 @@
 """
 Strategy orchestrator — evaluates all active strategies and merges signals.
 Dead strategies removed: POLY_EDGE, NEWS, MARKET_BIAS, POLY_COPY.
-Active: SNIPE, ARB, FRONTRUN, CORRELATE.
+Active: SNIPE, ARB, FRONTRUN, CORRELATE, MAKER, ORACLE_ARB.
+
+New in this version:
+  MAKER      — Passive CLOB market making (spread capture), pbot-6 style.
+  ORACLE_ARB — Final-seconds latency arbitrage on the Binance oracle.
 """
 
 import logging
 import time
 from typing import List
 from strategies.base import TradeSignal
-from strategies.snipe    import SnipeStrategy
-from strategies.arb      import ArbStrategy
-from strategies.frontrun import FrontrunStrategy
-from strategies.correlate import CorrelateStrategy
-from strategies.regime   import regime_controller
+from strategies.snipe      import SnipeStrategy
+from strategies.arb        import ArbStrategy
+from strategies.frontrun   import FrontrunStrategy
+from strategies.correlate  import CorrelateStrategy
+from strategies.regime     import regime_controller
+from strategies.maker      import MakerStrategy
+from strategies.oracle_arb import OracleArbStrategy
 
 log = logging.getLogger("strategies")
 
 _strategies = {
-    "SNIPE":     SnipeStrategy(),
-    "ARB":       ArbStrategy(),
-    "FRONTRUN":  FrontrunStrategy(),
-    "CORRELATE": CorrelateStrategy(),
+    "SNIPE":      SnipeStrategy(),
+    "ARB":        ArbStrategy(),
+    "FRONTRUN":   FrontrunStrategy(),
+    "CORRELATE":  CorrelateStrategy(),
+    "MAKER":      MakerStrategy(),
+    "ORACLE_ARB": OracleArbStrategy(),
 }
+
+# Structural strategies that bypass the regime/certainty multiplier system.
+# They fire based on market structure (spread, oracle lag), not directional bets.
+_STRUCTURAL_STRATEGIES = {"MAKER", "ORACLE_ARB"}
 
 
 async def evaluate_all(
@@ -38,14 +50,24 @@ async def evaluate_all(
     regime_mults = regime_controller.get_multipliers(asset, state)
     cert_mults   = learned.get("certainty_multipliers", {})
 
+    # Always include structural strategies regardless of what the learner has enabled.
+    all_names = set(active_names) | _STRUCTURAL_STRATEGIES
+
     signals = []
-    for name in active_names:
+    for name in all_names:
         strat = _strategies.get(name)
         if not strat:
             continue
         try:
             sig = await strat.evaluate(market, learned, state, spot_price=spot_price)
             if not sig:
+                continue
+
+            # Structural strategies (MAKER, ORACLE_ARB) bypass regime and
+            # certainty multipliers — they exploit market structure, not direction.
+            if name in _STRUCTURAL_STRATEGIES:
+                sig.mode_floor = 0.0   # always allowed through
+                signals.append(sig)
                 continue
 
             # Regime multiplier
