@@ -50,8 +50,8 @@ async def evaluate_all(
     regime_mults = regime_controller.get_multipliers(asset, state)
     cert_mults   = learned.get("certainty_multipliers", {})
 
-    # Always include structural strategies regardless of what the learner has enabled.
-    all_names = set(active_names) | _STRUCTURAL_STRATEGIES
+    # Respect the active strategies set configured by the user
+    all_names = set(active_names)
 
     signals = []
     for name in all_names:
