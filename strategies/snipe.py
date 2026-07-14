@@ -117,7 +117,7 @@ class SnipeStrategy(BaseStrategy):
             )
             return None
 
-        # ── Liquidity-floor guard ──────────────────────────────────────────
+        # ── Liquidity-floor guard ───────────────────────────────────────────────
         # Confirmed TWICE in production with otherwise-valid price data
         # (sum≈1.0): Bayse's AMM rejects MARKET orders at extreme prices
         # with "Your order could not be filled at the moment, please try
@@ -133,6 +133,21 @@ class SnipeStrategy(BaseStrategy):
                 f"likely unfillable (min_side={min_side:.3f} < 0.08)"
             )
             return None
+
+        # ── Data-driven entry price floor guard ─────────────────────────────
+        # Forensic analysis of 170 live trades showed:
+        #   Entry price < 0.55: 52 trades, only 23.1% WR, ₦2,651 loss.
+        #   BTC YES < 0.55: 9 trades, ZERO wins.
+        # Cheap market prices LOOK like attractive odds, but the market is
+        # almost always correctly priced — these are not mispriced opportunities.
+        yes_price = market.get("yes_price", 1)
+        no_price  = market.get("no_price", 1)
+        # We check the price of the direction we'd bet on
+        # (determined after the probability model below, so we check both for now)
+        if min(yes_price, no_price) < config.SNIPE_MIN_ENTRY_PRICE:
+            # The cheap side is always the one we'd be tempted to bet on
+            # Only block if BOTH sides are cheap (neither side is high-confidence)
+            pass  # detailed check is below after direction is known
 
         # ── Core probability model (GBM d2) ─────────────────────────────
         # Under Geometric Brownian Motion, P(S_T > K) = Φ(d2) where:
@@ -177,8 +192,34 @@ class SnipeStrategy(BaseStrategy):
         w_est     = w_yes if direction == "YES" else 1.0 - w_yes
         composite = probability_to_certainty(w_est)
 
-        # Retain distance_pct for logging only
+        # Retain distance_pct for logging and guards.
         distance_pct = (live_spot - threshold) / threshold
+
+        # ── Minimum distance-from-threshold guard (DATA-DRIVEN) ──────────────
+        # Forensic analysis of 170 live trades:
+        #   Within 0.1% of threshold: 134 trades, 52.2% WR, ₦2,477 LOSS.
+        #   0.3–0.5% from threshold:  4 trades, 100% WR, ₦81 PROFIT.
+        # When price hugs the threshold, any tiny tick the wrong way reverses
+        # the outcome. The GBM model's probabilities are most unreliable here
+        # because real resolution depends on which 1-min candle closes.
+        if abs(distance_pct) < config.SNIPE_MIN_DISTANCE_PCT:
+            log.info(
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — too close to threshold "
+                f"(dist={distance_pct:+.4%} < {config.SNIPE_MIN_DISTANCE_PCT:.2%} min)"
+            )
+            return None
+
+        # ── Direction-specific entry price floor (DATA-DRIVEN) ──────────────
+        # Now that we know direction, check the specific side we'd bet.
+        # Entry price < SNIPE_MIN_ENTRY_PRICE = 23% WR, ₦2,651 loss.
+        market_price_check = market["yes_price"] if direction == "YES" else market["no_price"]
+        if market_price_check < config.SNIPE_MIN_ENTRY_PRICE:
+            log.info(
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — entry price too cheap "
+                f"({direction} @ {market_price_check:.3f} < {config.SNIPE_MIN_ENTRY_PRICE:.2f} floor) "
+                f"— market almost certainly correctly priced"
+            )
+            return None
 
         # ── Learned certainty gate ─────────────────────────────────────────
         # The learner dynamically raises/lowers snipe_min_certainty based on
