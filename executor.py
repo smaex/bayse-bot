@@ -35,6 +35,17 @@ _trade_cooldown:      dict[str, float] = {}
 TRADE_COOLDOWN_SEC = 60
 MIN_TRADE_NGN      = 100.0
 
+# MAKER singleton — needed to track open limit orders for requoting.
+# Imported lazily to avoid circular imports.
+_maker_strategy = None
+
+def _get_maker():
+    global _maker_strategy
+    if _maker_strategy is None:
+        from strategies.maker import maker_strategy
+        _maker_strategy = maker_strategy
+    return _maker_strategy
+
 
 def init_executor(markets, tg_app):
     global active_markets, _tg_app
@@ -199,116 +210,133 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         )
         return
 
-    # ── Engine detection ───────────────────────────────────────────────────
-    market   = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
-    declared = market.get("engine") if market else None
-    if declared:
-        engine = declared
-    elif market:
-        engine = await _infer_engine(client, market)
+    # ── ORACLE_ARB: skip EV and price ceiling — certainty is the gate ──────
+    if is_oracle_arb:
+        log.info(
+            f"[{chat_id}] ORACLE_ARB FAST PATH | {sig.asset} {sig.outcome} "
+            f"certainty={sig.certainty:.0%} entry_price={sig.market_price:.3f} ₦{amount:,.0f}"
+        )
+        # Fall through directly to order placement
     else:
-        engine = "AMM"
+        # ── Engine detection ────────────────────────────────────────────────
+        market   = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
+        declared = market.get("engine") if market else None
+        if declared:
+            engine = declared
+        elif market:
+            engine = await _infer_engine(client, market)
+        else:
+            engine = "AMM"
 
-    # ── EV check with pre-trade Quote ──────────────────────────────────────
-    target_margin = {
-        "safe": 0.15, "balanced": 0.10, "aggressive": 0.05,
-        "full_send": 0.03, "custom": 0.08,
-    }.get(mode, 0.10)
+        # ── EV check with pre-trade Quote ───────────────────────────────────
+        target_margin = {
+            "safe": 0.15, "balanced": 0.10, "aggressive": 0.05,
+            "full_send": 0.03, "custom": 0.08,
+        }.get(mode, 0.10)
 
-    is_probe = sig.certainty >= 0.35 and sig.certainty < sig.mode_floor
-    if is_probe:
-        amount = MIN_TRADE_NGN
+        is_probe = sig.certainty >= 0.35 and sig.certainty < sig.mode_floor
+        if is_probe:
+            amount = MIN_TRADE_NGN
 
-    quote_price = sig.market_price
-    if engine == "AMM" and not is_probe:
-        try:
-            quote = await client.get_quote(
-                event_id=sig.event_id, market_id=sig.market_id,
-                outcome_id=sig.outcome_id, side="BUY", amount=amount,
-                currency=CURRENCY
-            )
-            q_price = float(quote.get("price") or sig.market_price)
-            q_qty = float(quote.get("quantity") or 0)
-            q_fee = float(quote.get("fee") or 0)
-            q_cost = float(quote.get("costOfShares") or 0)
+        quote_price = sig.market_price
+        if engine == "AMM" and not is_probe:
+            try:
+                quote = await client.get_quote(
+                    event_id=sig.event_id, market_id=sig.market_id,
+                    outcome_id=sig.outcome_id, side="BUY", amount=amount,
+                    currency=CURRENCY
+                )
+                q_price = float(quote.get("price") or sig.market_price)
+                q_qty = float(quote.get("quantity") or 0)
+                q_fee = float(quote.get("fee") or 0)
+                q_cost = float(quote.get("costOfShares") or 0)
 
-            if q_qty > 0 and q_cost > 0:
-                total_cost = q_cost + q_fee
-                quote_price = total_cost / (q_qty * 100.0) if CURRENCY == "NGN" else total_cost / q_qty
-            else:
-                fee_rate = _get_market_fee(sig.market_id)
-                eff_fee = _effective_fee(fee_rate, q_price)
-                quote_price = q_price * (1.0 + eff_fee)
+                if q_qty > 0 and q_cost > 0:
+                    total_cost = q_cost + q_fee
+                    quote_price = total_cost / (q_qty * 100.0) if CURRENCY == "NGN" else total_cost / q_qty
+                else:
+                    fee_rate = _get_market_fee(sig.market_id)
+                    eff_fee = _effective_fee(fee_rate, q_price)
+                    quote_price = q_price * (1.0 + eff_fee)
 
-            if quote_price <= 0:
-                log.warning(f"[{chat_id}] Invalid quote price {quote_price} returned. Skipping EV calculation.")
-                return
-            ev = sig.win_prob / quote_price - 1.0
-
-            if ev < target_margin:
-                log.info(f"[{chat_id}] EV {ev:+.1%} too low at size ₦{amount:,.0f} (price={quote_price:.3f}). Scaling down...")
-                scaled_success = False
-                for scale in [0.5, 0.25]:
-                    scaled_amount = max(MIN_TRADE_NGN, round(amount * scale, -2))
-                    if scaled_amount <= MIN_TRADE_NGN or scaled_amount >= amount:
-                        scaled_amount = MIN_TRADE_NGN
-
-                    try:
-                        scaled_quote = await client.get_quote(
-                            event_id=sig.event_id, market_id=sig.market_id,
-                            outcome_id=sig.outcome_id, side="BUY", amount=scaled_amount,
-                            currency=CURRENCY
-                        )
-                        sq_price = float(scaled_quote.get("price") or sig.market_price)
-                        sq_qty = float(scaled_quote.get("quantity") or 0)
-                        sq_fee = float(scaled_quote.get("fee") or 0)
-                        sq_cost = float(scaled_quote.get("costOfShares") or 0)
-
-                        if sq_qty > 0 and sq_cost > 0:
-                            scaled_price = (sq_cost + sq_fee) / (sq_qty * 100.0) if CURRENCY == "NGN" else (sq_cost + sq_fee) / sq_qty
-                        else:
-                            fee_rate = _get_market_fee(sig.market_id)
-                            eff_fee = _effective_fee(fee_rate, sq_price)
-                            scaled_price = sq_price * (1.0 + eff_fee)
-
-                        scaled_ev = sig.win_prob / scaled_price - 1.0
-                        if scaled_ev >= target_margin:
-                            log.info(
-                                f"[{chat_id}] Sizing down success! ₦{amount:,.0f} → ₦{scaled_amount:,.0f} "
-                                f"(EV={scaled_ev:.2%}, price={scaled_price:.3f})"
-                            )
-                            amount = scaled_amount
-                            quote_price = scaled_price
-                            ev = scaled_ev
-                            scaled_success = True
-                            break
-                    except Exception as q_err:
-                        log.debug(f"Sizing down quote failed for size ₦{scaled_amount}: {q_err}")
-
-                if not scaled_success:
-                    log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — no profitable size (quoted_price={quote_price:.3f} EV={ev:.2%})")
+                if quote_price <= 0:
+                    log.warning(f"[{chat_id}] Invalid quote price {quote_price} returned. Skipping EV calculation.")
                     return
-        except Exception as e:
-            log.warning(f"[{chat_id}] get_quote failed: {e}. Falling back to estimated EV.")
+                ev = sig.win_prob / quote_price - 1.0
+
+                if ev < target_margin:
+                    log.info(f"[{chat_id}] EV {ev:+.1%} too low at size ₦{amount:,.0f} (price={quote_price:.3f}). Scaling down...")
+                    scaled_success = False
+                    for scale in [0.5, 0.25]:
+                        scaled_amount = max(MIN_TRADE_NGN, round(amount * scale, -2))
+                        if scaled_amount <= MIN_TRADE_NGN or scaled_amount >= amount:
+                            scaled_amount = MIN_TRADE_NGN
+
+                        try:
+                            scaled_quote = await client.get_quote(
+                                event_id=sig.event_id, market_id=sig.market_id,
+                                outcome_id=sig.outcome_id, side="BUY", amount=scaled_amount,
+                                currency=CURRENCY
+                            )
+                            sq_price = float(scaled_quote.get("price") or sig.market_price)
+                            sq_qty = float(scaled_quote.get("quantity") or 0)
+                            sq_fee = float(scaled_quote.get("fee") or 0)
+                            sq_cost = float(scaled_quote.get("costOfShares") or 0)
+
+                            if sq_qty > 0 and sq_cost > 0:
+                                scaled_price = (sq_cost + sq_fee) / (sq_qty * 100.0) if CURRENCY == "NGN" else (sq_cost + sq_fee) / sq_qty
+                            else:
+                                fee_rate = _get_market_fee(sig.market_id)
+                                eff_fee = _effective_fee(fee_rate, sq_price)
+                                scaled_price = sq_price * (1.0 + eff_fee)
+
+                            scaled_ev = sig.win_prob / scaled_price - 1.0
+                            if scaled_ev >= target_margin:
+                                log.info(
+                                    f"[{chat_id}] Sizing down success! ₦{amount:,.0f} → ₦{scaled_amount:,.0f} "
+                                    f"(EV={scaled_ev:.2%}, price={scaled_price:.3f})"
+                                )
+                                amount = scaled_amount
+                                quote_price = scaled_price
+                                ev = scaled_ev
+                                scaled_success = True
+                                break
+                        except Exception as q_err:
+                            log.debug(f"Sizing down quote failed for size ₦{scaled_amount}: {q_err}")
+
+                    if not scaled_success:
+                        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — no profitable size (quoted_price={quote_price:.3f} EV={ev:.2%})")
+                        return
+            except Exception as e:
+                log.warning(f"[{chat_id}] get_quote failed: {e}. Falling back to estimated EV.")
+                fee_rate = _get_market_fee(sig.market_id)
+                eff_fee  = _effective_fee(fee_rate, sig.market_price)
+                ev = sig.win_prob / (sig.market_price * (1.0 + eff_fee)) - 1.0
+                if ev < target_margin:
+                    log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — fallback EV {ev:+.1%} < {target_margin:.0%}")
+                    return
+        else:
+            # CLOB or probe (probe EV is ignored/allowed at min size)
             fee_rate = _get_market_fee(sig.market_id)
             eff_fee  = _effective_fee(fee_rate, sig.market_price)
             ev = sig.win_prob / (sig.market_price * (1.0 + eff_fee)) - 1.0
-            if ev < target_margin:
-                log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — fallback EV {ev:+.1%} < {target_margin:.0%}")
+            if not is_probe and ev < target_margin:
+                log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — EV {ev:+.1%} < {target_margin:.0%}")
                 return
-    else:
-        # CLOB or probe (probe EV is ignored/allowed at min size)
-        fee_rate = _get_market_fee(sig.market_id)
-        eff_fee  = _effective_fee(fee_rate, sig.market_price)
-        ev = sig.win_prob / (sig.market_price * (1.0 + eff_fee)) - 1.0
-        if not is_probe and ev < target_margin:
-            log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — EV {ev:+.1%} < {target_margin:.0%}")
+
+        # Ceiling must match SNIPE_MAX_MARKET_PRICE (0.90)
+        if quote_price > 0.90:
+            log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — price {quote_price:.3f} > 0.90 ceiling")
             return
 
-    # Ceiling must match SNIPE_MAX_MARKET_PRICE (0.90)
-    if quote_price > 0.90:
-        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — price {quote_price:.3f} > 0.90 ceiling")
-        return
+    # ── Shared exposure check ──────────────────────────────────────────────
+    market   = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
+    if not is_oracle_arb:
+        # Engine may not be set if we went the oracle_arb path
+        if not market:
+            engine = "AMM"
+        elif not declared:
+            engine = await _infer_engine(client, market)
 
     if equity >= 3_000 and not risk.can_trade(equity, amount, max_exp):
         log.info(
@@ -334,16 +362,30 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
             _trade_cooldown[sig.market_id] = time.time()
             return
 
-    # ── Always MARKET orders ───────────────────────────────────────────────
-    # AMM always fills. Bayse CLOB has no book depth — LIMIT orders
-    # (even FAK) find no counterparty and get refunded immediately.
-    # MARKET orders route to the AMM curve which always provides liquidity.
+    # ── ORACLE_ARB fast path ───────────────────────────────────────────────
+    # Oracle arb signals have near-certain resolution (>95%). Skip EV gate
+    # and price ceiling — the edge is the latency itself.
+    is_oracle_arb = (sig.strategy == "ORACLE_ARB")
+    is_maker      = (sig.strategy == "MAKER")
+
+    # ── Always MARKET orders (unless MAKER uses LIMIT) ─────────────────────
+    # MAKER: places a passive LIMIT GTC order to capture the spread.
+    # All others (including ORACLE_ARB): MARKET for instant fill.
     slip_map      = {"safe": 0.003, "balanced": 0.005, "aggressive": 0.01, "full_send": 0.02}
     slippage      = slip_map.get(mode, 0.005)
     max_valid     = (1.0 - eff_fee) / 1.01
-    order_type    = "MARKET"
-    time_in_force = "FAK"
-    limit_price   = round(min(sig.market_price * (1.0 + slippage), max_valid), 3)
+    if is_maker:
+        order_type    = "LIMIT"
+        time_in_force = "GTC"   # Good-Till-Cancelled (stays on book until filled or cancelled)
+        limit_price   = sig.market_price  # executor already received our chosen bid price
+    elif is_oracle_arb:
+        order_type    = "MARKET"
+        time_in_force = "FAK"
+        limit_price   = round(min(sig.market_price * 1.05, max_valid), 3)  # 5% slippage: urgency
+    else:
+        order_type    = "MARKET"
+        time_in_force = "FAK"
+        limit_price   = round(min(sig.market_price * (1.0 + slippage), max_valid), 3)
 
     log.info(
         f"[{chat_id}] PLACING {sig.strategy} {sig.asset} {sig.timeframe} "
@@ -356,11 +398,36 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=sig.outcome_id, side="BUY",
             amount=amount, order_type=order_type,
-            price=None,
-            max_slippage=slippage, currency=CURRENCY,
+            price=limit_price if order_type == "LIMIT" else None,
+            max_slippage=slippage if order_type != "LIMIT" else None,
+            currency=CURRENCY,
             time_in_force=time_in_force,
         )
         order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
+
+        # For LIMIT (MAKER) orders, the order is placed but NOT immediately filled.
+        # Track it for requoting and record as pending.
+        if order_type == "LIMIT":
+            order_id = order.get("id") or order.get("orderId") or order.get("order_id")
+            if order_id:
+                import feeds_direct
+                binance_now, _ = feeds_direct.get_direct_price(sig.asset)
+                _get_maker().track_order(
+                    market_id    = sig.market_id,
+                    order_id     = order_id,
+                    placed_price = limit_price,
+                    binance_price= binance_now,
+                    amount       = amount,
+                    outcome_id   = sig.outcome_id,
+                )
+                log.info(
+                    f"[{chat_id}] MAKER LIMIT PLACED | {sig.asset} {sig.outcome} "
+                    f"@ {limit_price:.3f} ₦{amount:,.0f} | order={order_id}"
+                )
+                _trade_cooldown[sig.market_id] = time.time()
+            else:
+                log.warning(f"[{chat_id}] MAKER order placed but no order_id returned")
+            return  # Don't record to DB yet — wait for fill confirmation
 
         shares_filled = client.parse_filled_shares(order)
         filled_price  = float(order.get("avgFillPrice") or order.get("price") or limit_price)
