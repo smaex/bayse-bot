@@ -32,7 +32,7 @@ _user_daily:     dict = {}
 _active_markets: list = []
 _start_user_fn       = None
 
-_VALID_STRATEGIES = {"SNIPE", "ARB", "FRONTRUN", "CORRELATE"}
+_VALID_STRATEGIES = {"SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB"}
 _VALID_ASSETS     = {"BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "XAUUSD"}
 _VALID_TIMEFRAMES = {"5min", "15min", "1h", "6h", "1d"}
 MIN_TRADE_NGN     = 100
@@ -495,7 +495,7 @@ _MODES = {
             "mode": "safe", "assets": ["BTC", "EURUSD", "GBPUSD"],
             # 1h kept only for FX (EURUSD/GBPUSD only exist at 1h granularity,
             # and ARB can still work there). 5min added for the BTC leg.
-            "timeframes": ["5min", "15min", "1h"], "strategies": ["SNIPE", "ARB"],
+            "timeframes": ["5min", "15min", "1h"], "strategies": ["SNIPE", "ARB", "MAKER", "ORACLE_ARB"],
             "risk_pct": 0.5, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 15.0, "daily_multiplier": 5,
         },
@@ -508,7 +508,7 @@ _MODES = {
             # all hard-restricted to 5min/15min in code now; this just keeps
             # the user-level filter consistent so ARB doesn't waste cycles
             # scanning 1h candles this account isn't otherwise using.
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN"],
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "MAKER", "ORACLE_ARB"],
             "risk_pct": 1.5, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 20.0, "daily_multiplier": 10,
         },
@@ -517,7 +517,7 @@ _MODES = {
         "label": "🟠 *Aggressive mode applied.*",
         "settings": {
             "mode": "aggressive", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"],
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB"],
             "risk_pct": 3.0, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 30.0, "daily_multiplier": 20,
         },
@@ -526,7 +526,7 @@ _MODES = {
         "label": "🔴 *Full Send mode applied.*",
         "settings": {
             "mode": "full_send", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"],
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB"],
             "risk_pct": 5.0, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 50.0, "daily_multiplier": 50,
         },
