@@ -84,30 +84,27 @@ async def evaluate_all(
                 sig.certainty = min(1.0, max(0.0, sig.certainty * final_mult))
                 sig.reason   += f" | MULT(x{final_mult:.2f})"
 
-            # Mode floor
-            # 'custom' previously fell through to the 0.48 default (same as
-            # 'balanced') even though a user actively customizing settings
-            # is presumably more engaged/risk-tolerant than a brand-new
-            # balanced-mode default. Given it anyway, set explicitly to 0.42.
+            # Mode floor — minimum certainty to actually execute a trade.
+            # IMPORTANT: these must be consistent with SNIPE_MIN_CERTAINTY in config.py.
+            # SNIPE_MIN_CERTAINTY=0.27 requires win_prob>=62%. If mode_floor is 0.48,
+            # all SNIPE signals get killed here AFTER passing snipe.py's internal check.
+            # Aligned to allow 62%+ WR signals through in all modes.
             mode       = learned.get("mode", "balanced")
             mode_floor = {
-                "safe": 0.60, "balanced": 0.48, "aggressive": 0.40,
-                "full_send": 0.32, "custom": 0.42,
-            }.get(mode, 0.48)
+                "safe":       0.35,   # 65.8% WR minimum — cautious but not paralyzed
+                "balanced":   0.27,   # 62.1% WR minimum — our primary trading mode
+                "aggressive": 0.20,   # 59.0% WR minimum — more volume, higher variance
+                "full_send":  0.15,   # 56.8% WR minimum — maximum volume
+                "custom":     0.27,   # same as balanced by default
+            }.get(mode, 0.27)
 
             # Pantry raid (trading drought)
             if learned.get("pantry_raid_active"):
-                mode_floor -= 0.10
+                mode_floor -= 0.05
 
-            # Discovery probes: allow low-certainty signals through as tiny ₦100 trades.
-            # Lowered 0.35 -> 0.32. This does NOT bypass the EV/Kelly gate inside
-            # each strategy (snipe.py/correlate.py/frontrun.py already require
-            # positive expected value after fees before ever returning a signal)
-            # — it only controls whether a genuine-but-modest edge gets any
-            # trade at all versus being silenced. Worst case is a ₦100 probe
-            # on a thinner edge; the strategy math has already confirmed it's
-            # still +EV before this floor is even checked.
-            discovery_floor = 0.32
+            # Discovery probes: allow genuinely thin edges through as ₦100 probe trades.
+            # Strategy math has already confirmed +EV before this point.
+            discovery_floor = 0.15
 
             if sig.certainty >= mode_floor or sig.certainty >= discovery_floor:
                 sig.mode_floor = mode_floor
