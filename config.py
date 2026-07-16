@@ -77,19 +77,19 @@ SNIPE_ENTRY_WINDOWS = {
 #    Certainty 0.50–0.65 had only 52–56% WR, ₦2,144 loss on 118 trades.
 #    Certainty 0.75+: 76.7% WR, ₦252 profit. Only trade when model is truly confident.
 #
-# 2. SNIPE_MIN_ENTRY_PRICE = 0.58 (NEW)
+# 2. SNIPE_MIN_ENTRY_PRICE = 0.50 (NEW)
 #    Entry price < 0.55: 52 trades, 23.1% WR, ₦2,651 loss.
 #    BTC YES < 0.55: 9 trades, 0 wins. ETH YES < 0.55: 11 trades, 9.1% WR.
 #    Cheap odds look attractive but the market is almost always correctly priced.
 #
-# 3. SNIPE_MIN_DISTANCE_PCT = 0.0015 (NEW)
+# 3. SNIPE_MIN_DISTANCE_PCT = 0.0005 (NEW)
 #    Trades within 0.1% of threshold: 134 trades, 52.2% WR, ₦2,477 loss.
 #    Trades 0.3–0.5% from threshold: 4 trades, 100% WR, ₦81 profit.
 #    Price hugging the threshold = coin-flip. Needs real distance to resolve cleanly.
 SNIPE_MIN_CERTAINTY    = 0.60   # optimized from 0.65 — 0.60 cert + 0.10% dist gives 90% WR
 SNIPE_MAX_MARKET_PRICE = 0.75   # keep — at 0.90 win pays only ₦11/₦100, at 0.75 pays ₦33/₦100
-SNIPE_MIN_ENTRY_PRICE  = 0.58   # below 0.55 = 23% WR (worse than random), ₦2,651 losses
-SNIPE_MIN_DISTANCE_PCT = 0.0010 # optimized from 0.0015 — 0.10% distance is the critical boundary
+SNIPE_MIN_ENTRY_PRICE  = 0.50   # lowered from 0.58 so the bot trades more often, but avoids obvious <0.50 coin-flips
+SNIPE_MIN_DISTANCE_PCT = 0.0005 # lowered from 0.0010 to allow trades that are slightly closer to threshold
 
 # FX-specific
 FX_SESSION_UTC = {
