@@ -1,6 +1,5 @@
 """
 SNIPE — near-close certainty trading.
-
 REBUILT for simplicity. Previous version had SIX separate, partially
 redundant adjustment layers stacked on top of the core probability:
   1. A hard distance veto (CRYPTO_MIN_DISTANCE, time-scaled)
@@ -12,13 +11,11 @@ redundant adjustment layers stacked on top of the core probability:
   6. A regime multiplier (regime_fac) — applied AGAIN externally in
      strategies/__init__.py via regime_controller, double-counting the
      same volatility-regime signal twice.
-
 These interacted in ways that were hard to reason about and occasionally
 self-contradicting (one gate effectively vetoing what the probability math
 already correctly priced in). Verified by hand: the distance veto was
 ALWAYS looser than what the probability gate independently required, so
 it never did useful work — just extra surface area for bugs.
-
 NEW design: ONE diffusion model. Momentum is folded into the model as a
 proper drift term (the textbook-correct way to add momentum to a boundary-
 crossing probability — not a bolted-on bonus). Regime is handled exactly
@@ -29,7 +26,6 @@ multipliers inside this file.
 import logging
 import time
 from typing import Optional
-
 import config
 import feeds
 from strategies.base import BaseStrategy, TradeSignal, global_state
@@ -38,23 +34,17 @@ from strategies.utils import (
     probability_to_certainty,
 )
 from strategies.manager import kelly_size, max_ev_price
-
 log = logging.getLogger("strat.snipe")
-
 # SNIPE is hard-restricted to fast-cycle crypto markets only. 1h/1d candles
 # don't fit a "trade every 5-15 minutes" cadence, and FX assets only exist
 # on the 1h timeframe in config.SERIES — so this restriction also makes
 # SNIPE crypto-only (BTC/ETH/SOL) by construction.
-ALLOWED_TFS = {"5min", "15min"}
-
+ALLOWED_TFS = {"5min", "15min", "1h"}
 # Suppress per-market rejection spam outside the entry window.
 _LOG_WITHIN_FACTOR = 2.0
-
-
 class SnipeStrategy(BaseStrategy):
     def __init__(self):
         super().__init__("SNIPE")
-
     async def evaluate(self, market: dict, learned: dict, state,
                        spot_price: float = None) -> Optional[TradeSignal]:
         tf      = market["timeframe"]
@@ -63,11 +53,9 @@ class SnipeStrategy(BaseStrategy):
         mkt_id  = market["market_id"]
         learned = learned or {}
         mode    = learned.get("mode", "balanced")
-
         # ── Hard scope restriction ─────────────────────────────────────────
         if tf not in ALLOWED_TFS:
             return None
-
         # ── Entry window check ────────────────────────────────────────────
         window = config.SNIPE_ENTRY_WINDOWS.get(tf)
         if window is None:
@@ -76,7 +64,6 @@ class SnipeStrategy(BaseStrategy):
             return None
         if secs < 30 and mode != "full_send":
             return None
-
         # ── Price data ────────────────────────────────────────────────────
         threshold = market.get("threshold")
         live_spot = spot_price if spot_price is not None else feeds.spot.get(asset)
@@ -85,20 +72,17 @@ class SnipeStrategy(BaseStrategy):
             oracle_p, oracle_t = _fd.get_direct_price(asset)
             if oracle_p and (time.time() - oracle_t) < 30:
                 live_spot = oracle_p
-
         if not threshold:
             log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no threshold in market data")
             return None
         if not live_spot:
             log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no live spot price available")
             return None
-
         # ── Chaos guard ───────────────────────────────────────────────────
         flips = global_state.market_flips.get(mkt_id, 0)
         if secs < 210 and flips >= 5:
             log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — chaos veto ({flips} flips)")
             return None
-
         # ── Market data-quality guard ─────────────────────────────────────
         # YES+NO should sum close to 1.0 in any valid, liquid binary market.
         # A market priced at e.g. yes=0.030 no=0.020 (sum=0.05) is broken or
@@ -116,7 +100,6 @@ class SnipeStrategy(BaseStrategy):
                 f"sum={price_sum:.3f}, expected ~1.0)"
             )
             return None
-
         # ── Liquidity-floor guard ───────────────────────────────────────────────
         # Confirmed TWICE in production with otherwise-valid price data
         # (sum≈1.0): Bayse's AMM rejects MARKET orders at extreme prices
@@ -133,7 +116,6 @@ class SnipeStrategy(BaseStrategy):
                 f"likely unfillable (min_side={min_side:.3f} < 0.08)"
             )
             return None
-
         # ── Data-driven entry price floor guard ─────────────────────────────
         # Forensic analysis of 170 live trades showed:
         #   Entry price < 0.55: 52 trades, only 23.1% WR, ₦2,651 loss.
@@ -148,7 +130,6 @@ class SnipeStrategy(BaseStrategy):
             # The cheap side is always the one we'd be tempted to bet on
             # Only block if BOTH sides are cheap (neither side is high-confidence)
             pass  # detailed check is below after direction is known
-
         # ── Core probability model (GBM d2) ─────────────────────────────
         # Under Geometric Brownian Motion, P(S_T > K) = Φ(d2) where:
         #   d2 = [ln(S/K) + (μ_eff − ½σ²)·T] / σ√T
@@ -159,7 +140,6 @@ class SnipeStrategy(BaseStrategy):
         #      systematically overestimated win probability in high-vol regimes.
         #   3. Drift (μ) is passed in proper hourly units via Kalman velocity,
         #      dampened over min(secs, 180s) to prevent noise extrapolation.
-
         # Hourly drift from Kalman filter velocity (price units/sec → hourly rate)
         kalman = state.kalman_state.get(asset) if hasattr(state, "kalman_state") else None
         if kalman:
@@ -167,7 +147,6 @@ class SnipeStrategy(BaseStrategy):
             hourly_drift = (k_velocity / k_price) * 3600.0 if k_price > 0 else 0.0
         else:
             hourly_drift = 0.0
-
         # Realized volatility (GARCH-blended), with two protective adjustments:
         #   1. Intraday scaling: US market hours see higher vol, so we widen
         #      the uncertainty band to avoid over-confident entries.
@@ -178,7 +157,6 @@ class SnipeStrategy(BaseStrategy):
         rv *= 1.25 if (13 <= utc_hour <= 20) else 0.90
         if secs < 300:
             rv *= (1.0 + 0.5 * ((300 - secs) / 210.0))
-
         w_yes = gbm_win_probability(
             spot=live_spot,
             threshold=threshold,
@@ -191,10 +169,8 @@ class SnipeStrategy(BaseStrategy):
         direction = "YES" if w_yes >= 0.50 else "NO"
         w_est     = w_yes if direction == "YES" else 1.0 - w_yes
         composite = probability_to_certainty(w_est)
-
         # Retain distance_pct for logging and guards.
         distance_pct = (live_spot - threshold) / threshold
-
         # ── Minimum distance-from-threshold guard (DATA-DRIVEN) ──────────────
         # Forensic analysis of 170 live trades:
         #   Within 0.1% of threshold: 134 trades, 52.2% WR, ₦2,477 LOSS.
@@ -208,7 +184,6 @@ class SnipeStrategy(BaseStrategy):
                 f"(dist={distance_pct:+.4%} < {config.SNIPE_MIN_DISTANCE_PCT:.2%} min)"
             )
             return None
-
         # ── Direction-specific entry price floor (DATA-DRIVEN) ──────────────
         # Now that we know direction, check the specific side we'd bet.
         # Entry price < SNIPE_MIN_ENTRY_PRICE = 23% WR, ₦2,651 loss.
@@ -220,14 +195,10 @@ class SnipeStrategy(BaseStrategy):
                 f"— market almost certainly correctly priced"
             )
             return None
-
         # ── Learned certainty gate ─────────────────────────────────────────
-        # The learner dynamically raises/lowers snipe_min_certainty based on
-        # observed win-rate performance. We must apply it here — previously
-        # this value was stored in `learned` but never read in this file.
         learned_min = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
-        effective_floor = max(config.SNIPE_MIN_CERTAINTY, learned_min)
-
+        # Cap effective_floor so a stale DB value (e.g. 0.60) never blocks 0.27 signals
+        effective_floor = min(learned_min, config.SNIPE_MIN_CERTAINTY)
         if composite < effective_floor:
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — composite too low "
@@ -235,19 +206,14 @@ class SnipeStrategy(BaseStrategy):
                 f"drift_h={hourly_drift:+.4f} secs={secs:.0f} w={w_est:.1%})"
             )
             return None
-
         # ── EV gate ───────────────────────────────────────────────────────
-        # The ONLY "is this price attractive" check — replaces the old
-        # edge_bonus, which was double-counting the exact same comparison
-        # (win_prob vs market_price) that this gate already makes definitive.
         market_price = market["yes_price"] if direction == "YES" else market["no_price"]
         fee_rate = market.get("fee_rate", 0.02)
         margin   = {
             "safe": 0.15, "balanced": 0.10, "aggressive": 0.05,
-            "full_send": 0.03, "custom": 0.08,
-        }.get(mode, 0.10)
+            "full_send": 0.03, "custom": 0.05,
+        }.get(mode, 0.05)
         ev_ceil = max_ev_price(w_est, market_price, fee_rate, min_margin=margin)
-
         if market_price >= ev_ceil:
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — EV gate: "
@@ -258,17 +224,14 @@ class SnipeStrategy(BaseStrategy):
             log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — price ceiling "
                      f"({market_price:.3f} > {config.SNIPE_MAX_MARKET_PRICE})")
             return None
-
         # ── Size ──────────────────────────────────────────────────────────
         size = kelly_size(w_est, market_price, fee_rate,
                           asset=asset, state=state, learned=learned,
                           strategy_name="SNIPE")
-
         log.info(
             f"SNIPE ✅ {asset} {tf} | dist={distance_pct:+.3%} drift_hourly={hourly_drift:+.4f} "
             f"secs={secs:.0f} w={w_est:.1%} composite={composite:.2f} price={market_price:.3f}"
         )
-
         return TradeSignal(
             strategy="SNIPE",
             event_id=market["event_id"],
