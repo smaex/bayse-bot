@@ -82,9 +82,9 @@ SNIPE_ENTRY_WINDOWS = {
 # SNIPE_MIN_CERTAINTY=0.60 → requires win_prob >= 0.77 (77% WR) — almost never seen.
 # At 62% WR with Kelly sizing, EV is strongly positive even after fees.
 SNIPE_MIN_CERTAINTY    = 0.27   # 62% win-rate floor — profitable with Kelly, realistic in market
-SNIPE_MAX_MARKET_PRICE = 0.75   # keep — at 0.90 win pays only ₦11/₦100, at 0.75 pays ₦33/₦100
-SNIPE_MIN_ENTRY_PRICE  = 0.45   # avoids sub-0.45 long-shots (historically 0% WR on BTC YES <0.45)
-SNIPE_MIN_DISTANCE_PCT = 0.0008 # 0.08% minimum distance — filters pure threshold-huggers (52% WR)
+SNIPE_MAX_MARKET_PRICE = 0.88   # expanded from 0.75 — allows high-probability entries
+SNIPE_MIN_ENTRY_PRICE  = 0.15   # lowered from 0.45 — blocks sub-0.15 long-shots while unlocking normal trades
+SNIPE_MIN_DISTANCE_PCT = 0.0003 # 0.03% minimum distance — was 0.08%
 # FX-specific
 FX_SESSION_UTC = {
     "EURUSD": (6, 17),
@@ -100,7 +100,7 @@ CORRELATE_BASE_CERTAINTY  = 0.55
 CORRELATE_MAX_MARKET_PRICE= 0.65
 CORRELATE_MIN_REGIME      = 0.25
 # ── Frontrun ──────────────────────────────────────────────────────────────────
-FRONTRUN_ALLOWED_TFS       = {"5min", "15min"}
+FRONTRUN_ALLOWED_TFS       = {"5min", "15min", "1h"}
 FRONTRUN_BIAS_TRIGGER      = float(os.getenv("FRONTRUN_BIAS_TRIGGER", "0.0003"))  # 0.03% — catches real relay lag of 50-150ms (≈0.03-0.05% BTC move)
 # ── ARB ───────────────────────────────────────────────────────────────────────
 ARB_TRIGGER      = 0.94    # tightened from 0.98 — 6% edge needed to survive partial fills + fees
