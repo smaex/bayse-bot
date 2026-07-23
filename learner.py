@@ -1,20 +1,15 @@
 """
 Intelligence loop — trade resolution + daily self-improvement.
-
 Resolution fix: tries 4 different field patterns because Bayse docs
 don't explicitly document the resolvedOutcome field name.
 """
-
 import asyncio
 import logging
 import math
 from datetime import datetime, timezone, timedelta
-
 import config
 import database
-
 log = logging.getLogger("learner")
-
 DEFAULT_LEARNED: dict = {
     "snipe_min_certainty":      config.SNIPE_MIN_CERTAINTY,
     "correlation_threshold":    config.CORRELATION_THRESHOLD,
@@ -22,8 +17,6 @@ DEFAULT_LEARNED: dict = {
     "certainty_multipliers":    {s: 1.0 for s in config.ACTIVE_STRATEGIES},
     "trade_counts":             {},
 }
-
-
 def get_learned_overrides(chat_id: str) -> dict:
     user = database.get_user(chat_id)
     if not user:
@@ -32,17 +25,12 @@ def get_learned_overrides(chat_id: str) -> dict:
     learned = {**DEFAULT_LEARNED, **s.get("learned", {})}
     learned["mode"] = s.get("mode", "balanced")
     return learned
-
-
 def binomial_cdf(k: int, n: int, p: float) -> float:
     cdf = 0.0
     for i in range(k + 1):
         cdf += math.comb(n, i) * (p ** i) * ((1 - p) ** (n - i))
     return cdf
-
-
 # ── Resolution ────────────────────────────────────────────────────────────────
-
 def _resolved_won(resolved_label: str, trade: dict, market: dict) -> bool:
     """Determine win/loss from the resolved outcome label."""
     yes_label = (market.get("outcome1Label") or "YES").upper()
@@ -50,15 +38,12 @@ def _resolved_won(resolved_label: str, trade: dict, market: dict) -> bool:
     r         = resolved_label.upper().strip()
     yes_set   = {"YES", "UP", "1", yes_label}
     no_set    = {"NO",  "DOWN", "2", no_label}
-
     if r in yes_set:
         return trade["outcome"].upper() == "YES"
     if r in no_set:
         return trade["outcome"].upper() == "NO"
     # Fallback: direct outcome_id comparison
     return resolved_label == trade.get("outcome_id", "")
-
-
 def _detect_resolution(event: dict, trade: dict) -> tuple:
     """
     Returns (resolved_label, market_dict) or (None, None) if not resolved.
@@ -66,12 +51,10 @@ def _detect_resolution(event: dict, trade: dict) -> tuple:
     """
     markets = event.get("markets", [{}])
     market  = markets[0] if markets else {}
-
     # Method 1: direct resolvedOutcome on market
     r = market.get("resolvedOutcome") or event.get("resolvedOutcome")
     if r and str(r).upper() not in ("", "NONE", "NULL", "PENDING"):
         return r, market
-
     # Method 2: resolved outcome ID → map to label
     rid = market.get("resolvedOutcomeId") or event.get("resolvedOutcomeId")
     if rid:
@@ -79,7 +62,6 @@ def _detect_resolution(event: dict, trade: dict) -> tuple:
             return market.get("outcome1Label", "YES"), market
         if rid == market.get("outcome2Id"):
             return market.get("outcome2Label", "NO"), market
-
     # Method 3: one outcome price settled at 1.0
     p1 = float(market.get("outcome1Price") or 0)
     p2 = float(market.get("outcome2Price") or 0)
@@ -87,20 +69,15 @@ def _detect_resolution(event: dict, trade: dict) -> tuple:
         return market.get("outcome1Label", "YES"), market
     if p2 >= 0.99:
         return market.get("outcome2Label", "NO"), market
-
     # Method 4: event status says resolved but no specific field — assume from price
     status = event.get("status", "").lower()
     if status in ("resolved", "settled"):
         # Both prices collapsed — can't determine winner without more info
         log.warning(f"Event {event.get('id')} is resolved but no outcome field found. Skipping.")
         return None, None
-
     return None, None
-
-
 async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app=None):
     """Check unresolved trades every 30 seconds (was 2 minutes).
-
     Previously only checked trades 6+ minutes old, which created a long
     window where Bayse's real balance already reflected a trade's
     resolution while our own risk.deployed() tracking hadn't caught up yet
@@ -108,7 +85,6 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
     markets where SNIPE often enters in the final seconds before close.
     """
     import telegram_bot as tgb
-
     while True:
         await asyncio.sleep(30)
         for chat_id, client in list(user_clients.items()):
@@ -117,24 +93,19 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                 try:
                     event   = await client.get_event(trade["event_id"])
                     status  = event.get("status", "").lower()
-
                     # Not resolved yet
                     if status not in ("resolved", "settled", "closed"):
                         continue
-
                     # Cancelled / voided markets — free the position without recording a loss
                     if status in ("cancelled", "voided", "invalid"):
                         log.info(f"[{chat_id}] Trade {trade['trade_id']} voided — skipping")
                         if user_risks and chat_id in user_risks:
                             user_risks[chat_id].remove_position(trade["market_id"])
                         continue
-
                     resolved_label, market = _detect_resolution(event, trade)
                     if resolved_label is None:
                         continue
-
                     won = _resolved_won(resolved_label, trade, market)
-
                     # Try to get real PnL from the order API
                     pnl = None
                     if trade.get("order_id"):
@@ -155,7 +126,6 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                 pnl = float(raw)
                         except Exception as oe:
                             log.debug(f"get_order fallback: {oe}")
-
                     # Fallback PnL estimate
                     if pnl is None:
                         fr     = float((market or {}).get("feePercentage", 2)) / 100
@@ -167,32 +137,26 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                             pnl     = shares * (1.0 - entry) - fee_amt
                         else:
                             pnl = -amount
-
                     await asyncio.to_thread(database.resolve_trade, trade["trade_id"], won, pnl)
-
                     import strategy as strat_mod
                     if won:
                         strat_mod.record_success(trade["strategy"], trade["asset"])
                     else:
                         strat_mod.record_failure(trade["strategy"], trade["asset"])
-
                     if user_risks and chat_id in user_risks:
                         rm = user_risks[chat_id]
                         rm.add_pnl(pnl)
                         rm.remove_position(trade["market_id"])
-
                     # Stamp the resolution time so bot.py's quiet-state guard
                     # suppresses deposit/withdrawal detection for the next 60 s
                     # while the exchange balance and risk.deployed() re-sync.
                     import bot as _bot_mod
                     _bot_mod._last_resolution_time[chat_id] = __import__("time").time()
-
                     result = "WIN" if won else "LOSS"
                     log.info(
                         f"[{chat_id}] RESOLVED {result} | {trade['strategy']} "
                         f"{trade['asset']} {trade['timeframe']} | pnl=₦{pnl:+,.2f}"
                     )
-
                     if tg_app:
                         try:
                             fn = tgb.notify_win if won else tgb.notify_loss
@@ -201,24 +165,18 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                      trade["strategy"], pnl)
                         except Exception as ne:
                             log.warning(f"[{chat_id}] Notify failed: {ne}")
-
                 except Exception as e:
                     log.warning(f"[{chat_id}] Resolution check failed {trade['trade_id']}: {e}")
-
-
 # ── Daily learning ────────────────────────────────────────────────────────────
-
 async def run_learning(chat_id: str) -> tuple[dict, str]:
     user = await asyncio.to_thread(database.get_user, chat_id)
     if not user:
         return DEFAULT_LEARNED.copy(), "User not found."
-
     s       = user["settings"]
     learned = {**DEFAULT_LEARNED, **s.get("learned", {})}
     mults   = dict(learned.get("size_multipliers",    {k: 1.0 for k in config.ACTIVE_STRATEGIES}))
     cmults  = dict(learned.get("certainty_multipliers", {k: 1.0 for k in config.ACTIVE_STRATEGIES}))
     counts  = {}
-
     # ── Mean-reversion: blend all multipliers 10% back toward default (1.0) ──
     # Without this, a suppressed strategy generates fewer trades (because it's
     # suppressed), which means less data to prove recovery, which means the
@@ -229,31 +187,24 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         mults[k] = round(mults[k] * 0.90 + 1.0 * 0.10, 2)
     for k in list(cmults.keys()):
         cmults[k] = round(cmults[k] * 0.90 + 1.0 * 0.10, 2)
-
     reset_str = s.get("reset_learning_at")
     reset_dt = datetime.fromisoformat(reset_str) if reset_str else None
-
     stats    = await asyncio.to_thread(database.recent_stats, chat_id, days=30, after_dt=reset_dt)
     changes  = []
     warnings = []
-
     by_strategy: dict[str, list] = {}
     for row in stats:
         by_strategy.setdefault(row["strategy"], []).append(row)
-
     for strat, rows in by_strategy.items():
         total    = int(sum(r["total"] for r in rows))
         wins     = int(sum(r.get("wins") or 0 for r in rows))
         win_rate = wins / total if total > 0 else None
         counts[strat] = total
-
         if total < 10:
             continue
-
         expected_wr = 0.65 if strat == "SNIPE" else 0.55
         p_value     = binomial_cdf(wins, total, expected_wr)
         c           = cmults.get(strat, 1.0)
-
         if p_value < 0.05:
             # Certainty multiplier floor at 0.85 — this is a gentle nudge,
             # not a gate.  Size multipliers handle real throttling.
@@ -264,14 +215,12 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         elif win_rate is not None and win_rate >= expected_wr:
             c = min(1.5, c + 0.15)
         cmults[strat] = round(c, 2)
-
         m = mults.get(strat, 1.0)
         if win_rate is not None:
             if win_rate >= 0.75:   m = min(1.5, m + 0.25)  # cap lowered from 3.0 — 1.5x is sufficient reward
             elif win_rate >= 0.60: m = min(1.3, m + 0.15)  # cap lowered from 1.5
             elif win_rate < 0.55:  m = max(0.50, m - 0.15)
         mults[strat] = round(m, 2)
-
         # SNIPE threshold tuning
         if strat == "SNIPE" and win_rate is not None:
             cur = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
@@ -279,11 +228,10 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
                 new = min(round(cur + 0.02, 2), 0.70)
                 learned["snipe_min_certainty"] = new
                 changes.append(f"🎯 SNIPE certainty raised {cur} → {new}")
-            elif win_rate > 0.70 and cur > 0.45:
-                new = max(round(cur - 0.02, 2), 0.45)
+            elif win_rate > 0.70 and cur > 0.20:
+                new = max(round(cur - 0.02, 2), 0.20)
                 learned["snipe_min_certainty"] = new
                 changes.append(f"🎯 SNIPE certainty eased {cur} → {new}")
-
     # Combo-level self-correction
     combos = await asyncio.to_thread(database.get_combo_stats, chat_id, days=14, after_dt=reset_dt)
     for c in combos:
@@ -295,21 +243,17 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         wins_n = int(wr * total)
         pv     = binomial_cdf(wins_n, total, exp_wr)
         cv     = cmults.get(key, 1.0)
-
         if total >= 10 and pv < 0.05 and pnl < 0:
             cv = max(0.85, cv - 0.25)
             warnings.append(f"🔴 SELF-CORRECT: {key} penalised (-25%) — p={pv:.3f}")
         elif total >= 10 and pv > 0.20 and wr >= exp_wr:  # raised from 5 — 10 trades min for boost
             cv = min(1.5, cv + 0.20)
         cmults[key] = round(cv, 2)
-
     learned["size_multipliers"]     = mults
     learned["certainty_multipliers"] = cmults
     learned["trade_counts"]         = counts
-
     s["learned"] = learned
     await asyncio.to_thread(database.update_settings, chat_id, s)
-
     overall = await asyncio.to_thread(database.all_time_stats, chat_id)
     lines   = [
         "🧠 *Daily Learning Report*",
@@ -332,17 +276,13 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         lines += ["", "🚨 Warnings:"] + [f"  {w}" for w in warnings]
     if not changes and not warnings and stats:
         lines.append("\n✅ All strategies performing well.")
-
     # Temporal performance
     temporal = await asyncio.to_thread(database.get_hourly_stats, chat_id)
     if temporal:
         lines.append("\n🕒 Best trading hours (UTC):")
         for h in sorted(temporal, key=lambda x: x["win_rate"], reverse=True)[:3]:
             lines.append(f"  🌟 {h['hour']:02d}:00 — {h['win_rate']:.0%} WR ({h['total']} trades)")
-
     return learned, "\n".join(lines)
-
-
 async def daily_learning_loop(tg_app=None):
     import telegram_bot as tgb
     while True:
@@ -351,7 +291,6 @@ async def daily_learning_loop(tg_app=None):
         wait     = (midnight - now).total_seconds()
         log.info(f"Next learning cycle in {wait/3600:.1f}h")
         await asyncio.sleep(wait)
-
         for user in await asyncio.to_thread(database.get_all_active):
             cid = user["chat_id"]
             try:
