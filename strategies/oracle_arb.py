@@ -45,8 +45,8 @@ MIN_CERTAINTY = 0.95
 # Minimum distance from threshold (as % of threshold) to qualify.
 # e.g. 0.002 means price must be 0.2% away from threshold to avoid false signals.
 MIN_DISTANCE_PCT = 0.002
-# If the AMM is already pricing >0.92, most of the edge has been captured by others.
-MAX_ENTRY_PRICE = 0.92
+# Entry price ceiling: at 0.97, buying a 99% certain outcome pays out a clean 3-5% return in 60s.
+MAX_ENTRY_PRICE = 0.97
 # Cooldown after an oracle arb on a specific market — prevent double-entry.
 _oracle_fired: dict[str, float] = {}
 ORACLE_COOLDOWN = 120  # 2 minutes
