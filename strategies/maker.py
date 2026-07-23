@@ -162,13 +162,13 @@ class MakerStrategy(BaseStrategy):
         yes_bid_price = market.get("yes_price", 0)
         if yes_bid_price <= 0:
             return None
-        # Our limit price: Fair Value - half_spread (we are the new best bid).
-        our_bid = round(fv - HALF_SPREAD, 3)
-        our_bid = max(0.05, min(0.90, our_bid))
-        # Only quote if there is meaningful edge above current best bid.
-        if our_bid <= yes_bid_price + 0.005:
-            log.debug(f"MAKER SKIP {asset} — no edge (our_bid={our_bid:.3f} vs market_bid={yes_bid_price:.3f})")
+        # Fair value must be higher than market bid by at least 1 cent
+        if fv <= yes_bid_price + 0.01:
+            log.debug(f"MAKER SKIP {asset} — no edge (fv={fv:.3f} vs market_bid={yes_bid_price:.3f})")
             return None
+        # Quote a bid at min(fv - HALF_SPREAD, yes_bid_price + 0.01) so we are best bid while keeping spread edge
+        our_bid = round(min(fv - HALF_SPREAD, yes_bid_price + 0.01), 3)
+        our_bid = max(0.05, min(0.90, our_bid))
         log.info(
             f"MAKER SIGNAL {asset} | fv={fv:.3f} our_bid={our_bid:.3f} "
             f"market_bid={yes_bid_price:.3f} vol={rvol:.4f} secs={secs_to_close:.0f}"
