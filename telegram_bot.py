@@ -3,41 +3,32 @@ Telegram bot — multi-user setup and control.
 Fixes: engine label removed from notifications (always MARKET now),
        every command logged with chat_id for multi-user observability.
 """
-
 import logging
 import asyncio
 from datetime import date
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
 )
-
 import database
 import learner
 import config
 from config import TELEGRAM_TOKEN
-
 log = logging.getLogger("telegram_bot")
-
 _NEED_PUBLIC = 1
 _NEED_SECRET = 2
 _setup_state: dict[str, int] = {}
 _temp_pub:    dict[str, str] = {}
-
 _user_clients:   dict = {}
 _user_risks:     dict = {}
 _user_daily:     dict = {}
 _active_markets: list = []
 _start_user_fn       = None
-
 _VALID_STRATEGIES = {"SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB"}
 _VALID_ASSETS     = {"BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "XAUUSD"}
 _VALID_TIMEFRAMES = {"5min", "15min", "1h", "6h", "1d"}
 MIN_TRADE_NGN     = 100
-
-
 def inject(user_clients, user_risks, user_daily, active_markets, start_user_fn):
     global _user_clients, _user_risks, _user_daily, _active_markets, _start_user_fn
     _user_clients   = user_clients
@@ -45,8 +36,6 @@ def inject(user_clients, user_risks, user_daily, active_markets, start_user_fn):
     _user_daily     = user_daily
     _active_markets = active_markets
     _start_user_fn  = start_user_fn
-
-
 def build_app() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     for cmd, fn in [
@@ -75,18 +64,13 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(error_handler)
     return app
-
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if "Conflict" in str(err):
         log.warning("Telegram Conflict — ghost instance polling. Waiting.")
         return
     log.error(f"Telegram error: {err}", exc_info=err)
-
-
 # ── Setup flow ────────────────────────────────────────────────────────────────
-
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
     log.info(f"[{cid}] /start")
@@ -103,13 +87,10 @@ async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         "3. Paste your *Public Key* here (starts with `pk_`):",
         parse_mode="Markdown",
     )
-
-
 async def on_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid  = str(update.effective_chat.id)
     text = update.message.text.strip()
     st   = _setup_state.get(cid)
-
     if st == _NEED_PUBLIC:
         if not text.startswith("pk_"):
             await update.message.reply_text("❌ Public keys start with `pk_` — try again:", parse_mode="Markdown")
@@ -118,7 +99,6 @@ async def on_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         _setup_state[cid] = _NEED_SECRET
         await update.message.reply_text("✅ Got it!\n\nNow paste your *Secret Key* (starts with `sk_`):", parse_mode="Markdown")
         return
-
     if st == _NEED_SECRET:
         if not text.startswith("sk_"):
             await update.message.reply_text("❌ Secret keys start with `sk_` — try again:", parse_mode="Markdown")
@@ -148,11 +128,8 @@ async def on_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             log.warning(f"[{cid}] Connection failed: {e}")
             await update.message.reply_text(f"❌ *Connection failed*\n\n`{e}`\n\nCheck your keys and try /start again.", parse_mode="Markdown")
         return
-
     if not await asyncio.to_thread(database.get_user, cid):
         await update.message.reply_text("Use /start to connect your Bayse account.")
-
-
 async def _main_menu(update: Update):
     kb = [
         [InlineKeyboardButton("📊 Status",   callback_data="status"),
@@ -168,8 +145,6 @@ async def _main_menu(update: Update):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb),
     )
-
-
 async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
@@ -210,8 +185,6 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         await asyncio.to_thread(database.update_settings, cid, s)
         log.info(f"[{cid}] MODE changed to {s['mode']} via button")
         await q.message.reply_text(f"{mode_cfg['label']} applied. ✅", parse_mode="Markdown")
-
-
 def _guard(fn):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cid = str(update.effective_chat.id)
@@ -222,18 +195,13 @@ def _guard(fn):
         await fn(update, ctx)
     wrapper.__name__ = fn.__name__
     return wrapper
-
-
 # ── Commands ──────────────────────────────────────────────────────────────────
-
 @_guard
 async def cmd_status(update: Update, _ctx):
     await update.message.reply_text(await _status_text(str(update.effective_chat.id)), parse_mode="Markdown")
-
 @_guard
 async def cmd_balance(update: Update, _ctx):
     await update.message.reply_text(await _balance_text(str(update.effective_chat.id)), parse_mode="Markdown")
-
 @_guard
 async def cmd_wallet(update: Update, _ctx):
     cid    = str(update.effective_chat.id)
@@ -247,7 +215,6 @@ async def cmd_wallet(update: Update, _ctx):
     if len(text) > 3800:
         text = text[:3800] + "\n…(truncated)"
     await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
-
 @_guard
 async def cmd_rekey(update: Update, _ctx):
     cid = str(update.effective_chat.id)
@@ -258,7 +225,6 @@ async def cmd_rekey(update: Update, _ctx):
         "Please paste your new *Public Key* (starts with `pk_`):",
         parse_mode="Markdown",
     )
-
 @_guard
 async def cmd_trades(update: Update, _ctx):
     cid  = str(update.effective_chat.id)
@@ -272,11 +238,9 @@ async def cmd_trades(update: Update, _ctx):
         pnl  = f"₦{r['pnl_ngn']:+,.0f}" if r.get("pnl_ngn") is not None else "pending"
         lines.append(f"{icon} {r['strategy']} {r['asset']} {r['timeframe']} {r['outcome']} — {pnl}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
 @_guard
 async def cmd_markets(update: Update, _ctx):
     await update.message.reply_text(await _markets_text(str(update.effective_chat.id)), parse_mode="Markdown")
-
 @_guard
 async def cmd_analysis(update: Update, _ctx):
     import analysis as anal
@@ -287,11 +251,9 @@ async def cmd_analysis(update: Update, _ctx):
         return
     report = await anal.full_report(client, cid)
     await update.message.reply_text(report, parse_mode="Markdown")
-
 @_guard
 async def cmd_settings(update: Update, _ctx):
     await update.message.reply_text(await _settings_text(str(update.effective_chat.id)), parse_mode="Markdown")
-
 @_guard
 async def cmd_set(update: Update, _ctx):
     cid  = str(update.effective_chat.id)
@@ -311,12 +273,10 @@ async def cmd_set(update: Update, _ctx):
             parse_mode="Markdown",
         )
         return
-
     user = await asyncio.to_thread(database.get_user, cid)
     s    = user["settings"]
     key, vals = args[0].lower(), args[1:]
     msg = ""
-
     if key == "assets":
         bad = [v for v in vals if v.upper() not in _VALID_ASSETS]
         if bad:
@@ -375,19 +335,16 @@ async def cmd_set(update: Update, _ctx):
             await update.message.reply_text("Enter a number."); return
     else:
         await update.message.reply_text(f"Unknown setting `{key}`."); return
-
     s["mode"] = "custom"
     await asyncio.to_thread(database.update_settings, cid, s)
     log.info(f"[{cid}] /set {key} → {msg}")
     await update.message.reply_text(f"✅ {msg}", parse_mode="Markdown")
-
 @_guard
 async def cmd_pause(update: Update, _ctx):
     cid = str(update.effective_chat.id)
     await _set_paused(cid, True)
     log.info(f"[{cid}] PAUSED via /pause")
     await update.message.reply_text("⏸ Trading paused. /resume to restart.")
-
 @_guard
 async def cmd_resume(update: Update, _ctx):
     cid = str(update.effective_chat.id)
@@ -399,14 +356,12 @@ async def cmd_resume(update: Update, _ctx):
         risk.peak_balance = 0
     log.info(f"[{cid}] RESUMED via /resume")
     await update.message.reply_text("▶️ Trading resumed.")
-
 @_guard
 async def cmd_learning(update: Update, _ctx):
     cid = str(update.effective_chat.id)
     await update.message.reply_text("🧠 Running intelligence cycle…")
     _, report = await learner.run_learning(cid)
     await update.message.reply_text(report, parse_mode="Markdown")
-
 @_guard
 async def cmd_resetlearning(update: Update, _ctx):
     from datetime import datetime, timezone
@@ -418,7 +373,6 @@ async def cmd_resetlearning(update: Update, _ctx):
     await asyncio.to_thread(database.update_settings, cid, s)
     log.info(f"[{cid}] /resetlearning")
     await update.message.reply_text("🔄 Learned settings cleared and trade history reset.")
-
 @_guard
 async def cmd_learnstats(update: Update, _ctx):
     cid  = str(update.effective_chat.id)
@@ -432,7 +386,6 @@ async def cmd_learnstats(update: Update, _ctx):
         pnl  = r.get("total_pnl") or 0
         lines.append(f"{icon} {r['strategy']}/{r['asset']}/{r['timeframe']}: {r['win_rate']:.0%} WR ({r['total']} trades) ₦{pnl:,.0f}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
 @_guard
 async def cmd_debug(update: Update, _ctx):
     import feeds
@@ -453,7 +406,6 @@ async def cmd_debug(update: Update, _ctx):
             f"threshold={'✅' if m.get('threshold') else '❌ MISSING'}"
         )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
 @_guard
 async def cmd_disconnect(update: Update, _ctx):
     cid = str(update.effective_chat.id)
@@ -463,7 +415,6 @@ async def cmd_disconnect(update: Update, _ctx):
     _user_daily.pop(cid, None)
     log.info(f"[{cid}] DISCONNECTED")
     await update.message.reply_text("🔌 Disconnected. Trade history preserved. /start to reconnect.")
-
 async def cmd_help(update: Update, _ctx):
     await update.message.reply_text(
         "*Commands*\n\n"
@@ -484,10 +435,7 @@ async def cmd_help(update: Update, _ctx):
         "/disconnect — remove account",
         parse_mode="Markdown",
     )
-
-
 # ── Mode presets ──────────────────────────────────────────────────────────────
-
 _MODES = {
     "mode_safe": {
         "label": "🟢 *Safe mode applied.*",
@@ -532,8 +480,6 @@ _MODES = {
         },
     },
 }
-
-
 @_guard
 async def cmd_mode(update: Update, _ctx):
     kb = [
@@ -547,10 +493,7 @@ async def cmd_mode(update: Update, _ctx):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb),
     )
-
-
 # ── Text builders ─────────────────────────────────────────────────────────────
-
 async def _status_text(cid: str) -> str:
     client = _user_clients.get(cid)
     if not client:
@@ -559,16 +502,13 @@ async def _status_text(cid: str) -> str:
         free_cash = await client.get_balance_ngn()
     except Exception:
         return "Could not fetch balance."
-
     risk  = _user_risks.get(cid)
     user  = await asyncio.to_thread(database.get_user, cid)
     s     = user["settings"] if user else {}
-
     dd = deployed = 0.0; n_pos = 0
     if risk:
         n_pos    = len(risk.open_positions)
         deployed = sum(p.get("amount_ngn", 0) for p in risk.open_positions.values())
-
     # CRITICAL: get_balance_ngn() returns free/uncommitted cash only — it
     # does NOT include capital currently locked in open positions. But
     # day["start_balance"] (set in bot.py's _daily()) is always recorded as
@@ -579,14 +519,11 @@ async def _status_text(cid: str) -> str:
     # which based on production logs is most of the time (0-5 open SNIPE
     # positions is the normal state, not the exception).
     equity = free_cash + deployed
-
     day    = _user_daily.get(cid) or s.get("daily_state", {})
     profit = equity - day.get("start_balance", equity)
     target = _calc_target(s, day.get("start_balance", equity))
-
     if risk and risk.peak_balance:
         dd = max(0, (risk.peak_balance - equity) / risk.peak_balance)
-
     stats = await asyncio.to_thread(database.all_time_stats, cid)
     lines = [
         "📊 *Bot Status*\n",
@@ -607,8 +544,6 @@ async def _status_text(cid: str) -> str:
         f"Mode: *{s.get('mode','balanced').title()}*",
     ]
     return "\n".join(lines)
-
-
 async def _balance_text(cid: str) -> str:
     client = _user_clients.get(cid)
     if not client:
@@ -617,8 +552,6 @@ async def _balance_text(cid: str) -> str:
         return f"💰 Balance: ₦{(await client.get_balance_ngn()):,.2f}"
     except Exception as e:
         return f"Could not fetch balance: {e}"
-
-
 async def _markets_text(cid: str) -> str:
     user = await asyncio.to_thread(database.get_user, cid)
     if not user:
@@ -638,8 +571,6 @@ async def _markets_text(cid: str) -> str:
             f"YES:{m.get('yes_price',0):.3f} NO:{m.get('no_price',0):.3f} | {mins}m left"
         )
     return "\n".join(lines)
-
-
 async def _settings_text(cid: str) -> str:
     user = await asyncio.to_thread(database.get_user, cid)
     if not user:
@@ -659,47 +590,50 @@ async def _settings_text(cid: str) -> str:
         f"Daily target: {tgt}\n"
         f"Status:       {'⏸ Paused' if s.get('paused') else '🟢 Active'}"
     )
-
-
 def _calc_target(s: dict, start: float) -> float:
     if s.get("daily_target_ngn", 0) > 0:
         return float(s["daily_target_ngn"])
     return start * s.get("daily_multiplier", 10) / 100
-
-
 async def _set_paused(cid: str, paused: bool):
     user = await asyncio.to_thread(database.get_user, cid)
     if user:
         s = user["settings"]
         s["paused"] = paused
         await asyncio.to_thread(database.update_settings, cid, s)
-
-
 async def _clear_daily(cid: str):
     _user_daily.pop(cid, None)
-
-
 # ── Notifications ─────────────────────────────────────────────────────────────
-
 async def send_message(app: Application, chat_id: str, text: str, **kwargs):
     try:
         await app.bot.send_message(chat_id=chat_id, text=text, **kwargs)
     except Exception as e:
         log.warning(f"send_message → {chat_id}: {e}")
-
-
 async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
     """
-    Notification shows strategy, direction, amount and certainty.
-    Engine label removed — we always use MARKET orders so it's noise.
+    Differentiated Telegram notification per strategy.
+    Custom icons, titles, price info, and order-type badges.
     """
-    icon = "⬆️" if sig.outcome.upper() in ("YES", "UP") else "⬇️"
-    # Escape markdown special chars in reason
+    strat = sig.strategy.upper()
+    strat_meta = {
+        "SNIPE":      ("🎯", "*SNIPE Signal*"),
+        "ORACLE_ARB": ("⚡", "*ORACLE ARB* (Latency Edge)"),
+        "MAKER":      ("📊", "*MAKER* (Limit Order)" if engine == "CLOB_LIMIT" else "*MAKER*"),
+        "FRONTRUN":   ("🏎️", "*FRONTRUN* (Binance Impulse)"),
+        "CORRELATE":  ("🔗", "*CORRELATION* (Lead-Lag)"),
+        "ARB":        ("⚖️", "*RISK-FREE ARB*"),
+    }
+    icon_strat, title_strat = strat_meta.get(strat, ("🔔", f"*{strat} Trade*"))
+    
+    dir_icon = "⬆️" if sig.outcome.upper() in ("YES", "UP") else "⬇️"
     safe_reason = (getattr(sig, "reason", "") or "").replace("_", "\\_").replace("*", "\\*")
+    market_price = getattr(sig, "market_price", 0.0)
+    win_prob = getattr(sig, "win_prob", sig.certainty)
     msg = (
-        f"🔔 *Trade* ({sig.strategy})\n"
-        f"{sig.asset} {sig.timeframe}\n"
-        f"{icon} {sig.outcome} | ₦{amount:,.0f} @ {sig.certainty:.0%}\n"
+        f"{icon_strat} {title_strat}\n"
+        f"Asset: *{sig.asset} {sig.timeframe}*\n"
+        f"Direction: {dir_icon} *{sig.outcome}*\n"
+        f"Size: *₦{amount:,.0f}* @ price *{market_price:.3f}*\n"
+        f"Certainty: *{sig.certainty:.0%}* (Prob: {win_prob:.1%})\n"
         f"_{safe_reason}_"
     )
     try:
@@ -707,30 +641,47 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
     except Exception:
         # Fallback — plain text if markdown parsing fails
         try:
-            plain = f"Trade ({sig.strategy}) {sig.asset} {sig.timeframe} {sig.outcome} ₦{amount:,.0f} @ {sig.certainty:.0%}"
+            plain = (
+                f"{icon_strat} [{strat}] {sig.asset} {sig.timeframe} {dir_icon} {sig.outcome} "
+                f"₦{amount:,.0f} @ {market_price:.3f} (Cert: {sig.certainty:.0%})"
+            )
             await app.bot.send_message(chat_id=cid, text=plain)
         except Exception as e:
             log.error(f"notify_trade failed: {e}")
-
-
+_STRAT_ICONS = {
+    "SNIPE":      ("🎯", "SNIPE"),
+    "ORACLE_ARB": ("⚡", "ORACLE ARB"),
+    "MAKER":      ("📊", "MAKER"),
+    "FRONTRUN":   ("🏎️", "FRONTRUN"),
+    "CORRELATE":  ("🔗", "CORRELATION"),
+    "ARB":        ("⚖️", "RISK-FREE ARB"),
+}
 async def notify_win(app, cid, _mid, asset, tf, strat, pnl):
-    await send_message(app, cid, f"✅ *WIN* — {strat} {asset} {tf}\n+₦{pnl:,.2f}", parse_mode="Markdown")
-
+    icon, name = _STRAT_ICONS.get((strat or "").upper(), ("🔔", strat or "Trade"))
+    msg = (
+        f"🟢 *WIN* {icon} ({name})\n"
+        f"Market: *{asset} {tf}*\n"
+        f"Profit: *+₦{pnl:,.2f}*"
+    )
+    await send_message(app, cid, msg, parse_mode="Markdown")
 async def notify_loss(app, cid, _mid, asset, tf, strat, pnl):
-    await send_message(app, cid, f"❌ *LOSS* — {strat} {asset} {tf}\n₦{-abs(pnl):,.2f}", parse_mode="Markdown")
-
+    icon, name = _STRAT_ICONS.get((strat or "").upper(), ("🔔", strat or "Trade"))
+    msg = (
+        f"🔴 *LOSS* {icon} ({name})\n"
+        f"Market: *{asset} {tf}*\n"
+        f"PnL: *-₦{abs(pnl):,.2f}*"
+    )
+    await send_message(app, cid, msg, parse_mode="Markdown")
 async def notify_drawdown(app, cid, balance, peak, dd):
     await send_message(app, cid,
         f"⚠️ *Drawdown — Trading Paused*\n\n"
         f"Peak: ₦{peak:,.0f} → Now: ₦{balance:,.0f}\n"
         f"Drawdown: {dd:.1%}\n\n/resume to override.",
         parse_mode="Markdown")
-
 async def notify_arb(app, cid, sig, pairs, profit):
     await send_message(app, cid,
         f"⚖️ *ARB* | {sig.asset} {sig.timeframe}\n{pairs:.3f} pairs → ₦{profit:,.2f}",
         parse_mode="Markdown")
-
 async def notify_deposit_detected(app, cid, amount, currency):
     await send_message(app, cid,
         f"💸 *Deposit detected* +{currency} {amount:,.0f}\n"
