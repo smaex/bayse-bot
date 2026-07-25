@@ -364,21 +364,38 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                     amount       = amount,
                     outcome_id   = sig.outcome_id,
                 )
-                log.info(
-                    f"[{chat_id}] MAKER LIMIT PLACED | {sig.asset} {sig.outcome} "
-                    f"@ {limit_price:.3f} ₦{amount:,.0f} | order={order_id}"
-                )
-                if _tg_app:
-                    try:
-                        await telegram_bot.notify_trade(
-                            _tg_app, chat_id, sig, amount, engine="CLOB_LIMIT"
-                        )
-                    except Exception as ne:
-                        log.error(f"[{chat_id}] Limit order notification failed: {ne}")
+                # Record limit order in DB and risk manager so resolution_monitor tracks settlement & sends WIN/LOSS notifications
+                spot_vs_thresh = 0.0
+                if market and market.get("threshold") and feeds.spot.get(sig.asset):
+                    spot_vs_thresh = (feeds.spot[sig.asset] - market["threshold"]) / market["threshold"]
+                try:
+                    trade_id = await asyncio.to_thread(
+                        database.record_trade,
+                        chat_id=chat_id,
+                        strategy=sig.strategy, asset=sig.asset, timeframe=sig.timeframe,
+                        outcome=sig.outcome, outcome_id=sig.outcome_id,
+                        market_id=sig.market_id, event_id=sig.event_id, order_id=order_id,
+                        entry_price=_safe_float(limit_price),
+                        amount_ngn=_safe_float(amount),
+                        certainty=_safe_float(sig.certainty),
+                        secs_to_close=_safe_float(market["secs_to_close"] if market else 0),
+                        spot_vs_threshold_pct=_safe_float(spot_vs_thresh),
+                        market_price_at_entry=_safe_float(limit_price),
+                        engine="CLOB_LIMIT",
+                    )
+                    risk.add_position(sig.market_id, {
+                        "trade_id":    trade_id,    "event_id":   sig.event_id,
+                        "outcome":     sig.outcome, "outcome_id": sig.outcome_id,
+                        "entry_price": limit_price, "amount_ngn": amount,
+                        "strategy":    sig.strategy, "asset":      sig.asset,
+                        "timeframe":   sig.timeframe,
+                    })
+                except Exception as db_err:
+                    log.error(f"[{chat_id}] MAKER DB record failed: {db_err}")
                 _trade_cooldown[sig.market_id] = time.time()
             else:
                 log.warning(f"[{chat_id}] MAKER order placed but no order_id returned")
-            return  # Don't record to DB yet — wait for fill confirmation
+            return  # Limit order is now tracked in DB and will be resolved by resolution_monitor
         shares_filled = client.parse_filled_shares(order)
         filled_price  = float(order.get("avgFillPrice") or order.get("price") or limit_price)
         order_id      = order.get("id") or order.get("orderId") or order.get("order_id")
