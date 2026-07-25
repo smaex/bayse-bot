@@ -368,6 +368,13 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                     f"[{chat_id}] MAKER LIMIT PLACED | {sig.asset} {sig.outcome} "
                     f"@ {limit_price:.3f} ₦{amount:,.0f} | order={order_id}"
                 )
+                if _tg_app:
+                    try:
+                        await telegram_bot.notify_trade(
+                            _tg_app, chat_id, sig, amount, engine="CLOB_LIMIT"
+                        )
+                    except Exception as ne:
+                        log.error(f"[{chat_id}] Limit order notification failed: {ne}")
                 _trade_cooldown[sig.market_id] = time.time()
             else:
                 log.warning(f"[{chat_id}] MAKER order placed but no order_id returned")
