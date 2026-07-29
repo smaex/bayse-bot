@@ -165,19 +165,31 @@ class SnipeStrategy(BaseStrategy):
             hourly_drift=hourly_drift,
             horizon_cap=180.0,
         )
-        # w_yes is P(spot > threshold at close). Derive direction from this.
-        direction = "YES" if w_yes >= 0.50 else "NO"
-        w_est     = w_yes if direction == "YES" else 1.0 - w_yes
+        w_no = 1.0 - w_yes
+        yes_price = market.get("yes_price", 0.50)
+        no_price  = market.get("no_price", 0.50)
+        edge_yes = w_yes - yes_price
+        edge_no  = w_no  - no_price
+        # ── Two-Sided Statistical Edge Guard ─────────────────────────────────
+        # Require model win probability to be at least 5% HIGHER than exchange price
+        if edge_yes >= edge_no and edge_yes >= 0.05:
+            direction = "YES"
+            w_est     = w_yes
+            market_price_check = yes_price
+        elif edge_no > edge_yes and edge_no >= 0.05:
+            direction = "NO"
+            w_est     = w_no
+            market_price_check = no_price
+        else:
+            log.info(
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no 5% statistical edge "
+                f"(w_yes={w_yes:.1%} vs yes_p={yes_price:.3f}, w_no={w_no:.1%} vs no_p={no_price:.3f})"
+            )
+            return None
         composite = probability_to_certainty(w_est)
         # Retain distance_pct for logging and guards.
         distance_pct = (live_spot - threshold) / threshold
         # ── Minimum distance-from-threshold guard (DATA-DRIVEN) ──────────────
-        # Forensic analysis of 170 live trades:
-        #   Within 0.1% of threshold: 134 trades, 52.2% WR, ₦2,477 LOSS.
-        #   0.3–0.5% from threshold:  4 trades, 100% WR, ₦81 PROFIT.
-        # When price hugs the threshold, any tiny tick the wrong way reverses
-        # the outcome. The GBM model's probabilities are most unreliable here
-        # because real resolution depends on which 1-min candle closes.
         if abs(distance_pct) < config.SNIPE_MIN_DISTANCE_PCT:
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — too close to threshold "
@@ -185,9 +197,6 @@ class SnipeStrategy(BaseStrategy):
             )
             return None
         # ── Direction-specific entry price floor (DATA-DRIVEN) ──────────────
-        # Now that we know direction, check the specific side we'd bet.
-        # Entry price < SNIPE_MIN_ENTRY_PRICE = 23% WR, ₦2,651 loss.
-        market_price_check = market["yes_price"] if direction == "YES" else market["no_price"]
         if market_price_check < config.SNIPE_MIN_ENTRY_PRICE:
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — entry price too cheap "
