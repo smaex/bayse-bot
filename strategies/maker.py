@@ -153,25 +153,53 @@ class MakerStrategy(BaseStrategy):
             log.debug(f"MAKER SKIP {asset} — high vol {rvol:.4f}")
             return None
         # Calculate Fair Value.
-        fv = self._fair_value(asset, market)
-        if fv is None:
+        fv_yes = self._fair_value(asset, market)
+        if fv_yes is None:
             return None
-        # We quote on the YES (Up) side if it is underpriced.
-        # i.e. if our fair value says YES is worth 0.55 but the market bids 0.45,
-        # we can put a limit order at 0.48 and capture the spread when a seller arrives.
+        fv_no = 1.0 - fv_yes
+        # ── 5-Minute Price Momentum Guard ──────────────────────────────────────
+        # Calculate 5-minute price delta to prevent adverse selection into trends.
+        mom_5m = 0.0
+        try:
+            hist = getattr(state, "price_history", {}).get(asset, []) if state else []
+            if not hist:
+                from strategy import global_state
+                hist = global_state.price_history.get(asset, [])
+            if hist and len(hist) >= 5:
+                now_t = time.time()
+                old_prices = [p for t, p in hist if 240 <= (now_t - t) <= 360]
+                if old_prices and spot_price:
+                    mom_5m = (spot_price - old_prices[-1]) / old_prices[-1]
+        except Exception:
+            mom_5m = 0.0
         yes_bid_price = market.get("yes_price", 0)
-        if yes_bid_price <= 0:
+        no_bid_price  = market.get("no_price", 0)
+        edge_yes = fv_yes - yes_bid_price if yes_bid_price > 0 else 0.0
+        edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
+        # Select the side (YES or NO) with the strongest edge, guarded by momentum
+        chosen_side = None
+        if edge_yes >= edge_no and edge_yes >= 0.015 and mom_5m >= -0.0005:
+            chosen_side = "YES"
+            target_fv   = fv_yes
+            market_bid  = yes_bid_price
+            outcome_id  = market.get("yes_id", "")
+        elif edge_no > edge_yes and edge_no >= 0.015 and mom_5m <= +0.0005:
+            chosen_side = "NO"
+            target_fv   = fv_no
+            market_bid  = no_bid_price
+            outcome_id  = market.get("no_id", "")
+        else:
+            log.debug(
+                f"MAKER SKIP {asset} — no edge/momentum block "
+                f"(edge_yes={edge_yes:+.3f}, edge_no={edge_no:+.3f}, mom_5m={mom_5m:+.4f})"
+            )
             return None
-        # Fair value must be higher than market bid by at least 1 cent
-        if fv <= yes_bid_price + 0.01:
-            log.debug(f"MAKER SKIP {asset} — no edge (fv={fv:.3f} vs market_bid={yes_bid_price:.3f})")
-            return None
-        # Quote a bid at min(fv - HALF_SPREAD, yes_bid_price + 0.01) so we are best bid while keeping spread edge
-        our_bid = round(min(fv - HALF_SPREAD, yes_bid_price + 0.01), 3)
+        # Quote a bid at min(target_fv - HALF_SPREAD, market_bid + 0.01)
+        our_bid = round(min(target_fv - HALF_SPREAD, market_bid + 0.01), 3)
         our_bid = max(0.05, min(0.90, our_bid))
         log.info(
-            f"MAKER SIGNAL {asset} | fv={fv:.3f} our_bid={our_bid:.3f} "
-            f"market_bid={yes_bid_price:.3f} vol={rvol:.4f} secs={secs_to_close:.0f}"
+            f"MAKER SIGNAL {asset} | side={chosen_side} fv={target_fv:.3f} our_bid={our_bid:.3f} "
+            f"market_bid={market_bid:.3f} mom_5m={mom_5m:+.4f} secs={secs_to_close:.0f}"
         )
         return TradeSignal(
             strategy    = "MAKER",
@@ -179,15 +207,15 @@ class MakerStrategy(BaseStrategy):
             market_id   = market_id,
             asset       = asset,
             timeframe   = market["timeframe"],
-            outcome     = "YES",
-            outcome_id  = market["yes_id"],
-            certainty   = fv,
-            win_prob    = fv,
+            outcome     = chosen_side,
+            outcome_id  = outcome_id,
+            certainty   = target_fv,
+            win_prob    = target_fv,
             market_price= our_bid,    # executor will place LIMIT at this price
             size_pct    = 0.02,       # 2% of bankroll per maker order (small, high frequency)
-            reason      = f"MAKER fv={fv:.3f} spread_capture bid={our_bid:.3f}",
+            reason      = f"MAKER {chosen_side} fv={target_fv:.3f} spread_capture bid={our_bid:.3f}",
             title       = market.get("title", ""),
-            momentum_at_entry    = feeds_direct.get_latency_bias(asset, spot_price or 0.0),
+            momentum_at_entry    = mom_5m,
             realized_vol_at_entry= rvol,
         )
     async def cancel_all(self, client, market_id: str = None):
