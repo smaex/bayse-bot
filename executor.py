@@ -363,7 +363,17 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                     binance_price= binance_now,
                     amount       = amount,
                     outcome_id   = sig.outcome_id,
+                log.info(
+                    f"[{chat_id}] MAKER LIMIT PLACED | {sig.asset} {sig.outcome} "
+                    f"@ {limit_price:.3f} ₦{amount:,.0f} | order={order_id}"
                 )
+                if _tg_app:
+                    try:
+                        await telegram_bot.notify_trade(
+                            _tg_app, chat_id, sig, amount, engine="CLOB_LIMIT"
+                        )
+                    except Exception as ne:
+                        log.error(f"[{chat_id}] Limit order notification failed: {ne}")
                 # Record limit order in DB and risk manager so resolution_monitor tracks settlement & sends WIN/LOSS notifications
                 spot_vs_thresh = 0.0
                 if market and market.get("threshold") and feeds.spot.get(sig.asset):
@@ -395,7 +405,7 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                 _trade_cooldown[sig.market_id] = time.time()
             else:
                 log.warning(f"[{chat_id}] MAKER order placed but no order_id returned")
-            return  # Limit order is now tracked in DB and will be resolved by resolution_monitor
+            return  # Limit order is tracked in DB and will be resolved by resolution_monitor
         shares_filled = client.parse_filled_shares(order)
         filled_price  = float(order.get("avgFillPrice") or order.get("price") or limit_price)
         order_id      = order.get("id") or order.get("orderId") or order.get("order_id")
