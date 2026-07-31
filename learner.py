@@ -115,8 +115,8 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                                 order_data.get("filledSize") or
                                                 order_data.get("shares") or 0)
                             if shares <= 0:
-                                # Maker order never filled
-                                await asyncio.to_thread(database.resolve_trade, trade["trade_id"], False, 0.0)
+                                # Maker order never filled — mark as 0.0 PnL without counting as a loss
+                                await asyncio.to_thread(database.resolve_trade, trade["trade_id"], None, 0.0)
                                 if user_risks and chat_id in user_risks:
                                     user_risks[chat_id].remove_position(trade["market_id"])
                                 continue
