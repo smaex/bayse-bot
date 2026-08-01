@@ -39,12 +39,12 @@ log = logging.getLogger("strat.oracle_arb")
 # Extended from 60s to 120s: gives the bot more time to catch the guaranteed-win window.
 # At 120s out, if Binance is clearly 0.2%+ past the threshold, that outcome is
 # virtually certain and the AMM is still stale \u2014 that's free money.
-WINDOW_SECS = 120
+WINDOW_SECS = 240
 # Minimum certainty to fire. 0.95 = Binance must be clearly on one side.
-MIN_CERTAINTY = 0.95
+MIN_CERTAINTY = 0.93
 # Minimum distance from threshold (as % of threshold) to qualify.
-# e.g. 0.002 means price must be 0.2% away from threshold to avoid false signals.
-MIN_DISTANCE_PCT = 0.002
+# 0.001 means price must be 0.10% away from threshold to capture early latency edges.
+MIN_DISTANCE_PCT = 0.001
 # Entry price ceiling: at 0.97, buying a 99% certain outcome pays out a clean 3-5% return in 60s.
 MAX_ENTRY_PRICE = 0.97
 # Cooldown after an oracle arb on a specific market — prevent double-entry.
@@ -106,7 +106,7 @@ class OracleArbStrategy(BaseStrategy):
         # Get oracle price
         oracle_price, oracle_age = self._get_oracle_price(asset)
         if oracle_price <= 0:
-            log.debug(f"ORACLE_ARB SKIP {asset} — no direct feed or stale ({oracle_age:.1f}s)")
+            log.info(f"ORACLE_ARB SKIP {asset} — no direct feed or stale ({oracle_age:.1f}s)")
             return None
         # Determine outcome
         yes_wins = oracle_price >= threshold
@@ -114,7 +114,7 @@ class OracleArbStrategy(BaseStrategy):
         # Compute certainty based on distance and time
         certainty = self._certainty_from_distance(oracle_price, threshold, secs_to_close)
         if certainty < MIN_CERTAINTY:
-            log.debug(
+            log.info(
                 f"ORACLE_ARB SKIP {asset} — certainty {certainty:.2%} < {MIN_CERTAINTY:.0%} "
                 f"(spot={oracle_price:.2f} threshold={threshold:.2f} secs={secs_to_close:.1f})"
             )
@@ -130,7 +130,7 @@ class OracleArbStrategy(BaseStrategy):
             entry_price= market["no_price"]
         # Guard: if AMM has already priced it efficiently, skip (edge already gone)
         if entry_price > MAX_ENTRY_PRICE:
-            log.debug(
+            log.info(
                 f"ORACLE_ARB SKIP {asset} {outcome} — already priced at {entry_price:.3f} "
                 f"> {MAX_ENTRY_PRICE:.3f}"
             )
