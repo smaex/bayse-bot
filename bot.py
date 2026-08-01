@@ -633,17 +633,20 @@ async def main():
         database._init_pool()
     asyncio.create_task(server.start_server(port=8080))
     asyncio.create_task(_self_ping_loop())
-    database.release_singleton_lock()
-    if not database.force_acquire_singleton_lock():
-        log.critical("Could not acquire singleton lock. Exiting.")
-        return
-    log.info("Singleton lock acquired.")
+    if hasattr(database, "release_singleton_lock"):
+        database.release_singleton_lock()
+    if hasattr(database, "force_acquire_singleton_lock"):
+        if not database.force_acquire_singleton_lock():
+            log.critical("Could not acquire singleton lock. Exiting.")
+            return
+        log.info("Singleton lock acquired.")
     async def _lock_heartbeat():
         while True:
             await asyncio.sleep(12)
-            if not await asyncio.to_thread(database.heartbeat_singleton_lock):
-                log.critical("Lost singleton lock — self-terminating.")
-                os._exit(1)
+            if hasattr(database, "heartbeat_singleton_lock"):
+                if not await asyncio.to_thread(database.heartbeat_singleton_lock):
+                    log.critical("Lost singleton lock — self-terminating.")
+                    os._exit(1)
     asyncio.create_task(_lock_heartbeat())
     _tg_app = telegram_bot.build_app()
     telegram_bot.inject(
