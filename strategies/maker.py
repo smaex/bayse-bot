@@ -150,7 +150,7 @@ class MakerStrategy(BaseStrategy):
         # Volatility guard: don't make-market in very volatile conditions.
         rvol = self._realized_vol(asset)
         if rvol > HIGH_VOL_THRESHOLD:
-            log.debug(f"MAKER SKIP {asset} — high vol {rvol:.4f}")
+            log.info(f"MAKER SKIP {asset} — high vol {rvol:.4f}")
             return None
         # Calculate Fair Value.
         fv_yes = self._fair_value(asset, market)
@@ -178,18 +178,18 @@ class MakerStrategy(BaseStrategy):
         edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
         # Select the side (YES or NO) with the strongest edge, guarded by momentum & min 52% win probability floor
         chosen_side = None
-        if edge_yes >= edge_no and edge_yes >= 0.025 and fv_yes >= 0.52 and mom_5m >= -0.0005:
+        if edge_yes >= edge_no and edge_yes >= 0.015 and fv_yes >= 0.52 and mom_5m >= -0.0005:
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
-        elif edge_no > edge_yes and edge_no >= 0.025 and fv_no >= 0.52 and mom_5m <= +0.0005:
+        elif edge_no > edge_yes and edge_no >= 0.015 and fv_no >= 0.52 and mom_5m <= +0.0005:
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price
             outcome_id  = market.get("no_id", "")
         else:
-            log.debug(
+            log.info(
                 f"MAKER SKIP {asset} — no edge/win_prob block "
                 f"(fv_yes={fv_yes:.3f}, fv_no={fv_no:.3f}, edge_yes={edge_yes:+.3f}, edge_no={edge_no:+.3f}, mom_5m={mom_5m:+.4f})"
             )
@@ -198,7 +198,7 @@ class MakerStrategy(BaseStrategy):
         our_bid = round(min(target_fv - HALF_SPREAD, market_bid + 0.01), 3)
         # Entry price floor guard: don't place bids below 0.42 (underdog prices) or above 0.85
         if our_bid < 0.42 or our_bid > 0.85:
-            log.debug(f"MAKER SKIP {asset} — bid price out of bounds ({our_bid:.3f})")
+            log.info(f"MAKER SKIP {asset} — bid price out of bounds ({our_bid:.3f})")
             return None
         log.info(
             f"MAKER SIGNAL {asset} | side={chosen_side} fv={target_fv:.3f} our_bid={our_bid:.3f} "
