@@ -35,7 +35,16 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 # ── Ghost killer — must run before Telegram polling starts ────────────────────
 import ghost_kill
 ghost_kill.kill_ghosts()
-log = logging.getLogger("bot")
+log = logging.getLogger(__name__)
+def _safe_get_all_active():
+    if hasattr(database, "get_all_active"):
+        return database.get_all_active()
+    if hasattr(database, "get_all_users"):
+        try:
+            return [u for u in database.get_all_users() if u.get("is_active", 1) == 1]
+        except Exception:
+            pass
+    return []
 # ── Shared state ──────────────────────────────────────────────────────────────
 active_markets:    list[dict]             = []
 _user_clients:     dict[str, BayseClient] = {}
@@ -286,7 +295,7 @@ async def _user_loop(chat_id: str):
             log.error(f"[{chat_id}] Position exit eval error: {exit_err}", exc_info=True)
         # ── Refresh user cache ─────────────────────────────────────────────
         global _active_users_cache, _active_users_cache_time
-        _active_users_cache      = await asyncio.to_thread(database.get_all_active)
+        _active_users_cache      = await asyncio.to_thread(_safe_get_all_active)
         _active_users_cache_time = time.time()
         await _evaluate_single_user(user, penalty=0.0)
 async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dict):
@@ -532,7 +541,7 @@ async def _evaluate_all_users_for_asset(asset: str, penalty: float = 0.0):
     _last_market_eval[asset] = now
     global _active_users_cache, _active_users_cache_time
     if not _active_users_cache or (now - _active_users_cache_time) > _CACHE_TTL:
-        _active_users_cache      = await asyncio.to_thread(database.get_all_active)
+        _active_users_cache      = await asyncio.to_thread(_safe_get_all_active)
         _active_users_cache_time = now
     for user in _active_users_cache:
         asyncio.create_task(_evaluate_single_user(user, asset, penalty=penalty))
@@ -571,7 +580,7 @@ async def _heartbeat_loop():
             global _active_users_cache, _active_users_cache_time
             now = time.time()
             if not _active_users_cache or (now - _active_users_cache_time) > _CACHE_TTL:
-                _active_users_cache      = await asyncio.to_thread(database.get_all_active)
+                _active_users_cache      = await asyncio.to_thread(_safe_get_all_active)
                 _active_users_cache_time = now
             for user in _active_users_cache:
                 asyncio.create_task(_evaluate_single_user(user, penalty=0.0))
@@ -679,7 +688,7 @@ async def main():
     asyncio.create_task(_scan_loop())
     asyncio.create_task(_dashboard_loop())
     # ── Reconnect existing users with CORRECT status message ─────────────────
-    existing = await asyncio.to_thread(database.get_all_active)
+    existing = await asyncio.to_thread(_safe_get_all_active)
     log.info(f"Reconnecting {len(existing)} existing user(s)")
     for user in existing:
         cid      = user["chat_id"]
