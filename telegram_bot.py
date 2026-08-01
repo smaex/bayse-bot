@@ -12,6 +12,13 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters,
 )
 import database
+def _safe_get_user(cid: str):
+    if hasattr(database, "get_user"):
+        try:
+            return database.get_user(cid)
+        except Exception:
+            return None
+    return None
 import learner
 import config
 from config import TELEGRAM_TOKEN
@@ -74,7 +81,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     cid = str(update.effective_chat.id)
     log.info(f"[{cid}] /start")
-    user = await asyncio.to_thread(database.get_user, cid)
+    user = await asyncio.to_thread(_safe_get_user, cid)
     if user and user.get("is_active"):
         await _main_menu(update)
         return
@@ -128,7 +135,7 @@ async def on_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             log.warning(f"[{cid}] Connection failed: {e}")
             await update.message.reply_text(f"❌ *Connection failed*\n\n`{e}`\n\nCheck your keys and try /start again.", parse_mode="Markdown")
         return
-    if not await asyncio.to_thread(database.get_user, cid):
+    if not await asyncio.to_thread(_safe_get_user, cid):
         await update.message.reply_text("Use /start to connect your Bayse account.")
 async def _main_menu(update: Update):
     kb = [
@@ -149,7 +156,7 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     q   = update.callback_query
     await q.answer()
     cid = str(q.from_user.id)
-    if not await asyncio.to_thread(database.get_user, cid):
+    if not await asyncio.to_thread(_safe_get_user, cid):
         await q.message.reply_text("Use /start to connect.")
         return
     d = q.data
@@ -169,7 +176,7 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("▶️ Trading resumed.")
     elif d == "resetlearning":
         from datetime import datetime, timezone
-        user = await asyncio.to_thread(database.get_user, cid)
+        user = await asyncio.to_thread(_safe_get_user, cid)
         s    = user["settings"]
         s["learned"] = {}
         s["reset_learning_at"] = datetime.now(timezone.utc).isoformat()
@@ -178,7 +185,7 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("🔄 Learned settings cleared and trade history reset.")
     elif d in _MODES:
         mode_cfg = _MODES[d]
-        user     = await asyncio.to_thread(database.get_user, cid)
+        user     = await asyncio.to_thread(_safe_get_user, cid)
         s        = user["settings"]
         s.update(mode_cfg["settings"])
         s["mode"] = d.replace("mode_", "")
@@ -189,7 +196,7 @@ def _guard(fn):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cid = str(update.effective_chat.id)
         log.info(f"[{cid}] /{fn.__name__.replace('cmd_','')}")
-        if not await asyncio.to_thread(database.get_user, cid):
+        if not await asyncio.to_thread(_safe_get_user, cid):
             await update.message.reply_text("Use /start to connect.")
             return
         await fn(update, ctx)
@@ -273,7 +280,7 @@ async def cmd_set(update: Update, _ctx):
             parse_mode="Markdown",
         )
         return
-    user = await asyncio.to_thread(database.get_user, cid)
+    user = await asyncio.to_thread(_safe_get_user, cid)
     s    = user["settings"]
     key, vals = args[0].lower(), args[1:]
     msg = ""
@@ -366,7 +373,7 @@ async def cmd_learning(update: Update, _ctx):
 async def cmd_resetlearning(update: Update, _ctx):
     from datetime import datetime, timezone
     cid  = str(update.effective_chat.id)
-    user = await asyncio.to_thread(database.get_user, cid)
+    user = await asyncio.to_thread(_safe_get_user, cid)
     s    = user["settings"]
     s["learned"] = {}
     s["reset_learning_at"] = datetime.now(timezone.utc).isoformat()
@@ -393,7 +400,7 @@ async def cmd_debug(update: Update, _ctx):
     lines = ["🔍 *Debug*\n"]
     lines.append(f"*Spot prices:* {feeds.spot if feeds.spot else '⚠️ EMPTY'}")
     lines.append(f"*Active markets:* {len(_active_markets)}")
-    user = await asyncio.to_thread(database.get_user, cid)
+    user = await asyncio.to_thread(_safe_get_user, cid)
     s    = user.get("settings", {}) if user else {}
     ua, ut = s.get("assets", []), s.get("timeframes", [])
     rel  = [m for m in _active_markets if m.get("asset") in ua and m.get("timeframe") in ut]
@@ -503,7 +510,7 @@ async def _status_text(cid: str) -> str:
     except Exception:
         return "Could not fetch balance."
     risk  = _user_risks.get(cid)
-    user  = await asyncio.to_thread(database.get_user, cid)
+    user  = await asyncio.to_thread(_safe_get_user, cid)
     s     = user["settings"] if user else {}
     dd = deployed = 0.0; n_pos = 0
     if risk:
@@ -553,7 +560,7 @@ async def _balance_text(cid: str) -> str:
     except Exception as e:
         return f"Could not fetch balance: {e}"
 async def _markets_text(cid: str) -> str:
-    user = await asyncio.to_thread(database.get_user, cid)
+    user = await asyncio.to_thread(_safe_get_user, cid)
     if not user:
         return "Not connected."
     s   = user["settings"]
@@ -572,7 +579,7 @@ async def _markets_text(cid: str) -> str:
         )
     return "\n".join(lines)
 async def _settings_text(cid: str) -> str:
-    user = await asyncio.to_thread(database.get_user, cid)
+    user = await asyncio.to_thread(_safe_get_user, cid)
     if not user:
         return "Not connected."
     s   = user["settings"]
@@ -595,7 +602,7 @@ def _calc_target(s: dict, start: float) -> float:
         return float(s["daily_target_ngn"])
     return start * s.get("daily_multiplier", 10) / 100
 async def _set_paused(cid: str, paused: bool):
-    user = await asyncio.to_thread(database.get_user, cid)
+    user = await asyncio.to_thread(_safe_get_user, cid)
     if user:
         s = user["settings"]
         s["paused"] = paused
