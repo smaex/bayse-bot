@@ -14,7 +14,7 @@ def _effective_fee(fee_rate: float, market_price: float) -> float:
 
 
 def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.02,
-               fraction: float = 0.25, cap: float = 0.05,
+               fraction: float = 0.25, cap: float = 0.08,
                asset: str = None, state=None, learned: dict = None,
                strategy_name: str = None) -> float:
     """

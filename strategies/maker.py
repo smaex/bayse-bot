@@ -2,68 +2,90 @@
 MAKER — Passive Market Making (Spread Capture)
 ================================================
 Inspired by pbot-6's Polymarket strategy, adapted for Bayse CLOB.
+
 Instead of predicting price direction, the MAKER acts as a liquidity
 provider, placing passive LIMIT orders at prices that are slightly better
 than the current best bid. When retail traders use market orders, they
 cross our spread, and we capture the difference.
+
 Mathematical Model: Avellaneda-Stoikov Market Making
 - Calculates Fair Value of the binary option using our private Binance oracle.
 - Quotes a bid at Fair Value - half_spread (we earn the spread when filled).
 - Skews fair value up or down based on real-time Binance momentum.
 - Cancels and replaces orders if the oracle price shifts > REQUOTE_THRESHOLD.
+
 Adverse Selection Protection:
 - Cancels all open maker orders immediately if Binance volatility spikes,
   preventing a large trader from "picking us off" at a stale price.
 - Uses a small minimum order size to limit per-trade risk.
+
 Bayse API Compatibility (VERIFIED):
 - client.get_orderbook(outcome_id) → live bid/ask book ✅
 - client.place_order(..., order_type="LIMIT", price=..., time_in_force="GTC") ✅
 - client.cancel_order(order_id) → cancel specific order ✅
 - market has liquidityReward.maxSpreadCents → Bayse actually PAYS us to provide liquidity ✅
 """
+
 import asyncio
 import logging
 import math
 import time
 from typing import Optional
+
 import feeds_direct
 import feeds
 from strategies.base import TradeSignal, BaseStrategy
+
 log = logging.getLogger("strat.maker")
+
 # ── Parameters ────────────────────────────────────────────────────────────────
 # Half-spread we quote around Fair Value.
 # e.g. Fair Value = 0.50 → bid=0.475, capturing 0.025 per filled share
 HALF_SPREAD       = 0.025
+
 # If Binance price moves more than this % since we placed orders, requote.
 REQUOTE_THRESHOLD = 0.0015   # 0.15%
+
 # Minimum secs to market close. Don't make-market in last 45s (AMM locking risk).
 MIN_SECS_TO_CLOSE = 45
+
 # Max secs to market close. Don't open new maker positions if >90% of market life is over.
-MAX_MAKER_WINDOW  = 720      # Quote for first 12 minutes of a 15-min market (was 60s — too narrow)
+MAX_MAKER_WINDOW  = 840      # Quote for first 14 minutes of a 15-min market
 MARKET_LIFE_SEC   = 900      # Standard 15-min market
+
 # Bayse CLOB liquidityReward max spread (in cents / probability units).
 # Markets pay a rebate if our spread is within this range.
 MAX_REWARDED_SPREAD_CENTS = 5   # From API: "maxSpreadCents": 5
+
 # Volatility threshold — if realized vol is very high, widen spread or skip.
 HIGH_VOL_THRESHOLD = 0.003  # 0.3% per minute = very volatile
+
 # Order book depth to check for existing liquidity.
 BOOK_DEPTH        = 10
+
 # How often to reassess open maker quotes (seconds).
 REQUOTE_INTERVAL  = 5.0
+
+
 class MakerStrategy(BaseStrategy):
     """
     Passive CLOB market maker. Places a limit buy-order on the cheap side
     of each binary outcome and earns the Bayse liquidity reward when filled.
+
     One open order is tracked per (market_id, side). Orders are refreshed
     every REQUOTE_INTERVAL or when oracle moves REQUOTE_THRESHOLD.
+
     open_orders: { market_id → {"order_id", "placed_price", "binance_at_place", "amount", "outcome_id", "side"} }
     """
+
     def __init__(self):
         super().__init__("MAKER")
         self.open_orders: dict[str, dict] = {}   # market_id → order info
+
     def _fair_value(self, asset: str, market: dict) -> Optional[float]:
         """
         Fair Value of YES = P(spot at close >= threshold).
+
         Uses a simplified diffusion model:
           - annualized vol from GARCH state
           - time to close in years
@@ -76,10 +98,12 @@ class MakerStrategy(BaseStrategy):
             spot = feeds.spot.get(asset, 0.0)
         if not spot:
             return None
+
         threshold     = market.get("threshold")
         secs_to_close = market.get("secs_to_close", 0)
         if not threshold or secs_to_close <= 0:
             return None
+
         # Annualised vol from GARCH (stored in global_state)
         try:
             from strategy import global_state
@@ -92,22 +116,29 @@ class MakerStrategy(BaseStrategy):
                 annual_vol  = ASSET_HOURLY_VOL.get(asset, 0.022) * math.sqrt(8760)
         except Exception:
             annual_vol = 1.0  # fallback 100% annualised vol for crypto
+
         t_years = secs_to_close / (365.25 * 24 * 3600)
         if t_years <= 0:
             return None
+
         # Black-Scholes binary option probability (no drift assumed for short windows)
         d2 = (math.log(spot / threshold)) / (annual_vol * math.sqrt(t_years))
+
         # Normal CDF approximation
         def _ncdf(x: float) -> float:
             t_ = 1.0 / (1.0 + 0.2316419 * abs(x))
             poly = t_ * (0.319381530 + t_ * (-0.356563782 + t_ * (1.781477937 + t_ * (-1.821255978 + t_ * 1.330274429))))
             base = 1.0 - (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * x * x) * poly
             return base if x >= 0 else 1.0 - base
+
         fv = _ncdf(d2)
+
         # Momentum tilt: if Binance is trending hard, skew FV
         latency_bias = feeds_direct.get_latency_bias(asset, spot)
         fv = max(0.03, min(0.97, fv + latency_bias * 0.1))
+
         return fv
+
     def _realized_vol(self, asset: str) -> float:
         """Estimate recent realized vol from price_history."""
         try:
@@ -127,6 +158,7 @@ class MakerStrategy(BaseStrategy):
             return sum(returns) / len(returns) if returns else 0.0
         except Exception:
             return 0.0
+
     async def evaluate(self, market: dict, learned: dict, state,
                        spot_price: float = None) -> Optional[TradeSignal]:
         """
@@ -137,26 +169,34 @@ class MakerStrategy(BaseStrategy):
         secs_to_close = market.get("secs_to_close", 0)
         market_id     = market["market_id"]
         engine        = market.get("engine", "AMM")
-        # Only quote on CLOB markets.
-        if engine != "CLOB":
-            return None
+
+        # Log engine type but allow all market types.
+        # On AMM markets, MAKER acts as a directional limit-order strategy.
+        # executor.py already routes LIMIT vs MARKET correctly.
+        if engine == "CLOB":
+            log.info(f"MAKER {asset} — CLOB market, will place LIMIT order")
+
         # Time window guard.
         if secs_to_close < MIN_SECS_TO_CLOSE:
             return None
+
         # Don't open new quotes if market is mostly over
         secs_elapsed = MARKET_LIFE_SEC - secs_to_close
         if secs_elapsed > MAX_MAKER_WINDOW:
             return None
+
         # Volatility guard: don't make-market in very volatile conditions.
         rvol = self._realized_vol(asset)
         if rvol > HIGH_VOL_THRESHOLD:
             log.info(f"MAKER SKIP {asset} — high vol {rvol:.4f}")
             return None
+
         # Calculate Fair Value.
         fv_yes = self._fair_value(asset, market)
         if fv_yes is None:
             return None
         fv_no = 1.0 - fv_yes
+
         # ── 5-Minute Price Momentum Guard ──────────────────────────────────────
         # Calculate 5-minute price delta to prevent adverse selection into trends.
         mom_5m = 0.0
@@ -172,18 +212,21 @@ class MakerStrategy(BaseStrategy):
                     mom_5m = (spot_price - old_prices[-1]) / old_prices[-1]
         except Exception:
             mom_5m = 0.0
+
         yes_bid_price = market.get("yes_price", 0)
         no_bid_price  = market.get("no_price", 0)
+
         edge_yes = fv_yes - yes_bid_price if yes_bid_price > 0 else 0.0
         edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
+
         # Select the side (YES or NO) with the strongest edge, guarded by momentum & min 52% win probability floor
         chosen_side = None
-        if edge_yes >= edge_no and edge_yes >= 0.015 and fv_yes >= 0.52 and mom_5m >= -0.0005:
+        if edge_yes >= edge_no and edge_yes >= 0.010 and fv_yes >= 0.52 and mom_5m >= -0.0005:
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
-        elif edge_no > edge_yes and edge_no >= 0.015 and fv_no >= 0.52 and mom_5m <= +0.0005:
+        elif edge_no > edge_yes and edge_no >= 0.010 and fv_no >= 0.52 and mom_5m <= +0.0005:
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price
@@ -194,16 +237,19 @@ class MakerStrategy(BaseStrategy):
                 f"(fv_yes={fv_yes:.3f}, fv_no={fv_no:.3f}, edge_yes={edge_yes:+.3f}, edge_no={edge_no:+.3f}, mom_5m={mom_5m:+.4f})"
             )
             return None
+
         # Quote a bid at min(target_fv - HALF_SPREAD, market_bid + 0.01)
         our_bid = round(min(target_fv - HALF_SPREAD, market_bid + 0.01), 3)
         # Entry price floor guard: don't place bids below 0.42 (underdog prices) or above 0.85
         if our_bid < 0.42 or our_bid > 0.85:
             log.info(f"MAKER SKIP {asset} — bid price out of bounds ({our_bid:.3f})")
             return None
+
         log.info(
             f"MAKER SIGNAL {asset} | side={chosen_side} fv={target_fv:.3f} our_bid={our_bid:.3f} "
             f"market_bid={market_bid:.3f} mom_5m={mom_5m:+.4f} secs={secs_to_close:.0f}"
         )
+
         return TradeSignal(
             strategy    = "MAKER",
             event_id    = market["event_id"],
@@ -221,6 +267,7 @@ class MakerStrategy(BaseStrategy):
             momentum_at_entry    = mom_5m,
             realized_vol_at_entry= rvol,
         )
+
     async def cancel_all(self, client, market_id: str = None):
         """Cancel all open maker orders (called on vol spike or market close)."""
         targets = {market_id: self.open_orders[market_id]} if market_id and market_id in self.open_orders else dict(self.open_orders)
@@ -231,6 +278,7 @@ class MakerStrategy(BaseStrategy):
             except Exception as e:
                 log.warning(f"MAKER cancel failed for {info['order_id']}: {e}")
             self.open_orders.pop(mid, None)
+
     def track_order(self, market_id: str, order_id: str, placed_price: float,
                     binance_price: float, amount: float, outcome_id: str):
         """Called by executor after a LIMIT order is placed."""
@@ -242,6 +290,7 @@ class MakerStrategy(BaseStrategy):
             "outcome_id":     outcome_id,
             "placed_at":      time.time(),
         }
+
     def should_requote(self, market_id: str) -> bool:
         """True if Binance has moved enough that our quote is stale."""
         info = self.open_orders.get(market_id)
@@ -257,5 +306,7 @@ class MakerStrategy(BaseStrategy):
                 if base > 0 and abs(price_now - base) / base > REQUOTE_THRESHOLD:
                     return True
         return False
+
+
 # Singleton used by executor.py and bot.py
 maker_strategy = MakerStrategy()
