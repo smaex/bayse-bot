@@ -428,13 +428,14 @@ async def cmd_resetlearning(update: Update, _ctx):
     s["strategies"] = list(config.ACTIVE_STRATEGIES)
     await asyncio.to_thread(database.update_settings, cid, s)
     await asyncio.to_thread(database.invalidate_user_cache, cid)
+    strat_list = ', '.join(s.replace('_', '\\_') for s in config.ACTIVE_STRATEGIES)
     log.info(f"[{cid}] /resetlearning — cleared learned + synced strategies to {config.ACTIVE_STRATEGIES}")
     await update.message.reply_text(
         "🔄 *Learning Reset Complete*\n\n"
-        "✅ All certainty/size multipliers → 1.0\n"
-        "✅ All strategy suspensions → cleared\n"
-        "✅ Trade history horizon → reset to now\n"
-        f"✅ Active strategies → {', '.join(config.ACTIVE_STRATEGIES)}\n\n"
+        "✅ All certainty/size multipliers reset\n"
+        "✅ All strategy suspensions cleared\n"
+        "✅ Trade history horizon reset to now\n"
+        f"✅ Active strategies: {strat_list}\n\n"
         "The bot will now evaluate all strategies with fresh data.",
         parse_mode="Markdown",
     )
@@ -450,7 +451,8 @@ async def cmd_learnstats(update: Update, _ctx):
     for r in sorted(rows, key=lambda x: -(x.get("total_pnl") or 0)):
         icon = "✅" if r["win_rate"] >= 0.55 else ("⚠️" if r["win_rate"] >= 0.48 else "❌")
         pnl  = r.get("total_pnl") or 0
-        lines.append(f"{icon} {r['strategy']}/{r['asset']}/{r['timeframe']}: {r['win_rate']:.0%} WR ({r['total']} trades) ₦{pnl:,.0f}")
+        strat = r['strategy'].replace('_', '\\_')
+        lines.append(f"{icon} {strat}/{r['asset']}/{r['timeframe']}: {r['win_rate']:.0%} WR ({r['total']} trades) ₦{pnl:,.0f}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 @_guard
@@ -460,6 +462,7 @@ async def cmd_debug(update: Update, _ctx):
     import config
     import learner
     cid   = str(update.effective_chat.id)
+    _esc = lambda s: s.replace('_', '\\_')  # escape underscores for Telegram Markdown
     lines = ["🔍 *Strategy Debug*\n"]
 
     # Show current learned state
@@ -467,9 +470,9 @@ async def cmd_debug(update: Update, _ctx):
     suspended = learned.get("suspended_strategies", [])
     active = learned.get("strategies", config.ACTIVE_STRATEGIES)
 
-    lines.append(f"*Active strategies:* {', '.join(active)}")
+    lines.append(f"*Active strategies:* {', '.join(_esc(s) for s in active)}")
     if suspended:
-        lines.append(f"⛔ *SUSPENDED:* {', '.join(suspended)}")
+        lines.append(f"⛔ *SUSPENDED:* {', '.join(_esc(s) for s in suspended)}")
     else:
         lines.append("✅ No strategies suspended")
 
@@ -481,7 +484,7 @@ async def cmd_debug(update: Update, _ctx):
         cm = cmults.get(strat, 1.0)
         sm = smults.get(strat, 1.0)
         flag = "⚠️" if cm < 0.90 or sm < 0.70 else "✅"
-        lines.append(f"  {flag} {strat}: cert×{cm:.2f} size×{sm:.2f}")
+        lines.append(f"  {flag} {_esc(strat)}: cert×{cm:.2f} size×{sm:.2f}")
 
     # Show feed status
     lines.append(f"\n📡 *Feed Status:*")
