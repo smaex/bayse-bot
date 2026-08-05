@@ -461,6 +461,7 @@ async def cmd_debug(update: Update, _ctx):
     import feeds_direct
     import config
     import learner
+    import time
     cid   = str(update.effective_chat.id)
     _esc = lambda s: s.replace('_', '\\_')  # escape underscores for Telegram Markdown
     lines = ["🔍 *Strategy Debug*\n"]
