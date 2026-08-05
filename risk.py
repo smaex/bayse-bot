@@ -111,8 +111,8 @@ class RiskManager:
     def add_pnl(self, pnl: float):
         self.daily_realized_pnl += pnl
         if pnl < 0:
-            self.probation_trades_left = 2
-            log.warning(f"Risk Manager: Entering PROBATION for next 2 trades after loss of ₦{abs(pnl):,.0f}")
+            self.probation_trades_left = 1
+            log.warning(f"Risk Manager: Entering PROBATION for next 1 trade after loss of ₦{abs(pnl):,.0f}")
         elif pnl > 0 and self.probation_trades_left > 0:
             self.probation_trades_left -= 1
             if self.probation_trades_left == 0:

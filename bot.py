@@ -1,14 +1,17 @@
 """
 Multi-user trading bot — one server, all users via Telegram.
 """
+
 import asyncio
 import logging
 import os
 import sys
 import time
 from datetime import date
+
 # pyrefly: ignore [missing-import]
 from aiohttp import web, ClientSession, ClientTimeout
+
 import database
 import feeds
 import scanner
@@ -26,16 +29,20 @@ from client import BayseClient
 from config import (TELEGRAM_TOKEN, CURRENCY, SCAN_INTERVAL_SECONDS,
                     SYSTEMIC_RISK_HALT_MINS, EXIT_EV_THRESHOLD, MIN_EXIT_TIME_REMAINING)
 from strategies.utils import win_probability, realized_vol_hourly
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # ── Ghost killer — must run before Telegram polling starts ────────────────────
 import ghost_kill
 ghost_kill.kill_ghosts()
+
 log = logging.getLogger(__name__)
+
 def _safe_get_all_active():
     if hasattr(database, "get_all_active"):
         return database.get_all_active()
@@ -45,6 +52,7 @@ def _safe_get_all_active():
         except Exception:
             pass
     return []
+
 # ── Shared state ──────────────────────────────────────────────────────────────
 active_markets:    list[dict]             = []
 _user_clients:     dict[str, BayseClient] = {}
@@ -57,22 +65,31 @@ _low_bal_notified: dict[str, str]         = {}
 _systemic_alert:   dict[str, bool]        = {}
 _scan_client:      BayseClient | None     = None
 _tg_app                                   = None
+
 _last_market_eval: dict[str, float] = {}
+
 _active_users_cache:      list[dict] = []
 _active_users_cache_time: float      = 0.0
 _CACHE_TTL                           = 30.0
+
 _BALANCE_EVENT_MIN_NGN = 200
 _BALANCE_EVENT_MIN_PCT = 0.05
 _MIN_VIABLE_BALANCE    = 500
+
+
 def _get_client(user: dict) -> BayseClient:
     cid = user["chat_id"]
     if cid not in _user_clients:
         _user_clients[cid] = BayseClient(user["public_key"], user["secret_key"])
     return _user_clients[cid]
+
+
 def _get_risk(chat_id: str) -> RiskManager:
     if chat_id not in _user_risks:
         _user_risks[chat_id] = RiskManager()
     return _user_risks[chat_id]
+
+
 def _daily(chat_id: str, balance: float, settings: dict) -> dict:
     today = date.today().isoformat()
     ds = _user_daily.get(chat_id)
@@ -84,12 +101,17 @@ def _daily(chat_id: str, balance: float, settings: dict) -> dict:
             asyncio.create_task(asyncio.to_thread(database.update_settings, chat_id, settings))
         _user_daily[chat_id] = ds
     return ds
+
+
 def _daily_target(settings: dict, start: float) -> float:
     abs_ = settings.get("daily_target_ngn", 0)
     if abs_ > 0:
         return float(abs_)
     return start * settings.get("daily_multiplier", 10) / 100
+
+
 # ── User lifecycle ────────────────────────────────────────────────────────────
+
 async def start_user(chat_id: str):
     global _scan_client
     user = await asyncio.to_thread(database.get_user, chat_id)
@@ -98,11 +120,13 @@ async def start_user(chat_id: str):
     client = _get_client(user)
     if _scan_client is None:
         _scan_client = client
+
     settings = user.get("settings", {})
     # Do NOT silently cap risk_pct / maxexposure on restart.
     # Previously this overrode aggressive/full_send mode settings on every deploy,
     # locking users at 2% risk regardless of what they chose via /mode or /set.
     # Hard safety rails live in executor (_execute_logic caps at 5%) and risk.py.
+
     risk = _get_risk(chat_id)
     if not risk.open_positions:
         async def _load():
@@ -117,17 +141,22 @@ async def start_user(chat_id: str):
                         "timeframe": t["timeframe"],
                     })
         asyncio.create_task(_load())
+
     if chat_id not in _user_tasks or _user_tasks[chat_id].done():
         _user_tasks[chat_id] = asyncio.create_task(_user_loop(chat_id))
         is_paused = settings.get("paused", False)
         mode      = settings.get("mode", "balanced")
         log.info(f"[{chat_id}] Trading loop started | mode={mode} | paused={is_paused}")
+
 _user_tasks: dict[str, asyncio.Task] = {}
+
+
 async def _user_loop(chat_id: str):
     """30-second housekeeping loop per user."""
     strategy.set_user_context(chat_id)
     iter_count   = 0
     last_log_min = -1  # track last minute we logged status
+
     while True:
         await asyncio.sleep(30)
         iter_count += 1
@@ -138,15 +167,18 @@ async def _user_loop(chat_id: str):
         client   = _get_client(user)
         risk     = _get_risk(chat_id)
         settings = user.get("settings", {})
+
         try:
             free_cash = await client.get_balance_ngn()
             risk.current_free_cash = free_cash
         except Exception as e:
             log.warning(f"[{chat_id}] Balance fetch failed: {e}")
             continue
+
         equity = free_cash + risk.deployed()
         risk.update_balance(equity)
         risk.update_peak(equity)
+
         # ── Structured status log every 5 minutes ─────────────────────────
         current_min = int(time.time() // 60)
         if current_min % 5 == 0 and current_min != last_log_min:
@@ -160,6 +192,7 @@ async def _user_loop(chat_id: str):
                 f"mode={mode} | paused={paused} | "
                 f"positions={n_pos} | deployed=₦{deployed:,.0f}"
             )
+
         # ── Deposit / withdrawal detection (debounced + quiet-state guard) ────
         # QUIET-STATE GUARD: if any position is open, a market is locked for
         # execution, or a trade was resolved in the last 60 s, the exchange
@@ -221,11 +254,13 @@ async def _user_loop(chat_id: str):
                     _last_balance[chat_id] = equity
             else:
                 _last_balance[chat_id] = equity
+
         # ── Paused check ───────────────────────────────────────────────────
         if settings.get("paused"):
             if iter_count % 6 == 0:   # log every 3 minutes when paused
                 log.info(f"[{chat_id}] PAUSED — skipping evaluation")
             continue
+
         # ── Low balance guard ──────────────────────────────────────────────
         if equity < _MIN_VIABLE_BALANCE:
             today = date.today().isoformat()
@@ -240,18 +275,21 @@ async def _user_loop(chat_id: str):
                         parse_mode="Markdown",
                     )
             continue
+
         # ── Daily target ───────────────────────────────────────────────────
         day    = _daily(chat_id, equity, settings)
         from datetime import datetime, timezone
         today_utc = datetime.now(timezone.utc).date().isoformat()
         profit = await asyncio.to_thread(database.get_daily_resolved_pnl, chat_id, today_utc)
         target = _daily_target(settings, day["start_balance"])
+
         # Sync ground-truth values onto risk so is_in_strict_mode() actually
         # works. risk.daily_target was never assigned anywhere before this —
         # it stayed at its 0.0 default permanently, silently disabling the
         # "tighten up near daily target" safety check with no error at all.
         risk.daily_target      = target
         risk.daily_realized_pnl = profit
+
         if target > 0 and profit >= target and not day["target_hit"]:
             day["target_hit"] = True
             settings["daily_state"] = day
@@ -265,6 +303,7 @@ async def _user_loop(chat_id: str):
                     parse_mode="Markdown",
                 )
             continue
+
         # ── Drawdown check ─────────────────────────────────────────────────
         if not risk.check_drawdown(equity):
             dd = (risk.peak_balance - equity) / risk.peak_balance
@@ -274,6 +313,7 @@ async def _user_loop(chat_id: str):
             if _tg_app:
                 await telegram_bot.notify_drawdown(_tg_app, chat_id, equity, risk.peak_balance, dd)
             continue
+
         # ── Systemic halt ──────────────────────────────────────────────────
         alert = strategy.check_systemic_risk()
         if alert:
@@ -288,21 +328,27 @@ async def _user_loop(chat_id: str):
                     )
         else:
             _systemic_alert[chat_id] = False
+
         # ── Position Exit / Soft Stop-Loss ──────────────────────────────────
         try:
             await _evaluate_and_exit_positions(chat_id, client, risk, settings)
         except Exception as exit_err:
             log.error(f"[{chat_id}] Position exit eval error: {exit_err}", exc_info=True)
+
         # ── Refresh user cache ─────────────────────────────────────────────
         global _active_users_cache, _active_users_cache_time
         _active_users_cache      = await asyncio.to_thread(_safe_get_all_active)
         _active_users_cache_time = time.time()
+
         await _evaluate_single_user(user, penalty=0.0)
+
+
 async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dict):
     """
     Soft model-based exit: re-evaluate every open position using the diffusion
     model's updated win probability. If EV drops below EXIT_EV_THRESHOLD
     (default -15%), the thesis is mathematically wrong — exit the position.
+
     This runs every 30s inside _user_loop. It does NOT use a hard price-based
     stop-loss (that's suboptimal for binary options that settle at 0 or 1).
     Instead, it compares the model's estimated win probability against the
@@ -312,40 +358,51 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         return
     if settings.get("paused"):
         return
+
     positions_to_exit = []
+
     for market_id, pos in list(risk.open_positions.items()):
         market = next((m for m in active_markets if m["market_id"] == market_id), None)
         if not market:
             continue
+
         secs = market.get("secs_to_close", 0)
         # Don't try to exit in the final 90 seconds — settlement/oracle resolution
         # risk makes exit prices unreliable and the market is about to close anyway
         if secs < MIN_EXIT_TIME_REMAINING:
             continue
+
         asset = pos.get("asset", "")
         outcome = pos.get("outcome", "YES")
         threshold = market.get("threshold")
         spot_price = feeds.spot.get(asset)
+
         if not threshold or not spot_price:
             continue
+
         # Re-estimate win probability using the diffusion model
         dist_pct = (spot_price - threshold) / threshold
         rv = realized_vol_hourly(asset, strategy.global_state)
         w_est = win_probability(dist_pct, secs, asset, sigma_override=rv)
+
         # If we hold NO, our win prob is the probability price stays BELOW threshold
         if outcome == "NO":
             w_est = 1.0 - w_est
+
         # Current market price for our held outcome
         if outcome == "YES":
             current_price = market.get("yes_price", 0.5)
         else:
             current_price = market.get("no_price", 0.5)
+
         if current_price <= 0.01:
             continue  # Price too low to sell meaningfully
+
         # EV = (expected payout) / (current price to exit) - 1
         # For holding: we win 1.0 with probability w_est, lose with (1 - w_est)
         # But we can sell at current_price now. So EV of continuing to hold:
         ev_hold = w_est / current_price - 1.0
+
         if ev_hold < EXIT_EV_THRESHOLD:
             positions_to_exit.append({
                 "market_id": market_id,
@@ -355,6 +412,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 "current_price": current_price,
                 "ev_hold": ev_hold,
             })
+
     # Execute exits
     for exit_info in positions_to_exit:
         pos = exit_info["pos"]
@@ -363,21 +421,26 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         w_est = exit_info["w_est"]
         current_price = exit_info["current_price"]
         ev_hold = exit_info["ev_hold"]
+
         outcome_id = pos.get("outcome_id", "")
         event_id = pos.get("event_id", "")
         amount_ngn = pos.get("amount_ngn", 0)
         entry_price = pos.get("entry_price", 0)
+
         if not outcome_id or not event_id:
             continue
+
         # Calculate the exact number of shares to sell
         shares_to_sell = amount_ngn / (entry_price * 100.0) if CURRENCY == "NGN" else amount_ngn / entry_price
         sell_amount = round(shares_to_sell, 4)
+
         log.info(
             f"[{chat_id}] EXIT SIGNAL | {pos.get('strategy', '?')} {pos.get('asset', '?')} "
             f"{pos.get('outcome', '?')} | w_est={w_est:.1%} price={current_price:.3f} "
             f"EV={ev_hold:+.1%} < {EXIT_EV_THRESHOLD:.0%} | "
             f"entry={entry_price:.3f} → now={current_price:.3f}"
         )
+
         try:
             resp = await client.place_order(
                 event_id=event_id, market_id=market_id,
@@ -387,15 +450,19 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             )
             order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
             order_id = order.get("id") or order.get("orderId") or order.get("order_id")
+
             sell_price = float(order.get("avgFillPrice") or order.get("price") or current_price)
             pnl = (sell_price - entry_price) * (amount_ngn / entry_price) if entry_price > 0 else 0
+
             log.info(
                 f"[{chat_id}] EXIT FILLED | {pos.get('strategy', '?')} {pos.get('asset', '?')} "
                 f"@ {sell_price:.4f} | PnL ≈ ₦{pnl:+,.0f} | order={order_id}"
             )
+
             # Update risk manager
             risk.remove_position(market_id)
             risk.add_pnl(pnl)
+
             # Resolve the trade in DB
             trade_id = pos.get("trade_id")
             if trade_id:
@@ -403,6 +470,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                     await asyncio.to_thread(database.resolve_trade, trade_id, pnl > 0, pnl)
                 except Exception as db_err:
                     log.error(f"[{chat_id}] EXIT DB resolve failed: {db_err}")
+
             # Notify user
             if _tg_app:
                 emoji = "🟢" if pnl >= 0 else "🔴"
@@ -419,18 +487,23 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                     )
                 except Exception:
                     pass
+
         except Exception as e:
             log.error(f"[{chat_id}] EXIT order failed for {market_id}: {e}", exc_info=True)
+
+
 async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: float = 0.0):
     chat_id  = user["chat_id"]
     client   = _user_clients.get(chat_id)
     risk     = _user_risks.get(chat_id)
     if not client or not risk:
         return
+
     settings = user.get("settings", {})
     risk.mode = settings.get("mode", "balanced")
     if settings.get("paused"):
         return
+
     free_cash = risk.current_free_cash
     if free_cash <= 0:
         try:
@@ -438,26 +511,36 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
             risk.current_free_cash = free_cash
         except Exception:
             return
+
     equity = free_cash + risk.deployed()
     if risk.target_hit or risk.max_drawdown_hit:
         return
+
     learned = await asyncio.to_thread(learner.get_learned_overrides, chat_id)
     if risk.peak_balance > 0:
         learned["drawdown_pct"] = (risk.peak_balance - equity) / risk.peak_balance
+
     user_assets = settings.get("assets",     config.ALL_ASSETS)
     raw_tfs     = settings.get("timeframes",  ["5min", "15min", "1h"])
     user_strats = settings.get("strategies",  config.ACTIVE_STRATEGIES)
     max_exp     = settings.get("maxexposure", 20.0) / 100.0
+
     # Normalise timeframe strings (5m → 5min)
     user_tfs = []
     for tf in raw_tfs:
         c = tf.lower().replace("min", "").replace("m", "")
         user_tfs.append(c + "min" if c in ("5", "15") else tf)
-    learned["strategies"] = [s for s in user_strats
-                              if s not in learned.get("suspended_strategies", [])]
+
+    suspended = learned.get("suspended_strategies", [])
+    if suspended:
+        log.warning(f"[{chat_id}] Strategies SUSPENDED by learner: {suspended}")
+    learned["strategies"] = [s for s in user_strats if s not in suspended]
+
     await _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
                             learned, max_exp, user_assets, user_tfs,
                             trigger_asset=trigger_asset, penalty=penalty)
+
+
 async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
                              learned, max_exp, user_assets, user_tfs,
                              trigger_asset=None, penalty=0.0):
@@ -485,8 +568,15 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
                 market, learned, strategy.global_state, spot_price=spot_price
             )
             all_signals.extend(sigs)
+
         if all_signals:
-            log.info(f"[{chat_id}] {len(all_signals)} signal(s) from {evaluated} markets evaluated")
+            by_strat = {}
+            for s in all_signals:
+                by_strat[s.strategy] = by_strat.get(s.strategy, 0) + 1
+            log.info(
+                f"[{chat_id}] {len(all_signals)} signal(s) from {evaluated} markets | "
+                f"breakdown: {by_strat}"
+            )
         elif evaluated > 0:
             # Always log when markets exist but no signals — critical for debugging
             spot_summary = {a: round(feeds.spot[a], 2) for a in user_assets if feeds.spot.get(a)}
@@ -494,6 +584,7 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
                 f"[{chat_id}] 0 signals | {evaluated} markets evaluated | "
                 f"no_spot={skipped_no_spot} | spot={spot_summary}"
             )
+
         final = strategies.merge_signals(all_signals, strategy.global_state)
         for sig in final:
             if sig.strategy == "ARB":
@@ -502,7 +593,10 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
                 await executor.execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     except Exception as e:
         log.error(f"[{chat_id}] Market eval error: {e}", exc_info=True)
+
+
 # ── Shared scan loop ──────────────────────────────────────────────────────────
+
 async def _scan_loop():
     global active_markets
     while True:
@@ -517,9 +611,13 @@ async def _scan_loop():
             feeds.restart_bayse_feed(active_markets, _on_market_update)
         except Exception as e:
             log.warning(f"Scan failed: {e}")
+
+
 def _refresh_timers():
     for m in active_markets:
         m["secs_to_close"] = scanner._seconds_to_close(m.get("closing_date", ""))
+
+
 def _on_spot_price(asset: str, price: float):
     lag = feeds_direct.check_lag(asset, price)
     if lag["status"] == "stale":
@@ -534,17 +632,23 @@ def _on_spot_price(asset: str, price: float):
     strategy.update_price_history(asset, lag["price"])
     recorder.record_spot_tick(asset, lag["price"])
     asyncio.create_task(_evaluate_all_users_for_asset(asset, penalty))
+
+
 async def _evaluate_all_users_for_asset(asset: str, penalty: float = 0.0):
     now = time.time()
     if now - _last_market_eval.get(asset, 0) < 1.0:
         return
     _last_market_eval[asset] = now
+
     global _active_users_cache, _active_users_cache_time
     if not _active_users_cache or (now - _active_users_cache_time) > _CACHE_TTL:
         _active_users_cache      = await asyncio.to_thread(_safe_get_all_active)
         _active_users_cache_time = now
+
     for user in _active_users_cache:
         asyncio.create_task(_evaluate_single_user(user, asset, penalty=penalty))
+
+
 def _on_market_update(market_id: str, prices: dict):
     market = next((m for m in active_markets if m["market_id"] == market_id), None)
     if not market:
@@ -554,6 +658,7 @@ def _on_market_update(market_id: str, prices: dict):
         # Uses the OLD (pre-update) yes_price as the move-detection baseline —
         # this must happen BEFORE we write the new price below.
         strategy.record_btc_move(market, prices.get("yes", market["yes_price"]))
+
     # CRITICAL: actually commit the live price update. Previously this never
     # happened — active_markets' yes_price/no_price were only ever refreshed
     # by the next REST scan (every 15s), meaning every strategy was reading
@@ -568,8 +673,12 @@ def _on_market_update(market_id: str, prices: dict):
             market["no_price"]  = nn
         # else: malformed tick, leave the last-known-good price in place
         # rather than poisoning the market dict with a bad data point.
+
     asyncio.create_task(_evaluate_all_users_for_asset(asset, penalty=0.0))
+
+
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
+
 async def _heartbeat_loop():
     log.info("Heartbeat evaluation loop started (30s)")
     while True:
@@ -577,16 +686,68 @@ async def _heartbeat_loop():
             await asyncio.sleep(30)
             if not active_markets:
                 continue
-            global _active_users_cache, _active_users_cache_time
+            global _active_users_cache, _active_users_cache_time, _last_successful_eval
             now = time.time()
             if not _active_users_cache or (now - _active_users_cache_time) > _CACHE_TTL:
                 _active_users_cache      = await asyncio.to_thread(_safe_get_all_active)
                 _active_users_cache_time = now
             for user in _active_users_cache:
                 asyncio.create_task(_evaluate_single_user(user, penalty=0.0))
+            _last_successful_eval = time.time()
         except Exception as e:
             log.error(f"Heartbeat error: {e}")
+
+
+# ── Feed watchdog + dead-man switch ───────────────────────────────────────────
+_FEED_STALE_ALERT_SEC = 120  # Alert if no price update in 2 minutes
+_last_feed_alert: float = 0.0
+_last_successful_eval: float = time.time()
+_DEAD_MAN_THRESHOLD = 300  # 5 minutes with no evaluation = alert
+
+async def _feed_watchdog():
+    """Runs every 30s. Alerts via Telegram if feeds go stale or bot is dead."""
+    global _last_feed_alert, _last_successful_eval
+    while True:
+        await asyncio.sleep(30)
+        now = time.time()
+
+        # Check feed staleness
+        stale_assets = []
+        for asset in ["BTC", "ETH", "SOL"]:
+            _, t = feeds_direct.get_direct_price(asset)
+            if t and (now - t) > _FEED_STALE_ALERT_SEC:
+                stale_assets.append(f"{asset} ({now - t:.0f}s)")
+
+        if stale_assets and (now - _last_feed_alert) > 300:
+            _last_feed_alert = now
+            msg = f"⚠️ FEED WATCHDOG: Stale prices — {', '.join(stale_assets)}"
+            log.warning(msg)
+            if _tg_app:
+                for user_id in list(_user_clients.keys()):
+                    try:
+                        await telegram_bot.send_message(_tg_app, user_id, msg)
+                    except Exception:
+                        pass
+
+        # Check if active_markets is empty
+        if not active_markets and (now - _last_feed_alert) > 300:
+            _last_feed_alert = now
+            log.warning("FEED WATCHDOG: active_markets is EMPTY — scanner returned no markets")
+
+        # Dead-man switch
+        if (now - _last_successful_eval) > _DEAD_MAN_THRESHOLD and (now - _last_feed_alert) > 300:
+            _last_feed_alert = now
+            msg = f"🚨 DEAD MAN SWITCH: No successful evaluation in {int(now - _last_successful_eval)}s!"
+            log.error(msg)
+            if _tg_app:
+                for user_id in list(_user_clients.keys()):
+                    try:
+                        await telegram_bot.send_message(_tg_app, user_id, msg)
+                    except Exception:
+                        pass
+
 # ── Self-ping ─────────────────────────────────────────────────────────────────
+
 async def _self_ping_loop():
     url = (os.environ.get("APP_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
     if not url:
@@ -600,7 +761,10 @@ async def _self_ping_loop():
                     log.debug(f"Self-ping {r.status}")
             except Exception:
                 pass
+
+
 # ── Dashboard stats ───────────────────────────────────────────────────────────
+
 async def _dashboard_loop():
     while True:
         try:
@@ -630,18 +794,25 @@ async def _dashboard_loop():
         except Exception as e:
             log.error(f"Dashboard update error: {e}")
         await asyncio.sleep(30)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
+
 async def main():
     global _tg_app, active_markets, _scan_client
+
     if not TELEGRAM_TOKEN:
         log.error("TELEGRAM_TOKEN not set")
         sys.exit(1)
+
     if hasattr(database, "init_db"):
         database.init_db()
     elif hasattr(database, "_init_pool"):
         database._init_pool()
+
     asyncio.create_task(server.start_server(port=8080))
     asyncio.create_task(_self_ping_loop())
+
     if hasattr(database, "release_singleton_lock"):
         database.release_singleton_lock()
     if hasattr(database, "force_acquire_singleton_lock"):
@@ -649,6 +820,7 @@ async def main():
             log.critical("Could not acquire singleton lock. Exiting.")
             return
         log.info("Singleton lock acquired.")
+
     async def _lock_heartbeat():
         while True:
             await asyncio.sleep(12)
@@ -657,28 +829,34 @@ async def main():
                     log.critical("Lost singleton lock — self-terminating.")
                     os._exit(1)
     asyncio.create_task(_lock_heartbeat())
+
     _tg_app = telegram_bot.build_app()
     telegram_bot.inject(
         user_clients=_user_clients, user_risks=_user_risks,
         user_daily=_user_daily, active_markets=active_markets,
         start_user_fn=start_user,
     )
+
     import random
     await asyncio.sleep(random.uniform(2, 8))
+
     try:
         await _tg_app.bot.set_webhook(url="https://google.com/unused-kick")
         await asyncio.sleep(5)
         await _tg_app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         log.warning(f"Telegram ghost kick: {e}")
+
     await _tg_app.initialize()
     await _tg_app.start()
     try:
         await _tg_app.updater.start_polling(drop_pending_updates=True)
     except Exception as e:
         log.error(f"Telegram polling start: {e}")
+
     executor.init_executor(active_markets, _tg_app)
     await strategy.load_memory()
+
     asyncio.create_task(feeds.start_feeds(on_price=_on_spot_price))
     asyncio.create_task(feeds_direct.binance_feed())
     asyncio.create_task(feeds_direct.binance_rest_fallback())
@@ -687,17 +865,23 @@ async def main():
     asyncio.create_task(_heartbeat_loop())
     asyncio.create_task(_scan_loop())
     asyncio.create_task(_dashboard_loop())
+    asyncio.create_task(_feed_watchdog())
+
     # ── Reconnect existing users with CORRECT status message ─────────────────
     existing = await asyncio.to_thread(_safe_get_all_active)
     log.info(f"Reconnecting {len(existing)} existing user(s)")
+
     for user in existing:
         cid      = user["chat_id"]
         settings = user.get("settings", {})
         is_paused = settings.get("paused", False)
         mode      = settings.get("mode", "balanced")
+
         await start_user(cid)
+
         if _scan_client is None:
             _scan_client = _get_client(user)
+
         # Tell user what state the bot is actually in — not a blanket "resumed"
         try:
             if is_paused:
@@ -719,6 +903,7 @@ async def main():
                 log.info(f"[{cid}] Reconnected | mode={mode} | ACTIVE — notified")
         except Exception:
             pass
+
     if _scan_client:
         active_markets = await scanner.scan_all(_scan_client)
         telegram_bot._active_markets = active_markets
@@ -726,14 +911,18 @@ async def main():
         log.info(f"Initial scan: {len(active_markets)} markets")
         feeds.restart_bayse_feed(active_markets, _on_market_update)
         asyncio.create_task(scanner.discover_series(_scan_client))
+
     for _ in range(20):
         if len(feeds.spot) >= 2:
             break
         await asyncio.sleep(1)
     log.info(f"Spot prices: {feeds.spot}")
+
     while True:
         await asyncio.sleep(5)
         _refresh_timers()
+
+
 if __name__ == "__main__":
     import os
     asyncio.run(main())

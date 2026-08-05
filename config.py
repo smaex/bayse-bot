@@ -1,16 +1,20 @@
 import os
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
+
 # ── Credentials ───────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ENCRYPTION_KEY  = os.getenv("ENCRYPTION_KEY", "")
+
 # ── Bayse API ─────────────────────────────────────────────────────────────────
 BASE_URL        = "https://relay.bayse.markets"
 WS_MARKETS_URL  = "wss://socket.bayse.markets/ws/v1/markets"
 WS_REALTIME_URL = "wss://socket.bayse.markets/ws/v1/realtime"
+
 # ── Market series slugs ───────────────────────────────────────────────────────
 # Only assets confirmed available on the Bayse realtime WS feed:
 #   Binance source  : BTC, ETH, SOL
@@ -42,18 +46,23 @@ SERIES = {
     "GBPUSD": {"1h": "fx-gbpusd-1h"},
     "XAUUSD": {"1h": "commodity-xauusd-1h"},
 }
+
 # These are the only assets with confirmed real-time price feeds on Bayse.
 # DO NOT add BNB, USDJPY, EURJPY, GBPJPY, EURGBP — they are not on the WS feed.
 ALL_ASSETS     = ["BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "XAUUSD"]
 ALL_TIMEFRAMES = ["5min", "15min", "1h", "6h", "1d"]
+
 ASSET_ORACLE = {
     "BTC": "BINANCE", "ETH": "BINANCE", "SOL": "BINANCE",
     "EURUSD": "TWELVEDATA", "GBPUSD": "TWELVEDATA", "XAUUSD": "TWELVEDATA",
 }
+
 # ── Active strategies (only what's implemented and working) ───────────────────
-ACTIVE_STRATEGIES = ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"]
+ACTIVE_STRATEGIES = ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB"]
+
 # ── Currency ──────────────────────────────────────────────────────────────────
 CURRENCY = "NGN"
+
 # ── Sniping ───────────────────────────────────────────────────────────────────
 SNIPE_ENTRY_WINDOWS = {
     "5min":  300,
@@ -84,7 +93,8 @@ SNIPE_ENTRY_WINDOWS = {
 SNIPE_MIN_CERTAINTY    = 0.27   # 62% win-rate floor — profitable with Kelly, realistic in market
 SNIPE_MAX_MARKET_PRICE = 0.88   # expanded from 0.75 — allows high-probability entries
 SNIPE_MIN_ENTRY_PRICE  = 0.15   # lowered from 0.45 — blocks sub-0.15 long-shots while unlocking normal trades
-SNIPE_MIN_DISTANCE_PCT = 0.0003 # 0.03% minimum distance — was 0.08%
+SNIPE_MIN_DISTANCE_PCT = 0.00010  # 0.010% minimum distance — allows high-probability entries near threshold
+
 # FX-specific
 FX_SESSION_UTC = {
     "EURUSD": (6, 17),
@@ -93,29 +103,37 @@ FX_SESSION_UTC = {
 }
 SNIPE_VELOCITY_WINDOW = 60
 SNIPE_VELOCITY_VETO   = 0.40
+
 # ── Correlation ───────────────────────────────────────────────────────────────
-CORRELATION_THRESHOLD     = 0.0020  # 0.20% — was 0.35%, BTC rarely moves that much in 3 min
+CORRELATION_THRESHOLD     = 0.0015  # 0.15% — lowered to give CORRELATE realistic firing chance
 CORRELATION_WINDOW_SEC    = 180
 CORRELATE_BASE_CERTAINTY  = 0.55
 CORRELATE_MAX_MARKET_PRICE= 0.65
-CORRELATE_MIN_REGIME      = 0.25
+CORRELATE_MIN_REGIME      = 0.15
+
 # ── Frontrun ──────────────────────────────────────────────────────────────────
 FRONTRUN_ALLOWED_TFS       = {"5min", "15min", "1h"}
 FRONTRUN_BIAS_TRIGGER      = float(os.getenv("FRONTRUN_BIAS_TRIGGER", "0.0003"))  # 0.03% — catches real relay lag of 50-150ms (≈0.03-0.05% BTC move)
+
 # ── ARB ───────────────────────────────────────────────────────────────────────
-ARB_TRIGGER      = 0.94    # tightened from 0.98 — 6% edge needed to survive partial fills + fees
+ARB_TRIGGER      = 0.97    # 3% edge — enough to be profitable after fees on ₦100 test trades
 ARB_MIN_TIME_SECS = 120    # raised from 30s — need time for both legs to fill safely
 ARB_MAX_SIZE_NGN  = 50_000
+
 # ── Fee formula ───────────────────────────────────────────────────────────────
 # Bayse fee formula: fee = feeRate × max(1 - price, 0.5)
 # The floor is 0.5 as specified in the Bayse fees documentation.
 FEE_FLOOR = 0.5
+
 # ── Soft Stop-Loss / Exit Strategy ───────────────────────────────────────────
 EXIT_EV_THRESHOLD = -0.15          # Exit if EV drops below -15% (thesis wrong)
 MIN_EXIT_TIME_REMAINING = 90       # Don't try to exit in the final 90 seconds due to settlement risk
+
+
 # ── Risk ─────────────────────────────────────────────────────────────────────
 MAX_DRAWDOWN_STOP      = 0.15
 MAX_PORTFOLIO_EXPOSURE = 0.20
+
 # ── Hourly volatility baselines ───────────────────────────────────────────────
 ASSET_HOURLY_VOL = {
     "BTC":    0.018,
@@ -125,16 +143,19 @@ ASSET_HOURLY_VOL = {
     "GBPUSD": 0.0007,
     "XAUUSD": 0.0015,
 }
+
 # ── Kelly sizing ──────────────────────────────────────────────────────────────
 # Min: 3% — smallest useful bet on Bayse (100₦ min, 3% of ₦30k = ₦900)
 # Max: 50% — only hit on ORACLE_ARB near-certainty signals (95%+ confidence)
 # SNIPE will typically size 5-20% depending on win_prob and market_price edge
 DYNAMIC_KELLY_MIN = 0.03
 DYNAMIC_KELLY_MAX = 0.50
+
 # ── Rate limits ───────────────────────────────────────────────────────────────
 WRITE_RATE_LIMIT      = 15
 READ_RATE_LIMIT       = 25
 SCAN_INTERVAL_SECONDS = 15
+
 # ── Infra guard ───────────────────────────────────────────────────────────────
 INFRA_STALE_LAG_SEC      = 120.0  # crypto: >120s of no oracle data = hard block
 INFRA_DEGRADED_LAG_SEC   = 45.0   # >45s = apply safety spread
@@ -142,12 +163,22 @@ INFRA_STALE_DIFF_PCT     = 0.0080 # >0.80% price diff = genuinely broken feed
 INFRA_DEGRADED_DIFF_PCT  = 0.0015 # >0.15% = safety spread (was 0.08% — too tight)
 # NOTE: 0.20% divergence is a FRONTRUN opportunity, not a stale feed.
 # Old 0.0020 stale threshold blocked evaluations exactly when FRONTRUN should fire.
+
 # ── Systemic risk halt ────────────────────────────────────────────────────────
 SYSTEMIC_RISK_HALT_MINS       = 5
 VOL_SPIKE_THRESHOLD           = 25.0
 CRYPTO_VOL_SPIKE_THRESHOLD    = 100.0
 SYSTEMIC_RISK_COUNT_THRESHOLD = 3
 SYSTEMIC_RISK_VOL_MULT        = 3.0
+
 # ── Misc ─────────────────────────────────────────────────────────────────────
 MIN_PAYOUT_RATIO   = 0.06
 PROFIT_ALERT_NGN   = 20_000
+
+# ── Test Mode ─────────────────────────────────────────────────────────────────
+# When True, ALL trades are capped at TEST_MAX_TRADE_NGN regardless of Kelly/mode.
+# Purpose: gather strategy performance data with minimal bankroll risk.
+# Set to False once enough data is collected and strategies are validated.
+TEST_MODE          = True
+TEST_MAX_TRADE_NGN = 100    # ₦100 per trade — absolute ceiling during testing
+TEST_MIN_BANKROLL  = 1000   # Stop all trading if bankroll drops below ₦1,000
