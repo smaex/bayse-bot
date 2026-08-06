@@ -87,10 +87,11 @@ SNIPE_ENTRY_WINDOWS = {
 #    Trades 0.3–0.5% from threshold: 4 trades, 100% WR, ₦81 profit.
 #    Price hugging the threshold = coin-flip. Needs real distance to resolve cleanly.
 # NOTE on certainty scale: probability_to_certainty(w) = (w - 0.50) / 0.45
-# So SNIPE_MIN_CERTAINTY=0.27 → requires win_prob >= 0.62 (62% WR).
+# So SNIPE_MIN_CERTAINTY=0.12 → requires win_prob >= 0.554 (55.4% WR).
+# SNIPE_MIN_CERTAINTY=0.27 → requires win_prob >= 0.62 (62% WR) — too restrictive in calm markets.
 # SNIPE_MIN_CERTAINTY=0.60 → requires win_prob >= 0.77 (77% WR) — almost never seen.
-# At 62% WR with Kelly sizing, EV is strongly positive even after fees.
-SNIPE_MIN_CERTAINTY    = 0.27   # 62% win-rate floor — profitable with Kelly, realistic in market
+#
+SNIPE_MIN_CERTAINTY    = 0.12   # 55% win-rate floor — the 5% edge gate is the real protector
 SNIPE_MAX_MARKET_PRICE = 0.88   # expanded from 0.75 — allows high-probability entries
 SNIPE_MIN_ENTRY_PRICE  = 0.15   # lowered from 0.45 — blocks sub-0.15 long-shots while unlocking normal trades
 SNIPE_MIN_DISTANCE_PCT = 0.00010  # 0.010% minimum distance — allows high-probability entries near threshold
