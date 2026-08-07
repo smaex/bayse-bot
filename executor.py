@@ -194,6 +194,8 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     if amount > hard_cap:
         amount = hard_cap
 
+    effective_min = max(MIN_TRADE_NGN, min_t)
+
     # ── TEST MODE: cap all trades for data collection ─────────────────────
     if config.TEST_MODE:
         if equity < config.TEST_MIN_BANKROLL:
@@ -202,7 +204,7 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                 f"₦{config.TEST_MIN_BANKROLL:,.0f} floor — HALTING all trades"
             )
             return
-        amount = min(amount, config.TEST_MAX_TRADE_NGN)
+        amount = max(effective_min, min(amount, config.TEST_MAX_TRADE_NGN))
 
     # ── Buy-power scale-down ───────────────────────────────────────────────
     # If calculated amount exceeds available free cash, scale down rather

@@ -180,6 +180,6 @@ PROFIT_ALERT_NGN   = 20_000
 # When True, ALL trades are capped at TEST_MAX_TRADE_NGN regardless of Kelly/mode.
 # Purpose: gather strategy performance data with minimal bankroll risk.
 # Set to False once enough data is collected and strategies are validated.
-TEST_MODE          = True
-TEST_MAX_TRADE_NGN = 100    # ₦100 per trade — absolute ceiling during testing
+TEST_MODE          = False
+TEST_MAX_TRADE_NGN = 500    # ₦500 max per trade during test runs if enabled
 TEST_MIN_BANKROLL  = 1000   # Stop all trading if bankroll drops below ₦1,000
