@@ -65,9 +65,10 @@ class CorrelateStrategy(BaseStrategy):
 
         tgt_thresh = market.get("threshold")
         tgt_spot   = spot_price if spot_price is not None else feeds.spot.get(asset)
-        if tgt_thresh and tgt_spot:
-            if direction == "UP"   and tgt_spot < tgt_thresh: return None
-            if direction == "DOWN" and tgt_spot > tgt_thresh: return None
+        if tgt_thresh and tgt_spot and tgt_thresh > 0:
+            dist = (tgt_spot - tgt_thresh) / tgt_thresh
+            if direction == "UP"   and dist < -0.01: return None  # deep wrong side (>1% below)
+            if direction == "DOWN" and dist > +0.01: return None  # deep wrong side (>1% above)
 
         outcome    = "YES" if direction == "UP" else "NO"
         outcome_id = market["yes_id"] if outcome == "YES" else market["no_id"]
