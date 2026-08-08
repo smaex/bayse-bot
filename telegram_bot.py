@@ -423,11 +423,14 @@ async def cmd_resetlearning(update: Update, _ctx):
     s    = user["settings"]
     s["learned"] = {}
     s["reset_learning_at"] = datetime.now(timezone.utc).isoformat()
-    # Also sync strategies list to current ACTIVE_STRATEGIES
-    # (fixes stale DB entries missing MAKER/ORACLE_ARB)
+    s["paused"] = False
     s["strategies"] = list(config.ACTIVE_STRATEGIES)
     await asyncio.to_thread(database.update_settings, cid, s)
     await asyncio.to_thread(database.invalidate_user_cache, cid)
+    risk = _user_risks.get(cid)
+    if risk:
+        risk.paused = False
+        risk.peak_balance = 0
     strat_list = ', '.join(s.replace('_', '\\_') for s in config.ACTIVE_STRATEGIES)
     log.info(f"[{cid}] /resetlearning — cleared learned + synced strategies to {config.ACTIVE_STRATEGIES}")
     await update.message.reply_text(
