@@ -244,9 +244,9 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
 
         # ── EV check with pre-trade Quote ───────────────────────────────────
         target_margin = {
-            "safe": 0.15, "balanced": 0.10, "aggressive": 0.05,
-            "full_send": 0.03, "custom": 0.08,
-        }.get(mode, 0.10)
+            "safe": 0.03, "balanced": 0.01, "aggressive": 0.00,
+            "full_send": 0.00, "custom": 0.01,
+        }.get(mode, 0.01)
 
         is_probe = sig.certainty >= 0.35 and sig.certainty < sig.mode_floor
         if is_probe:

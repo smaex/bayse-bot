@@ -553,16 +553,24 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
         all_signals = []
         evaluated   = 0
         skipped_no_spot = 0
+        skipped_status  = 0
+        skipped_asset   = 0
+        skipped_tf      = 0
+        skipped_halted  = 0
         for market in active_markets:
             if market.get("status") != "open":
+                skipped_status += 1
                 continue
             if market["asset"] not in user_assets:
+                skipped_asset += 1
                 continue
             if trigger_asset and market["asset"] != trigger_asset:
                 continue
             if market["timeframe"] not in user_tfs:
+                skipped_tf += 1
                 continue
             if strategy.is_halted(market["asset"]):
+                skipped_halted += 1
                 continue
             evaluated += 1
             # Pass spot price explicitly — one consistent value per eval cycle
@@ -582,12 +590,15 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
                 f"[{chat_id}] {len(all_signals)} signal(s) from {evaluated} markets | "
                 f"breakdown: {by_strat}"
             )
-        elif evaluated > 0:
-            # Always log when markets exist but no signals — critical for debugging
+        else:
+            # Always log market evaluation — critical for debugging
             spot_summary = {a: round(feeds.spot[a], 2) for a in user_assets if feeds.spot.get(a)}
             log.info(
-                f"[{chat_id}] 0 signals | {evaluated} markets evaluated | "
-                f"no_spot={skipped_no_spot} | spot={spot_summary}"
+                f"[{chat_id}] 0 signals | total={len(active_markets)} markets | evaluated={evaluated} | "
+                f"skip_status={skipped_status} skip_asset={skipped_asset} "
+                f"skip_tf={skipped_tf} skip_halted={skipped_halted} "
+                f"no_spot={skipped_no_spot} | "
+                f"user_assets={user_assets} user_tfs={user_tfs} | spot={spot_summary}"
             )
 
         final = strategies.merge_signals(all_signals, strategy.global_state)
