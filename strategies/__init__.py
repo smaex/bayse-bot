@@ -94,20 +94,19 @@ async def evaluate_all(
             # Aligned to allow 62%+ WR signals through in all modes.
             mode       = learned.get("mode", "balanced")
             mode_floor = {
-                "safe":       0.35,   # 65.8% WR minimum — cautious but not paralyzed
-                "balanced":   0.27,   # 62.1% WR minimum — our primary trading mode
-                "aggressive": 0.20,   # 59.0% WR minimum — more volume, higher variance
-                "full_send":  0.15,   # 56.8% WR minimum — maximum volume
-                "custom":     0.27,   # same as balanced by default
-            }.get(mode, 0.27)
+                "safe":       0.20,   # 59.0% WR minimum
+                "balanced":   0.12,   # 55.4% WR minimum — matches SNIPE_MIN_CERTAINTY
+                "aggressive": 0.08,   # 53.6% WR minimum
+                "full_send":  0.05,   # 52.3% WR minimum
+                "custom":     0.12,   # same as balanced by default
+            }.get(mode, 0.12)
 
             # Pantry raid (trading drought)
             if learned.get("pantry_raid_active"):
-                mode_floor -= 0.05
+                mode_floor -= 0.03
 
-            # Discovery probes: allow genuinely thin edges through as ₦100 probe trades.
-            # Strategy math has already confirmed +EV before this point.
-            discovery_floor = 0.15
+            # Discovery probes: allow thin edges through as probe trades.
+            discovery_floor = 0.10
 
             if sig.certainty >= mode_floor or sig.certainty >= discovery_floor:
                 sig.mode_floor = mode_floor
