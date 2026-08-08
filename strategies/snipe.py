@@ -117,22 +117,8 @@ class SnipeStrategy(BaseStrategy):
             )
             return None
 
-        # ── Liquidity-floor guard ───────────────────────────────────────────────
-        # Confirmed TWICE in production with otherwise-valid price data
-        # (sum≈1.0): Bayse's AMM rejects MARKET orders at extreme prices
-        # with "Your order could not be filled at the moment, please try
-        # again later." Session 1: price=0.020. This session: price=0.050.
-        # Both looked like huge mathematical edges and both were genuinely
-        # unfillable. Matches ARB's existing 0.08 floor, added for the same
-        # observed reason — this isn't a guess, it's the second confirmed
-        # occurrence of the identical failure.
-        min_side = min(market.get("yes_price", 1), market.get("no_price", 1))
-        if min_side < 0.08:
-            log.info(
-                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — extreme price, "
-                f"likely unfillable (min_side={min_side:.3f} < 0.08)"
-            )
-            return None
+        # Entry price floor & unfillability checks are handled dynamically below
+        # after direction and chosen entry price are determined.
 
         # ── Data-driven entry price floor guard ─────────────────────────────
         # Forensic analysis of 170 live trades showed:

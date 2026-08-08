@@ -177,12 +177,8 @@ class MakerStrategy(BaseStrategy):
             log.info(f"MAKER {asset} — CLOB market, will place LIMIT order")
 
         # Time window guard.
+        # Don't make-market in the final 45s of a candle (settlement risk)
         if secs_to_close < MIN_SECS_TO_CLOSE:
-            return None
-
-        # Don't open new quotes if market is mostly over
-        secs_elapsed = MARKET_LIFE_SEC - secs_to_close
-        if secs_elapsed > MAX_MAKER_WINDOW:
             return None
 
         # Volatility guard: don't make-market in very volatile conditions.
