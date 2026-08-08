@@ -499,7 +499,12 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
     if not client or not risk:
         return
 
-    settings = user.get("settings", {})
+    # Always re-fetch settings from DB — the user dict passed in may be a
+    # stale cached copy with paused=True even after /resume was called.
+    fresh_user = await asyncio.to_thread(database.get_user, chat_id)
+    if not fresh_user or not fresh_user.get("is_active"):
+        return
+    settings = fresh_user.get("settings", {})
     risk.mode = settings.get("mode", "balanced")
     if settings.get("paused"):
         return

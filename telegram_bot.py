@@ -749,6 +749,11 @@ async def _set_paused(cid: str, paused: bool):
         s = user["settings"]
         s["paused"] = paused
         await asyncio.to_thread(database.update_settings, cid, s)
+        await asyncio.to_thread(database.invalidate_user_cache, cid)
+        # Also bust bot.py's own user cache so _evaluate_single_user
+        # picks up the new paused state on the very next heartbeat tick
+        import bot as _bot
+        _bot._active_users_cache_time = 0.0
 
 
 async def _clear_daily(cid: str):
