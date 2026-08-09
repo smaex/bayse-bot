@@ -425,6 +425,8 @@ async def cmd_resetlearning(update: Update, _ctx):
     s["reset_learning_at"] = datetime.now(timezone.utc).isoformat()
     s["paused"] = False
     s["strategies"] = list(config.ACTIVE_STRATEGIES)
+    s["timeframes"] = ["15min", "5min"]
+    s["assets"]     = list(config.ALL_ASSETS)
     await asyncio.to_thread(database.update_settings, cid, s)
     await asyncio.to_thread(database.invalidate_user_cache, cid)
     risk = _user_risks.get(cid)

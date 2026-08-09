@@ -526,7 +526,7 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
         learned["drawdown_pct"] = (risk.peak_balance - equity) / risk.peak_balance
 
     user_assets = settings.get("assets",     config.ALL_ASSETS)
-    raw_tfs     = settings.get("timeframes",  ["5min", "15min", "1h"])
+    raw_tfs     = settings.get("timeframes",  ["15min", "5min"])
     user_strats = settings.get("strategies",  config.ACTIVE_STRATEGIES)
     max_exp     = settings.get("maxexposure", 20.0) / 100.0
 
@@ -557,6 +557,7 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
         skipped_asset   = 0
         skipped_tf      = 0
         skipped_halted  = 0
+        skipped_trigger = 0
         for market in active_markets:
             if market.get("status") != "open":
                 skipped_status += 1
@@ -565,6 +566,7 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
                 skipped_asset += 1
                 continue
             if trigger_asset and market["asset"] != trigger_asset:
+                skipped_trigger += 1
                 continue
             if market["timeframe"] not in user_tfs:
                 skipped_tf += 1
@@ -593,10 +595,12 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
         else:
             # Always log market evaluation — critical for debugging
             spot_summary = {a: round(feeds.spot[a], 2) for a in user_assets if feeds.spot.get(a)}
+            strats_eval  = learned.get("strategies", user_strats)
             log.info(
                 f"[{chat_id}] 0 signals | total={len(active_markets)} markets | evaluated={evaluated} | "
+                f"strats={strats_eval} | "
                 f"skip_status={skipped_status} skip_asset={skipped_asset} "
-                f"skip_tf={skipped_tf} skip_halted={skipped_halted} "
+                f"skip_tf={skipped_tf} skip_trigger={skipped_trigger} skip_halted={skipped_halted} "
                 f"no_spot={skipped_no_spot} | "
                 f"user_assets={user_assets} user_tfs={user_tfs} | spot={spot_summary}"
             )
