@@ -20,7 +20,7 @@ log = logging.getLogger("strat.correlate")
 # Same fast-cycle restriction as SNIPE and FRONTRUN. CORRELATE's signal decays
 # within CORRELATION_WINDOW_SEC (180s) — evaluating it against a 1h/1d candle
 # whose threshold was set hours ago doesn't fit that decay window at all.
-ALLOWED_TFS = {"5min", "15min"}
+ALLOWED_TFS = {"5min", "15min", "1h"}
 
 
 class CorrelateStrategy(BaseStrategy):

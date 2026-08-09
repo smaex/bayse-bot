@@ -45,7 +45,7 @@ log = logging.getLogger("strat.snipe")
 # don't fit a "trade every 5-15 minutes" cadence, and FX assets only exist
 # on the 1h timeframe in config.SERIES — so this restriction also makes
 # SNIPE crypto-only (BTC/ETH/SOL) by construction.
-ALLOWED_TFS = {"5min", "15min", "1h"}
+ALLOWED_TFS = {"5min", "15min", "1h", "6h", "1d"}
 
 # Suppress per-market rejection spam outside the entry window.
 _LOG_WITHIN_FACTOR = 2.0
