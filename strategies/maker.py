@@ -218,12 +218,12 @@ class MakerStrategy(BaseStrategy):
         # Select the side (YES or NO) with the strongest edge, guarded by momentum & min 45% win probability floor
         # NOTE: old 0.52 floor blocked ALL no-side trades since fv_yes+fv_no≈1.0
         chosen_side = None
-        if edge_yes >= edge_no and edge_yes >= 0.010 and fv_yes >= 0.45 and mom_5m >= -0.0050:
+        if edge_yes >= edge_no and edge_yes >= 0.007 and fv_yes >= 0.45 and mom_5m >= -0.0050:
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
-        elif edge_no > edge_yes and edge_no >= 0.010 and fv_no >= 0.45 and mom_5m <= +0.0050:
+        elif edge_no > edge_yes and edge_no >= 0.007 and fv_no >= 0.45 and mom_5m <= +0.0050:
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price
@@ -236,9 +236,11 @@ class MakerStrategy(BaseStrategy):
             return None
 
         # Quote a bid at min(target_fv - HALF_SPREAD, market_bid + 0.01)
+        chosen_edge = edge_yes if chosen_side == "YES" else edge_no
         our_bid = round(min(target_fv - HALF_SPREAD, market_bid + 0.01), 3)
-        # Entry price floor guard: don't place bids below 0.35 or above 0.85
-        if our_bid < 0.35 or our_bid > 0.85:
+        # Entry price floor guard: don't place bids below 0.28 or above 0.85.
+        # 0.28 allows NO bids on markets where YES has moved to 0.65-0.70.
+        if our_bid < 0.28 or our_bid > 0.85:
             log.info(f"MAKER SKIP {asset} — bid price out of bounds ({our_bid:.3f})")
             return None
 
@@ -255,7 +257,7 @@ class MakerStrategy(BaseStrategy):
             timeframe   = market["timeframe"],
             outcome     = chosen_side,
             outcome_id  = outcome_id,
-            certainty   = target_fv,
+            certainty   = min(0.90, 0.45 + chosen_edge * 4.0),  # edge 0.01→~0.49, 0.05→~0.65
             win_prob    = target_fv,
             market_price= our_bid,    # executor will place LIMIT at this price
             size_pct    = 0.02,       # 2% of bankroll per maker order (small, high frequency)
