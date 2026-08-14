@@ -139,6 +139,8 @@ async def start_user(chat_id: str):
                         "entry_price": t["entry_price"], "amount_ngn": t["amount_ngn"],
                         "strategy": t["strategy"], "asset": t["asset"],
                         "timeframe": t["timeframe"],
+                        "order_type": t.get("order_type", "MARKET"),  # DB trades are real fills
+                        "confirmed_filled": True,                       # restored from DB = confirmed
                     })
         asyncio.create_task(_load())
 
@@ -489,7 +491,17 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                     pass
 
         except Exception as e:
-            log.error(f"[{chat_id}] EXIT order failed for {market_id}: {e}", exc_info=True)
+            err_str = str(e).lower()
+            if "insufficient shares" in err_str or "insufficient balance" in err_str:
+                # Phantom position: LIMIT order was never filled but tracker thought it was open.
+                # Remove it so future signals aren't permanently blocked.
+                log.warning(
+                    f"[{chat_id}] EXIT failed — phantom/unfilled LIMIT position on {market_id}. "
+                    f"Removing from tracker. Error: {e}"
+                )
+                risk.remove_position(market_id)
+            else:
+                log.error(f"[{chat_id}] EXIT order failed for {market_id}: {e}", exc_info=True)
 
 
 async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: float = 0.0):

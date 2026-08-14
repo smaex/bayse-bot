@@ -137,8 +137,8 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     declared  = None   # set inside engine-detection block; init here so exposure check never NameErrors
     engine    = "AMM"  # safe default
 
-    if risk.is_in_strict_mode() and sig.certainty < 0.70:
-        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — strict mode (near daily target), certainty {sig.certainty:.0%} < 70%")
+    if risk.is_in_strict_mode() and sig.certainty < 0.40:
+        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — strict mode (near daily target), certainty {sig.certainty:.0%} < 40%")
         return
 
     # ── Sizing (Kelly / Conviction) ────────────────────────────────────────

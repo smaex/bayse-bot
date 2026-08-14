@@ -119,6 +119,7 @@ class RiskManager:
                 log.info("Risk Manager: Probation cleared! Returning to full position sizes.")
 
     def add_position(self, market_id: str, pos: dict):
+        pos.setdefault("placed_at", time.time())  # always stamp entry time
         self.open_positions[market_id] = pos
         log.info(
             f"Position opened [{pos['strategy']}] "
@@ -130,7 +131,25 @@ class RiskManager:
         self.open_positions.pop(market_id, None)
 
     def already_in(self, market_id: str) -> bool:
-        return market_id in self.open_positions or market_id in self.pending_markets
+        if market_id in self.pending_markets:
+            return True
+        pos = self.open_positions.get(market_id)
+        if pos is None:
+            return False
+        # LIMIT orders (MAKER strategy) that haven't been confirmed filled
+        # can sit in open_positions forever, permanently blocking new signals.
+        # Expire them after 12 minutes — the maximum remaining life of a 15-min
+        # market after entry. If not filled by then, they never will be.
+        if pos.get("order_type") == "LIMIT" and not pos.get("confirmed_filled", False):
+            age = time.time() - pos.get("placed_at", 0)
+            if age > 720:  # 12 minutes
+                log.info(
+                    f"Expired stale LIMIT position on {market_id} "
+                    f"(strategy={pos.get('strategy')}, age={age:.0f}s, never confirmed filled)"
+                )
+                self.open_positions.pop(market_id, None)
+                return False
+        return True
 
     def lock_market(self, market_id: str):
         self.pending_markets.add(market_id)
