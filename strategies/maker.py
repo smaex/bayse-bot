@@ -215,15 +215,16 @@ class MakerStrategy(BaseStrategy):
         edge_yes = fv_yes - yes_bid_price if yes_bid_price > 0 else 0.0
         edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
 
-        # Select the side (YES or NO) with the strongest edge, guarded by momentum & min 45% win probability floor
-        # NOTE: old 0.52 floor blocked ALL no-side trades since fv_yes+fv_no≈1.0
+        # Select the side (YES or NO) with the strongest edge, guarded by momentum & min 40% win probability floor
+        # NOTE: 0.40 floor (was 0.45) allows trades where FV is 40-49% but market prices it at 30-35%.
+        # At 40% FV the trade still has positive EV if market prices it even lower.
         chosen_side = None
-        if edge_yes >= edge_no and edge_yes >= 0.007 and fv_yes >= 0.45 and mom_5m >= -0.0050:
+        if edge_yes >= edge_no and edge_yes >= 0.007 and fv_yes >= 0.40 and mom_5m >= -0.0050:
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
-        elif edge_no > edge_yes and edge_no >= 0.007 and fv_no >= 0.45 and mom_5m <= +0.0050:
+        elif edge_no > edge_yes and edge_no >= 0.007 and fv_no >= 0.40 and mom_5m <= +0.0050:
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price

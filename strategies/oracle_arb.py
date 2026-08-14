@@ -45,19 +45,19 @@ log = logging.getLogger("strat.oracle_arb")
 # ── Parameters ────────────────────────────────────────────────────────────────
 
 # Only activate in the final N seconds before market closing.
-# Extended from 60s to 120s: gives the bot more time to catch the guaranteed-win window.
-# At 120s out, if Binance is clearly 0.2%+ past the threshold, that outcome is
-# virtually certain and the AMM is still stale \u2014 that's free money.
-WINDOW_SECS = 240
+# 120s: at 2 minutes out, if Binance is clearly 0.3%+ past the threshold,
+# that outcome is virtually certain given remaining price volatility.
+WINDOW_SECS = 120
 
-# Minimum certainty to fire. 0.90 = Binance must be clearly on one side.
+# Minimum certainty to fire. Certainty formula now returns 0.92-0.99.
 MIN_CERTAINTY = 0.90
 
-# Minimum distance from threshold (as % of threshold) to qualify.
-# 0.001 means price must be 0.10% away from threshold to capture early latency edges.
-MIN_DISTANCE_PCT = 0.001
+# Minimum distance from threshold as % of threshold.
+# 0.003 = 0.30% away. BTC at $63,000 threshold needs to be at $62,810 or $63,189.
+# This ensures a 0.3% adverse move cannot flip the outcome in 120s.
+MIN_DISTANCE_PCT = 0.003
 
-# Entry price ceiling: at 0.97, buying a 99% certain outcome pays out a clean 3-5% return in 60s.
+# Entry price ceiling: at 0.97, buying a 99% certain outcome pays 3-5% in 60s.
 MAX_ENTRY_PRICE = 0.97
 
 # Cooldown after an oracle arb on a specific market — prevent double-entry.
@@ -110,7 +110,14 @@ class OracleArbStrategy(BaseStrategy):
         time_factor = max(0.0, 1.0 - (secs_to_close / WINDOW_SECS))  # 0→1 as time runs out
 
         distance_factor = min(1.0, abs(distance_pct) / 0.01)  # 1.0% away = full certainty
-        base_certainty = 0.90 + 0.09 * distance_factor * time_factor
+
+        # Need both distance AND time to agree before we're confident.
+        # With 120s window: at 60s remaining, time_factor=0.5. At 30s, time_factor=0.75.
+        combined = distance_factor * time_factor
+        if combined < 0.15:  # too uncertain: either too far from close or too close to threshold
+            return 0.0
+
+        base_certainty = 0.90 + 0.09 * combined
 
         return min(0.99, base_certainty)
 
@@ -194,10 +201,9 @@ class OracleArbStrategy(BaseStrategy):
             certainty   = certainty,
             win_prob    = certainty,
             market_price= entry_price,
-            # Dynamic sizing: scale from 10% at 95% certainty up to 30% at 99%+.
-            # ORACLE_ARB is the highest-quality signal the bot generates — the outcome
-            # is virtually guaranteed. This is where we make \u20a6200k/month.
-            size_pct    = min(0.30, 0.10 + (certainty - 0.95) * 5.0),
+            # Dynamic sizing: scale from 5% at 90% certainty up to 25% at 99%+.
+            # Floored at 5% — formula can go negative below 0.95 certainty.
+            size_pct    = max(0.05, min(0.25, 0.05 + (certainty - 0.90) * 2.5)),
             reason      = (
                 f"ORACLE_ARB {outcome} | oracle={oracle_price:.2f} "
                 f"vs threshold={threshold:.2f} dist={distance_pct:+.3%} "
