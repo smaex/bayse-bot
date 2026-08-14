@@ -628,10 +628,14 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
     no_p  = market["no_price"]
 
     # ── Extreme-price guard ───────────────────────────────────────────────
-    if min(yes_p, no_p) < 0.08:
+    # Only block genuinely broken/zero markets (< 2 cents). The old 0.08 floor
+    # was killing arb on near-resolved markets like YES=0.95 NO=0.03 — the most
+    # profitable arbs. The leg-size check below (amount < MIN_TRADE_NGN) handles
+    # any cases where a cheap side makes the trade uneconomical.
+    if min(yes_p, no_p) < 0.02:
         log.info(
-            f"[{chat_id}] ARB SKIP {sig.asset} — extreme-price market "
-            f"(yes={yes_p:.3f} no={no_p:.3f}), unaffordable with current balance"
+            f"[{chat_id}] ARB SKIP {sig.asset} — near-zero price market "
+            f"(yes={yes_p:.3f} no={no_p:.3f}), likely broken/settled market"
         )
         return
 
