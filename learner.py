@@ -307,6 +307,15 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
     learned["certainty_multipliers"] = cmults
     learned["trade_counts"]         = counts
 
+    # Pantry raid: if no trades in the past 24h, lower mode_floor by 0.03
+    # to allow more signals through during droughts. Checked via trade_counts total.
+    total_recent = sum(counts.values())
+    if total_recent == 0:
+        learned["pantry_raid_active"] = True
+        changes.append("🍞 Pantry raid active — lowering certainty floor (no trades in 24h)")
+    else:
+        learned["pantry_raid_active"] = False
+
     s["learned"] = learned
     await asyncio.to_thread(database.update_settings, chat_id, s)
 

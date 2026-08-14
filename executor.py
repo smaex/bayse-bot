@@ -16,6 +16,7 @@ import re
 import time
 from typing import Optional
 
+import config
 import database
 import feeds
 import scanner
@@ -133,6 +134,8 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     learned   = settings.get("learned", {})
     mult      = learned.get("size_multipliers", {}).get(sig.strategy, 1.0)
     user_risk = min(settings.get("risk_pct", 2.0), 5.0) / 100.0
+    declared  = None   # set inside engine-detection block; init here so exposure check never NameErrors
+    engine    = "AMM"  # safe default
 
     if risk.is_in_strict_mode() and sig.certainty < 0.70:
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — strict mode (near daily target), certainty {sig.certainty:.0%} < 70%")

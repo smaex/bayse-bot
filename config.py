@@ -65,11 +65,11 @@ CURRENCY = "NGN"
 
 # ── Sniping ───────────────────────────────────────────────────────────────────
 SNIPE_ENTRY_WINDOWS = {
-    "5min":  300,
-    "15min": 900,
-    "1h":    1800,
-    "6h":    7200,
-    "1d":    21600,
+    "5min":  600,    # was 300 — evaluate in final 10 mins of 5min market (not just 5)
+    "15min": 1800,   # was 900 — evaluate in final 30 mins of 15min market (not just 15)
+    "1h":    3600,   # was 1800 — evaluate in final 60 mins
+    "6h":    10800,  # was 7200
+    "1d":    43200,  # was 21600
 }
 # DATA-DRIVEN TUNING (from 170 live trades forensic analysis, 2026-07-14):
 #

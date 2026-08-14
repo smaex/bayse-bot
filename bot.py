@@ -579,6 +579,7 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
             spot_price = feeds.spot.get(market["asset"])
             if not spot_price:
                 skipped_no_spot += 1
+                continue  # Don't evaluate without a spot price — strategies will get inconsistent data
             sigs = await strategies.evaluate_all(
                 market, learned, strategy.global_state, spot_price=spot_price
             )
@@ -595,7 +596,7 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
         else:
             # Always log market evaluation — critical for debugging
             spot_summary = {a: round(feeds.spot[a], 2) for a in user_assets if feeds.spot.get(a)}
-            strats_eval  = learned.get("strategies", user_strats)
+            strats_eval  = learned.get("strategies", [])  # BUG FIX: user_strats is not in scope here
             log.info(
                 f"[{chat_id}] 0 signals | total={len(active_markets)} markets | evaluated={evaluated} | "
                 f"strats={strats_eval} | "
