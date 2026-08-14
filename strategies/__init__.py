@@ -60,6 +60,9 @@ async def evaluate_all(
             continue
         try:
             sig = await strat.evaluate(market, learned, state, spot_price=spot_price)
+            log.debug(
+                f"eval {name} on {asset}/{market.get('timeframe','?')} → {'SIGNAL' if sig else 'none'}"
+            )
             if not sig:
                 continue
 

@@ -237,9 +237,9 @@ class SnipeStrategy(BaseStrategy):
         market_price = market["yes_price"] if direction == "YES" else market["no_price"]
         fee_rate = market.get("fee_rate", 0.02)
         margin   = {
-            "safe": 0.08, "balanced": 0.03, "aggressive": 0.02,
-            "full_send": 0.01, "custom": 0.03,
-        }.get(mode, 0.03)
+            "safe": 0.05, "balanced": 0.01, "aggressive": 0.00,
+            "full_send": 0.00, "custom": 0.01,
+        }.get(mode, 0.01)
         ev_ceil = max_ev_price(w_est, market_price, fee_rate, min_margin=margin)
 
         if market_price >= ev_ceil:

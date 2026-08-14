@@ -218,12 +218,12 @@ class MakerStrategy(BaseStrategy):
         # Select the side (YES or NO) with the strongest edge, guarded by momentum & min 45% win probability floor
         # NOTE: old 0.52 floor blocked ALL no-side trades since fv_yes+fv_no≈1.0
         chosen_side = None
-        if edge_yes >= edge_no and edge_yes >= 0.010 and fv_yes >= 0.45 and mom_5m >= -0.0010:
+        if edge_yes >= edge_no and edge_yes >= 0.010 and fv_yes >= 0.45 and mom_5m >= -0.0050:
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
-        elif edge_no > edge_yes and edge_no >= 0.010 and fv_no >= 0.45 and mom_5m <= +0.0010:
+        elif edge_no > edge_yes and edge_no >= 0.010 and fv_no >= 0.45 and mom_5m <= +0.0050:
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price
@@ -237,8 +237,8 @@ class MakerStrategy(BaseStrategy):
 
         # Quote a bid at min(target_fv - HALF_SPREAD, market_bid + 0.01)
         our_bid = round(min(target_fv - HALF_SPREAD, market_bid + 0.01), 3)
-        # Entry price floor guard: don't place bids below 0.42 (underdog prices) or above 0.85
-        if our_bid < 0.42 or our_bid > 0.85:
+        # Entry price floor guard: don't place bids below 0.35 or above 0.85
+        if our_bid < 0.35 or our_bid > 0.85:
             log.info(f"MAKER SKIP {asset} — bid price out of bounds ({our_bid:.3f})")
             return None
 
