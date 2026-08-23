@@ -226,32 +226,29 @@ async def _user_loop(chat_id: str):
                         # check (~30s later) — treat as real and act on it.
                         if delta > 0:
                             log.info(f"[{chat_id}] DEPOSIT detected +₦{delta:,.0f} | new balance ₦{equity:,.0f}")
-                            day = _user_daily.get(chat_id, {})
-                            day["start_balance"] = equity
-                            settings["daily_state"] = day
-                            await asyncio.to_thread(database.update_settings, chat_id, settings)
+                            # Update peak_balance so drawdown tracking stays accurate,
+                            # but do NOT update start_balance — daily profit target is
+                            # locked to the balance at the START of the day, not moving
+                            # targets every time the user deposits or wins.
                             risk.peak_balance = equity
-                            _user_daily[chat_id] = day
+                            _last_balance[chat_id] = equity
                             if _tg_app:
                                 await telegram_bot.notify_deposit_detected(_tg_app, chat_id, delta, "NGN")
                         else:
                             log.info(f"[{chat_id}] WITHDRAWAL detected ₦{delta:,.0f} | new balance ₦{equity:,.0f}")
-                            day = _user_daily.get(chat_id, {})
-                            day["start_balance"] = equity
-                            settings["daily_state"] = day
-                            await asyncio.to_thread(database.update_settings, chat_id, settings)
-                            # Adjust peak_balance to prevent false drawdown pauses on withdrawals
+                            # Adjust peak_balance to prevent false drawdown pauses on withdrawals.
+                            # Again, do NOT touch start_balance — daily target stays fixed.
                             risk.peak_balance = max(0.0, risk.peak_balance + delta)
-                            _user_daily[chat_id] = day
+                            _last_balance[chat_id] = equity
                             if _tg_app:
                                 await telegram_bot.send_message(
                                     _tg_app, chat_id,
                                     f"💸 *Withdrawal detected* — ₦{abs(delta):,.0f} removed\n"
-                                    f"New balance: ₦{equity:,.2f}",
+                                    f"New balance: ₦{equity:,.2f}\n"
+                                    f"_(Daily profit target unchanged — based on start-of-day balance)_",
                                     parse_mode="Markdown",
                                 )
                         _pending_balance_event.pop(chat_id, None)
-                        _last_balance[chat_id] = equity
                     else:
                         # First time seeing this deviation — don't act yet, just
                         # remember it. _last_balance is deliberately NOT updated
