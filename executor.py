@@ -399,11 +399,11 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     elif is_oracle_arb:
         order_type    = "MARKET"
         time_in_force = "FAK"
-        limit_price   = round(min(sig.market_price * 1.05, max_valid), 3)  # 5% slippage: urgency
+        limit_price   = round(min(sig.market_price * 1.05, 0.85, max_valid), 3)  # Hard cap at 0.85
     else:
         order_type    = "MARKET"
         time_in_force = "FAK"
-        limit_price   = round(min(sig.market_price * (1.0 + slippage), max_valid), 3)
+        limit_price   = round(min(sig.market_price * (1.0 + slippage), 0.75, max_valid), 3)  # Hard cap at 0.75
 
     log.info(
         f"[{chat_id}] PLACING {sig.strategy} {sig.asset} {sig.timeframe} "
