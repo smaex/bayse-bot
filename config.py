@@ -92,7 +92,9 @@ SNIPE_ENTRY_WINDOWS = {
 # SNIPE_MIN_CERTAINTY=0.60 → requires win_prob >= 0.77 (77% WR) — almost never seen.
 #
 SNIPE_MIN_CERTAINTY    = 0.12   # 55% win-rate floor — the 5% edge gate is the real protector
-SNIPE_MAX_MARKET_PRICE = 0.88   # expanded from 0.75 — allows high-probability entries
+SNIPE_MAX_MARKET_PRICE = 0.65   # DATA-DRIVEN: cap at 0.65 so positions have room to appreciate and exit profitably
+                                  # Audit Aug 13-23: entries >= 0.80 had -₦314 net loss despite 57% win rate
+                                  # (fee drag: buy at 0.85 → only +₦7 net per win, -₦100 per loss)
 SNIPE_MIN_ENTRY_PRICE  = 0.15   # lowered from 0.45 — blocks sub-0.15 long-shots while unlocking normal trades
 SNIPE_MIN_DISTANCE_PCT = 0.00010  # 0.010% minimum distance — allows high-probability entries near threshold
 
@@ -128,7 +130,14 @@ FEE_FLOOR = 0.5
 
 # ── Soft Stop-Loss / Exit Strategy ───────────────────────────────────────────
 EXIT_EV_THRESHOLD = -0.15          # Exit if EV drops below -15% (thesis wrong)
-MIN_EXIT_TIME_REMAINING = 90       # Don't try to exit in the final 90 seconds due to settlement risk
+MIN_EXIT_TIME_REMAINING = 45       # Allow exits down to 45s remaining (was 90s)
+                                   # Audit showed profitable exits happen in 60-90s window before resolution
+
+# Take-profit exit: if a position gains > 35% and < 300s remain, lock in the gain.
+# This is how MAKER exits generated PROFITS (not just cut losses):
+#   Entry at 0.35, price rises to 0.72 → exit at 0.72 locks +₦106 instead of gambling on resolution.
+TAKE_PROFIT_GAIN_PCT      = 0.35   # 35% gain from entry_price triggers profit lock
+TAKE_PROFIT_MIN_SECS_REMAINING = 300  # Only lock profit when < 5 mins remain (trend is confirming)
 
 
 # ── Risk ─────────────────────────────────────────────────────────────────────

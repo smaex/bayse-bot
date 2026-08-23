@@ -341,9 +341,14 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                 log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — EV {ev:+.1%} < {target_margin:.0%}")
                 return
 
-        # Ceiling must match SNIPE_MAX_MARKET_PRICE (0.90)
-        if quote_price > 0.90:
-            log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — price {quote_price:.3f} > 0.90 ceiling")
+        # ── Global entry price ceiling ───────────────────────────────────────
+        # DATA-DRIVEN (Audit Aug 13-23 2026): entries >= 0.80 → -₦314 net loss at 57% win rate.
+        # Buying at 0.85 means: +₦7 net on a WIN (after fees), -₦100 on a LOSS.
+        # You need a 93%+ win rate just to break even. That never happens.
+        # Hard cap at 0.75 — SNIPE_MAX_MARKET_PRICE is now 0.65, so this is a
+        # final backstop that catches any unexpected rounding or overrides.
+        if quote_price > 0.75:
+            log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — price {quote_price:.3f} > 0.75 ceiling (fee drag kills EV above 0.75)")
             return
 
     # ── Shared exposure check ──────────────────────────────────────────────

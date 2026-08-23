@@ -27,7 +27,8 @@ import feeds_direct
 from risk import RiskManager
 from client import BayseClient
 from config import (TELEGRAM_TOKEN, CURRENCY, SCAN_INTERVAL_SECONDS,
-                    SYSTEMIC_RISK_HALT_MINS, EXIT_EV_THRESHOLD, MIN_EXIT_TIME_REMAINING)
+                    SYSTEMIC_RISK_HALT_MINS, EXIT_EV_THRESHOLD, MIN_EXIT_TIME_REMAINING,
+                    TAKE_PROFIT_GAIN_PCT, TAKE_PROFIT_MIN_SECS_REMAINING)
 from strategies.utils import win_probability, realized_vol_hourly
 
 logging.basicConfig(
@@ -154,13 +155,19 @@ _user_tasks: dict[str, asyncio.Task] = {}
 
 
 async def _user_loop(chat_id: str):
-    """30-second housekeeping loop per user."""
+    """5-second housekeeping loop per user.
+
+    Fast 5s cycle (was 30s) is needed for the take-profit exit logic:
+    if a position gains >35% in the final 5 minutes, we need to catch
+    that window before the candle closes or a reversal wipes the gain.
+    The evaluation itself is cheap (no network calls) so 5s is safe.
+    """
     strategy.set_user_context(chat_id)
     iter_count   = 0
     last_log_min = -1  # track last minute we logged status
 
     while True:
-        await asyncio.sleep(30)
+        await asyncio.sleep(5)
         iter_count += 1
         user = await asyncio.to_thread(database.get_user, chat_id)
         if not user or not user.get("is_active"):
@@ -351,10 +358,11 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
     model's updated win probability. If EV drops below EXIT_EV_THRESHOLD
     (default -15%), the thesis is mathematically wrong — exit the position.
 
-    This runs every 30s inside _user_loop. It does NOT use a hard price-based
+    This runs every 5s inside _user_loop (was 30s). It does NOT use a hard price-based
     stop-loss (that's suboptimal for binary options that settle at 0 or 1).
     Instead, it compares the model's estimated win probability against the
     current market price to determine if holding is still +EV.
+    Also fires a take-profit exit if the position gained >35% and <5 mins remain.
     """
     if not risk.open_positions:
         return
@@ -369,7 +377,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             continue
 
         secs = market.get("secs_to_close", 0)
-        # Don't try to exit in the final 90 seconds — settlement/oracle resolution
+        # Don't try to exit in the final 45 seconds — settlement/oracle resolution
         # risk makes exit prices unreliable and the market is about to close anyway
         if secs < MIN_EXIT_TIME_REMAINING:
             continue
@@ -400,6 +408,28 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         if current_price <= 0.01:
             continue  # Price too low to sell meaningfully
 
+        # ── Take-Profit exit: lock in gains before a final-seconds reversal ─────
+        # Mechanism: if position gained > TAKE_PROFIT_GAIN_PCT (35%) AND there are
+        # < TAKE_PROFIT_MIN_SECS_REMAINING (300s = 5 mins) remaining, sell now.
+        # This is exactly how MAKER generates profitable exits — entry at 0.35,
+        # market moves to 0.72 = +106% gain → exit locks ₦106 profit instead of
+        # gambling it all on the last 5 minutes of a 15-min candle.
+        entry_price = pos.get("entry_price", 0.0)
+        if entry_price > 0 and secs < TAKE_PROFIT_MIN_SECS_REMAINING:
+            gain_pct = (current_price - entry_price) / entry_price
+            if gain_pct >= TAKE_PROFIT_GAIN_PCT:
+                positions_to_exit.append({
+                    "market_id": market_id,
+                    "pos": pos,
+                    "market": market,
+                    "w_est": w_est,
+                    "current_price": current_price,
+                    "ev_hold": gain_pct,   # re-use field; logged below as gain
+                    "exit_reason": "TAKE_PROFIT",
+                })
+                continue  # don't also check EV stop-loss for this position
+
+        # ── EV Stop-Loss exit: model says thesis is invalidated ───────────────
         # EV = (expected payout) / (current price to exit) - 1
         # For holding: we win 1.0 with probability w_est, lose with (1 - w_est)
         # But we can sell at current_price now. So EV of continuing to hold:
@@ -413,6 +443,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 "w_est": w_est,
                 "current_price": current_price,
                 "ev_hold": ev_hold,
+                "exit_reason": "STOP_LOSS",
             })
 
     # Execute exits
@@ -423,6 +454,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         w_est = exit_info["w_est"]
         current_price = exit_info["current_price"]
         ev_hold = exit_info["ev_hold"]
+        exit_reason = exit_info.get("exit_reason", "STOP_LOSS")
 
         outcome_id = pos.get("outcome_id", "")
         event_id = pos.get("event_id", "")
@@ -436,12 +468,19 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         shares_to_sell = amount_ngn / (entry_price * 100.0) if CURRENCY == "NGN" else amount_ngn / entry_price
         sell_amount = round(shares_to_sell, 4)
 
-        log.info(
-            f"[{chat_id}] EXIT SIGNAL | {pos.get('strategy', '?')} {pos.get('asset', '?')} "
-            f"{pos.get('outcome', '?')} | w_est={w_est:.1%} price={current_price:.3f} "
-            f"EV={ev_hold:+.1%} < {EXIT_EV_THRESHOLD:.0%} | "
-            f"entry={entry_price:.3f} → now={current_price:.3f}"
-        )
+        if exit_reason == "TAKE_PROFIT":
+            log.info(
+                f"[{chat_id}] TAKE-PROFIT SIGNAL | {pos.get('strategy', '?')} {pos.get('asset', '?')} "
+                f"{pos.get('outcome', '?')} | entry={entry_price:.3f} now={current_price:.3f} "
+                f"gain={ev_hold:+.1%} | locking profit with {market.get('secs_to_close', 0):.0f}s remaining"
+            )
+        else:
+            log.info(
+                f"[{chat_id}] EXIT SIGNAL | {pos.get('strategy', '?')} {pos.get('asset', '?')} "
+                f"{pos.get('outcome', '?')} | w_est={w_est:.1%} price={current_price:.3f} "
+                f"EV={ev_hold:+.1%} < {EXIT_EV_THRESHOLD:.0%} | "
+                f"entry={entry_price:.3f} → now={current_price:.3f}"
+            )
 
         try:
             resp = await client.place_order(
@@ -458,7 +497,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
 
             log.info(
                 f"[{chat_id}] EXIT FILLED | {pos.get('strategy', '?')} {pos.get('asset', '?')} "
-                f"@ {sell_price:.4f} | PnL ≈ ₦{pnl:+,.0f} | order={order_id}"
+                f"@ {sell_price:.4f} | PnL ≈ ₦{pnl:+,.0f} | reason={exit_reason} | order={order_id}"
             )
 
             # Update risk manager
@@ -473,19 +512,31 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 except Exception as db_err:
                     log.error(f"[{chat_id}] EXIT DB resolve failed: {db_err}")
 
-            # Notify user
+            # Notify user — differentiate take-profit from stop-loss
             if _tg_app:
                 emoji = "🟢" if pnl >= 0 else "🔴"
                 try:
+                    if exit_reason == "TAKE_PROFIT":
+                        gain_pct = ev_hold  # stored gain_pct in ev_hold field for TAKE_PROFIT
+                        tg_msg = (
+                            f"{emoji} *Take-Profit Exit* 💰\n"
+                            f"Strategy: {pos.get('strategy', '?')}\n"
+                            f"Asset: {pos.get('asset', '?')} {pos.get('outcome', '')}\n"
+                            f"Entry: {entry_price:.3f} → Exit: {sell_price:.3f}\n"
+                            f"Gain: {gain_pct:+.1%} locked in before reversal risk\n"
+                            f"PnL: ₦{pnl:+,.0f}"
+                        )
+                    else:
+                        tg_msg = (
+                            f"{emoji} *Position Exited (Stop-Loss)*\n"
+                            f"Strategy: {pos.get('strategy', '?')}\n"
+                            f"Asset: {pos.get('asset', '?')} {pos.get('outcome', '')}\n"
+                            f"Entry: {entry_price:.3f} → Exit: {sell_price:.3f}\n"
+                            f"PnL: ₦{pnl:+,.0f}\n"
+                            f"Reason: Model EV dropped to {ev_hold:+.0%} (thesis invalidated)"
+                        )
                     await telegram_bot.send_message(
-                        _tg_app, chat_id,
-                        f"{emoji} *Position Exited (Stop-Loss)*\n"
-                        f"Strategy: {pos.get('strategy', '?')}\n"
-                        f"Asset: {pos.get('asset', '?')} {pos.get('outcome', '')}\n"
-                        f"Entry: {entry_price:.3f} → Exit: {sell_price:.3f}\n"
-                        f"PnL: ₦{pnl:+,.0f}\n"
-                        f"Reason: Model EV dropped to {ev_hold:+.0%} (thesis invalidated)",
-                        parse_mode="Markdown",
+                        _tg_app, chat_id, tg_msg, parse_mode="Markdown",
                     )
                 except Exception:
                     pass
