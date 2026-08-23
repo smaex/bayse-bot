@@ -215,16 +215,39 @@ class MakerStrategy(BaseStrategy):
         edge_yes = fv_yes - yes_bid_price if yes_bid_price > 0 else 0.0
         edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
 
+        # ── Early-Candle Noise Filter ──────────────────────────────────────────
+        # DATA-DRIVEN (Audit Aug 13-23): minute-0 entries (secs_to_close > 800s) where
+        # distance from threshold was < 0.015% are pure coin-flips — the market hasn't
+        # had time to develop directional momentum and the AMM spread hasn't compressed.
+        # Skip these early entries unless price is meaningfully away from the threshold.
+        if secs_to_close > 800:
+            spot_local = feeds.spot.get(asset, 0.0) or feeds_direct.get_direct_price(asset)[0]
+            threshold_local = market.get("threshold", 0.0)
+            if spot_local and threshold_local:
+                dist_from_thresh = abs(spot_local - threshold_local) / threshold_local
+                if dist_from_thresh < 0.00015:  # 0.015% minimum distance
+                    log.info(
+                        f"MAKER SKIP {asset} — early candle noise filter "
+                        f"(secs={secs_to_close:.0f} > 800, dist={dist_from_thresh:.4%} < 0.015%)"
+                    )
+                    return None
+
+        # ── ETH Extra Edge Cushion ─────────────────────────────────────────────
+        # DATA-DRIVEN (Audit Aug 13-23): MAKER ETH had 37.9% win rate, -₦402 net loss.
+        # BTC: 47.6% WR, +₦320. SOL: 50.0% WR, +₦701.
+        # ETH has higher AMM noise and lower book depth — require extra 0.005 edge before trading.
+        eth_edge_cushion = 0.005 if asset == "ETH" else 0.0
+
         # Select the side (YES or NO) with the strongest edge, guarded by momentum & min 40% win probability floor
         # NOTE: 0.40 floor (was 0.45) allows trades where FV is 40-49% but market prices it at 30-35%.
         # At 40% FV the trade still has positive EV if market prices it even lower.
         chosen_side = None
-        if edge_yes >= edge_no and edge_yes >= 0.007 and fv_yes >= 0.40 and mom_5m >= -0.0050:
+        if edge_yes >= edge_no and edge_yes >= (0.007 + eth_edge_cushion) and fv_yes >= 0.40 and mom_5m >= -0.0050:
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
-        elif edge_no > edge_yes and edge_no >= 0.007 and fv_no >= 0.40 and mom_5m <= +0.0050:
+        elif edge_no > edge_yes and edge_no >= (0.007 + eth_edge_cushion) and fv_no >= 0.40 and mom_5m <= +0.0050:
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price

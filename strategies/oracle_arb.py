@@ -57,8 +57,11 @@ MIN_CERTAINTY = 0.90
 # This ensures a 0.3% adverse move cannot flip the outcome in 120s.
 MIN_DISTANCE_PCT = 0.003
 
-# Entry price ceiling: at 0.97, buying a 99% certain outcome pays 3-5% in 60s.
-MAX_ENTRY_PRICE = 0.97
+# Entry price ceiling: max 0.85. At 0.97 the Bayse taker fee exceeds the gross profit margin.
+# Audit Aug 13-23: both ORACLE_ARB trades WON (100% accuracy) but produced net LOSSES of -₦5.90.
+# At 0.97 entry: win pays +₦2.94 gross, fee is ~₦8 → net -₦5. Never trade where fee > gross payout.
+# At 0.85 entry: win pays +₦15 gross, fee is ~₦3.75 → net +₦11.25 per ₦100. Profitable.
+MAX_ENTRY_PRICE = 0.85
 
 # Cooldown after an oracle arb on a specific market — prevent double-entry.
 _oracle_fired: dict[str, float] = {}
