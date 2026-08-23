@@ -35,6 +35,7 @@ from typing import Optional
 import feeds_direct
 import feeds
 from strategies.base import TradeSignal, BaseStrategy
+from strategies.utils import gbm_win_probability, realized_vol_hourly
 
 log = logging.getLogger("strat.maker")
 
@@ -82,15 +83,11 @@ class MakerStrategy(BaseStrategy):
         super().__init__("MAKER")
         self.open_orders: dict[str, dict] = {}   # market_id → order info
 
-    def _fair_value(self, asset: str, market: dict) -> Optional[float]:
+    def _fair_value(self, asset: str, market: dict, state=None) -> Optional[float]:
         """
         Fair Value of YES = P(spot at close >= threshold).
 
-        Uses a simplified diffusion model:
-          - annualized vol from GARCH state
-          - time to close in years
-          - log-normal probability
-        Blended with a momentum tilt from Binance oracle.
+        Uses rigorous GBM model with Itô correction and asset-specific Kalman velocity drift.
         """
         spot, t = feeds_direct.get_direct_price(asset)
         if not spot or (time.time() - t) > 10:
@@ -104,40 +101,28 @@ class MakerStrategy(BaseStrategy):
         if not threshold or secs_to_close <= 0:
             return None
 
-        # Annualised vol from GARCH (stored in global_state)
-        try:
-            from strategy import global_state
-            garch_var = global_state.garch_state.get(asset, {}).get("var", None)
-            if garch_var and garch_var > 0:
-                hourly_var  = garch_var * 2000        # scale from tick to hourly
-                annual_vol  = math.sqrt(max(hourly_var, 1e-10) * 8760)
-            else:
-                from config import ASSET_HOURLY_VOL
-                annual_vol  = ASSET_HOURLY_VOL.get(asset, 0.022) * math.sqrt(8760)
-        except Exception:
-            annual_vol = 1.0  # fallback 100% annualised vol for crypto
+        # Realized volatility (GARCH-blended)
+        rv = realized_vol_hourly(asset, state) if state else 0.022
 
-        t_years = secs_to_close / (365.25 * 24 * 3600)
-        if t_years <= 0:
-            return None
+        # Hourly drift from asset's Kalman filter velocity
+        kalman = state.kalman_state.get(asset) if (state and hasattr(state, "kalman_state")) else None
+        if kalman:
+            k_price, k_velocity = kalman["x"]
+            hourly_drift = (k_velocity / k_price) * 3600.0 if k_price > 0 else 0.0
+        else:
+            hourly_drift = 0.0
 
-        # Black-Scholes binary option probability (no drift assumed for short windows)
-        d2 = (math.log(spot / threshold)) / (annual_vol * math.sqrt(t_years))
+        # Exact GBM win probability
+        fv = gbm_win_probability(
+            spot=spot,
+            threshold=threshold,
+            secs=secs_to_close,
+            hourly_vol=rv,
+            hourly_drift=hourly_drift,
+            horizon_cap=180.0,
+        )
 
-        # Normal CDF approximation
-        def _ncdf(x: float) -> float:
-            t_ = 1.0 / (1.0 + 0.2316419 * abs(x))
-            poly = t_ * (0.319381530 + t_ * (-0.356563782 + t_ * (1.781477937 + t_ * (-1.821255978 + t_ * 1.330274429))))
-            base = 1.0 - (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * x * x) * poly
-            return base if x >= 0 else 1.0 - base
-
-        fv = _ncdf(d2)
-
-        # Momentum tilt: if Binance is trending hard, skew FV
-        latency_bias = feeds_direct.get_latency_bias(asset, spot)
-        fv = max(0.03, min(0.97, fv + latency_bias * 0.1))
-
-        return fv
+        return max(0.03, min(0.97, fv))
 
     def _realized_vol(self, asset: str) -> float:
         """Estimate recent realized vol from price_history."""
@@ -171,8 +156,6 @@ class MakerStrategy(BaseStrategy):
         engine        = market.get("engine", "AMM")
 
         # Log engine type but allow all market types.
-        # On AMM markets, MAKER acts as a directional limit-order strategy.
-        # executor.py already routes LIMIT vs MARKET correctly.
         if engine == "CLOB":
             log.info(f"MAKER {asset} — CLOB market, will place LIMIT order")
 
@@ -187,14 +170,33 @@ class MakerStrategy(BaseStrategy):
             log.info(f"MAKER SKIP {asset} — high vol {rvol:.4f}")
             return None
 
-        # Calculate Fair Value.
-        fv_yes = self._fair_value(asset, market)
+        # ── Price data ────────────────────────────────────────────────────────
+        spot, t = feeds_direct.get_direct_price(asset)
+        if not spot or (time.time() - t) > 10:
+            spot = feeds.spot.get(asset, 0.0)
+        threshold = market.get("threshold", 0.0)
+        if not spot or not threshold:
+            return None
+
+        dist_pct = (spot - threshold) / threshold
+
+        # ── Early-Candle Warm-up Filter ────────────────────────────────────────
+        # In the first 2.5 minutes (secs > 750), require clear distance (>= 0.05%)
+        # so we do not enter on opening tick noise before the candle trend forms.
+        if secs_to_close > 750 and abs(dist_pct) < 0.00050:
+            log.info(
+                f"MAKER SKIP {asset} — early candle warm-up "
+                f"(secs={secs_to_close:.0f} > 750, dist={dist_pct:+.4%} < 0.05%)"
+            )
+            return None
+
+        # Calculate Drift-Aware Fair Value
+        fv_yes = self._fair_value(asset, market, state=state)
         if fv_yes is None:
             return None
         fv_no = 1.0 - fv_yes
 
-        # ── 5-Minute Price Momentum Guard ──────────────────────────────────────
-        # Calculate 5-minute price delta to prevent adverse selection into trends.
+        # ── 5-Minute Price Momentum ───────────────────────────────────────────
         mom_5m = 0.0
         try:
             hist = getattr(state, "price_history", {}).get(asset, []) if state else []
@@ -204,8 +206,8 @@ class MakerStrategy(BaseStrategy):
             if hist and len(hist) >= 5:
                 now_t = time.time()
                 old_prices = [p for t, p in hist if 240 <= (now_t - t) <= 360]
-                if old_prices and spot_price:
-                    mom_5m = (spot_price - old_prices[-1]) / old_prices[-1]
+                if old_prices and spot:
+                    mom_5m = (spot - old_prices[-1]) / old_prices[-1]
         except Exception:
             mom_5m = 0.0
 
@@ -215,47 +217,33 @@ class MakerStrategy(BaseStrategy):
         edge_yes = fv_yes - yes_bid_price if yes_bid_price > 0 else 0.0
         edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
 
-        # ── Early-Candle Noise Filter ──────────────────────────────────────────
-        # DATA-DRIVEN (Audit Aug 13-23): minute-0 entries (secs_to_close > 800s) where
-        # distance from threshold was < 0.015% are pure coin-flips — the market hasn't
-        # had time to develop directional momentum and the AMM spread hasn't compressed.
-        # Skip these early entries unless price is meaningfully away from the threshold.
-        if secs_to_close > 800:
-            spot_local = feeds.spot.get(asset, 0.0) or feeds_direct.get_direct_price(asset)[0]
-            threshold_local = market.get("threshold", 0.0)
-            if spot_local and threshold_local:
-                dist_from_thresh = abs(spot_local - threshold_local) / threshold_local
-                if dist_from_thresh < 0.00015:  # 0.015% minimum distance
-                    log.info(
-                        f"MAKER SKIP {asset} — early candle noise filter "
-                        f"(secs={secs_to_close:.0f} > 800, dist={dist_from_thresh:.4%} < 0.015%)"
-                    )
-                    return None
-
         # ── ETH Extra Edge Cushion ─────────────────────────────────────────────
-        # DATA-DRIVEN (Audit Aug 13-23): MAKER ETH had 37.9% win rate, -₦402 net loss.
-        # BTC: 47.6% WR, +₦320. SOL: 50.0% WR, +₦701.
-        # ETH has higher AMM noise and lower book depth — require extra 0.005 edge before trading.
         eth_edge_cushion = 0.005 if asset == "ETH" else 0.0
 
-        # Select the side (YES or NO) with the strongest edge, guarded by momentum & min 40% win probability floor
-        # NOTE: 0.40 floor (was 0.45) allows trades where FV is 40-49% but market prices it at 30-35%.
-        # At 40% FV the trade still has positive EV if market prices it even lower.
+        # ── Trend-Aligned Side Selection ────────────────────────────────────────
+        # Never catch falling knives!
+        # - To buy YES: spot must not be significantly below threshold (dist >= -0.03%),
+        #   momentum must not be dumping (mom_5m >= -0.0008), and fv_yes >= 0.45.
+        # - To buy NO: spot must not be significantly above threshold (dist <= +0.03%),
+        #   momentum must not be pumping (mom_5m <= +0.0008), and fv_no >= 0.45.
         chosen_side = None
-        if edge_yes >= edge_no and edge_yes >= (0.007 + eth_edge_cushion) and fv_yes >= 0.40 and mom_5m >= -0.0050:
+        if (edge_yes >= edge_no and edge_yes >= (0.007 + eth_edge_cushion)
+                and fv_yes >= 0.45 and mom_5m >= -0.0008 and dist_pct >= -0.00030):
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
-        elif edge_no > edge_yes and edge_no >= (0.007 + eth_edge_cushion) and fv_no >= 0.40 and mom_5m <= +0.0050:
+        elif (edge_no > edge_yes and edge_no >= (0.007 + eth_edge_cushion)
+                and fv_no >= 0.45 and mom_5m <= +0.0008 and dist_pct <= +0.00030):
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price
             outcome_id  = market.get("no_id", "")
         else:
             log.info(
-                f"MAKER SKIP {asset} — no edge/win_prob block "
-                f"(fv_yes={fv_yes:.3f}, fv_no={fv_no:.3f}, edge_yes={edge_yes:+.3f}, edge_no={edge_no:+.3f}, mom_5m={mom_5m:+.4f})"
+                f"MAKER SKIP {asset} — trend/edge guard "
+                f"(fv_yes={fv_yes:.3f}, fv_no={fv_no:.3f}, edge_yes={edge_yes:+.3f}, "
+                f"edge_no={edge_no:+.3f}, dist={dist_pct:+.3%}, mom_5m={mom_5m:+.4f})"
             )
             return None
 
@@ -263,14 +251,13 @@ class MakerStrategy(BaseStrategy):
         chosen_edge = edge_yes if chosen_side == "YES" else edge_no
         our_bid = round(min(target_fv - HALF_SPREAD, market_bid + 0.01), 3)
         # Entry price floor guard: don't place bids below 0.28 or above 0.85.
-        # 0.28 allows NO bids on markets where YES has moved to 0.65-0.70.
         if our_bid < 0.28 or our_bid > 0.85:
             log.info(f"MAKER SKIP {asset} — bid price out of bounds ({our_bid:.3f})")
             return None
 
         log.info(
             f"MAKER SIGNAL {asset} | side={chosen_side} fv={target_fv:.3f} our_bid={our_bid:.3f} "
-            f"market_bid={market_bid:.3f} mom_5m={mom_5m:+.4f} secs={secs_to_close:.0f}"
+            f"market_bid={market_bid:.3f} mom_5m={mom_5m:+.4f} dist={dist_pct:+.3%} secs={secs_to_close:.0f}"
         )
 
         return TradeSignal(
