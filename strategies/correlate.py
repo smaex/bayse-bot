@@ -67,22 +67,20 @@ class CorrelateStrategy(BaseStrategy):
         tgt_spot   = spot_price if spot_price is not None else feeds.spot.get(asset)
         if tgt_thresh and tgt_spot and tgt_thresh > 0:
             dist = (tgt_spot - tgt_thresh) / tgt_thresh
-            if direction == "UP"   and dist < -0.01: return None  # deep wrong side (>1% below)
-            if direction == "DOWN" and dist > +0.01: return None  # deep wrong side (>1% above)
+            if direction == "UP"   and dist < -0.0010: return None  # cannot buy UP if asset is >0.10% below threshold
+            if direction == "DOWN" and dist > +0.0010: return None  # cannot buy DOWN if asset is >0.10% above threshold
 
         outcome    = "YES" if direction == "UP" else "NO"
         outcome_id = market["yes_id"] if outcome == "YES" else market["no_id"]
         mkt_price  = market["yes_price"] if outcome == "YES" else market["no_price"]
 
-        # Market data-quality guard — same fix as SNIPE/FRONTRUN. The
-        # existing CORRELATE_MAX_MARKET_PRICE check only catches the high
-        # extreme; a broken/dead-liquidity market priced near zero would
-        # sail through that check and look like a false "great deal".
+        # Market data-quality guard
         price_sum = market.get("yes_price", 0) + market.get("no_price", 0)
         if not (0.90 <= price_sum <= 1.05):
             return None
 
-        if mkt_price > config.CORRELATE_MAX_MARKET_PRICE:
+        # Price bounds: must be in 0.40 - 0.65 range
+        if mkt_price < 0.40 or mkt_price > config.CORRELATE_MAX_MARKET_PRICE:
             return None
 
         regime = regime_score(asset, state)

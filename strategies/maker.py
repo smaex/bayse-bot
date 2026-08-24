@@ -250,8 +250,9 @@ class MakerStrategy(BaseStrategy):
         # Quote a bid at min(target_fv - HALF_SPREAD, market_bid + 0.01)
         chosen_edge = edge_yes if chosen_side == "YES" else edge_no
         our_bid = round(min(target_fv - HALF_SPREAD, market_bid + 0.01), 3)
-        # Entry price floor guard: don't place bids below 0.28 or above 0.85.
-        if our_bid < 0.28 or our_bid > 0.85:
+        # Entry price bounds: don't place bids below 0.28 (underdog) or above 0.65 (asymmetry).
+        # Bidding <= 0.65 ensures every maker fill has at least 35% to 150% upside on resolution!
+        if our_bid < 0.28 or our_bid > 0.65:
             log.info(f"MAKER SKIP {asset} — bid price out of bounds ({our_bid:.3f})")
             return None
 

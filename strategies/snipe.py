@@ -181,27 +181,28 @@ class SnipeStrategy(BaseStrategy):
         edge_yes = w_yes - yes_price
         edge_no  = w_no  - no_price
 
-        # ── Two-Sided Statistical Edge Guard ─────────────────────────────────
-        # Require model win probability to be at least 5% HIGHER than exchange price
-        if edge_yes >= edge_no and edge_yes >= 0.05:
+        # ── High-Probability Directional Edge Selection ────────────────────────
+        # SNIPE is a high-conviction directional strategy — win probability MUST be >= 52%
+        # AND strictly aligned with where the spot price is relative to the threshold!
+        # This permanently prevents the "underdog trap" (buying NO at 0.16 when spot is above threshold).
+        distance_pct = (live_spot - threshold) / threshold
+
+        if w_yes >= 0.52 and edge_yes >= 0.05 and distance_pct >= -0.00020:
             direction = "YES"
             w_est     = w_yes
             market_price_check = yes_price
-        elif edge_no > edge_yes and edge_no >= 0.05:
+        elif w_no >= 0.52 and edge_no >= 0.05 and distance_pct <= +0.00020:
             direction = "NO"
             w_est     = w_no
             market_price_check = no_price
         else:
             log.info(
-                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no 5% statistical edge "
-                f"(w_yes={w_yes:.1%} vs yes_p={yes_price:.3f}, w_no={w_no:.1%} vs no_p={no_price:.3f})"
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no directional edge "
+                f"(w_yes={w_yes:.1%} vs yes_p={yes_price:.3f}, w_no={w_no:.1%} vs no_p={no_price:.3f}, dist={distance_pct:+.3%})"
             )
             return None
 
         composite = probability_to_certainty(w_est)
-
-        # Retain distance_pct for logging and guards.
-        distance_pct = (live_spot - threshold) / threshold
 
         # ── Minimum distance-from-threshold guard (DATA-DRIVEN) ──────────────
         if abs(distance_pct) < config.SNIPE_MIN_DISTANCE_PCT:
@@ -212,11 +213,12 @@ class SnipeStrategy(BaseStrategy):
             return None
 
         # ── Direction-specific entry price floor (DATA-DRIVEN) ──────────────
+        # Entry price must be between SNIPE_MIN_ENTRY_PRICE (0.45) and SNIPE_MAX_MARKET_PRICE (0.65).
+        # Cheap underdog contracts (<0.45) have low win-rates, while expensive contracts (>0.65) have fee drag.
         if market_price_check < config.SNIPE_MIN_ENTRY_PRICE:
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — entry price too cheap "
-                f"({direction} @ {market_price_check:.3f} < {config.SNIPE_MIN_ENTRY_PRICE:.2f} floor) "
-                f"— market almost certainly correctly priced"
+                f"({direction} @ {market_price_check:.3f} < {config.SNIPE_MIN_ENTRY_PRICE:.2f} floor)"
             )
             return None
 

@@ -79,8 +79,8 @@ class FrontrunStrategy(BaseStrategy):
             return None
 
         market_price = market["yes_price"] if outcome == "YES" else market["no_price"]
-        if market_price > 0.95:
-            return None   # move already priced in
+        if market_price < 0.40 or market_price > 0.65:
+            return None   # must be in actionable 0.40 - 0.65 window
 
         # Calculate dynamic win probability based on fresh oracle price
         oracle_dist = (oracle_p - threshold) / threshold
