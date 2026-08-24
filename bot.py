@@ -483,9 +483,8 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         if not outcome_id or not event_id:
             continue
 
-        # Calculate the exact number of shares to sell
-        shares_to_sell = amount_ngn / (entry_price * 100.0) if CURRENCY == "NGN" else amount_ngn / entry_price
-        sell_amount = round(shares_to_sell, 4)
+        # Bayse API expects amount in currency units (NGN), min ₦100.
+        sell_amount = round(amount_ngn, 2) if CURRENCY == "NGN" else round(amount_ngn / entry_price, 4)
 
         if exit_reason == "TAKE_PROFIT":
             log.info(
@@ -512,7 +511,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 event_id=event_id, market_id=market_id,
                 outcome_id=outcome_id, side="SELL",
                 amount=sell_amount, order_type="MARKET",
-                currency=CURRENCY, max_slippage=0.03,
+                currency=CURRENCY, max_slippage=0.15,
             )
             order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
             order_id = order.get("id") or order.get("orderId") or order.get("order_id")
