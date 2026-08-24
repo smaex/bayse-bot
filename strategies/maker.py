@@ -180,13 +180,14 @@ class MakerStrategy(BaseStrategy):
 
         dist_pct = (spot - threshold) / threshold
 
-        # ── Early-Candle Warm-up Filter ────────────────────────────────────────
-        # In the first 2.5 minutes (secs > 750), require clear distance (>= 0.05%)
-        # so we do not enter on opening tick noise before the candle trend forms.
-        if secs_to_close > 750 and abs(dist_pct) < 0.00050:
+        # ── Early-Candle Warm-up Window (Hard 3-Minute Rule) ───────────────────
+        # In the first 3 minutes of a 15-min candle (secs_to_close > 720s), price direction
+        # has not developed and opening spreads are noisy.
+        # Require the candle to be at least 3 minutes old (secs <= 720) before quoting maker orders.
+        if secs_to_close > 720:
             log.info(
-                f"MAKER SKIP {asset} — early candle warm-up "
-                f"(secs={secs_to_close:.0f} > 750, dist={dist_pct:+.4%} < 0.05%)"
+                f"MAKER SKIP {asset} — candle warm-up window "
+                f"(secs={secs_to_close:.0f} > 720, waiting for 3-minute trend formation)"
             )
             return None
 
