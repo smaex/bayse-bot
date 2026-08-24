@@ -191,6 +191,16 @@ class MakerStrategy(BaseStrategy):
             )
             return None
 
+        # ── Minimum Distance from Threshold (0.080% floor) ─────────────────────
+        # Don't place maker orders when the spot price is hugging the strike threshold (< 0.08%).
+        # At 0.02%-0.05% distance, a tiny 1-tick oscillation flips the outcome.
+        if abs(dist_pct) < 0.00080:
+            log.info(
+                f"MAKER SKIP {asset} — too close to threshold "
+                f"(dist={dist_pct:+.4%} < 0.080% min distance)"
+            )
+            return None
+
         # Calculate Drift-Aware Fair Value
         fv_yes = self._fair_value(asset, market, state=state)
         if fv_yes is None:
