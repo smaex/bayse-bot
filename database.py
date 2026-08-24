@@ -395,14 +395,14 @@ def get_unresolved(chat_id: str, older_than_minutes: int = 6) -> list[dict]:
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)).isoformat()
     return _fetch_all("""
         SELECT * FROM trades
-        WHERE chat_id = %s AND won IS NULL
+        WHERE chat_id = %s AND resolved_at IS NULL
           AND created_at < %s::TIMESTAMPTZ
     """, (chat_id, cutoff))
 
 
 def get_all_unresolved(chat_id: str) -> list[dict]:
     return _fetch_all("""
-        SELECT * FROM trades WHERE chat_id = %s AND won IS NULL
+        SELECT * FROM trades WHERE chat_id = %s AND resolved_at IS NULL
         ORDER BY created_at DESC
     """, (chat_id,))
 
