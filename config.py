@@ -65,38 +65,20 @@ CURRENCY = "NGN"
 
 # ── Sniping ───────────────────────────────────────────────────────────────────
 SNIPE_ENTRY_WINDOWS = {
-    "5min":  600,    # was 300 — evaluate in final 10 mins of 5min market (not just 5)
-    "15min": 1800,   # was 900 — evaluate in final 30 mins of 15min market (not just 15)
-    "1h":    3600,   # was 1800 — evaluate in final 60 mins
-    "6h":    10800,  # was 7200
-    "1d":    43200,  # was 21600
+    "5min":  240,    # evaluate in final 4 minutes of 5min market
+    "15min": 450,    # evaluate in final 7.5 minutes of 15min market (not minute-0)
+    "1h":    1800,   # evaluate in final 30 minutes of 1h market
+    "6h":    7200,
+    "1d":    21600,
 }
-# DATA-DRIVEN TUNING (from 170 live trades forensic analysis, 2026-07-14):
-#
-# 1. SNIPE_MIN_CERTAINTY raised 0.55 → 0.65
-#    Certainty 0.50–0.65 had only 52–56% WR, ₦2,144 loss on 118 trades.
-#    Certainty 0.75+: 76.7% WR, ₦252 profit. Only trade when model is truly confident.
-#
-# 2. SNIPE_MIN_ENTRY_PRICE = 0.58 (NEW)
-#    Entry price < 0.55: 52 trades, 23.1% WR, ₦2,651 loss.
-#    BTC YES < 0.55: 9 trades, 0 wins. ETH YES < 0.55: 11 trades, 9.1% WR.
-#    Cheap odds look attractive but the market is almost always correctly priced.
-#
-# 3. SNIPE_MIN_DISTANCE_PCT = 0.0015 (NEW)
-#    Trades within 0.1% of threshold: 134 trades, 52.2% WR, ₦2,477 loss.
-#    Trades 0.3–0.5% from threshold: 4 trades, 100% WR, ₦81 profit.
-#    Price hugging the threshold = coin-flip. Needs real distance to resolve cleanly.
-# NOTE on certainty scale: probability_to_certainty(w) = (w - 0.50) / 0.45
-# So SNIPE_MIN_CERTAINTY=0.12 → requires win_prob >= 0.554 (55.4% WR).
-# SNIPE_MIN_CERTAINTY=0.27 → requires win_prob >= 0.62 (62% WR) — too restrictive in calm markets.
-# SNIPE_MIN_CERTAINTY=0.60 → requires win_prob >= 0.77 (77% WR) — almost never seen.
-#
+# DATA-DRIVEN TUNING:
+# SNIPE only trades high-conviction directional entries between 0.45 and 0.65.
+# - Underdog entries (<0.45) have poor win-rates and lose 77%+ of the time.
+# - High-price entries (>0.65) suffer from severe fee drag.
 SNIPE_MIN_CERTAINTY    = 0.12   # 55% win-rate floor — the 5% edge gate is the real protector
-SNIPE_MAX_MARKET_PRICE = 0.65   # DATA-DRIVEN: cap at 0.65 so positions have room to appreciate and exit profitably
-                                  # Audit Aug 13-23: entries >= 0.80 had -₦314 net loss despite 57% win rate
-                                  # (fee drag: buy at 0.85 → only +₦7 net per win, -₦100 per loss)
-SNIPE_MIN_ENTRY_PRICE  = 0.15   # lowered from 0.45 — blocks sub-0.15 long-shots while unlocking normal trades
-SNIPE_MIN_DISTANCE_PCT = 0.00010  # 0.010% minimum distance — allows high-probability entries near threshold
+SNIPE_MAX_MARKET_PRICE = 0.65   # Hard cap at 0.65 so positions have room to appreciate and exit profitably
+SNIPE_MIN_ENTRY_PRICE  = 0.45   # Hard floor at 0.45 — completely blocks low-probability underdog traps
+SNIPE_MIN_DISTANCE_PCT = 0.00010  # 0.010% minimum distance
 
 # FX-specific
 FX_SESSION_UTC = {

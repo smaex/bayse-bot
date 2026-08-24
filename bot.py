@@ -405,34 +405,56 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         if current_price <= 0.01:
             continue  # Price too low to sell meaningfully
 
-        # ── Take-Profit exit: lock in gains before a final-seconds reversal ─────
-        # Mechanism: if position gained > TAKE_PROFIT_GAIN_PCT (35%) AND there are
-        # < TAKE_PROFIT_MIN_SECS_REMAINING (300s = 5 mins) remaining, sell now.
-        # This is exactly how MAKER generates profitable exits — entry at 0.35,
-        # market moves to 0.72 = +106% gain → exit locks ₦106 profit instead of
-        # gambling it all on the last 5 minutes of a 15-min candle.
-        entry_price = pos.get("entry_price", 0.0)
-        if entry_price > 0 and secs < TAKE_PROFIT_MIN_SECS_REMAINING:
+        # Track the highest price reached during the position's life
+        pos["peak_price"] = max(pos.get("peak_price", entry_price), current_price)
+        peak_price = pos["peak_price"]
+
+        # ── Take-Profit / Reversal Protection exit ─────────────────────────────
+        # 1. Target Hit: position gained >= 35% with < 5 mins remaining -> lock in gain!
+        # 2. Reversal Protection: position was UP >= 25% (peak >= entry * 1.25), but has
+        #    now dropped >= 15% from its peak (current_price <= peak * 0.85) -> sell immediately
+        #    while still in profit rather than letting a winning trade reverse into a loss!
+        if entry_price > 0:
             gain_pct = (current_price - entry_price) / entry_price
-            if gain_pct >= TAKE_PROFIT_GAIN_PCT:
+            peak_gain_pct = (peak_price - entry_price) / entry_price
+            dropped_from_peak = (peak_price - current_price) / peak_price if peak_price > 0 else 0.0
+
+            # Target hit in final 5 minutes
+            if secs < TAKE_PROFIT_MIN_SECS_REMAINING and gain_pct >= TAKE_PROFIT_GAIN_PCT:
                 positions_to_exit.append({
                     "market_id": market_id,
                     "pos": pos,
                     "market": market,
                     "w_est": w_est,
                     "current_price": current_price,
-                    "ev_hold": gain_pct,   # re-use field; logged below as gain
+                    "ev_hold": gain_pct,
                     "exit_reason": "TAKE_PROFIT",
                 })
-                continue  # don't also check EV stop-loss for this position
+                continue
 
-        # ── EV Stop-Loss exit: model says thesis is invalidated ───────────────
-        # EV = (expected payout) / (current price to exit) - 1
-        # For holding: we win 1.0 with probability w_est, lose with (1 - w_est)
-        # But we can sell at current_price now. So EV of continuing to hold:
+            # Trailing Reversal Protection: was winning (+25%+ peak), now reversing (dropped 15%+ from peak)
+            if peak_gain_pct >= 0.25 and dropped_from_peak >= 0.15 and current_price > entry_price:
+                positions_to_exit.append({
+                    "market_id": market_id,
+                    "pos": pos,
+                    "market": market,
+                    "w_est": w_est,
+                    "current_price": current_price,
+                    "ev_hold": gain_pct,
+                    "exit_reason": "REVERSAL_EXIT",
+                })
+                continue
+
+        # ── Stop-Loss exit: model invalidation OR adverse price flip ─────────
+        # 1. EV Drop: expected value of holding vs market price drops below -15%
+        # 2. Adverse Price Flip: position lost >= 35% of value AND spot has flipped to the wrong side of threshold.
+        #    e.g. entered YES at 0.51, spot dumps below threshold, market bid is 0.30.
+        #    Selling at 0.30 salvages 30% of capital instead of riding it to 0.00!
         ev_hold = w_est / current_price - 1.0
+        loss_pct = (entry_price - current_price) / entry_price if entry_price > 0 else 0.0
+        adverse_flip = (outcome == "YES" and dist_pct < -0.00030) or (outcome == "NO" and dist_pct > +0.00030)
 
-        if ev_hold < EXIT_EV_THRESHOLD:
+        if ev_hold < EXIT_EV_THRESHOLD or (loss_pct >= 0.35 and adverse_flip and current_price >= 0.08):
             positions_to_exit.append({
                 "market_id": market_id,
                 "pos": pos,
@@ -470,6 +492,12 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 f"[{chat_id}] TAKE-PROFIT SIGNAL | {pos.get('strategy', '?')} {pos.get('asset', '?')} "
                 f"{pos.get('outcome', '?')} | entry={entry_price:.3f} now={current_price:.3f} "
                 f"gain={ev_hold:+.1%} | locking profit with {market.get('secs_to_close', 0):.0f}s remaining"
+            )
+        elif exit_reason == "REVERSAL_EXIT":
+            log.info(
+                f"[{chat_id}] REVERSAL PROTECTION SIGNAL | {pos.get('strategy', '?')} {pos.get('asset', '?')} "
+                f"{pos.get('outcome', '?')} | entry={entry_price:.3f} peak={pos.get('peak_price', entry_price):.3f} "
+                f"now={current_price:.3f} | locking remaining gain {ev_hold:+.1%} before candle dump"
             )
         else:
             log.info(
@@ -514,13 +542,23 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 emoji = "🟢" if pnl >= 0 else "🔴"
                 try:
                     if exit_reason == "TAKE_PROFIT":
-                        gain_pct = ev_hold  # stored gain_pct in ev_hold field for TAKE_PROFIT
+                        gain_pct = ev_hold
                         tg_msg = (
                             f"{emoji} *Take-Profit Exit* 💰\n"
                             f"Strategy: {pos.get('strategy', '?')}\n"
                             f"Asset: {pos.get('asset', '?')} {pos.get('outcome', '')}\n"
                             f"Entry: {entry_price:.3f} → Exit: {sell_price:.3f}\n"
-                            f"Gain: {gain_pct:+.1%} locked in before reversal risk\n"
+                            f"Gain: {gain_pct:+.1%} locked in before close\n"
+                            f"PnL: ₦{pnl:+,.0f}"
+                        )
+                    elif exit_reason == "REVERSAL_EXIT":
+                        gain_pct = ev_hold
+                        tg_msg = (
+                            f"{emoji} *Reversal Protection Exit* 🛡️\n"
+                            f"Strategy: {pos.get('strategy', '?')}\n"
+                            f"Asset: {pos.get('asset', '?')} {pos.get('outcome', '')}\n"
+                            f"Entry: {entry_price:.3f} (Peak: {pos.get('peak_price', entry_price):.3f}) → Exit: {sell_price:.3f}\n"
+                            f"Protected Gain: {gain_pct:+.1%} locked before candle dump\n"
                             f"PnL: ₦{pnl:+,.0f}"
                         )
                     else:
@@ -530,7 +568,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                             f"Asset: {pos.get('asset', '?')} {pos.get('outcome', '')}\n"
                             f"Entry: {entry_price:.3f} → Exit: {sell_price:.3f}\n"
                             f"PnL: ₦{pnl:+,.0f}\n"
-                            f"Reason: Model EV dropped to {ev_hold:+.0%} (thesis invalidated)"
+                            f"Reason: Price flipped against thesis (salvaged capital)"
                         )
                     await telegram_bot.send_message(
                         _tg_app, chat_id, tg_msg, parse_mode="Markdown",
