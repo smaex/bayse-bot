@@ -367,6 +367,14 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         )
         return
 
+    # ── Correlated crypto exposure cap ─────────────────────────────────────
+    if not is_oracle_arb and risk.has_correlated_open_position(sig.asset, sig.outcome, sig.timeframe, certainty=sig.certainty):
+        log.info(
+            f"[{chat_id}] SKIP {sig.strategy} {sig.asset} {sig.outcome} — "
+            f"correlated crypto position already open in same direction on {sig.timeframe} (certainty={sig.certainty:.2f} < 0.65)"
+        )
+        return
+
     # ── Market-specific minimum ───────────────────────────────────────────
     cached_min = _market_min_cache.get(sig.market_id, 0.0)
     if cached_min > 0 and amount < cached_min:

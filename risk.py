@@ -130,6 +130,26 @@ class RiskManager:
     def remove_position(self, market_id: str):
         self.open_positions.pop(market_id, None)
 
+    def has_correlated_open_position(self, asset: str, outcome: str, timeframe: str = "15min", certainty: float = 0.0) -> bool:
+        """
+        Prevents stacking weak correlated bets on BTC, ETH, and SOL.
+        Macro Consensus Exception: If certainty >= 0.65 (strong macro breakout where
+        the model has high mathematical edge and conviction), all 3 assets are allowed
+        to trade to capture the multi-asset winning sweep!
+        """
+        if certainty >= 0.65:
+            return False  # High macro conviction — allow the multi-asset sweep!
+
+        crypto_assets = {"BTC", "ETH", "SOL"}
+        if asset not in crypto_assets:
+            return False
+        for pos in self.open_positions.values():
+            if (pos.get("asset") in crypto_assets
+                    and pos.get("outcome") == outcome
+                    and pos.get("timeframe") == timeframe):
+                return True
+        return False
+
     def already_in(self, market_id: str) -> bool:
         if market_id in self.pending_markets:
             return True
