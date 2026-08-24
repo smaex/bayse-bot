@@ -78,7 +78,10 @@ SNIPE_ENTRY_WINDOWS = {
 SNIPE_MIN_CERTAINTY    = 0.12   # 55% win-rate floor — the 5% edge gate is the real protector
 SNIPE_MAX_MARKET_PRICE = 0.65   # Hard cap at 0.65 so positions have room to appreciate and exit profitably
 SNIPE_MIN_ENTRY_PRICE  = 0.45   # Hard floor at 0.45 — completely blocks low-probability underdog traps
-SNIPE_MIN_DISTANCE_PCT = 0.00010  # 0.010% minimum distance
+# Minimum spot-vs-threshold distance to consider a directional signal.
+# 0.060% ensures the asset has genuinely broken away from the strike price,
+# permanently preventing entering 1-tick coin flips right on the strike threshold.
+SNIPE_MIN_DISTANCE_PCT = 0.00060  # 0.060% minimum distance (was 0.010%)
 
 # FX-specific
 FX_SESSION_UTC = {

@@ -296,6 +296,15 @@ async def _user_loop(chat_id: str):
         risk.daily_target      = target
         risk.daily_realized_pnl = profit
 
+        # ── Position Exit / Soft Stop-Loss (ALWAYS RUNS FIRST) ───────────────
+        # Must run before target_hit / drawdown continue checks!
+        # Even if trading is paused, daily target is hit, or in drawdown, existing open
+        # positions must ALWAYS be actively monitored, stopped-out on reversals, or profit-locked!
+        try:
+            await _evaluate_and_exit_positions(chat_id, client, risk, settings)
+        except Exception as exit_err:
+            log.error(f"[{chat_id}] Position exit eval error: {exit_err}", exc_info=True)
+
         if target > 0 and profit >= target and not day["target_hit"]:
             day["target_hit"] = True
             settings["daily_state"] = day
@@ -334,12 +343,6 @@ async def _user_loop(chat_id: str):
                     )
         else:
             _systemic_alert[chat_id] = False
-
-        # ── Position Exit / Soft Stop-Loss ──────────────────────────────────
-        try:
-            await _evaluate_and_exit_positions(chat_id, client, risk, settings)
-        except Exception as exit_err:
-            log.error(f"[{chat_id}] Position exit eval error: {exit_err}", exc_info=True)
 
         # ── Refresh user cache ─────────────────────────────────────────────
         global _active_users_cache, _active_users_cache_time
