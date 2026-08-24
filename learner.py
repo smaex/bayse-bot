@@ -125,8 +125,20 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                     # Cancelled / voided markets — free the position without recording a loss
                     if status in ("cancelled", "voided", "invalid"):
                         log.info(f"[{chat_id}] Trade {trade['trade_id']} voided — skipping")
+                        await asyncio.to_thread(database.resolve_trade, trade["trade_id"], None, 0.0)
                         if user_risks and chat_id in user_risks:
                             user_risks[chat_id].remove_position(trade["market_id"])
+                        if tg_app:
+                            try:
+                                msg = (
+                                    f"ℹ️ *Market Voided / Cancelled*\n"
+                                    f"Asset: {trade.get('asset', '?')} {trade.get('outcome', '')}\n"
+                                    f"Amount: ₦{trade.get('amount_ngn', 0):,.0f} returned to balance\n"
+                                    f"Status: Market voided by exchange (0.00 PnL)"
+                                )
+                                await tgb.send_message(tg_app, chat_id, msg, parse_mode="Markdown")
+                            except Exception:
+                                pass
                         continue
 
                     resolved_label, market = _detect_resolution(event, trade)
@@ -148,6 +160,18 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                 await asyncio.to_thread(database.resolve_trade, trade["trade_id"], None, 0.0)
                                 if user_risks and chat_id in user_risks:
                                     user_risks[chat_id].remove_position(trade["market_id"])
+                                if tg_app:
+                                    try:
+                                        msg = (
+                                            f"ℹ️ *Unfilled Limit Order Returned*\n"
+                                            f"Strategy: {trade.get('strategy', 'MAKER')}\n"
+                                            f"Asset: {trade.get('asset', '?')} {trade.get('outcome', '')}\n"
+                                            f"Amount: ₦{trade.get('amount_ngn', 0):,.0f} returned to balance\n"
+                                            f"Status: Market closed with limit order unfilled (no loss)"
+                                        )
+                                        await tgb.send_message(tg_app, chat_id, msg, parse_mode="Markdown")
+                                    except Exception:
+                                        pass
                                 continue
                             raw = (order_data.get("profit") or order_data.get("pnl")
                                    or order_data.get("realizedPnl"))
