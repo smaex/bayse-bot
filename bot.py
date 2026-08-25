@@ -366,8 +366,6 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
     """
     if not risk.open_positions:
         return
-    if settings.get("paused"):
-        return
 
     positions_to_exit = []
 
@@ -382,10 +380,12 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         if secs < MIN_EXIT_TIME_REMAINING:
             continue
 
-        asset = pos.get("asset", "")
-        outcome = pos.get("outcome", "YES")
-        threshold = market.get("threshold")
-        spot_price = feeds.spot.get(asset)
+        asset       = pos.get("asset", "")
+        outcome     = pos.get("outcome", "YES")
+        entry_price = float(pos.get("entry_price") or 0.5)
+        amount_ngn  = float(pos.get("amount_ngn") or 100.0)
+        threshold   = market.get("threshold")
+        spot_price  = feeds.spot.get(asset)
 
         if not threshold or not spot_price:
             continue

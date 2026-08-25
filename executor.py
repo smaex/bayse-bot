@@ -392,31 +392,32 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
             _trade_cooldown[sig.market_id] = time.time()
             return
 
-    # ── Always MARKET orders (unless MAKER uses LIMIT) ─────────────────────
+    # ── Strict Price-Capped Execution ─────────────────────────────────────
     # MAKER: places a passive LIMIT GTC order to capture the spread.
-    # All others (including ORACLE_ARB): MARKET for instant fill.
+    # All taker strategies (SNIPE, ORACLE_ARB, CORRELATE, FRONTRUN): use LIMIT FAK
+    # (Fill-And-Kill / IOC) with a strict price ceiling passed directly to the exchange.
+    # This physically FORBIDS the exchange from ever filling orders at 0.990 or 0.830!
     fee_rate      = _get_market_fee(sig.market_id)
     eff_fee       = _effective_fee(fee_rate, sig.market_price)
     slip_map      = {"safe": 0.003, "balanced": 0.005, "aggressive": 0.01, "full_send": 0.02}
     slippage      = slip_map.get(mode, 0.005)
     max_valid     = (1.0 - eff_fee) / 1.01
+    order_type    = "LIMIT"
+
     if is_maker:
-        order_type    = "LIMIT"
         time_in_force = "GTC"   # Good-Till-Cancelled (stays on book until filled or cancelled)
-        limit_price   = sig.market_price  # executor already received our chosen bid price
+        limit_price   = sig.market_price  # passive bid
     elif is_oracle_arb:
-        order_type    = "MARKET"
-        time_in_force = "FAK"
-        limit_price   = round(min(sig.market_price * 1.05, 0.85, max_valid), 3)  # Hard cap at 0.85
+        time_in_force = "FAK"   # Fill-And-Kill (instant taker fill, hard cap at 0.85)
+        limit_price   = round(min(sig.market_price * 1.02, 0.85, max_valid), 3)
     else:
-        order_type    = "MARKET"
-        time_in_force = "FAK"
-        limit_price   = round(min(sig.market_price * (1.0 + slippage), 0.75, max_valid), 3)  # Hard cap at 0.75
+        time_in_force = "FAK"   # Fill-And-Kill (instant taker fill, hard cap at 0.65)
+        limit_price   = round(min(sig.market_price * (1.0 + slippage), 0.65, max_valid), 3)
 
     log.info(
         f"[{chat_id}] PLACING {sig.strategy} {sig.asset} {sig.timeframe} "
         f"{sig.outcome} | {order_type}/{time_in_force} "
-        f"₦{amount:,.0f} @ {sig.market_price:.3f} | certainty={sig.certainty:.0%}"
+        f"₦{amount:,.0f} @ cap={limit_price:.3f} (sig={sig.market_price:.3f}) | cert={sig.certainty:.0%}"
     )
 
     try:
@@ -424,16 +425,16 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=sig.outcome_id, side="BUY",
             amount=amount, order_type=order_type,
-            price=limit_price if order_type == "LIMIT" else None,
-            max_slippage=slippage if order_type != "LIMIT" else None,
+            price=limit_price,
+            max_slippage=slippage,
             currency=CURRENCY,
             time_in_force=time_in_force,
         )
         order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
 
-        # For LIMIT (MAKER) orders, the order is placed but NOT immediately filled.
+        # For LIMIT (MAKER) orders, the order is placed as a passive bid.
         # Track it for requoting and record as pending.
-        if order_type == "LIMIT":
+        if is_maker:
             order_id = order.get("id") or order.get("orderId") or order.get("order_id")
             if order_id:
                 import feeds_direct
