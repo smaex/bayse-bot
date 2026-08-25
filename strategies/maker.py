@@ -302,15 +302,16 @@ class MakerStrategy(BaseStrategy):
             self.open_orders.pop(mid, None)
 
     def track_order(self, market_id: str, order_id: str, placed_price: float,
-                    binance_price: float, amount: float, outcome_id: str):
+                    binance_price: float, amount: float, outcome_id: str, asset: str = ""):
         """Called by executor after a LIMIT order is placed."""
         self.open_orders[market_id] = {
-            "order_id":       order_id,
-            "placed_price":   placed_price,
+            "order_id":         order_id,
+            "placed_price":     placed_price,
             "binance_at_place": binance_price,
-            "amount":         amount,
-            "outcome_id":     outcome_id,
-            "placed_at":      time.time(),
+            "amount":           amount,
+            "outcome_id":       outcome_id,
+            "asset":            asset,
+            "placed_at":        time.time(),
         }
 
     def should_requote(self, market_id: str) -> bool:
@@ -318,15 +319,15 @@ class MakerStrategy(BaseStrategy):
         info = self.open_orders.get(market_id)
         if not info:
             return False
-        asset  = None
-        # We don't store asset in open_orders, so re-check via direct_spot
-        # by comparing any asset's price move as a proxy.
-        for a in ("BTC", "ETH", "SOL"):
-            price_now, t = feeds_direct.get_direct_price(a)
-            if price_now and (time.time() - t) < 5:
-                base = info.get("binance_at_place", price_now)
-                if base > 0 and abs(price_now - base) / base > REQUOTE_THRESHOLD:
-                    return True
+        asset = info.get("asset")
+        if not asset:
+            return False
+        price_now, t = feeds_direct.get_direct_price(asset)
+        if not price_now or (time.time() - t) > 5:
+            price_now = feeds.spot.get(asset, 0.0)
+        base = info.get("binance_at_place", price_now)
+        if base > 0 and abs(price_now - base) / base > REQUOTE_THRESHOLD:
+            return True
         return False
 
 
