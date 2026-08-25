@@ -446,6 +446,7 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                     binance_price= binance_now,
                     amount       = amount,
                     outcome_id   = sig.outcome_id,
+                    asset        = sig.asset,
                 )
                 log.info(
                     f"[{chat_id}] MAKER LIMIT PLACED | {sig.asset} {sig.outcome} "
