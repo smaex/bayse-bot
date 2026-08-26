@@ -154,22 +154,11 @@ class RiskManager:
         if market_id in self.pending_markets:
             return True
         pos = self.open_positions.get(market_id)
-        if pos is None:
-            return False
-        # LIMIT orders (MAKER strategy) that haven't been confirmed filled
-        # can sit in open_positions forever, permanently blocking new signals.
-        # Expire them after 12 minutes — the maximum remaining life of a 15-min
-        # market after entry. If not filled by then, they never will be.
-        if pos.get("order_type") == "LIMIT" and not pos.get("confirmed_filled", False):
-            age = time.time() - pos.get("placed_at", 0)
-            if age > 720:  # 12 minutes
-                log.info(
-                    f"Expired stale LIMIT position on {market_id} "
-                    f"(strategy={pos.get('strategy')}, age={age:.0f}s, never confirmed filled)"
-                )
-                self.open_positions.pop(market_id, None)
-                return False
-        return True
+        if pos is not None:
+            # Active position or pending limit order already exists for this exact market!
+            # Never open duplicate orders on the same market.
+            return True
+        return False
 
     def lock_market(self, market_id: str):
         self.pending_markets.add(market_id)
