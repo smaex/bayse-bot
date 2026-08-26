@@ -267,12 +267,16 @@ class MakerStrategy(BaseStrategy):
             )
             return None
 
-        # Quote a bid at min(target_fv - HALF_SPREAD, market_bid + 0.01)
+        # Quote a competitive bid:
+        # Instead of pinning to 0.510 when market_bid is 0.50, calculate a competitive bid:
+        # our_bid = min(target_fv - HALF_SPREAD, max(market_bid + 0.01, target_fv - 0.05, 0.540))
+        # This places bids between 0.540 and 0.650 where active takers actually trade!
         chosen_edge = edge_yes if chosen_side == "YES" else edge_no
-        our_bid = round(min(target_fv - HALF_SPREAD, market_bid + 0.01), 3)
-        # Entry price bounds: don't place bids below 0.28 (underdog) or above 0.65 (asymmetry).
-        # Bidding <= 0.65 ensures every maker fill has at least 35% to 150% upside on resolution!
-        if our_bid < 0.28 or our_bid > 0.65:
+        competitive_bid = max(market_bid + 0.01, target_fv - 0.05, 0.540)
+        our_bid = round(min(target_fv - HALF_SPREAD, competitive_bid), 3)
+
+        # Entry price bounds: 0.50 to 0.65 (guarantees >= 54% to 100% profit on win)
+        if our_bid < 0.50 or our_bid > 0.65:
             log.info(f"MAKER SKIP {asset} — bid price out of bounds ({our_bid:.3f})")
             return None
 
