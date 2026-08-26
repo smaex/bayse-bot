@@ -228,24 +228,33 @@ class MakerStrategy(BaseStrategy):
         edge_yes = fv_yes - yes_bid_price if yes_bid_price > 0 else 0.0
         edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
 
-        # ── ETH Extra Edge Cushion ─────────────────────────────────────────────
-        eth_edge_cushion = 0.005 if asset == "ETH" else 0.0
+        # ── Asset-Specific Edge & Distance Calibration ────────────────────────
+        # ETH has higher mean-reversion chop than SOL/BTC, requiring higher distance (+0.10%)
+        # and stronger edge cushion (+1.5%).
+        # BTC is lower volatility, requiring +0.06% distance and standard edge.
+        min_dist_req = 0.0010 if asset == "ETH" else (0.00060 if asset == "BTC" else 0.00080)
+        eth_edge_cushion = 0.015 if asset == "ETH" else 0.0
 
-        # ── Trend-Aligned Side Selection ────────────────────────────────────────
-        # Never catch falling knives!
-        # - To buy YES: spot must not be significantly below threshold (dist >= -0.03%),
-        #   momentum must not be dumping (mom_5m >= -0.0008), and fv_yes >= 0.45.
-        # - To buy NO: spot must not be significantly above threshold (dist <= +0.03%),
-        #   momentum must not be pumping (mom_5m <= +0.0008), and fv_no >= 0.45.
+        if abs(dist_pct) < min_dist_req:
+            log.info(
+                f"MAKER SKIP {asset} — below calibrated distance threshold "
+                f"(dist={dist_pct:+.4%} < {min_dist_req:+.4%})"
+            )
+            return None
+
+        # ── Strict Directional Alignment ────────────────────────────────────────
+        # NEVER trade against the spot side!
+        # - To buy YES: spot MUST be above threshold (dist_pct >= +min_dist_req) AND mom_5m >= -0.0004
+        # - To buy NO: spot MUST be below threshold (dist_pct <= -min_dist_req) AND mom_5m <= +0.0004
         chosen_side = None
-        if (edge_yes >= edge_no and edge_yes >= (0.007 + eth_edge_cushion)
-                and fv_yes >= 0.45 and mom_5m >= -0.0008 and dist_pct >= -0.00030):
+        if (dist_pct > 0 and edge_yes >= (0.007 + eth_edge_cushion)
+                and fv_yes >= 0.50 and mom_5m >= -0.0004):
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
-        elif (edge_no > edge_yes and edge_no >= (0.007 + eth_edge_cushion)
-                and fv_no >= 0.45 and mom_5m <= +0.0008 and dist_pct <= +0.00030):
+        elif (dist_pct < 0 and edge_no >= (0.007 + eth_edge_cushion)
+                and fv_no >= 0.50 and mom_5m <= +0.0004):
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price
