@@ -150,14 +150,25 @@ class RiskManager:
                 return True
         return False
 
-    def already_in(self, market_id: str) -> bool:
+    def already_in(self, market_id: str, asset: str = "") -> bool:
         if market_id in self.pending_markets:
             return True
         pos = self.open_positions.get(market_id)
         if pos is not None:
             # Active position or pending limit order already exists for this exact market!
-            # Never open duplicate orders on the same market.
             return True
+        # Asset-level deduplication: if we already hold ANY position on this asset
+        # (even on a different market_id / different side), block new entries.
+        # This prevents contradictory opposing bets (YES + NO) on the same asset
+        # within the same candle, which guarantees a net loss.
+        if asset:
+            for existing_pos in self.open_positions.values():
+                if existing_pos.get("asset") == asset:
+                    log.info(
+                        f"BLOCK duplicate asset entry: already holding {asset} "
+                        f"({existing_pos.get('outcome')} @ {existing_pos.get('entry_price', 0):.3f})"
+                    )
+                    return True
         return False
 
     def lock_market(self, market_id: str):

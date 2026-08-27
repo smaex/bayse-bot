@@ -368,10 +368,33 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         return
 
     positions_to_exit = []
+    stale_positions = []
 
     for market_id, pos in list(risk.open_positions.items()):
         market = next((m for m in active_markets if m["market_id"] == market_id), None)
+
+        # ── CRITICAL FIX: If the market rotated out of active_markets ─────────
+        # (new candle started, scanner replaced the old market_id), we MUST still
+        # evaluate the position. Use stored position data + live Binance spot feed.
+        # Without this, the exit engine silently skips the position and it rides
+        # all the way to resolution at 0.00 or 1.00 with zero protection!
+        asset       = pos.get("asset", "")
+        outcome     = pos.get("outcome", "YES")
+        entry_price = float(pos.get("entry_price") or 0.5)
+        amount_ngn  = float(pos.get("amount_ngn") or 100.0)
+        spot_price  = feeds.spot.get(asset)
+
         if not market:
+            # Market has rotated out — the candle this position was placed on has
+            # likely already resolved. Clean up stale positions older than 16 minutes
+            # (a 15-min candle + 1 min buffer) since they're already settled.
+            age_secs = time.time() - pos.get("placed_at", 0)
+            if age_secs > 960:  # 16 minutes
+                log.warning(
+                    f"[{chat_id}] Cleaning stale position on {market_id} "
+                    f"(age={age_secs:.0f}s, asset={asset}, strategy={pos.get('strategy')})"
+                )
+                stale_positions.append(market_id)
             continue
 
         secs = market.get("secs_to_close", 0)
@@ -380,12 +403,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         if secs < MIN_EXIT_TIME_REMAINING:
             continue
 
-        asset       = pos.get("asset", "")
-        outcome     = pos.get("outcome", "YES")
-        entry_price = float(pos.get("entry_price") or 0.5)
-        amount_ngn  = float(pos.get("amount_ngn") or 100.0)
         threshold   = market.get("threshold")
-        spot_price  = feeds.spot.get(asset)
 
         if not threshold or not spot_price:
             continue
@@ -588,6 +606,10 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 risk.remove_position(market_id)
             else:
                 log.error(f"[{chat_id}] EXIT order failed for {market_id}: {e}", exc_info=True)
+
+    # Clean up stale/expired positions that rotated out of active_markets
+    for stale_mid in stale_positions:
+        risk.remove_position(stale_mid)
 
 
 async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: float = 0.0):

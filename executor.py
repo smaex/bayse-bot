@@ -107,7 +107,7 @@ async def execute_trade(chat_id: str, sig, client, risk, settings: dict,
     if strategy.global_state.systemic_halt_until > time.time():
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — systemic halt active")
         return
-    if risk.already_in(sig.market_id):
+    if risk.already_in(sig.market_id, asset=sig.asset):
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — already in/pending on {sig.market_id}")
         return
     last = _trade_cooldown.get(sig.market_id, 0.0)
