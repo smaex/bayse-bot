@@ -399,72 +399,70 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         if outcome == "NO":
             w_est = 1.0 - w_est
 
-        # Current market price for our held outcome
+        # Current market price for our held outcome (use live price or estimated thesis value)
         if outcome == "YES":
             current_price = market.get("yes_price", 0.5)
         else:
             current_price = market.get("no_price", 0.5)
 
-        if current_price <= 0.01:
-            continue  # Price too low to sell meaningfully
+        # Dynamic Thesis Value based on continuous spot diffusion:
+        # If orderbook quotes are lagging, w_est gives the true statistical fair value of the position
+        effective_val = w_est
 
-        # Track the highest price reached during the position's life
-        pos["peak_price"] = max(pos.get("peak_price", entry_price), current_price)
+        # Track the highest price/valuation reached during the position's life
+        pos["peak_price"] = max(pos.get("peak_price", entry_price), current_price, effective_val)
         peak_price = pos["peak_price"]
 
-        # ── Take-Profit / Reversal Protection exit (HARDENED) ─────────────────
-        # 1. Target Hit: position gained >= 20% with < 400s remaining -> lock in gain immediately!
-        # 2. Reversal Protection: position was UP >= 15% (peak >= entry * 1.15), but has
-        #    now dropped >= 10% from its peak (current_price <= peak * 0.90) -> sell immediately
-        #    while still in profit rather than letting a winning trade reverse into a loss!
-        if entry_price > 0:
-            gain_pct = (current_price - entry_price) / entry_price
-            peak_gain_pct = (peak_price - entry_price) / entry_price
-            dropped_from_peak = (peak_price - current_price) / peak_price if peak_price > 0 else 0.0
+        # ── 1. DYNAMIC TAKE-PROFIT & TRAILING PROFIT LOCK ─────────────────────
+        # Locks in profit whenever:
+        # A) Live price or diffusion model shows >= +15% profit with < 450s remaining
+        # B) Position peaked >= +15% profit, and spot/price is now declining (trailing lock)
+        gain_pct = max((current_price - entry_price) / entry_price if entry_price > 0 else 0.0,
+                       (effective_val - entry_price) / entry_price if entry_price > 0 else 0.0)
+        peak_gain_pct = (peak_price - entry_price) / entry_price if entry_price > 0 else 0.0
+        dropped_from_peak = (peak_price - max(current_price, effective_val)) / peak_price if peak_price > 0 else 0.0
 
-            # Target hit: lock in +20%+ profit in the second half of candle
-            if secs < 400 and gain_pct >= 0.20:
-                positions_to_exit.append({
-                    "market_id": market_id,
-                    "pos": pos,
-                    "market": market,
-                    "w_est": w_est,
-                    "current_price": current_price,
-                    "ev_hold": gain_pct,
-                    "exit_reason": "TAKE_PROFIT",
-                })
-                continue
-
-            # Trailing Reversal Protection: was winning (+15%+ peak), now reversing (dropped 10%+ from peak)
-            if peak_gain_pct >= 0.15 and dropped_from_peak >= 0.10 and current_price >= entry_price:
-                positions_to_exit.append({
-                    "market_id": market_id,
-                    "pos": pos,
-                    "market": market,
-                    "w_est": w_est,
-                    "current_price": current_price,
-                    "ev_hold": gain_pct,
-                    "exit_reason": "REVERSAL_EXIT",
-                })
-                continue
-
-        # ── Stop-Loss exit: instant spot invalidation OR model EV drop ─────────
-        # 1. Adverse Spot Flip: Spot price has crossed to the wrong side of threshold by >= 0.010%.
-        #    e.g. held YES, spot dumped below threshold -> SELL IMMEDIATELY!
-        #    e.g. held NO, spot surged above threshold -> SELL IMMEDIATELY!
-        # 2. EV Drop: expected value of holding drops below -10% or loss_pct >= 20%.
-        ev_hold = w_est / current_price - 1.0 if current_price > 0 else -1.0
-        loss_pct = (entry_price - current_price) / entry_price if entry_price > 0 else 0.0
-        adverse_flip = (outcome == "YES" and dist_pct < -0.00010) or (outcome == "NO" and dist_pct > +0.00010)
-
-        if adverse_flip or ev_hold < -0.10 or (loss_pct >= 0.20 and current_price >= 0.05):
+        if secs < 450 and gain_pct >= 0.15:
             positions_to_exit.append({
                 "market_id": market_id,
                 "pos": pos,
                 "market": market,
                 "w_est": w_est,
                 "current_price": current_price,
-                "ev_hold": ev_hold,
+                "ev_hold": gain_pct,
+                "exit_reason": "TAKE_PROFIT",
+            })
+            continue
+
+        if peak_gain_pct >= 0.12 and dropped_from_peak >= 0.08 and max(current_price, effective_val) >= entry_price:
+            positions_to_exit.append({
+                "market_id": market_id,
+                "pos": pos,
+                "market": market,
+                "w_est": w_est,
+                "current_price": current_price,
+                "ev_hold": gain_pct,
+                "exit_reason": "REVERSAL_EXIT",
+            })
+            continue
+
+        # ── 2. DYNAMIC REAL-TIME STOP-LOSS (SPOT INVALIDATION) ─────────────────
+        # Instantly dumps the position if:
+        # A) Spot price crosses to the losing side of threshold by >= 0.005%
+        # B) Win probability (w_est) drops below 40% (thesis mathematically broken)
+        # C) Current loss >= 15%
+        adverse_flip = (outcome == "YES" and dist_pct < -0.00005) or (outcome == "NO" and dist_pct > +0.00005)
+        thesis_broken = (w_est < 0.40)
+        loss_pct = (entry_price - current_price) / entry_price if entry_price > 0 else 0.0
+
+        if adverse_flip or thesis_broken or (loss_pct >= 0.15 and current_price >= 0.05):
+            positions_to_exit.append({
+                "market_id": market_id,
+                "pos": pos,
+                "market": market,
+                "w_est": w_est,
+                "current_price": current_price,
+                "ev_hold": w_est - 0.5,
                 "exit_reason": "STOP_LOSS",
             })
 
