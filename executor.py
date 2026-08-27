@@ -482,6 +482,7 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                     )
                     risk.add_position(sig.market_id, {
                         "trade_id":    trade_id,    "event_id":   sig.event_id,
+                        "order_id":    order_id,
                         "outcome":     sig.outcome, "outcome_id": sig.outcome_id,
                         "entry_price": limit_price, "amount_ngn": amount,
                         "strategy":    sig.strategy, "asset":      sig.asset,

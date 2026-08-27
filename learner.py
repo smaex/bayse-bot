@@ -65,7 +65,10 @@ def _detect_resolution(event: dict, trade: dict) -> tuple:
     Tries 4 field patterns because the Bayse API docs are incomplete here.
     """
     markets = event.get("markets", [{}])
-    market  = markets[0] if markets else {}
+    target_mid = trade.get("market_id")
+    market = next((m for m in markets if m.get("id") == target_mid or m.get("marketId") == target_mid), None)
+    if not market:
+        market = markets[0] if markets else {}
 
     # Method 1: direct resolvedOutcome on market
     r = market.get("resolvedOutcome") or event.get("resolvedOutcome")

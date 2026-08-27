@@ -526,11 +526,25 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             )
 
         try:
+            # Step 1: If this was a maker LIMIT order, CANCEL the open buy order on the exchange first!
+            # If the order is still resting on the book when spot dumps, someone will dump INTO our buy order.
+            # Cancelling it immediately stops us from getting filled at the worst possible time!
+            maker_order_id = pos.get("order_id")
+            if maker_order_id:
+                try:
+                    await client.cancel_order(maker_order_id)
+                    log.info(f"[{chat_id}] EXIT: Cancelled resting LIMIT order {maker_order_id} on {market_id}")
+                except Exception as ce:
+                    # Order might already be filled or expired, which is normal
+                    log.debug(f"[{chat_id}] Cancel resting order notice: {ce}")
+
+            # Step 2: Sell held shares at market. Use generous 0.30 slippage so exit
+            # is guaranteed to execute and salvage cash instead of rejecting!
             resp = await client.place_order(
                 event_id=event_id, market_id=market_id,
                 outcome_id=outcome_id, side="SELL",
                 amount=sell_amount, order_type="MARKET",
-                currency=CURRENCY, max_slippage=0.15,
+                currency=CURRENCY, max_slippage=0.30,
             )
             order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
             order_id = order.get("id") or order.get("orderId") or order.get("order_id")
