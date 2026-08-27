@@ -180,24 +180,20 @@ class MakerStrategy(BaseStrategy):
 
         dist_pct = (spot - threshold) / threshold
 
-        # ── Early-Candle Warm-up Window (Hard 3-Minute Rule) ───────────────────
-        # In the first 3 minutes of a 15-min candle (secs_to_close > 720s), price direction
-        # has not developed and opening spreads are noisy.
-        # Require the candle to be at least 3 minutes old (secs <= 720) before quoting maker orders.
+        # ── Quoting Window Guard (Minutes 3 to 10 of a 15-min candle) ─────────
+        # - Don't quote in the first 3 minutes (secs > 720): trend hasn't formed yet.
+        # - Don't open new maker limit bids in the final 5 minutes (secs < 300): late-candle whips
+        #   and disappearing orderbook bids make late maker entries highly vulnerable to reversals.
         if secs_to_close > 720:
             log.info(
                 f"MAKER SKIP {asset} — candle warm-up window "
                 f"(secs={secs_to_close:.0f} > 720, waiting for 3-minute trend formation)"
             )
             return None
-
-        # ── Minimum Distance from Threshold (0.080% floor) ─────────────────────
-        # Don't place maker orders when the spot price is hugging the strike threshold (< 0.08%).
-        # At 0.02%-0.05% distance, a tiny 1-tick oscillation flips the outcome.
-        if abs(dist_pct) < 0.00080:
+        if secs_to_close < 300:
             log.info(
-                f"MAKER SKIP {asset} — too close to threshold "
-                f"(dist={dist_pct:+.4%} < 0.080% min distance)"
+                f"MAKER SKIP {asset} — late-candle window "
+                f"(secs={secs_to_close:.0f} < 300, risk of late-candle reversal)"
             )
             return None
 
@@ -229,11 +225,11 @@ class MakerStrategy(BaseStrategy):
         edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
 
         # ── Asset-Specific Edge & Distance Calibration ────────────────────────
-        # ETH has higher mean-reversion chop than SOL/BTC, requiring higher distance (+0.10%)
-        # and stronger edge cushion (+1.5%).
-        # BTC is lower volatility, requiring +0.06% distance and standard edge.
-        min_dist_req = 0.0010 if asset == "ETH" else (0.00060 if asset == "BTC" else 0.00080)
-        eth_edge_cushion = 0.015 if asset == "ETH" else 0.0
+        # ETH has higher mean-reversion chop than SOL/BTC, requiring higher distance (+0.12%)
+        # and stronger edge cushion (+2.0%).
+        # BTC requires +0.07% distance. SOL requires +0.10% distance.
+        min_dist_req = 0.0012 if asset == "ETH" else (0.00070 if asset == "BTC" else 0.0010)
+        eth_edge_cushion = 0.020 if asset == "ETH" else 0.0
 
         if abs(dist_pct) < min_dist_req:
             log.info(
@@ -242,19 +238,18 @@ class MakerStrategy(BaseStrategy):
             )
             return None
 
-        # ── Strict Directional Alignment ────────────────────────────────────────
+        # ── Strict Directional Alignment & Win Probability Floor ──────────────
         # NEVER trade against the spot side!
-        # - To buy YES: spot MUST be above threshold (dist_pct >= +min_dist_req) AND mom_5m >= -0.0004
-        # - To buy NO: spot MUST be below threshold (dist_pct <= -min_dist_req) AND mom_5m <= +0.0004
+        # Requires true high-probability thesis (Fair Value >= 0.58, not 50/50 coinflips!)
         chosen_side = None
         if (dist_pct > 0 and edge_yes >= (0.007 + eth_edge_cushion)
-                and fv_yes >= 0.50 and mom_5m >= -0.0004):
+                and fv_yes >= 0.58 and mom_5m >= -0.0002):
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
         elif (dist_pct < 0 and edge_no >= (0.007 + eth_edge_cushion)
-                and fv_no >= 0.50 and mom_5m <= +0.0004):
+                and fv_no >= 0.58 and mom_5m <= +0.0002):
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price
