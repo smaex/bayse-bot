@@ -225,11 +225,11 @@ class MakerStrategy(BaseStrategy):
         edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
 
         # ── Asset-Specific Edge & Distance Calibration ────────────────────────
-        # ETH has higher mean-reversion chop than SOL/BTC, requiring higher distance (+0.12%)
-        # and stronger edge cushion (+2.0%).
-        # BTC requires +0.07% distance. SOL requires +0.10% distance.
-        min_dist_req = 0.0012 if asset == "ETH" else (0.00070 if asset == "BTC" else 0.0010)
-        eth_edge_cushion = 0.020 if asset == "ETH" else 0.0
+        # ETH has severe mean-reversion chop (routinely oscillates ±0.20% within a candle),
+        # requiring distance >= 0.200% and a 2.5% edge cushion to avoid chop losses.
+        # SOL requires >= 0.150% distance. BTC requires >= 0.080% distance.
+        min_dist_req = 0.0020 if asset == "ETH" else (0.00080 if asset == "BTC" else 0.0015)
+        eth_edge_cushion = 0.025 if asset == "ETH" else 0.0
 
         if abs(dist_pct) < min_dist_req:
             log.info(
