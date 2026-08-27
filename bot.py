@@ -412,18 +412,18 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         pos["peak_price"] = max(pos.get("peak_price", entry_price), current_price)
         peak_price = pos["peak_price"]
 
-        # ── Take-Profit / Reversal Protection exit ─────────────────────────────
-        # 1. Target Hit: position gained >= 35% with < 5 mins remaining -> lock in gain!
-        # 2. Reversal Protection: position was UP >= 25% (peak >= entry * 1.25), but has
-        #    now dropped >= 15% from its peak (current_price <= peak * 0.85) -> sell immediately
+        # ── Take-Profit / Reversal Protection exit (HARDENED) ─────────────────
+        # 1. Target Hit: position gained >= 20% with < 400s remaining -> lock in gain immediately!
+        # 2. Reversal Protection: position was UP >= 15% (peak >= entry * 1.15), but has
+        #    now dropped >= 10% from its peak (current_price <= peak * 0.90) -> sell immediately
         #    while still in profit rather than letting a winning trade reverse into a loss!
         if entry_price > 0:
             gain_pct = (current_price - entry_price) / entry_price
             peak_gain_pct = (peak_price - entry_price) / entry_price
             dropped_from_peak = (peak_price - current_price) / peak_price if peak_price > 0 else 0.0
 
-            # Target hit in final 5 minutes
-            if secs < TAKE_PROFIT_MIN_SECS_REMAINING and gain_pct >= TAKE_PROFIT_GAIN_PCT:
+            # Target hit: lock in +20%+ profit in the second half of candle
+            if secs < 400 and gain_pct >= 0.20:
                 positions_to_exit.append({
                     "market_id": market_id,
                     "pos": pos,
@@ -435,8 +435,8 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 })
                 continue
 
-            # Trailing Reversal Protection: was winning (+25%+ peak), now reversing (dropped 15%+ from peak)
-            if peak_gain_pct >= 0.25 and dropped_from_peak >= 0.15 and current_price > entry_price:
+            # Trailing Reversal Protection: was winning (+15%+ peak), now reversing (dropped 10%+ from peak)
+            if peak_gain_pct >= 0.15 and dropped_from_peak >= 0.10 and current_price >= entry_price:
                 positions_to_exit.append({
                     "market_id": market_id,
                     "pos": pos,
@@ -448,16 +448,16 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 })
                 continue
 
-        # ── Stop-Loss exit: model invalidation OR adverse price flip ─────────
-        # 1. EV Drop: expected value of holding vs market price drops below -15%
-        # 2. Adverse Price Flip: position lost >= 35% of value AND spot has flipped to the wrong side of threshold.
-        #    e.g. entered YES at 0.51, spot dumps below threshold, market bid is 0.30.
-        #    Selling at 0.30 salvages 30% of capital instead of riding it to 0.00!
-        ev_hold = w_est / current_price - 1.0
+        # ── Stop-Loss exit: instant spot invalidation OR model EV drop ─────────
+        # 1. Adverse Spot Flip: Spot price has crossed to the wrong side of threshold by >= 0.010%.
+        #    e.g. held YES, spot dumped below threshold -> SELL IMMEDIATELY!
+        #    e.g. held NO, spot surged above threshold -> SELL IMMEDIATELY!
+        # 2. EV Drop: expected value of holding drops below -10% or loss_pct >= 20%.
+        ev_hold = w_est / current_price - 1.0 if current_price > 0 else -1.0
         loss_pct = (entry_price - current_price) / entry_price if entry_price > 0 else 0.0
-        adverse_flip = (outcome == "YES" and dist_pct < -0.00030) or (outcome == "NO" and dist_pct > +0.00030)
+        adverse_flip = (outcome == "YES" and dist_pct < -0.00010) or (outcome == "NO" and dist_pct > +0.00010)
 
-        if ev_hold < EXIT_EV_THRESHOLD or (loss_pct >= 0.35 and adverse_flip and current_price >= 0.08):
+        if adverse_flip or ev_hold < -0.10 or (loss_pct >= 0.20 and current_price >= 0.05):
             positions_to_exit.append({
                 "market_id": market_id,
                 "pos": pos,
