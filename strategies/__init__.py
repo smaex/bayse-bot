@@ -129,15 +129,15 @@ def merge_signals(all_signals: List[TradeSignal], state=None) -> List[TradeSigna
     merged: dict[str, TradeSignal] = {}
 
     for sig in all_signals:
-        key = f"{sig.asset}:{sig.outcome}"
+        key = f"{sig.market_id}"
         if key not in merged:
             merged[key] = sig
         else:
             existing = merged[key]
-            if existing.timeframe != sig.timeframe or existing.strategy != sig.strategy:
+            if existing.strategy != sig.strategy:
                 # Convergence — boost the stronger signal
                 existing.certainty = min(1.0, existing.certainty + 0.15)
-                existing.reason   += f" | CONVERGENCE({sig.strategy}/{sig.timeframe})"
+                existing.reason   += f" | CONVERGENCE({sig.strategy})"
                 existing.converged_with.append(sig.timeframe)
             if sig.certainty > existing.certainty:
                 sig.certainty      = existing.certainty  # keep the boost
