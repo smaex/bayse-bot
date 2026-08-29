@@ -180,14 +180,14 @@ class MakerStrategy(BaseStrategy):
 
         dist_pct = (spot - threshold) / threshold
 
-        # ── Quoting Window Guard (Minutes 3 to 10 of a 15-min candle) ─────────
-        # - Don't quote in the first 3 minutes (secs > 720): trend hasn't formed yet.
+        # ── Quoting Window Guard (Minutes 4 to 10 of a 15-min candle) ─────────
+        # - Don't quote in the first 4 minutes (secs > 660): trend hasn't settled yet.
         # - Don't open new maker limit bids in the final 5 minutes (secs < 300): late-candle whips
         #   and disappearing orderbook bids make late maker entries highly vulnerable to reversals.
-        if secs_to_close > 720:
+        if secs_to_close > 660:
             log.info(
                 f"MAKER SKIP {asset} — candle warm-up window "
-                f"(secs={secs_to_close:.0f} > 720, waiting for 3-minute trend formation)"
+                f"(secs={secs_to_close:.0f} > 660, waiting for 4-minute trend formation)"
             )
             return None
         if secs_to_close < 300:
@@ -226,8 +226,9 @@ class MakerStrategy(BaseStrategy):
 
         # ── Asset-Specific Edge & Distance Calibration ────────────────────────
         # ETH has severe mean-reversion chop, requiring distance >= 0.200% and 2.5% edge cushion.
-        # SOL requires >= 0.150% distance. BTC requires >= 0.100% distance.
-        min_dist_req = 0.0020 if asset == "ETH" else (0.0010 if asset == "BTC" else 0.0015)
+        # SOL requires >= 0.200% distance to prevent early-candle micro-chop flips.
+        # BTC requires >= 0.100% distance.
+        min_dist_req = 0.0020 if asset in ("ETH", "SOL") else 0.0010
         eth_edge_cushion = 0.025 if asset == "ETH" else 0.0
 
         if abs(dist_pct) < min_dist_req:
