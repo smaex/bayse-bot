@@ -225,10 +225,9 @@ class MakerStrategy(BaseStrategy):
         edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
 
         # ── Asset-Specific Edge & Distance Calibration ────────────────────────
-        # ETH has severe mean-reversion chop (routinely oscillates ±0.20% within a candle),
-        # requiring distance >= 0.200% and a 2.5% edge cushion to avoid chop losses.
-        # SOL requires >= 0.150% distance. BTC requires >= 0.080% distance.
-        min_dist_req = 0.0020 if asset == "ETH" else (0.00080 if asset == "BTC" else 0.0015)
+        # ETH has severe mean-reversion chop, requiring distance >= 0.200% and 2.5% edge cushion.
+        # SOL requires >= 0.150% distance. BTC requires >= 0.100% distance.
+        min_dist_req = 0.0020 if asset == "ETH" else (0.0010 if asset == "BTC" else 0.0015)
         eth_edge_cushion = 0.025 if asset == "ETH" else 0.0
 
         if abs(dist_pct) < min_dist_req:
@@ -238,18 +237,21 @@ class MakerStrategy(BaseStrategy):
             )
             return None
 
-        # ── Strict Directional Alignment & Win Probability Floor ──────────────
+        # ── Strict Directional Alignment & Active Momentum Confirmation ────────
         # NEVER trade against the spot side!
-        # Requires true high-probability thesis (Fair Value >= 0.58, not 50/50 coinflips!)
+        # Requires true high-probability thesis (Fair Value >= 0.60, not 50/50 coinflips!)
+        # AND active momentum in the direction of the trade:
+        # - For YES: spot must be rising (mom_5m >= +0.0002)
+        # - For NO: spot must be falling (mom_5m <= -0.0002)
         chosen_side = None
         if (dist_pct > 0 and edge_yes >= (0.007 + eth_edge_cushion)
-                and fv_yes >= 0.58 and mom_5m >= -0.0002):
+                and fv_yes >= 0.60 and mom_5m >= 0.0002):
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
         elif (dist_pct < 0 and edge_no >= (0.007 + eth_edge_cushion)
-                and fv_no >= 0.58 and mom_5m <= +0.0002):
+                and fv_no >= 0.60 and mom_5m <= -0.0002):
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price
