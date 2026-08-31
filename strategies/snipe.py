@@ -187,11 +187,11 @@ class SnipeStrategy(BaseStrategy):
         # This permanently prevents the "underdog trap" (buying NO at 0.16 when spot is above threshold).
         distance_pct = (live_spot - threshold) / threshold
 
-        if w_yes >= 0.52 and edge_yes >= 0.05 and distance_pct >= -0.00020:
+        if w_yes >= 0.55 and edge_yes >= 0.05 and distance_pct >= 0.0000:
             direction = "YES"
             w_est     = w_yes
             market_price_check = yes_price
-        elif w_no >= 0.52 and edge_no >= 0.05 and distance_pct <= +0.00020:
+        elif w_no >= 0.55 and edge_no >= 0.05 and distance_pct <= 0.0000:
             direction = "NO"
             w_est     = w_no
             market_price_check = no_price

@@ -70,12 +70,26 @@ class FrontrunStrategy(BaseStrategy):
         if not threshold:
             return None
 
-        # live_spot already defined above — reuse it for threshold distance
+        # Strict Directional Alignment with Strike Threshold:
+        # NEVER buy YES if spot or oracle is below the strike threshold!
+        # NEVER buy NO if spot or oracle is above the strike threshold!
+        # This completely prevents buying into underdog traps where an oracle lag
+        # occurs while the asset is still on the losing side of the threshold.
         dist_pct = (live_spot - threshold) / threshold
-        prob = win_probability(dist_pct, secs, asset)
-        if outcome == "YES" and prob < 0.05:
+        oracle_dist = (oracle_p - threshold) / threshold
+
+        if outcome == "YES" and (dist_pct < 0.0000 or oracle_dist < 0.0000):
+            log.info(
+                f"FRONTRUN SKIP {asset} YES — spot/oracle below threshold "
+                f"(dist={dist_pct:+.4%}, oracle_dist={oracle_dist:+.4%})"
+            )
             return None
-        if outcome == "NO" and prob > 0.95:
+
+        if outcome == "NO" and (dist_pct > 0.0000 or oracle_dist > 0.0000):
+            log.info(
+                f"FRONTRUN SKIP {asset} NO — spot/oracle above threshold "
+                f"(dist={dist_pct:+.4%}, oracle_dist={oracle_dist:+.4%})"
+            )
             return None
 
         market_price = market["yes_price"] if outcome == "YES" else market["no_price"]
@@ -83,16 +97,26 @@ class FrontrunStrategy(BaseStrategy):
             return None   # must be in actionable 0.40 - 0.65 window
 
         # Calculate dynamic win probability based on fresh oracle price
-        oracle_dist = (oracle_p - threshold) / threshold
         w_oracle = win_probability(oracle_dist, secs, asset)
         win_prob = w_oracle if outcome == "YES" else 1.0 - w_oracle
+
+        # High-Conviction Probability Floor:
+        # A directional frontrun bet MUST have at least 55% statistical win probability.
+        if win_prob < 0.55:
+            log.info(
+                f"FRONTRUN SKIP {asset} {outcome} — win_prob {win_prob:.1%} < 55% floor"
+            )
+            return None
 
         # Import manager utilities
         from strategies.utils import probability_to_certainty
         from strategies.manager import kelly_size, max_ev_price
 
         certainty = probability_to_certainty(win_prob)
-        if certainty < 0.25:
+        if certainty < 0.50:
+            log.info(
+                f"FRONTRUN SKIP {asset} {outcome} — certainty {certainty:.2f} < 0.50 floor"
+            )
             return None
 
         # BUG FIX: explicit positive-EV gate before committing to a Kelly bet.
