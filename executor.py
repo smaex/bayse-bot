@@ -210,9 +210,17 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         amount = max(effective_min, min(amount, config.TEST_MAX_TRADE_NGN))
 
     # ── Buy-power scale-down ───────────────────────────────────────────────
-    # If calculated amount exceeds available free cash, scale down rather
-    # than rejecting the trade entirely. A smaller edge is still an edge.
+    # If calculated amount exceeds available free cash, scale down if within reasonable
+    # allocation bounds. On larger accounts (>=₦3,000), if free cash is <35% of the
+    # Kelly-optimal size, skip to avoid severe risk/reward distortion from under-allocation.
+    # On small accounts (<₦3,000), scale down to free_cash so the bot stays active.
     if amount > free_cash:
+        if equity >= 3_000 and free_cash < amount * 0.35:
+            log.info(
+                f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — free cash ₦{free_cash:,.0f} "
+                f"is <35% of optimal size ₦{amount:,.0f} (capital constrained)"
+            )
+            return
         log.info(
             f"[{chat_id}] {sig.strategy} {sig.asset} — scaling ₦{amount:,.0f} "
             f"down to free_cash ₦{free_cash:,.0f}"
@@ -408,8 +416,8 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         time_in_force = "GTC"   # Good-Till-Cancelled (stays on book until filled or cancelled)
         limit_price   = sig.market_price  # passive bid
     elif is_oracle_arb:
-        time_in_force = "FAK"   # Fill-And-Kill (instant taker fill, hard cap at 0.85)
-        limit_price   = round(min(sig.market_price * 1.02, 0.85, max_valid), 3)
+        time_in_force = "FAK"   # Fill-And-Kill (instant taker fill, hard cap at 0.75)
+        limit_price   = round(min(sig.market_price * 1.02, 0.75, max_valid), 3)
     else:
         time_in_force = "FAK"   # Fill-And-Kill (instant taker fill, hard cap at 0.65)
         limit_price   = round(min(sig.market_price * (1.0 + slippage), 0.65, max_valid), 3)
@@ -728,44 +736,55 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
     )
 
     # ── Order execution — sized from ACTUAL fills, not quotes ───────────────
-    # BUG FIX: burn qty must come from real filled share counts. AMM slippage
-    # means actual fills can differ from quote estimates; burning the estimate
-    # when actual fills are smaller → "insufficient shares" error.
+    # Upgrade: Place BOTH legs in parallel via asyncio.gather to eliminate execution latency gap.
+    # Sized from real filled share counts with atomic dual-leg rollback.
     yes_shares_filled = 0.0
     no_shares_filled  = 0.0
     yes_ok = False
     no_ok  = False
 
     try:
-        # Leg 1: YES
-        resp_yes = await client.place_order(
+        t_yes = client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["yes_id"], side="BUY",
             amount=amount_yes, order_type="MARKET", currency=CURRENCY,
             max_slippage=0.015,
         )
-        oy = resp_yes.get("order") or resp_yes.get("clobOrder") or resp_yes.get("ammOrder") or resp_yes
-        yes_shares_filled = client.parse_filled_shares(oy)
-        if yes_shares_filled <= 0:
-            fp = float(oy.get("avgFillPrice") or oy.get("price") or q_yes_p)
-            yes_shares_filled = amount_yes / (fp * _sdiv)
-            log.warning(f"[{chat_id}] ARB YES: no filled qty from API, estimated {yes_shares_filled:.2f}sh")
-        yes_ok = True
-
-        # Leg 2: NO
-        resp_no = await client.place_order(
+        t_no = client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=market["no_id"], side="BUY",
             amount=amount_no, order_type="MARKET", currency=CURRENCY,
             max_slippage=0.015,
         )
-        on_ = resp_no.get("order") or resp_no.get("clobOrder") or resp_no.get("ammOrder") or resp_no
-        no_shares_filled = client.parse_filled_shares(on_)
-        if no_shares_filled <= 0:
-            fp = float(on_.get("avgFillPrice") or on_.get("price") or q_no_p)
-            no_shares_filled = amount_no / (fp * _sdiv)
-            log.warning(f"[{chat_id}] ARB NO: no filled qty from API, estimated {no_shares_filled:.2f}sh")
-        no_ok = True
+
+        results = await asyncio.gather(t_yes, t_no, return_exceptions=True)
+        resp_yes, resp_no = results[0], results[1]
+
+        if isinstance(resp_yes, Exception):
+            log.warning(f"[{chat_id}] ARB YES leg order failed: {resp_yes}")
+        else:
+            oy = resp_yes.get("order") or resp_yes.get("clobOrder") or resp_yes.get("ammOrder") or resp_yes
+            yes_shares_filled = client.parse_filled_shares(oy)
+            if yes_shares_filled <= 0:
+                fp = float(oy.get("avgFillPrice") or oy.get("price") or q_yes_p)
+                yes_shares_filled = amount_yes / (fp * _sdiv)
+                log.warning(f"[{chat_id}] ARB YES: no filled qty from API, estimated {yes_shares_filled:.2f}sh")
+            yes_ok = True
+
+        if isinstance(resp_no, Exception):
+            log.warning(f"[{chat_id}] ARB NO leg order failed: {resp_no}")
+        else:
+            on_ = resp_no.get("order") or resp_no.get("clobOrder") or resp_no.get("ammOrder") or resp_no
+            no_shares_filled = client.parse_filled_shares(on_)
+            if no_shares_filled <= 0:
+                fp = float(on_.get("avgFillPrice") or on_.get("price") or q_no_p)
+                no_shares_filled = amount_no / (fp * _sdiv)
+                log.warning(f"[{chat_id}] ARB NO: no filled qty from API, estimated {no_shares_filled:.2f}sh")
+            no_ok = True
+
+        if not (yes_ok and no_ok):
+            failed_leg = "NO" if yes_ok else ("YES" if no_ok else "BOTH")
+            raise RuntimeError(f"Parallel ARB leg failure: {failed_leg} leg failed")
 
         # Burn actual filled pairs (subtract tiny epsilon to avoid precision errors)
         burn_qty = round(min(yes_shares_filled, no_shares_filled) - 0.001, 4)
@@ -796,12 +815,10 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
         log.error(f"[{chat_id}] ARB error: {e}")
 
         # ── Atomic dual-leg rollback ──────────────────────────────────────
-        # BUG FIX (old code): rollback only sold YES, leaving unhedged NO
-        # shares if both legs filled but burn failed — that's a directional
-        # bet, not a hedged position.
-        # NEW logic:
-        #   YES-only fill  → sell exactly yes_shares_filled
-        #   Both legs fill → sell BOTH legs to clear all exposure
+        # Handles all 3 asymmetric scenarios:
+        #   1. YES-only filled → sell YES shares
+        #   2. NO-only filled  → sell NO shares
+        #   3. Both filled but burn failed → sell BOTH legs to clear all exposure
         yes_rb = False
         no_rb  = False
 
@@ -815,6 +832,17 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
                 log.info(f"[{chat_id}] ARB rollback ✅ YES sold ({yes_shares_filled:.3f}sh)")
             except Exception as re_:
                 log.critical(f"[{chat_id}] ARB ROLLBACK YES FAILED — manual action needed: {re_}")
+
+        elif not yes_ok and no_ok:
+            try:
+                await client.place_order(
+                    sig.event_id, sig.market_id, market["no_id"],
+                    "SELL", round(no_shares_filled * 0.99, 4), "MARKET", currency=CURRENCY,
+                )
+                no_rb = True
+                log.info(f"[{chat_id}] ARB rollback ✅ NO sold ({no_shares_filled:.3f}sh)")
+            except Exception as re_:
+                log.critical(f"[{chat_id}] ARB ROLLBACK NO FAILED — manual action needed: {re_}")
 
         elif yes_ok and no_ok:
             # Both legs filled but burn failed — must clear both
@@ -839,6 +867,7 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
 
         fully_rb = (
             (yes_ok and not no_ok and yes_rb) or
+            (not yes_ok and no_ok and no_rb) or
             (yes_ok and no_ok and yes_rb and no_rb)
         )
 

@@ -538,13 +538,22 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                     # Order might already be filled or expired, which is normal
                     log.debug(f"[{chat_id}] Cancel resting order notice: {ce}")
 
-            # Step 2: Sell held shares at market. Use generous 0.30 slippage so exit
-            # is guaranteed to execute and salvage cash instead of rejecting!
+            # Step 2: Sell held shares at market with calibrated slippage.
+            # - TAKE_PROFIT: 0.05 (5%) — refuse to give away locked gains to wide AMM spreads
+            # - REVERSAL_EXIT: 0.08 (8%) — profit protection before candle dump
+            # - STOP_LOSS: 0.12 (12%) — salvage capital without dumping at predatory 30% discount
+            if exit_reason == "TAKE_PROFIT":
+                exit_slippage = 0.05
+            elif exit_reason == "REVERSAL_EXIT":
+                exit_slippage = 0.08
+            else:
+                exit_slippage = 0.12
+
             resp = await client.place_order(
                 event_id=event_id, market_id=market_id,
                 outcome_id=outcome_id, side="SELL",
                 amount=sell_amount, order_type="MARKET",
-                currency=CURRENCY, max_slippage=0.30,
+                currency=CURRENCY, max_slippage=exit_slippage,
             )
             order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
             order_id = order.get("id") or order.get("orderId") or order.get("order_id")
