@@ -495,6 +495,8 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                         "entry_price": limit_price, "amount_ngn": amount,
                         "strategy":    sig.strategy, "asset":      sig.asset,
                         "timeframe":   sig.timeframe,
+                        "threshold":   market.get("threshold") if market else getattr(sig, "threshold", None),
+                        "closing_date": market.get("closing_date") if market else "",
                     })
                 except Exception as db_err:
                     log.error(f"[{chat_id}] MAKER DB record failed: {db_err}")
@@ -591,10 +593,13 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
 
     risk.add_position(sig.market_id, {
         "trade_id":    trade_id,    "event_id":   sig.event_id,
+        "order_id":    order_id,
         "outcome":     sig.outcome, "outcome_id": sig.outcome_id,
         "entry_price": filled_price, "amount_ngn": actual_ngn,
         "strategy":    sig.strategy, "asset":      sig.asset,
         "timeframe":   sig.timeframe,
+        "threshold":   market.get("threshold") if market else getattr(sig, "threshold", None),
+        "closing_date": market.get("closing_date") if market else "",
     })
     risk.current_free_cash -= actual_ngn
     _trade_cooldown[sig.market_id] = time.time()

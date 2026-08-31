@@ -384,26 +384,27 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         amount_ngn  = float(pos.get("amount_ngn") or 100.0)
         spot_price  = feeds.spot.get(asset)
 
-        if not market:
-            # Market has rotated out — the candle this position was placed on has
-            # likely already resolved. Clean up stale positions older than 16 minutes
-            # (a 15-min candle + 1 min buffer) since they're already settled.
-            age_secs = time.time() - pos.get("placed_at", 0)
-            if age_secs > 960:  # 16 minutes
-                log.warning(
-                    f"[{chat_id}] Cleaning stale position on {market_id} "
-                    f"(age={age_secs:.0f}s, asset={asset}, strategy={pos.get('strategy')})"
-                )
-                stale_positions.append(market_id)
-            continue
+        # Retrieve market metadata from active scanner or stored position dictionary
+        threshold   = (market.get("threshold") if market else None) or pos.get("threshold")
+        closing_date = (market.get("closing_date") if market else "") or pos.get("closing_date", "")
+        secs        = market.get("secs_to_close", 0) if market else (scanner._seconds_to_close(closing_date) if closing_date else 0)
 
-        secs = market.get("secs_to_close", 0)
+        if not market:
+            # Market has rotated out — if candle has fully elapsed (secs <= 0), clean up stale positions
+            if secs <= 0:
+                age_secs = time.time() - pos.get("placed_at", 0)
+                if age_secs > 960:  # 16 minutes
+                    log.warning(
+                        f"[{chat_id}] Cleaning stale resolved position on {market_id} "
+                        f"(age={age_secs:.0f}s, asset={asset}, strategy={pos.get('strategy')})"
+                    )
+                    stale_positions.append(market_id)
+                continue
+
         # Don't try to exit in the final 45 seconds — settlement/oracle resolution
         # risk makes exit prices unreliable and the market is about to close anyway
         if secs < MIN_EXIT_TIME_REMAINING:
             continue
-
-        threshold   = market.get("threshold")
 
         if not threshold or not spot_price:
             continue
@@ -418,10 +419,10 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             w_est = 1.0 - w_est
 
         # Current market price for our held outcome (use live price or estimated thesis value)
-        if outcome == "YES":
-            current_price = market.get("yes_price", 0.5)
+        if market:
+            current_price = market.get("yes_price", 0.5) if outcome == "YES" else market.get("no_price", 0.5)
         else:
-            current_price = market.get("no_price", 0.5)
+            current_price = entry_price
 
         # Dynamic Thesis Value based on continuous spot diffusion:
         # If orderbook quotes are lagging, w_est gives the true statistical fair value of the position
