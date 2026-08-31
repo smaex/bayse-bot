@@ -542,13 +542,13 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             # Step 2: Sell held shares at market with calibrated slippage.
             # - TAKE_PROFIT: 0.05 (5%) — refuse to give away locked gains to wide AMM spreads
             # - REVERSAL_EXIT: 0.08 (8%) — profit protection before candle dump
-            # - STOP_LOSS: 0.12 (12%) — salvage capital without dumping at predatory 30% discount
+            # - STOP_LOSS: 0.25 (25%) — generous slippage to guarantee emergency execution and salvage cash
             if exit_reason == "TAKE_PROFIT":
                 exit_slippage = 0.05
             elif exit_reason == "REVERSAL_EXIT":
                 exit_slippage = 0.08
             else:
-                exit_slippage = 0.12
+                exit_slippage = 0.25
 
             resp = await client.place_order(
                 event_id=event_id, market_id=market_id,
