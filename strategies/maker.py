@@ -180,14 +180,15 @@ class MakerStrategy(BaseStrategy):
 
         dist_pct = (spot - threshold) / threshold
 
-        # ── Quoting Window Guard (Minutes 4 to 10 of a 15-min candle) ─────────
-        # - Don't quote in the first 4 minutes (secs > 660): trend hasn't settled yet.
+        # ── Quoting Window Guard (Minutes 5.5 to 10 of a 15-min candle) ─────────
+        # - Don't quote in the first 5.5 minutes (secs > 570): trend hasn't settled yet, high retrace risk.
         # - Don't open new maker limit bids in the final 5 minutes (secs < 300): late-candle whips
         #   and disappearing orderbook bids make late maker entries highly vulnerable to reversals.
-        if secs_to_close > 660:
+        # - Today's empirical data shows 100% win rate between 570s and 300s!
+        if secs_to_close > 570:
             log.info(
                 f"MAKER SKIP {asset} — candle warm-up window "
-                f"(secs={secs_to_close:.0f} > 660, waiting for 4-minute trend formation)"
+                f"(secs={secs_to_close:.0f} > 570, waiting for 5.5-minute trend formation)"
             )
             return None
         if secs_to_close < 300:
