@@ -225,10 +225,12 @@ class MakerStrategy(BaseStrategy):
         edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
 
         # ── Asset-Specific Edge & Distance Calibration ────────────────────────
-        # ETH has severe mean-reversion chop, requiring distance >= 0.200% and 2.5% edge cushion.
-        # SOL requires >= 0.200% distance to prevent early-candle micro-chop flips.
-        # BTC requires >= 0.100% distance.
-        min_dist_req = 0.0020 if asset in ("ETH", "SOL") else 0.0010
+        # All crypto assets (BTC, ETH, SOL) require distance >= 0.200% (0.0020).
+        # Previous 0.0010 for BTC allowed entry at -0.120% ($75 away from strike), which
+        # easily flipped on normal 10-minute noise and caused a loss. At >= 0.200%,
+        # BTC is at least $130+ away from the strike, matching the 100% win-rate of ETH/SOL.
+        # ETH retains an additional 2.5% edge cushion due to higher mean-reversion chop.
+        min_dist_req = 0.0020
         eth_edge_cushion = 0.025 if asset == "ETH" else 0.0
 
         if abs(dist_pct) < min_dist_req:
