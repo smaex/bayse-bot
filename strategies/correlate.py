@@ -67,8 +67,9 @@ class CorrelateStrategy(BaseStrategy):
         tgt_spot   = spot_price if spot_price is not None else feeds.spot.get(asset)
         if tgt_thresh and tgt_spot and tgt_thresh > 0:
             dist = (tgt_spot - tgt_thresh) / tgt_thresh
-            if direction == "UP"   and dist < -0.0010: return None  # cannot buy UP if asset is >0.10% below threshold
-            if direction == "DOWN" and dist > +0.0010: return None  # cannot buy DOWN if asset is >0.10% above threshold
+            # Strict directional alignment: Target asset must NOT be on the opposite side of its own threshold!
+            if direction == "UP"   and dist < 0.0000: return None  # cannot buy UP if target asset is below its own strike
+            if direction == "DOWN" and dist > 0.0000: return None  # cannot buy DOWN if target asset is above its own strike
 
         outcome    = "YES" if direction == "UP" else "NO"
         outcome_id = market["yes_id"] if outcome == "YES" else market["no_id"]

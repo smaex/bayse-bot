@@ -53,15 +53,15 @@ WINDOW_SECS = 120
 MIN_CERTAINTY = 0.90
 
 # Minimum distance from threshold as % of threshold.
-# 0.003 = 0.30% away. BTC at $63,000 threshold needs to be at $62,810 or $63,189.
-# This ensures a 0.3% adverse move cannot flip the outcome in 120s.
-MIN_DISTANCE_PCT = 0.003
+# 0.004 = 0.40% away. BTC at $63,000 threshold needs to be at $62,748 or $63,252.
+# This ensures a 0.4% adverse move cannot flip the outcome in 120s.
+MIN_DISTANCE_PCT = 0.004
 
-# Entry price ceiling: max 0.85. At 0.97 the Bayse taker fee exceeds the gross profit margin.
-# Audit Aug 13-23: both ORACLE_ARB trades WON (100% accuracy) but produced net LOSSES of -₦5.90.
-# At 0.97 entry: win pays +₦2.94 gross, fee is ~₦8 → net -₦5. Never trade where fee > gross payout.
-# At 0.85 entry: win pays +₦15 gross, fee is ~₦3.75 → net +₦11.25 per ₦100. Profitable.
-MAX_ENTRY_PRICE = 0.85
+# Entry price ceiling: max 0.75. At 0.75, a win pays +₦33 gross per ₦100.
+# At 0.85 (old value): win pays only +₦14 per ₦100, needs 87.6% WR to break even.
+# At 0.75: win pays +₦33 per ₦100, needs only 75% WR to break even.
+# A single loss at ₦400 order size would wipe 4+ MAKER wins — this cap prevents that.
+MAX_ENTRY_PRICE = 0.75
 
 # Cooldown after an oracle arb on a specific market — prevent double-entry.
 _oracle_fired: dict[str, float] = {}
@@ -204,9 +204,10 @@ class OracleArbStrategy(BaseStrategy):
             certainty   = certainty,
             win_prob    = certainty,
             market_price= entry_price,
-            # Dynamic sizing: scale from 5% at 90% certainty up to 25% at 99%+.
-            # Floored at 5% — formula can go negative below 0.95 certainty.
-            size_pct    = max(0.05, min(0.25, 0.05 + (certainty - 0.90) * 2.5)),
+            # Dynamic sizing: scale from 5% at 90% certainty up to 10% at 95%+.
+            # Old: 25% max — a single loss at ₦400 wiped 4+ MAKER wins.
+            # New: 10% max — a single loss at ₦160 costs ~2 MAKER wins (recoverable).
+            size_pct    = max(0.05, min(0.10, 0.05 + (certainty - 0.90) * 1.0)),
             reason      = (
                 f"ORACLE_ARB {outcome} | oracle={oracle_price:.2f} "
                 f"vs threshold={threshold:.2f} dist={distance_pct:+.3%} "
