@@ -17,18 +17,20 @@ from strategies.arb        import ArbStrategy
 from strategies.frontrun   import FrontrunStrategy
 from strategies.correlate  import CorrelateStrategy
 from strategies.regime     import regime_controller
-from strategies.maker      import MakerStrategy
-from strategies.oracle_arb import OracleArbStrategy
+from strategies.maker          import MakerStrategy
+from strategies.oracle_arb     import OracleArbStrategy
+from strategies.paired_sniper  import PairedSniperStrategy
 
 log = logging.getLogger("strategies")
 
 _strategies = {
-    "SNIPE":      SnipeStrategy(),
-    "ARB":        ArbStrategy(),
-    "FRONTRUN":   FrontrunStrategy(),
-    "CORRELATE":  CorrelateStrategy(),
-    "MAKER":      MakerStrategy(),
-    "ORACLE_ARB": OracleArbStrategy(),
+    "SNIPE":         SnipeStrategy(),
+    "ARB":           ArbStrategy(),
+    "FRONTRUN":      FrontrunStrategy(),
+    "CORRELATE":     CorrelateStrategy(),
+    "MAKER":         MakerStrategy(),
+    "ORACLE_ARB":    OracleArbStrategy(),
+    "PAIRED_SNIPER": PairedSniperStrategy(),
 }
 
 # Structural strategies that bypass the regime/certainty multiplier system.
