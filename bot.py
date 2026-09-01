@@ -432,6 +432,25 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         pos["peak_price"] = max(pos.get("peak_price", entry_price), current_price, effective_val)
         peak_price = pos["peak_price"]
 
+        # ── Proactive Threat Warning Nudge (Spot Compression Alert) ───────────
+        # If spot compresses to within 0.08% of strike and threat has not been alerted yet:
+        is_threatened = (outcome == "YES" and dist_pct < 0.0008) or (outcome == "NO" and dist_pct > -0.0008)
+        if is_threatened and not pos.get("threat_alerted") and _tg_app:
+            pos["threat_alerted"] = True
+            try:
+                tf = pos.get("timeframe", "15min")
+                strat = pos.get("strategy", "?")
+                threat_msg = (
+                    f"⚠️ *POSITION THREAT WARNING*\n\n"
+                    f"Strategy: *{strat}* | *{asset} {tf}* (*{outcome}*)\n"
+                    f"Strike Distance: *{dist_pct:+.3%}* (compressing!)\n"
+                    f"Time Remaining: *{secs:.0f}s*\n"
+                    f"Status: *Proactively cancelled resting orders & armed emergency SL*"
+                )
+                asyncio.create_task(telegram_bot.send_message(_tg_app, chat_id, threat_msg, parse_mode="Markdown"))
+            except Exception:
+                pass
+
         # ── 1. DYNAMIC TAKE-PROFIT & TRAILING PROFIT LOCK ─────────────────────
         # Locks in profit whenever:
         # A) Live price or diffusion model shows >= +15% profit with < 450s remaining
@@ -606,13 +625,14 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                             f"PnL: ₦{pnl:+,.0f}"
                         )
                     else:
+                        salvaged_cash = max(0.0, amount_ngn + pnl)
+                        saved_loss = max(0.0, amount_ngn - abs(pnl))
                         tg_msg = (
-                            f"{emoji} *Position Exited (Stop-Loss)*\n"
-                            f"Strategy: {pos.get('strategy', '?')}\n"
-                            f"Asset: {pos.get('asset', '?')} {pos.get('outcome', '')}\n"
-                            f"Entry: {entry_price:.3f} → Exit: {sell_price:.3f}\n"
-                            f"PnL: ₦{pnl:+,.0f}\n"
-                            f"Reason: Price flipped against thesis (salvaged capital)"
+                            f"🛡️ *Emergency Stop-Loss (Capital Salvaged)*\n\n"
+                            f"Strategy: *{pos.get('strategy', '?')}* | *{pos.get('asset', '?')}* (*{pos.get('outcome', '')}*)\n"
+                            f"Entry: *{entry_price:.3f}* → Exit: *{sell_price:.3f}*\n"
+                            f"Salvaged Cash: *₦{salvaged_cash:,.2f}* (saved ~₦{saved_loss:,.2f} of max loss)\n"
+                            f"Realized PnL: *-₦{abs(pnl):,.2f}* (capital protected)"
                         )
                     await telegram_bot.send_message(
                         _tg_app, chat_id, tg_msg, parse_mode="Markdown",

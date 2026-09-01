@@ -150,7 +150,10 @@ class RiskManager:
                 return True
         return False
 
-    def already_in(self, market_id: str, asset: str = "") -> bool:
+    def already_in(self, market_id: str, asset: str = "", is_hedge: bool = False) -> bool:
+        if is_hedge:
+            # Matched-pair hedge explicitly acquires the opposite side to lock in redemption spread
+            return False
         if market_id in self.pending_markets:
             return True
         pos = self.open_positions.get(market_id)
@@ -159,8 +162,6 @@ class RiskManager:
             return True
         # Asset-level deduplication: if we already hold ANY position on this asset
         # (even on a different market_id / different side), block new entries.
-        # This prevents contradictory opposing bets (YES + NO) on the same asset
-        # within the same candle, which guarantees a net loss.
         if asset:
             for existing_pos in self.open_positions.values():
                 if existing_pos.get("asset") == asset:
