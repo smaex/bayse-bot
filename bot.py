@@ -473,8 +473,10 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         adverse_flip = (outcome == "YES" and dist_pct < -0.00005) or (outcome == "NO" and dist_pct > +0.00005)
         thesis_broken = (w_est < 0.40)
         loss_pct = (entry_price - current_price) / entry_price if entry_price > 0 else 0.0
+        # MAKER Late-Candle Protection: cancel resting limit orders in the final 5 mins (<300s) to prevent adverse selection dumps
+        is_maker_late = (pos.get("strategy") == "MAKER" and secs < 300 and not pos.get("confirmed_filled"))
 
-        if adverse_flip or thesis_broken or (loss_pct >= 0.15 and current_price >= 0.05):
+        if adverse_flip or thesis_broken or is_maker_late or (loss_pct >= 0.15 and current_price >= 0.05):
             positions_to_exit.append({
                 "market_id": market_id,
                 "pos": pos,

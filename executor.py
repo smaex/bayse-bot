@@ -341,11 +341,12 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                     log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — fallback EV {ev:+.1%} < {target_margin:.0%}")
                     return
         else:
-            # CLOB or probe: evaluate EV using worst-case price (inclusive of slippage & fees)
+            # CLOB or probe: evaluate EV using worst-case price (inclusive of spread buffer & fees)
             fee_rate = _get_market_fee(sig.market_id)
             slip_map_ev = {"safe": 0.008, "balanced": 0.015, "aggressive": 0.020, "full_send": 0.025, "custom": 0.015}
             slip_ev = slip_map_ev.get(mode, 0.015) if not is_maker else 0.0
-            worst_case_p = min(sig.market_price * (1.0 + slip_ev), 0.650)
+            taker_buf = max(0.012, sig.market_price * slip_ev) if not is_maker else 0.0
+            worst_case_p = min(sig.market_price + taker_buf, 0.650)
             eff_fee  = _effective_fee(fee_rate, worst_case_p)
             ev = sig.win_prob / (worst_case_p * (1.0 + eff_fee)) - 1.0
             if not is_probe and ev < target_margin:
@@ -423,7 +424,8 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         limit_price   = round(min(sig.market_price * 1.02, 0.75, max_valid), 3)
     else:
         time_in_force = "FAK"   # Fill-And-Kill (instant taker fill, hard cap at 0.65)
-        limit_price   = round(min(sig.market_price * (1.0 + slippage), 0.65, max_valid), 3)
+        taker_buffer  = max(0.012, sig.market_price * slippage)
+        limit_price   = round(min(sig.market_price + taker_buffer, 0.65, max_valid), 3)
 
     log.info(
         f"[{chat_id}] PLACING {sig.strategy} {sig.asset} {sig.timeframe} "
