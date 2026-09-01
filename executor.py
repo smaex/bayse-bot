@@ -341,12 +341,15 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                     log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — fallback EV {ev:+.1%} < {target_margin:.0%}")
                     return
         else:
-            # CLOB or probe (probe EV is ignored/allowed at min size)
+            # CLOB or probe: evaluate EV using worst-case price (inclusive of slippage & fees)
             fee_rate = _get_market_fee(sig.market_id)
-            eff_fee  = _effective_fee(fee_rate, sig.market_price)
-            ev = sig.win_prob / (sig.market_price * (1.0 + eff_fee)) - 1.0
+            slip_map_ev = {"safe": 0.008, "balanced": 0.015, "aggressive": 0.020, "full_send": 0.025, "custom": 0.015}
+            slip_ev = slip_map_ev.get(mode, 0.015) if not is_maker else 0.0
+            worst_case_p = min(sig.market_price * (1.0 + slip_ev), 0.650)
+            eff_fee  = _effective_fee(fee_rate, worst_case_p)
+            ev = sig.win_prob / (worst_case_p * (1.0 + eff_fee)) - 1.0
             if not is_probe and ev < target_margin:
-                log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — EV {ev:+.1%} < {target_margin:.0%}")
+                log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — worst-case EV {ev:+.1%} < {target_margin:.0%} (worst_price={worst_case_p:.3f})")
                 return
 
         # ── Global entry price ceiling ───────────────────────────────────────
@@ -407,8 +410,8 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     # This physically FORBIDS the exchange from ever filling orders at 0.990 or 0.830!
     fee_rate      = _get_market_fee(sig.market_id)
     eff_fee       = _effective_fee(fee_rate, sig.market_price)
-    slip_map      = {"safe": 0.003, "balanced": 0.005, "aggressive": 0.01, "full_send": 0.02}
-    slippage      = slip_map.get(mode, 0.005)
+    slip_map      = {"safe": 0.008, "balanced": 0.015, "aggressive": 0.020, "full_send": 0.025, "custom": 0.015}
+    slippage      = slip_map.get(mode, 0.015)
     max_valid     = (1.0 - eff_fee) / 1.01
     order_type    = "LIMIT"
 
