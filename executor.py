@@ -173,31 +173,27 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     if risk.is_on_probation():
         raw_pct *= 0.50
 
-    # ── NGN amount ─────────────────────────────────────────────────────────
-    if equity < 3_000:
-        amount = MIN_TRADE_NGN
-    else:
-        # For Kelly sizing, we don't apply user_risk * 3 cap since Kelly is already capped
-        cap_factor = 1.0 if kelly_pct > 0.0 else (user_risk * 3.0)
-        final_pct = min(raw_pct, cap_factor)
-        amount = max(min_t, min(max_t, equity * final_pct))
+    # ── NGN amount scaled dynamically per user settings ──────────────────
+    cap_factor = 1.0 if kelly_pct > 0.0 else (user_risk * 3.0)
+    final_pct = min(raw_pct, cap_factor)
+    calculated_amount = equity * final_pct
 
-    # ── Mode-aware per-trade hard ceiling ──────────────────────────────────
-    # Previously locked at equity×5% regardless of mode, which broke
-    # aggressive / full_send users who expect larger position sizes.
-    # Now scales with mode while still respecting the user's maxtrade cap.
+    # Bound dynamically between user's configured mintrade and maxtrade
+    effective_min = max(MIN_TRADE_NGN, float(min_t))
+    effective_max = max(effective_min, float(max_t))
+    amount = max(effective_min, min(effective_max, calculated_amount))
+
+    # Mode-aware per-trade ceiling while strictly respecting user maxtrade
     _mode_cap_pct = {
-        "safe":      0.03,
-        "balanced":  0.05,
+        "safe":       0.03,
+        "balanced":   0.05,
         "aggressive": 0.10,
-        "full_send": 0.20,
-        "custom":    0.10,
+        "full_send":  0.20,
+        "custom":     0.10,
     }.get(mode, 0.05)
-    hard_cap = min(max(MIN_TRADE_NGN, equity * _mode_cap_pct), max_t)
+    hard_cap = min(max(effective_min, equity * _mode_cap_pct), effective_max)
     if amount > hard_cap:
         amount = hard_cap
-
-    effective_min = max(MIN_TRADE_NGN, min_t)
 
     # ── TEST MODE: cap all trades for data collection ─────────────────────
     if config.TEST_MODE:
@@ -227,7 +223,6 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         )
         amount = free_cash
 
-    effective_min = max(MIN_TRADE_NGN, min_t)
     if amount < effective_min:
         log.info(
             f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — amount ₦{amount:,.0f} "

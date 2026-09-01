@@ -544,13 +544,13 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             # Step 2: Sell held shares at market with calibrated slippage.
             # - TAKE_PROFIT: 0.05 (5%) — refuse to give away locked gains to wide AMM spreads
             # - REVERSAL_EXIT: 0.08 (8%) — profit protection before candle dump
-            # - STOP_LOSS: 0.25 (25%) — generous slippage to guarantee emergency execution and salvage cash
+            # - STOP_LOSS: 0.80 (80%) — unconstrained emergency slippage to guarantee immediate execution on rapid contract price drops
             if exit_reason == "TAKE_PROFIT":
                 exit_slippage = 0.05
             elif exit_reason == "REVERSAL_EXIT":
                 exit_slippage = 0.08
             else:
-                exit_slippage = 0.25
+                exit_slippage = 0.80
 
             resp = await client.place_order(
                 event_id=event_id, market_id=market_id,
@@ -624,12 +624,18 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             err_str = str(e).lower()
             if "insufficient shares" in err_str or "insufficient balance" in err_str:
                 # Phantom position: LIMIT order was never filled but tracker thought it was open.
-                # Remove it so future signals aren't permanently blocked.
+                # Remove it so future signals aren't permanently blocked and resolve with 0 PnL.
                 log.warning(
                     f"[{chat_id}] EXIT failed — phantom/unfilled LIMIT position on {market_id}. "
                     f"Removing from tracker. Error: {e}"
                 )
                 risk.remove_position(market_id)
+                trade_id = pos.get("trade_id")
+                if trade_id:
+                    try:
+                        await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
+                    except Exception:
+                        pass
             else:
                 log.error(f"[{chat_id}] EXIT order failed for {market_id}: {e}", exc_info=True)
 

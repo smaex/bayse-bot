@@ -154,12 +154,12 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                     pnl = None
                     if trade.get("order_id"):
                         try:
-                            order_data  = await client.get_order(trade["order_id"])
-                            shares      = float(order_data.get("quantity") or
-                                                order_data.get("filledSize") or
-                                                order_data.get("shares") or 0)
-                            if shares <= 0:
-                                # Maker order never filled — mark as 0.0 PnL without counting as a loss
+                            order_data   = await client.get_order(trade["order_id"])
+                            order_status = str(order_data.get("status") or "").lower()
+                            shares       = client.parse_filled_shares(order_data)
+                            if shares <= 0 or order_status in ("cancelled", "expired", "open", "rejected", "killed"):
+                                # Maker/Taker order was never filled — mark as 0.0 PnL without counting as a loss
+                                log.info(f"[{chat_id}] Order {trade['order_id']} was unfilled (status={order_status}, shares={shares}) — resolving with 0.0 PnL")
                                 await asyncio.to_thread(database.resolve_trade, trade["trade_id"], None, 0.0)
                                 if user_risks and chat_id in user_risks:
                                     user_risks[chat_id].remove_position(trade["market_id"])
@@ -170,7 +170,7 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                             f"Strategy: {trade.get('strategy', 'MAKER')}\n"
                                             f"Asset: {trade.get('asset', '?')} {trade.get('outcome', '')}\n"
                                             f"Amount: ₦{trade.get('amount_ngn', 0):,.0f} returned to balance\n"
-                                            f"Status: Market closed with limit order unfilled (no loss)"
+                                            f"Status: Market closed with order unfilled (0.00 PnL)"
                                         )
                                         await tgb.send_message(tg_app, chat_id, msg, parse_mode="Markdown")
                                     except Exception:
