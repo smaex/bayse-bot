@@ -40,7 +40,7 @@ _user_daily:     dict = {}
 _active_markets: list = []
 _start_user_fn       = None
 
-_VALID_STRATEGIES = {"SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB"}
+_VALID_STRATEGIES = {"SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER"}
 _VALID_ASSETS     = {"BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "XAUUSD"}
 _VALID_TIMEFRAMES = {"5min", "15min", "1h", "6h", "1d"}
 MIN_TRADE_NGN     = 100
@@ -573,7 +573,7 @@ _MODES = {
             "mode": "safe", "assets": ["BTC", "EURUSD", "GBPUSD"],
             # 1h kept only for FX (EURUSD/GBPUSD only exist at 1h granularity,
             # and ARB can still work there). 5min added for the BTC leg.
-            "timeframes": ["5min", "15min", "1h"], "strategies": ["SNIPE", "ARB", "MAKER", "ORACLE_ARB"],
+            "timeframes": ["5min", "15min", "1h"], "strategies": ["SNIPE", "ARB", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER"],
             "risk_pct": 0.5, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 15.0, "daily_multiplier": 5,
         },
@@ -586,7 +586,7 @@ _MODES = {
             # all hard-restricted to 5min/15min in code now; this just keeps
             # the user-level filter consistent so ARB doesn't waste cycles
             # scanning 1h candles this account isn't otherwise using.
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "MAKER", "ORACLE_ARB"],
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER"],
             "risk_pct": 1.5, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 20.0, "daily_multiplier": 10,
         },
@@ -595,7 +595,7 @@ _MODES = {
         "label": "🟠 *Aggressive mode applied.*",
         "settings": {
             "mode": "aggressive", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB"],
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER"],
             "risk_pct": 3.0, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 30.0, "daily_multiplier": 20,
         },
@@ -604,7 +604,7 @@ _MODES = {
         "label": "🔴 *Full Send mode applied.*",
         "settings": {
             "mode": "full_send", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB"],
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER"],
             "risk_pct": 5.0, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 50.0, "daily_multiplier": 50,
         },
@@ -778,12 +778,13 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
     """
     strat = sig.strategy.upper()
     strat_meta = {
-        "SNIPE":      ("🎯", "*SNIPE Signal*"),
-        "ORACLE_ARB": ("⚡", "*ORACLE ARB* (Latency Edge)"),
-        "MAKER":      ("📊", "*MAKER* (Limit Order)" if engine == "CLOB_LIMIT" else "*MAKER*"),
-        "FRONTRUN":   ("🏎️", "*FRONTRUN* (Binance Impulse)"),
-        "CORRELATE":  ("🔗", "*CORRELATION* (Lead-Lag)"),
-        "ARB":        ("⚖️", "*RISK-FREE ARB*"),
+        "SNIPE":         ("🎯", "*SNIPE Signal*"),
+        "ORACLE_ARB":    ("⚡", "*ORACLE ARB* (Latency Edge)"),
+        "MAKER":         ("📊", "*MAKER* (Limit Order)" if engine == "CLOB_LIMIT" else "*MAKER*"),
+        "FRONTRUN":      ("🏎️", "*FRONTRUN* (Binance Impulse)"),
+        "CORRELATE":     ("🔗", "*CORRELATION* (Lead-Lag)"),
+        "ARB":           ("⚖️", "*RISK-FREE ARB*"),
+        "PAIRED_SNIPER": ("⚡", "*PAIRED SNIPER* (Ohioism Engine)"),
     }
     icon_strat, title_strat = strat_meta.get(strat, ("🔔", f"*{strat} Trade*"))
     
@@ -815,12 +816,13 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
 
 
 _STRAT_ICONS = {
-    "SNIPE":      ("🎯", "SNIPE"),
-    "ORACLE_ARB": ("⚡", "ORACLE ARB"),
-    "MAKER":      ("📊", "MAKER"),
-    "FRONTRUN":   ("🏎️", "FRONTRUN"),
-    "CORRELATE":  ("🔗", "CORRELATION"),
-    "ARB":        ("⚖️", "RISK-FREE ARB"),
+    "SNIPE":         ("🎯", "SNIPE"),
+    "ORACLE_ARB":    ("⚡", "ORACLE ARB"),
+    "MAKER":         ("📊", "MAKER"),
+    "FRONTRUN":      ("🏎️", "FRONTRUN"),
+    "CORRELATE":     ("🔗", "CORRELATION"),
+    "ARB":           ("⚖️", "RISK-FREE ARB"),
+    "PAIRED_SNIPER": ("⚡", "PAIRED SNIPER"),
 }
 
 async def notify_win(app, cid, _mid, asset, tf, strat, pnl):
