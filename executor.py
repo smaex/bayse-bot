@@ -417,11 +417,20 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         limit_price   = sig.market_price  # passive bid
     elif is_oracle_arb:
         time_in_force = "FAK"   # Fill-And-Kill (instant taker fill, hard cap at 0.75)
-        limit_price   = round(min(sig.market_price * 1.02, 0.75, max_valid), 3)
+        taker_buffer  = max(0.025, sig.market_price * 0.05)
+        limit_price   = round(min(sig.market_price + taker_buffer, 0.75, max_valid), 3)
+    elif sig.strategy == "PAIRED_SNIPER":
+        time_in_force = "FAK"
+        taker_buffer  = max(0.015, sig.market_price * slippage)
+        # Sizing / price cap scales with conviction:
+        # Near-settlement lock (w_prob >= 0.85) allows limit price up to 0.93
+        # Standard momentum capped at 0.75
+        cap = 0.93 if sig.certainty >= 0.85 else 0.75
+        limit_price   = round(min(sig.market_price + taker_buffer, cap, max_valid), 3)
     else:
-        time_in_force = "FAK"   # Fill-And-Kill (instant taker fill, hard cap at 0.65)
+        time_in_force = "FAK"   # Fill-And-Kill (instant taker fill, hard cap at 0.70)
         taker_buffer  = max(0.012, sig.market_price * slippage)
-        limit_price   = round(min(sig.market_price + taker_buffer, 0.65, max_valid), 3)
+        limit_price   = round(min(sig.market_price + taker_buffer, 0.70, max_valid), 3)
 
     log.info(
         f"[{chat_id}] PLACING {sig.strategy} {sig.asset} {sig.timeframe} "
@@ -641,13 +650,13 @@ async def execute_arb(chat_id: str, sig, client, risk, equity: float, free_cash:
 
     _arb_pending.add(sig.market_id)
     try:
-        await _execute_arb_logic(chat_id, sig, client, market, free_cash)
+        await _execute_arb_logic(chat_id, sig, client, market, free_cash, settings)
     finally:
         _arb_pending.discard(sig.market_id)
         _trade_cooldown[sig.market_id] = time.time()
 
 
-async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash: float):
+async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash: float, settings: dict = None):
     """
     Safe ARB execution using actual filled-share counts for burn sizing.
     Fetches quotes for both YES and NO outcomes before trading to guarantee
@@ -670,15 +679,20 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
         return
 
     # ── Budget allocation ─────────────────────────────────────────────────
-    budget  = min(ARB_MAX_SIZE_NGN, free_cash * 0.30)
+    min_leg = max(MIN_TRADE_NGN, float(settings.get("mintrade", MIN_TRADE_NGN))) if settings else MIN_TRADE_NGN
+    if free_cash >= min_leg * 2.0:
+        budget = max(min_leg * 2.0, min(ARB_MAX_SIZE_NGN, free_cash * 0.40))
+    else:
+        budget = free_cash
+
     total_p = yes_p + no_p
     amount_yes = round(budget * (yes_p / total_p), 2)
     amount_no  = round(budget * (no_p  / total_p), 2)
 
-    if amount_yes < MIN_TRADE_NGN or amount_no < MIN_TRADE_NGN:
+    if amount_yes < min_leg or amount_no < min_leg:
         log.info(
             f"[{chat_id}] ARB SKIP {sig.asset} — leg sizes too small "
-            f"(yes=₦{amount_yes:,.0f} no=₦{amount_no:,.0f}, min=₦{MIN_TRADE_NGN:,.0f})"
+            f"(yes=₦{amount_yes:,.0f} no=₦{amount_no:,.0f}, min=₦{min_leg:,.0f})"
         )
         return
 

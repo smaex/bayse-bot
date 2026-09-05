@@ -71,17 +71,17 @@ SNIPE_ENTRY_WINDOWS = {
     "6h":    7200,
     "1d":    21600,
 }
-# DATA-DRIVEN TUNING:
-# SNIPE only trades high-conviction directional entries between 0.45 and 0.65.
+# DATA-DRIVEN TUNING (Calibrated from 2-week DB forensics):
+# SNIPE only trades high-conviction directional entries between 0.45 and 0.70.
 # - Underdog entries (<0.45) have poor win-rates and lose 77%+ of the time.
-# - High-price entries (>0.65) suffer from severe fee drag.
-SNIPE_MIN_CERTAINTY    = 0.12   # 55% win-rate floor — the 5% edge gate is the real protector
-SNIPE_MAX_MARKET_PRICE = 0.65   # Hard cap at 0.65 so positions have room to appreciate and exit profitably
+# - High-certainty entries (>=0.45, win_prob >= 70%) have 100% historical win-rate.
+SNIPE_MIN_CERTAINTY    = 0.45   # 70%+ win-rate floor (calibrated from 2-week forensics: cert >= 0.60 was 100% WR)
+SNIPE_MAX_MARKET_PRICE = 0.70   # Raised to 0.70 to capture high-conviction signals matching executor taker cap
 SNIPE_MIN_ENTRY_PRICE  = 0.45   # Hard floor at 0.45 — completely blocks low-probability underdog traps
 # Minimum spot-vs-threshold distance to consider a directional signal.
-# 0.060% ensures the asset has genuinely broken away from the strike price,
-# permanently preventing entering 1-tick coin flips right on the strike threshold.
-SNIPE_MIN_DISTANCE_PCT = 0.00060  # 0.060% minimum distance (was 0.010%)
+# 0.180% ensures the asset has genuinely broken away from the strike price,
+# permanently preventing entering micro-distance coin flips (<0.10% was 44.7% WR).
+SNIPE_MIN_DISTANCE_PCT = 0.0018  # 0.180% minimum distance (raised from 0.060%)
 
 # FX-specific
 FX_SESSION_UTC = {

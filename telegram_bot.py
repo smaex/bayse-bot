@@ -198,6 +198,10 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
     elif d == "resume":
         await _set_paused(cid, False)
         await _clear_daily(cid)
+        risk = _user_risks.get(cid)
+        if risk:
+            risk.paused = False
+            risk.peak_balance = 0
         log.info(f"[{cid}] RESUMED via button")
         await q.message.reply_text("▶️ Trading resumed.")
     elif d == "resetlearning":

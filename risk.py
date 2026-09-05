@@ -50,6 +50,13 @@ class RiskManager:
             log.info(f"Daily risk reset: profit was ₦{self.daily_realized_pnl:,.0f}")
             self.daily_realized_pnl = 0.0
             self.last_reset_date = today
+            # If the risk manager paused from yesterday's drawdown, reset the baseline for the new day
+            # so the bot never stays permanently silent across trading days
+            if self.paused:
+                log.info("Daily risk reset: clearing drawdown pause for new trading day")
+                self.paused = False
+                self.peak_balance = self.current_free_cash
+                self._dd_breach_since = 0.0
 
     def update_balance(self, balance: float):
         self.update_peak(balance)
