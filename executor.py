@@ -439,6 +439,7 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     )
 
     try:
+        t_order_start = time.time()
         resp  = await client.place_order(
             event_id=sig.event_id, market_id=sig.market_id,
             outcome_id=sig.outcome_id, side="BUY",
@@ -448,6 +449,7 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
             currency=CURRENCY,
             time_in_force=time_in_force,
         )
+        rtt_ms = (time.time() - t_order_start) * 1000.0
         order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
 
         # For LIMIT (MAKER) orders, the order is placed as a passive bid.
@@ -468,7 +470,7 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                 )
                 log.info(
                     f"[{chat_id}] MAKER LIMIT PLACED | {sig.asset} {sig.outcome} "
-                    f"@ {limit_price:.3f} ₦{amount:,.0f} | order={order_id}"
+                    f"@ {limit_price:.3f} ₦{amount:,.0f} | order={order_id} | rtt={rtt_ms:.0f}ms"
                 )
                 if _tg_app:
                     try:
@@ -519,16 +521,27 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         shares_filled = client.parse_filled_shares(order)
         filled_price  = float(order.get("avgFillPrice") or order.get("price") or limit_price)
         order_id      = order.get("id") or order.get("orderId") or order.get("order_id")
+        order_status  = str(order.get("status") or "").lower()
 
+        # ── FAK / Zero-Fill Reasoning (Order is a Request, Not a Result) ────────
+        # If the order was killed, rejected, or cancelled with 0 shares filled,
+        # it is a Zero-Fill. Do NOT manufacture a phantom position or deduct cash.
         if shares_filled <= 0:
-            if order_id:
+            if order_status in ("cancelled", "killed", "rejected", "expired") or time_in_force == "FAK":
+                log.info(
+                    f"[{chat_id}] ⚪ ZERO FILL (FAK killed/cancelled) | {sig.strategy} {sig.asset} "
+                    f"order={order_id} status={order_status} rtt={rtt_ms:.0f}ms | liquidity moved away"
+                )
+                _trade_cooldown[sig.market_id] = time.time()
+                return
+            elif order_id:
                 shares_filled = (
                     amount / (filled_price * 100.0)
                     if CURRENCY == "NGN" else amount / filled_price
                 )
-                log.warning(f"[{chat_id}] AMM zero-fill estimate for {sig.asset}")
+                log.warning(f"[{chat_id}] AMM zero-fill estimate for {sig.asset} | rtt={rtt_ms:.0f}ms")
             else:
-                log.info(f"[{chat_id}] Order rejected — no order_id returned")
+                log.info(f"[{chat_id}] Order rejected — no order_id returned | rtt={rtt_ms:.0f}ms")
                 return
 
         actual_ngn = shares_filled * filled_price * (100.0 if CURRENCY == "NGN" else 1.0)
@@ -539,7 +552,8 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
 
         log.info(
             f"[{chat_id}] ✅ FILLED | {sig.strategy} {sig.asset} {sig.timeframe} "
-            f"{sig.outcome} @ {filled_price:.4f} ₦{actual_ngn:,.0f} | order={order_id}"
+            f"{sig.outcome} @ {filled_price:.4f} ₦{actual_ngn:,.0f} | order={order_id} "
+            f"rtt={rtt_ms:.0f}ms (shares={shares_filled:.2f})"
         )
 
     except Exception as e:

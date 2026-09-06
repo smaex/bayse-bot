@@ -76,6 +76,7 @@ def build_app() -> Application:
         ("disconnect",    cmd_disconnect),
         ("rekey",         cmd_rekey),
         ("wallet",        cmd_wallet),
+        ("shadow",        cmd_shadow),
         ("help",          cmd_help),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
@@ -546,6 +547,12 @@ async def cmd_disconnect(update: Update, _ctx):
     log.info(f"[{cid}] DISCONNECTED")
     await update.message.reply_text("🔌 Disconnected. Trade history preserved. /start to reconnect.")
 
+@_guard
+async def cmd_shadow(update: Update, _ctx):
+    import shadow_tracker
+    report = shadow_tracker.get_summary_report()
+    await update.message.reply_text(report, parse_mode="Markdown")
+
 async def cmd_help(update: Update, _ctx):
     await update.message.reply_text(
         "*Commands*\n\n"
@@ -562,6 +569,7 @@ async def cmd_help(update: Update, _ctx):
         "/set — change a setting\n"
         "/pause — stop trading\n"
         "/resume — resume trading\n"
+        "/shadow — view mid-market shadow tracker report\n"
         "/debug — diagnose why trades aren't firing\n"
         "/disconnect — remove account",
         parse_mode="Markdown",

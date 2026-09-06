@@ -802,6 +802,11 @@ async def _scan_loop():
             executor.init_executor(active_markets, _tg_app)
             log.info(f"Scan: {len(active_markets)} markets")
             feeds.restart_bayse_feed(active_markets, _on_market_update)
+            try:
+                import shadow_tracker
+                shadow_tracker.on_market_scan(active_markets)
+            except Exception as se:
+                log.debug(f"Shadow tracker scan hook: {se}")
         except Exception as e:
             log.warning(f"Scan failed: {e}")
 
@@ -864,6 +869,11 @@ def _on_market_update(market_id: str, prices: dict):
         if 0.90 <= (ny + nn) <= 1.05:
             market["yes_price"] = ny
             market["no_price"]  = nn
+        try:
+            import shadow_tracker
+            shadow_tracker.on_price_update(market_id, prices)
+        except Exception:
+            pass
         # else: malformed tick, leave the last-known-good price in place
         # rather than poisoning the market dict with a bad data point.
 
