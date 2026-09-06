@@ -68,9 +68,9 @@ async def evaluate_all(
             if not sig:
                 continue
 
-            # Structural strategies (MAKER, ORACLE_ARB) bypass regime and
-            # certainty multipliers — they exploit market structure, not direction.
-            if name in _STRUCTURAL_STRATEGIES:
+            # Structural strategies (MAKER, ORACLE_ARB) and matched-pair hedges (PAIRED_SNIPER)
+            # bypass regime and certainty multipliers — they exploit market structure / locked-in spread.
+            if name in _STRUCTURAL_STRATEGIES or "PAIR_HEDGE" in getattr(sig, "reason", ""):
                 sig.mode_floor = 0.0   # always allowed through
                 signals.append(sig)
                 continue

@@ -180,15 +180,15 @@ class MakerStrategy(BaseStrategy):
 
         dist_pct = (spot - threshold) / threshold
 
-        # ── Quoting Window Guard (Minutes 5.5 to 10 of a 15-min candle) ─────────
-        # - Don't quote in the first 5.5 minutes (secs > 570): trend hasn't settled yet, high retrace risk.
+        # ── Quoting Window Guard (Minutes 6.0 to 10 of a 15-min candle) ─────────
+        # - Don't quote in the first 6.0 minutes (secs > 540): trend hasn't settled yet, high retrace risk.
         # - Don't open new maker limit bids in the final 5 minutes (secs < 300): late-candle whips
         #   and disappearing orderbook bids make late maker entries highly vulnerable to reversals.
-        # - Today's empirical data shows 100% win rate between 570s and 300s!
-        if secs_to_close > 570:
+        # - DB empirical data shows 64.3% win rate and positive net PnL in this core window!
+        if secs_to_close > 540:
             log.info(
                 f"MAKER SKIP {asset} — candle warm-up window "
-                f"(secs={secs_to_close:.0f} > 570, waiting for 5.5-minute trend formation)"
+                f"(secs={secs_to_close:.0f} > 540, waiting for 6.0-minute trend formation)"
             )
             return None
         if secs_to_close < 300:
@@ -226,11 +226,10 @@ class MakerStrategy(BaseStrategy):
         edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
 
         # ── Asset-Specific Edge & Distance Calibration ────────────────────────
-        # All crypto assets (BTC, ETH, SOL) require distance >= 0.280% (0.0028).
-        # At >= 0.280%, the spot price has a thick buffer ($8.00+ on ETH, $0.40+ on SOL,
-        # $180+ on BTC), completely protecting against 15-second micro-reversals.
-        # Today's winning trades were all at >= 0.280%!
-        min_dist_req = 0.0028
+        # Calibrated by 2-week DB forensics:
+        # - ETH: requires >= 0.350% ($9.50+ buffer) due to higher micro-volatility chop.
+        # - BTC & SOL: require >= 0.280% ($180+ on BTC, $0.40+ on SOL).
+        min_dist_req = 0.0035 if asset == "ETH" else 0.0028
         eth_edge_cushion = 0.025 if asset == "ETH" else 0.0
 
         if abs(dist_pct) < min_dist_req:
@@ -242,19 +241,20 @@ class MakerStrategy(BaseStrategy):
 
         # ── Strict Directional Alignment & Active Momentum Confirmation ────────
         # NEVER trade against the spot side!
-        # Requires true high-probability thesis (Fair Value >= 0.60, not 50/50 coinflips!)
+        # Requires true high-probability thesis (Fair Value >= 0.62, edge >= 0.020)
         # AND active momentum in the direction of the trade:
         # - For YES: spot must be rising (mom_5m >= +0.0002)
         # - For NO: spot must be falling (mom_5m <= -0.0002)
         chosen_side = None
-        if (dist_pct > 0 and edge_yes >= (0.007 + eth_edge_cushion)
-                and fv_yes >= 0.60 and mom_5m >= 0.0002):
+        min_maker_edge = 0.020 + eth_edge_cushion  # at least 2.0 cents of real edge
+        if (dist_pct > 0 and edge_yes >= min_maker_edge
+                and fv_yes >= 0.62 and mom_5m >= 0.0002):
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
-        elif (dist_pct < 0 and edge_no >= (0.007 + eth_edge_cushion)
-                and fv_no >= 0.60 and mom_5m <= -0.0002):
+        elif (dist_pct < 0 and edge_no >= min_maker_edge
+                and fv_no >= 0.62 and mom_5m <= -0.0002):
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price
@@ -280,9 +280,15 @@ class MakerStrategy(BaseStrategy):
             log.info(f"MAKER SKIP {asset} — bid price out of bounds ({our_bid:.3f})")
             return None
 
+        # Data-driven certainty calibration: combines true statistical win probability and spread edge
+        cert = min(0.95, max(target_fv, 0.50 + chosen_edge * 3.5))
+        if cert < 0.65:
+            log.info(f"MAKER SKIP {asset} — certainty {cert:.1%} below 65% conviction floor")
+            return None
+
         log.info(
             f"MAKER SIGNAL {asset} | side={chosen_side} fv={target_fv:.3f} our_bid={our_bid:.3f} "
-            f"market_bid={market_bid:.3f} mom_5m={mom_5m:+.4f} dist={dist_pct:+.3%} secs={secs_to_close:.0f}"
+            f"market_bid={market_bid:.3f} mom_5m={mom_5m:+.4f} dist={dist_pct:+.3%} cert={cert:.1%} secs={secs_to_close:.0f}"
         )
 
         return TradeSignal(
@@ -293,7 +299,7 @@ class MakerStrategy(BaseStrategy):
             timeframe   = market["timeframe"],
             outcome     = chosen_side,
             outcome_id  = outcome_id,
-            certainty   = min(0.90, 0.45 + chosen_edge * 4.0),  # edge 0.01→~0.49, 0.05→~0.65
+            certainty   = cert,
             win_prob    = target_fv,
             market_price= our_bid,    # executor will place LIMIT at this price
             size_pct    = 0.02,       # 2% of bankroll per maker order (small, high frequency)

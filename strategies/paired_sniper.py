@@ -101,7 +101,7 @@ class PairedSniperStrategy(BaseStrategy):
                         market_price=c2,
                         certainty=0.99,
                         win_prob=1.0,
-                        edge=locked_edge,
+                        edge_at_entry=locked_edge,
                         size_pct=0.05,
                         reason=f"PAIR_HEDGE: C1(YES)={c1:.3f} + C2(NO)={c2:.3f} < 0.95 (edge=+{locked_edge:.1%})",
                         title=market.get("title", ""),
@@ -129,7 +129,7 @@ class PairedSniperStrategy(BaseStrategy):
                         market_price=c2,
                         certainty=0.99,
                         win_prob=1.0,
-                        edge=locked_edge,
+                        edge_at_entry=locked_edge,
                         size_pct=0.05,
                         reason=f"PAIR_HEDGE: C1(NO)={c1:.3f} + C2(YES)={c2:.3f} < 0.95 (edge=+{locked_edge:.1%})",
                         title=market.get("title", ""),
@@ -157,13 +157,17 @@ class PairedSniperStrategy(BaseStrategy):
         w_no = 1.0 - w_yes
 
         # ── 5. Conviction Scoring & Outcome Selection ─────────────────────────
-        # Directional Strike Boundary: Never buy YES if below strike, never buy NO if above strike
-        if dist_pct >= 0.0000 and w_yes >= 0.55:
+        # Directional Strike Boundary & Calibrated Distance Cushion:
+        # - Near-settlement lock (secs <= 90 & w_prob >= 0.85): requires dist >= 0.0015
+        # - Standard momentum: requires dist >= 0.0035 for ETH, >= 0.0028 for BTC/SOL
+        min_dist = 0.0015 if (secs <= 90 and max(w_yes, w_no) >= 0.85) else (0.0035 if asset == "ETH" else 0.0028)
+
+        if dist_pct >= min_dist and w_yes >= 0.55:
             chosen_outcome = "YES"
             chosen_token_id = market.get("yes_token_id") or market.get("outcome1Id", "")
             win_prob = w_yes
             quote_price = yes_price
-        elif dist_pct <= -0.0000 and w_no >= 0.55:
+        elif dist_pct <= -min_dist and w_no >= 0.55:
             chosen_outcome = "NO"
             chosen_token_id = market.get("no_token_id") or market.get("outcome2Id", "")
             win_prob = w_no
@@ -209,7 +213,7 @@ class PairedSniperStrategy(BaseStrategy):
             market_price=quote_price,
             certainty=cert,
             win_prob=win_prob,
-            edge=ev,
+            edge_at_entry=ev,
             size_pct=size_pct,
             reason=f"OHIO_TAKER {chosen_outcome} w_est={win_prob:.1%} ev={ev:+.1%} (dist={dist_pct:+.3%})",
             title=market.get("title", ""),

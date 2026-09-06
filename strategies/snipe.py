@@ -224,8 +224,8 @@ class SnipeStrategy(BaseStrategy):
 
         # ── Learned certainty gate ─────────────────────────────────────────
         learned_min = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
-        # Cap effective_floor so a stale DB value (e.g. 0.60) never blocks 0.27 signals
-        effective_floor = min(learned_min, config.SNIPE_MIN_CERTAINTY)
+        # Ensure the calibrated config floor (0.45) is the absolute minimum requirement
+        effective_floor = max(config.SNIPE_MIN_CERTAINTY, learned_min)
 
         if composite < effective_floor:
             log.info(
