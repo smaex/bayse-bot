@@ -41,10 +41,13 @@ SERIES = {
         "6h":    "crypto-sol-6h",
         "1d":    "crypto-sol-1d",
     },
-    # FX — only 1h confirmed on Bayse WS
+    # Commodities & FX
     "EURUSD": {"1h": "fx-eurusd-1h"},
     "GBPUSD": {"1h": "fx-gbpusd-1h"},
-    "XAUUSD": {"1h": "commodity-xauusd-1h"},
+    "XAUUSD": {
+        "15min": "commodity-xauusd-15min",
+        "1h":    "commodity-xauusd-1h",
+    },
 }
 
 # These are the only assets with confirmed real-time price feeds on Bayse.

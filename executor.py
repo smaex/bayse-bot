@@ -415,6 +415,56 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     if is_maker:
         time_in_force = "GTC"   # Good-Till-Cancelled (stays on book until filled or cancelled)
         limit_price   = sig.market_price  # passive bid
+    elif engine == "CLOB":
+        # ── CLOB Taker Execution: Price to match real Order Book Asks ────────
+        # On a CLOB, buying into a book requires crossing the spread to the lowest ask.
+        # Theoretical midpoint bidding (sig.market_price) always lands below the ask and
+        # causes 100% zero-fill FAK cancellations.
+        time_in_force = "FAK"
+        cap = (
+            0.75 if is_oracle_arb
+            else (0.93 if (sig.strategy == "PAIRED_SNIPER" and sig.certainty >= 0.85) else 0.70)
+        )
+        limit_price = round(min(sig.market_price + max(0.012, sig.market_price * slippage), cap, max_valid), 3)
+        try:
+            ob = await asyncio.wait_for(client.get_orderbook(sig.outcome_id, depth=5), timeout=1.5)
+            asks = ob.get("asks", [])
+            if not asks:
+                log.info(
+                    f"[{chat_id}] SKIP {sig.strategy} {sig.asset} {sig.outcome} — "
+                    f"CLOB orderbook has no asks (zero liquidity)"
+                )
+                _trade_cooldown[sig.market_id] = time.time()
+                return
+
+            best_ask = float(asks[0]["price"])
+            if best_ask > cap:
+                log.info(
+                    f"[{chat_id}] SKIP {sig.strategy} {sig.asset} {sig.outcome} — "
+                    f"best ask {best_ask:.3f} > cap {cap:.3f}"
+                )
+                _trade_cooldown[sig.market_id] = time.time()
+                return
+
+            # Verify EV against the real fill price on the book
+            eff_fee_ask = _effective_fee(fee_rate, best_ask)
+            ev_at_ask = sig.win_prob / (best_ask * (1.0 + eff_fee_ask)) - 1.0
+            if ev_at_ask < target_margin:
+                log.info(
+                    f"[{chat_id}] SKIP {sig.strategy} {sig.asset} {sig.outcome} — "
+                    f"best ask {best_ask:.3f} EV {ev_at_ask:+.1%} < target {target_margin:.0%}"
+                )
+                _trade_cooldown[sig.market_id] = time.time()
+                return
+
+            # Price to match the resting ask with 1-2 ticks slippage buffer (up to cap)
+            limit_price = round(min(best_ask + 0.003, cap, max_valid), 3)
+            log.info(
+                f"[{chat_id}] CLOB Book Match: best_ask={best_ask:.3f} -> limit_price={limit_price:.3f} "
+                f"(EV={ev_at_ask:+.1%})"
+            )
+        except Exception as obe:
+            log.warning(f"[{chat_id}] CLOB orderbook fetch error: {obe}, using estimated limit {limit_price:.3f}")
     elif is_oracle_arb:
         time_in_force = "FAK"   # Fill-And-Kill (instant taker fill, hard cap at 0.75)
         taker_buffer  = max(0.025, sig.market_price * 0.05)
@@ -422,9 +472,6 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
     elif sig.strategy == "PAIRED_SNIPER":
         time_in_force = "FAK"
         taker_buffer  = max(0.015, sig.market_price * slippage)
-        # Sizing / price cap scales with conviction:
-        # Near-settlement lock (w_prob >= 0.85) allows limit price up to 0.93
-        # Standard momentum capped at 0.75
         cap = 0.93 if sig.certainty >= 0.85 else 0.75
         limit_price   = round(min(sig.market_price + taker_buffer, cap, max_valid), 3)
     else:
