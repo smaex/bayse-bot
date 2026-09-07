@@ -133,15 +133,16 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                             user_risks[chat_id].remove_position(trade["market_id"])
                         if tg_app:
                             try:
-                                msg = (
-                                    f"ℹ️ *Market Voided / Cancelled*\n"
-                                    f"Asset: {trade.get('asset', '?')} {trade.get('outcome', '')}\n"
-                                    f"Amount: ₦{trade.get('amount_ngn', 0):,.0f} returned to balance\n"
-                                    f"Status: Market voided by exchange (0.00 PnL)"
+                                await tgb.notify_unfilled(
+                                    tg_app, chat_id,
+                                    trade.get("strategy", "MAKER"),
+                                    trade.get("asset", "?"),
+                                    trade.get("timeframe", ""),
+                                    trade.get("outcome", ""),
+                                    trade.get("amount_ngn", 0),
                                 )
-                                await tgb.send_message(tg_app, chat_id, msg, parse_mode="Markdown")
-                            except Exception:
-                                pass
+                            except Exception as ne:
+                                log.warning(f"[{chat_id}] notify_unfilled (voided) failed: {ne}")
                         continue
 
                     resolved_label, market = _detect_resolution(event, trade)
@@ -165,16 +166,16 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                     user_risks[chat_id].remove_position(trade["market_id"])
                                 if tg_app:
                                     try:
-                                        msg = (
-                                            f"ℹ️ *Unfilled Limit Order Returned*\n"
-                                            f"Strategy: {trade.get('strategy', 'MAKER')}\n"
-                                            f"Asset: {trade.get('asset', '?')} {trade.get('outcome', '')}\n"
-                                            f"Amount: ₦{trade.get('amount_ngn', 0):,.0f} returned to balance\n"
-                                            f"Status: Market closed with order unfilled (0.00 PnL)"
+                                        await tgb.notify_unfilled(
+                                            tg_app, chat_id,
+                                            trade.get("strategy", "MAKER"),
+                                            trade.get("asset", "?"),
+                                            trade.get("timeframe", ""),
+                                            trade.get("outcome", ""),
+                                            trade.get("amount_ngn", 0),
                                         )
-                                        await tgb.send_message(tg_app, chat_id, msg, parse_mode="Markdown")
-                                    except Exception:
-                                        pass
+                                    except Exception as ne:
+                                        log.warning(f"[{chat_id}] notify_unfilled failed: {ne}")
                                 continue
                             raw = (order_data.get("profit") or order_data.get("pnl")
                                    or order_data.get("realizedPnl"))

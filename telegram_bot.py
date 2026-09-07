@@ -281,8 +281,19 @@ async def cmd_trades(update: Update, _ctx):
         return
     lines = ["📋 *Last 10 Trades*\n"]
     for r in rows:
-        icon = "✅" if r["won"] == 1 else ("❌" if r["won"] == 0 else "⏳")
-        pnl  = f"₦{r['pnl_ngn']:+,.0f}" if r.get("pnl_ngn") is not None else "pending"
+        # won=null + pnl=0.0 → unfilled FAK order (returned), not a loss
+        if r["won"] is None and (r.get("pnl_ngn") or 0) == 0.0:
+            icon = "⚪"
+            pnl  = "UNFILLED (returned)"
+        elif r["won"] == 1:
+            icon = "✅"
+            pnl  = f"₦{r['pnl_ngn']:+,.0f}" if r.get("pnl_ngn") is not None else "pending"
+        elif r["won"] == 0:
+            icon = "❌"
+            pnl  = f"₦{r['pnl_ngn']:+,.0f}" if r.get("pnl_ngn") is not None else "pending"
+        else:
+            icon = "⏳"
+            pnl  = "pending"
         lines.append(f"{icon} {r['strategy']} {r['asset']} {r['timeframe']} {r['outcome']} — {pnl}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -839,21 +850,57 @@ _STRAT_ICONS = {
 
 async def notify_win(app, cid, _mid, asset, tf, strat, pnl):
     icon, name = _STRAT_ICONS.get((strat or "").upper(), ("🔔", strat or "Trade"))
+    _esc = lambda s: (s or "").replace("_", "\\_").replace("*", "\\*")
     msg = (
-        f"🟢 *WIN* {icon} ({name})\n"
-        f"Market: *{asset} {tf}*\n"
+        f"🟢 *WIN* {icon} ({_esc(name)})\n"
+        f"Market: *{_esc(asset)} {_esc(tf)}*\n"
         f"Profit: *+₦{pnl:,.2f}*"
     )
-    await send_message(app, cid, msg, parse_mode="Markdown")
+    try:
+        await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+    except Exception:
+        try:
+            await app.bot.send_message(chat_id=cid,
+                text=f"🟢 WIN | {name} | {asset} {tf} | +₦{pnl:,.2f}")
+        except Exception as e:
+            log.error(f"notify_win failed: {e}")
 
 async def notify_loss(app, cid, _mid, asset, tf, strat, pnl):
     icon, name = _STRAT_ICONS.get((strat or "").upper(), ("🔔", strat or "Trade"))
+    _esc = lambda s: (s or "").replace("_", "\\_").replace("*", "\\*")
     msg = (
-        f"🔴 *LOSS* {icon} ({name})\n"
-        f"Market: *{asset} {tf}*\n"
+        f"🔴 *LOSS* {icon} ({_esc(name)})\n"
+        f"Market: *{_esc(asset)} {_esc(tf)}*\n"
         f"PnL: *-₦{abs(pnl):,.2f}*"
     )
-    await send_message(app, cid, msg, parse_mode="Markdown")
+    try:
+        await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+    except Exception:
+        try:
+            await app.bot.send_message(chat_id=cid,
+                text=f"🔴 LOSS | {name} | {asset} {tf} | -₦{abs(pnl):,.2f}")
+        except Exception as e:
+            log.error(f"notify_loss failed: {e}")
+
+async def notify_unfilled(app, cid, strat, asset, tf, outcome, amount_ngn):
+    """Notify user when a FAK/limit order was cancelled with zero fill.
+    This is NOT a loss — no money was deducted. The position was never opened."""
+    icon, name = _STRAT_ICONS.get((strat or "").upper(), ("🔔", strat or "Trade"))
+    _esc = lambda s: (s or "").replace("_", "\\_").replace("*", "\\*")
+    msg = (
+        f"⚪ *Unfilled Order — No Loss*\n"
+        f"{icon} {_esc(name)} | {_esc(asset)} {_esc(tf)} {_esc(outcome)}\n"
+        f"₦{amount_ngn:,.0f} was *not* deducted — order cancelled before fill.\n"
+        f"_The market moved before execution. Capital preserved._"
+    )
+    try:
+        await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+    except Exception:
+        try:
+            await app.bot.send_message(chat_id=cid,
+                text=f"⚪ UNFILLED | {name} | {asset} {tf} | ₦{amount_ngn:,.0f} returned, no loss")
+        except Exception as e:
+            log.error(f"notify_unfilled failed: {e}")
 
 async def notify_drawdown(app, cid, balance, peak, dd):
     await send_message(app, cid,
