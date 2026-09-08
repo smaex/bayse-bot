@@ -41,7 +41,7 @@ DEFAULT_SETTINGS: dict = {
     "maxexposure":      20.0,
     "daily_multiplier": 10,
     "daily_target_ngn": 0,
-    "paused":           False,
+    "paused":           True,
     "learned":          {},
     "mode":             "balanced",
 }

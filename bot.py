@@ -97,8 +97,18 @@ def _daily(chat_id: str, balance: float, settings: dict) -> dict:
     if not ds or ds.get("date") != today:
         ds = settings.get("daily_state", {})
         if ds.get("date") != today:
+            old_target_hit = ds.get("target_hit", False)
             ds = {"date": today, "start_balance": balance, "target_hit": False}
             settings["daily_state"] = ds
+            # Automatically unpause if paused due to yesterday's daily target or drawdown
+            if old_target_hit or settings.get("paused_reason") in ("daily_target", "drawdown"):
+                settings["paused"] = False
+                settings.pop("paused_reason", None)
+                risk = _user_risks.get(chat_id)
+                if risk:
+                    risk.paused = False
+                    risk.peak_balance = balance
+                    risk._dd_breach_since = 0.0
             asyncio.create_task(asyncio.to_thread(database.update_settings, chat_id, settings))
         _user_daily[chat_id] = ds
     return ds
@@ -309,6 +319,7 @@ async def _user_loop(chat_id: str):
             day["target_hit"] = True
             settings["daily_state"] = day
             settings["paused"]       = True
+            settings["paused_reason"] = "daily_target"
             await asyncio.to_thread(database.update_settings, chat_id, settings)
             log.info(f"[{chat_id}] DAILY TARGET HIT ₦{profit:+,.0f} — trading paused")
             if _tg_app:
@@ -323,6 +334,7 @@ async def _user_loop(chat_id: str):
         if not risk.check_drawdown(equity):
             dd = (risk.peak_balance - equity) / risk.peak_balance
             settings["paused"] = True
+            settings["paused_reason"] = "drawdown"
             await asyncio.to_thread(database.update_settings, chat_id, settings)
             log.warning(f"[{chat_id}] DRAWDOWN STOP {dd:.1%} — trading paused")
             if _tg_app:
