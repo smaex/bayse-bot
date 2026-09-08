@@ -400,6 +400,28 @@ def get_unresolved(chat_id: str, older_than_minutes: int = 6) -> list[dict]:
     """, (chat_id, cutoff))
 
 
+def reset_bad_resolutions(chat_id: str) -> int:
+    """Reset trades that were incorrectly resolved with won=NULL, pnl=0.
+    These were stamped as resolved but never got a real win/loss value —
+    likely due to phantom detection firing on already-resolved markets.
+    Resetting allows resolution_monitor to re-process them correctly.
+    Returns the number of trades reset."""
+    result = _execute(
+        """UPDATE trades
+           SET resolved_at = NULL, pnl_ngn = 0
+           WHERE chat_id = %s
+             AND resolved_at IS NOT NULL
+             AND won IS NULL""",
+        (chat_id,),
+    )
+    # _execute doesn't return rowcount directly; re-query to confirm
+    count = _fetch_all(
+        "SELECT COUNT(*) AS n FROM trades WHERE chat_id = %s AND resolved_at IS NULL AND won IS NULL",
+        (chat_id,),
+    )
+    return count[0]["n"] if count else 0
+
+
 def get_all_unresolved(chat_id: str) -> list[dict]:
     return _fetch_all("""
         SELECT * FROM trades WHERE chat_id = %s AND resolved_at IS NULL

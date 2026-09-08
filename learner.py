@@ -153,6 +153,8 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
 
                     # Try to get real PnL from the order API
                     pnl = None
+                    actual_shares = None
+                    actual_fill_price = None
                     if trade.get("order_id"):
                         try:
                             order_data   = await client.get_order(trade["order_id"])
@@ -177,22 +179,37 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                     except Exception as ne:
                                         log.warning(f"[{chat_id}] notify_unfilled failed: {ne}")
                                 continue
+
+                            # Save fill data for precise PnL calculation below
+                            actual_shares = shares
+                            actual_fill_price = float(order_data.get("avgFillPrice") or order_data.get("price") or 0)
+
+                            # If Bayse directly provides realized PnL, use it
                             raw = (order_data.get("profit") or order_data.get("pnl")
                                    or order_data.get("realizedPnl"))
                             if raw is not None:
                                 pnl = float(raw)
+                            elif actual_shares > 0 and actual_fill_price > 0:
+                                # Precise PnL from actual fill data:
+                                # WIN: redeemed at ₦1.00/share → profit = shares × (1 - fill_price) - fee
+                                # LOSS: lost the cost basis → pnl = -amount_ngn
+                                fee_ngn = float(order_data.get("fee") or 0)
+                                if won:
+                                    pnl = actual_shares * (1.0 - actual_fill_price) - fee_ngn
+                                else:
+                                    pnl = -(actual_shares * actual_fill_price + fee_ngn)
                         except Exception as oe:
                             log.debug(f"get_order fallback: {oe}")
 
-                    # Fallback PnL estimate
+                    # Fallback PnL estimate (when order API unavailable)
                     if pnl is None:
                         fr     = float((market or {}).get("feePercentage", 2)) / 100
                         entry  = trade["entry_price"]
                         amount = trade["amount_ngn"]
                         if won:
-                            shares  = amount / entry
-                            fee_amt = fr * shares * entry * max(1 - entry, config.FEE_FLOOR)
-                            pnl     = shares * (1.0 - entry) - fee_amt
+                            shares_est  = amount / entry if entry > 0 else 0
+                            fee_amt = fr * shares_est * entry * max(1 - entry, config.FEE_FLOOR)
+                            pnl     = shares_est * (1.0 - entry) - fee_amt
                         else:
                             pnl = -amount
 

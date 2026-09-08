@@ -655,19 +655,41 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         except Exception as e:
             err_str = str(e).lower()
             if "insufficient shares" in err_str or "insufficient balance" in err_str:
-                # Phantom position: LIMIT order was never filled but tracker thought it was open.
-                # Remove it so future signals aren't permanently blocked and resolve with 0 PnL.
-                log.warning(
-                    f"[{chat_id}] EXIT failed — phantom/unfilled LIMIT position on {market_id}. "
-                    f"Removing from tracker. Error: {e}"
-                )
-                risk.remove_position(market_id)
-                trade_id = pos.get("trade_id")
-                if trade_id:
+                # Could be either:
+                # A) True phantom: LIMIT order was never filled (shares = 0)
+                # B) Market already resolved: shares were redeemed by the exchange before we could sell
+                # Check the order fill status before corrupting the trade record.
+                order_id = pos.get("order_id")
+                filled_size = 0.0
+                if order_id:
                     try:
-                        await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
-                    except Exception:
-                        pass
+                        od = await client.get_order(order_id)
+                        filled_size = client.parse_filled_shares(od)
+                    except Exception as oe:
+                        log.debug(f"[{chat_id}] get_order check: {oe}")
+
+                risk.remove_position(market_id)
+
+                if filled_size <= 0:
+                    # Genuine phantom — LIMIT order was never filled.
+                    log.warning(
+                        f"[{chat_id}] EXIT failed — phantom/unfilled LIMIT position on {market_id} "
+                        f"(filledSize=0). Removing from tracker. Error: {e}"
+                    )
+                    trade_id = pos.get("trade_id")
+                    if trade_id:
+                        try:
+                            await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
+                        except Exception:
+                            pass
+                else:
+                    # Order WAS filled but market resolved before we could exit.
+                    # Do NOT touch resolved_at/won here — resolution_monitor will
+                    # process this correctly via get_unresolved → get_event → get_order.
+                    log.info(
+                        f"[{chat_id}] EXIT failed on resolved market {market_id} "
+                        f"(filledSize={filled_size:.2f}) — deferring to resolution_monitor. Error: {e}"
+                    )
             else:
                 log.error(f"[{chat_id}] EXIT order failed for {market_id}: {e}", exc_info=True)
 
