@@ -242,7 +242,9 @@ class SnipeStrategy(BaseStrategy):
             "safe": 0.05, "balanced": 0.01, "aggressive": 0.00,
             "full_send": 0.00, "custom": 0.01,
         }.get(mode, 0.01)
+        # ── Dynamic EV Price Ceiling ───────────────────────────────────────
         ev_ceil = max_ev_price(w_est, market_price, fee_rate, min_margin=margin)
+        hard_safety_ceiling = 0.84  # Never pay above 0.84 to prevent asymmetric tail-risk on late flash crashes
 
         if market_price >= ev_ceil:
             log.info(
@@ -250,9 +252,9 @@ class SnipeStrategy(BaseStrategy):
                 f"price={market_price:.3f} >= ceil={ev_ceil:.3f} (w={w_est:.1%})"
             )
             return None
-        if market_price > config.SNIPE_MAX_MARKET_PRICE:
-            log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — price ceiling "
-                     f"({market_price:.3f} > {config.SNIPE_MAX_MARKET_PRICE})")
+        if market_price > hard_safety_ceiling:
+            log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — hard safety ceiling "
+                     f"({market_price:.3f} > {hard_safety_ceiling:.2f})")
             return None
 
         # ── Size ──────────────────────────────────────────────────────────

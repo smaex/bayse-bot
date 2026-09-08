@@ -20,22 +20,26 @@ from strategies.regime     import regime_controller
 from strategies.maker          import MakerStrategy
 from strategies.oracle_arb     import OracleArbStrategy
 from strategies.paired_sniper  import PairedSniperStrategy
+from strategies.midmarket_maker import MidmarketMakerStrategy
+from strategies.liquidity_regime import classify_regime
 
 log = logging.getLogger("strategies")
 
 _strategies = {
-    "SNIPE":         SnipeStrategy(),
-    "ARB":           ArbStrategy(),
-    "FRONTRUN":      FrontrunStrategy(),
-    "CORRELATE":     CorrelateStrategy(),
-    "MAKER":         MakerStrategy(),
-    "ORACLE_ARB":    OracleArbStrategy(),
-    "PAIRED_SNIPER": PairedSniperStrategy(),
+    "SNIPE":           SnipeStrategy(),
+    "ARB":             ArbStrategy(),
+    "FRONTRUN":        FrontrunStrategy(),
+    "CORRELATE":       CorrelateStrategy(),
+    "MAKER":           MakerStrategy(),
+    "ORACLE_ARB":      OracleArbStrategy(),
+    "PAIRED_SNIPER":   PairedSniperStrategy(),
+    "MIDMARKET_MAKER": MidmarketMakerStrategy(),
 }
 
 # Structural strategies that bypass the regime/certainty multiplier system.
-# They fire based on market structure (spread, oracle lag), not directional bets.
-_STRUCTURAL_STRATEGIES = {"MAKER", "ORACLE_ARB"}
+# They fire based on market structure (spread, oracle lag, locked-in mid-market), not directional bets.
+_STRUCTURAL_STRATEGIES = {"MAKER", "ORACLE_ARB", "MIDMARKET_MAKER"}
+_TAKER_STRATEGIES = {"SNIPE", "FRONTRUN", "CORRELATE", "ARB"}
 
 
 async def evaluate_all(
@@ -54,6 +58,29 @@ async def evaluate_all(
 
     # Respect the active strategies set configured by the user
     all_names = set(active_names)
+
+    # ── Liquidity Regime Switching Orchestrator ──────────────────────────────
+    ob_yes = market.get("ob_yes")
+    ob_no  = market.get("ob_no")
+    yes_p  = float(market.get("yes_price") or 0.5)
+    no_p   = float(market.get("no_price")  or 0.5)
+
+    liq_regime = "TIGHT_LIQUID"
+    if ob_yes and ob_no:
+        liq_regime, _ = classify_regime(ob_yes, ob_no)
+    elif (yes_p + no_p > 1.15) or (min(yes_p, no_p) < 0.20 and max(yes_p, no_p) > 0.80):
+        liq_regime = "DISLOCATED_WIDE"
+
+    if liq_regime == "DISLOCATED_WIDE":
+        # Block naive taker snipes (would pay 0.95+ or suffer zero-fills)
+        # Enable active mid-market dual limit orders
+        all_names = {n for n in all_names if n not in _TAKER_STRATEGIES}
+        all_names.add("MIDMARKET_MAKER")
+        log.debug(f"Market {asset}/{market.get('timeframe')} classified DISLOCATED_WIDE: routing to makers")
+    elif liq_regime == "THIN_ONE_SIDED":
+        # Block taker snipes on empty books to prevent FAK zero-fills
+        all_names = {n for n in all_names if n not in _TAKER_STRATEGIES}
+        log.debug(f"Market {asset}/{market.get('timeframe')} classified THIN_ONE_SIDED: suppressing takers")
 
     signals = []
     for name in all_names:

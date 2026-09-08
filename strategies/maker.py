@@ -180,21 +180,19 @@ class MakerStrategy(BaseStrategy):
 
         dist_pct = (spot - threshold) / threshold
 
-        # ── Quoting Window Guard (Minutes 6.0 to 10 of a 15-min candle) ─────────
-        # - Don't quote in the first 6.0 minutes (secs > 540): trend hasn't settled yet, high retrace risk.
-        # - Don't open new maker limit bids in the final 5 minutes (secs < 300): late-candle whips
-        #   and disappearing orderbook bids make late maker entries highly vulnerable to reversals.
-        # - DB empirical data shows 64.3% win rate and positive net PnL in this core window!
-        if secs_to_close > 540:
+        # ── Quoting Window Guard (Minutes 4.0 to 12.0 of a 15-min candle) ─────────
+        # - Don't quote in the first 4.0 minutes (secs > 660): trend hasn't settled yet.
+        # - Don't open new maker limit bids in the final 3 minutes (secs < 180): settlement risk.
+        if secs_to_close > 660:
             log.info(
                 f"MAKER SKIP {asset} — candle warm-up window "
-                f"(secs={secs_to_close:.0f} > 540, waiting for 6.0-minute trend formation)"
+                f"(secs={secs_to_close:.0f} > 660, waiting for trend formation)"
             )
             return None
-        if secs_to_close < 300:
+        if secs_to_close < 180:
             log.info(
                 f"MAKER SKIP {asset} — late-candle window "
-                f"(secs={secs_to_close:.0f} < 300, risk of late-candle reversal)"
+                f"(secs={secs_to_close:.0f} < 180, risk of settlement volatility)"
             )
             return None
 
@@ -226,11 +224,11 @@ class MakerStrategy(BaseStrategy):
         edge_no  = fv_no  - no_bid_price  if no_bid_price > 0 else 0.0
 
         # ── Asset-Specific Edge & Distance Calibration ────────────────────────
-        # Calibrated by 2-week DB forensics:
-        # - ETH: requires >= 0.350% ($9.50+ buffer) due to higher micro-volatility chop.
-        # - BTC & SOL: require >= 0.280% ($180+ on BTC, $0.40+ on SOL).
-        min_dist_req = 0.0035 if asset == "ETH" else 0.0028
-        eth_edge_cushion = 0.025 if asset == "ETH" else 0.0
+        # Calibrated for adaptive market making:
+        # - ETH: requires >= 0.20% buffer due to micro-volatility chop.
+        # - BTC & SOL: require >= 0.15% buffer ($115+ on BTC, $0.15+ on SOL).
+        min_dist_req = 0.0020 if asset == "ETH" else 0.0015
+        eth_edge_cushion = 0.020 if asset == "ETH" else 0.0
 
         if abs(dist_pct) < min_dist_req:
             log.info(
