@@ -40,7 +40,25 @@ _user_daily:     dict = {}
 _active_markets: list = []
 _start_user_fn       = None
 
-_VALID_STRATEGIES = {"SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER"}
+_VALID_STRATEGIES = {"SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"}
+_STRATEGY_ALIASES = {
+    "MIDMARKET": "MIDMARKET_MAKER",
+    "MID_MARKET": "MIDMARKET_MAKER",
+    "MID-MARKET": "MIDMARKET_MAKER",
+    "MIDMARKET_MAKER": "MIDMARKET_MAKER",
+    "MID": "MIDMARKET_MAKER",
+    "PAIRED": "PAIRED_SNIPER",
+    "PAIREDSNIPER": "PAIRED_SNIPER",
+    "ORACLE": "ORACLE_ARB",
+    "ORACLEARB": "ORACLE_ARB",
+    "FRONT_RUN": "FRONTRUN",
+    "CORRELATION": "CORRELATE",
+}
+
+def _normalize_strat(s: str) -> str:
+    cleaned = s.strip().upper().replace("-", "_")
+    return _STRATEGY_ALIASES.get(cleaned, cleaned)
+
 _VALID_ASSETS     = {"BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "XAUUSD"}
 _VALID_TIMEFRAMES = {"5min", "15min", "1h", "6h", "1d"}
 MIN_TRADE_NGN     = 100
@@ -65,6 +83,8 @@ def build_app() -> Application:
         ("markets",       cmd_markets),
         ("analysis",      cmd_analysis),
         ("settings",      cmd_settings),
+        ("strategies",    cmd_strategies),
+        ("strategy",      cmd_strategies),
         ("set",           cmd_set),
         ("pause",         cmd_pause),
         ("resume",        cmd_resume),
@@ -317,6 +337,23 @@ async def cmd_settings(update: Update, _ctx):
     await update.message.reply_text(await _settings_text(str(update.effective_chat.id)), parse_mode="Markdown")
 
 @_guard
+async def cmd_strategies(update: Update, _ctx):
+    cid = str(update.effective_chat.id)
+    user = await asyncio.to_thread(_safe_get_user, cid)
+    if not user:
+        await update.message.reply_text("Use /start to connect.")
+        return
+    s = user.get("settings", {})
+    active = set(s.get("strategies", []))
+    lines = ["⚙️ *Bot Strategy Status*\n"]
+    for strat in sorted(_VALID_STRATEGIES):
+        icon, name = _STRAT_ICONS.get(strat, ("🔔", strat))
+        status = "✅ ACTIVE" if strat in active else "⚪ OFF"
+        lines.append(f"{icon} *{strat}*: {status}")
+    lines.append("\n*To enable or set strategies:*\n`/set strategies SNIPE MAKER MIDMARKET_MAKER PAIRED_SNIPER`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+@_guard
 async def cmd_set(update: Update, _ctx):
     cid  = str(update.effective_chat.id)
     args = update.message.text.split()[1:]
@@ -350,12 +387,12 @@ async def cmd_set(update: Update, _ctx):
         bad = [v for v in vals if v.lower() not in _VALID_TIMEFRAMES]
         if bad:
             await update.message.reply_text(f"Unknown: {bad}\nValid: {', '.join(sorted(_VALID_TIMEFRAMES))}"); return
-        s["timeframes"] = [v.lower() for v in vals]; msg = f"Timeframes: {s['timeframes']}"
-    elif key == "strategies":
-        bad = [v for v in vals if v.upper() not in _VALID_STRATEGIES]
+    elif key in ("strategies", "strategy", "strat"):
+        norm_strats = [_normalize_strat(v) for v in vals]
+        bad = [v for v in norm_strats if v not in _VALID_STRATEGIES]
         if bad:
             await update.message.reply_text(f"Unknown: {bad}\nValid: {', '.join(sorted(_VALID_STRATEGIES))}"); return
-        s["strategies"] = [v.upper() for v in vals]; msg = f"Strategies: {s['strategies']}"
+        s["strategies"] = norm_strats; msg = f"Strategies: {s['strategies']}"
     elif key == "risk":
         try:
             pct = float(vals[0])
@@ -594,9 +631,7 @@ _MODES = {
         "label": "🟢 *Safe mode applied.*",
         "settings": {
             "mode": "safe", "assets": ["BTC", "EURUSD", "GBPUSD"],
-            # 1h kept only for FX (EURUSD/GBPUSD only exist at 1h granularity,
-            # and ARB can still work there). 5min added for the BTC leg.
-            "timeframes": ["5min", "15min", "1h"], "strategies": ["SNIPE", "ARB", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER"],
+            "timeframes": ["5min", "15min", "1h"], "strategies": ["SNIPE", "ARB", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"],
             "risk_pct": 0.5, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 15.0, "daily_multiplier": 5,
         },
@@ -605,11 +640,7 @@ _MODES = {
         "label": "🔵 *Balanced mode applied.*",
         "settings": {
             "mode": "balanced", "assets": ["BTC", "ETH", "SOL"],
-            # Pure fast-cycle focus — dropped 1h. SNIPE/FRONTRUN/CORRELATE are
-            # all hard-restricted to 5min/15min in code now; this just keeps
-            # the user-level filter consistent so ARB doesn't waste cycles
-            # scanning 1h candles this account isn't otherwise using.
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER"],
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"],
             "risk_pct": 1.5, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 20.0, "daily_multiplier": 10,
         },
@@ -618,7 +649,7 @@ _MODES = {
         "label": "🟠 *Aggressive mode applied.*",
         "settings": {
             "mode": "aggressive", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER"],
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"],
             "risk_pct": 3.0, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 30.0, "daily_multiplier": 20,
         },
@@ -627,7 +658,7 @@ _MODES = {
         "label": "🔴 *Full Send mode applied.*",
         "settings": {
             "mode": "full_send", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER"],
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"],
             "risk_pct": 5.0, "mintrade": MIN_TRADE_NGN,
             "maxexposure": 50.0, "daily_multiplier": 50,
         },
@@ -806,12 +837,13 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
         "MAKER":         ("📊", "*MAKER* (Limit Order)" if engine == "CLOB_LIMIT" else "*MAKER*"),
         "FRONTRUN":      ("🏎️", "*FRONTRUN* (Binance Impulse)"),
         "CORRELATE":     ("🔗", "*CORRELATION* (Lead-Lag)"),
-        "ARB":           ("⚖️", "*RISK-FREE ARB*"),
-        "PAIRED_SNIPER": ("⚡", "*PAIRED SNIPER* (Ohioism Engine)"),
+        "ARB":             ("⚖️", "*RISK-FREE ARB*"),
+        "PAIRED_SNIPER":   ("⚡", "*PAIRED SNIPER* (Ohioism Engine)"),
+        "MIDMARKET_MAKER": ("🎯", "*MID-MARKET MAKER* (Dual Liquidity Trap)"),
     }
     icon_strat, title_strat = strat_meta.get(strat, ("🔔", f"*{strat} Trade*"))
     
-    dir_icon = "⬆️" if sig.outcome.upper() in ("YES", "UP") else "⬇️"
+    dir_icon = "🎯" if sig.outcome.upper() in ("DUAL_LIMIT", "ARB") else ("⬆️" if sig.outcome.upper() in ("YES", "UP") else "⬇️")
     safe_reason = (getattr(sig, "reason", "") or "").replace("_", "\\_").replace("*", "\\*")
     market_price = getattr(sig, "market_price", 0.0)
     win_prob = getattr(sig, "win_prob", sig.certainty)
@@ -839,13 +871,14 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
 
 
 _STRAT_ICONS = {
-    "SNIPE":         ("🎯", "SNIPE"),
-    "ORACLE_ARB":    ("⚡", "ORACLE ARB"),
-    "MAKER":         ("📊", "MAKER"),
-    "FRONTRUN":      ("🏎️", "FRONTRUN"),
-    "CORRELATE":     ("🔗", "CORRELATION"),
-    "ARB":           ("⚖️", "RISK-FREE ARB"),
-    "PAIRED_SNIPER": ("⚡", "PAIRED SNIPER"),
+    "SNIPE":           ("🎯", "SNIPE"),
+    "ORACLE_ARB":      ("⚡", "ORACLE ARB"),
+    "MAKER":           ("📊", "MAKER"),
+    "FRONTRUN":        ("🏎️", "FRONTRUN"),
+    "CORRELATE":       ("🔗", "CORRELATION"),
+    "ARB":             ("⚖️", "RISK-FREE ARB"),
+    "PAIRED_SNIPER":   ("⚡", "PAIRED SNIPER"),
+    "MIDMARKET_MAKER": ("🎯", "MID-MARKET MAKER"),
 }
 
 async def notify_win(app, cid, _mid, asset, tf, strat, pnl):

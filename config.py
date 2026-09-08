@@ -61,7 +61,7 @@ ASSET_ORACLE = {
 }
 
 # ── Active strategies (only what's implemented and working) ───────────────────
-ACTIVE_STRATEGIES = ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER"]
+ACTIVE_STRATEGIES = ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"]
 
 # ── Currency ──────────────────────────────────────────────────────────────────
 CURRENCY = "NGN"

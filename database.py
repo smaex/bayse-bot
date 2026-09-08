@@ -34,7 +34,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 DEFAULT_SETTINGS: dict = {
     "assets":           ["BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "XAUUSD"],
     "timeframes":       ["15min", "5min"],
-    "strategies":       ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER"],
+    "strategies":       ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"],
     "risk_pct":         2.0,
     "mintrade":         100,
     "maxtrade":         5_000,
