@@ -794,6 +794,8 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
         for sig in final:
             if sig.strategy == "ARB":
                 await executor.execute_arb(chat_id, sig, client, risk, equity, free_cash, settings)
+            elif sig.strategy == "MIDMARKET_MAKER":
+                await executor.execute_midmarket_maker(chat_id, sig, client, risk, equity, free_cash, settings)
             else:
                 await executor.execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
     except Exception as e:
@@ -846,7 +848,8 @@ def _on_spot_price(asset: str, price: float):
 
 async def _evaluate_all_users_for_asset(asset: str, penalty: float = 0.0):
     now = time.time()
-    if now - _last_market_eval.get(asset, 0) < 1.0:
+    # 250ms debounce: provides sub-second event-driven reaction to spot/book moves
+    if now - _last_market_eval.get(asset, 0) < 0.25:
         return
     _last_market_eval[asset] = now
 
@@ -869,16 +872,12 @@ def _on_market_update(market_id: str, prices: dict):
         # this must happen BEFORE we write the new price below.
         strategy.record_btc_move(market, prices.get("yes", market["yes_price"]))
 
-    # CRITICAL: actually commit the live price update. Previously this never
-    # happened — active_markets' yes_price/no_price were only ever refreshed
-    # by the next REST scan (every 15s), meaning every strategy was reading
-    # stale prices for EV/edge calculations on every tick except the one
-    # right after a scan. This is the live source of truth; commit it.
+    # Commit live price updates to market state in real time
     new_yes = prices.get("yes")
     new_no  = prices.get("no")
     if new_yes is not None and new_no is not None:
         ny, nn = float(new_yes), float(new_no)
-        if 0.90 <= (ny + nn) <= 1.05:
+        if 0.01 <= ny <= 0.99 and 0.01 <= nn <= 0.99:
             market["yes_price"] = ny
             market["no_price"]  = nn
         try:
@@ -886,8 +885,6 @@ def _on_market_update(market_id: str, prices: dict):
             shadow_tracker.on_price_update(market_id, prices)
         except Exception:
             pass
-        # else: malformed tick, leave the last-known-good price in place
-        # rather than poisoning the market dict with a bad data point.
 
     asyncio.create_task(_evaluate_all_users_for_asset(asset, penalty=0.0))
 

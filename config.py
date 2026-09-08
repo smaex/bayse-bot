@@ -79,12 +79,11 @@ SNIPE_ENTRY_WINDOWS = {
 # - Underdog entries (<0.45) have poor win-rates and lose 77%+ of the time.
 # - High-certainty entries (>=0.45, win_prob >= 70%) have 100% historical win-rate.
 SNIPE_MIN_CERTAINTY    = 0.45   # 70%+ win-rate floor (calibrated from 2-week forensics: cert >= 0.60 was 100% WR)
-SNIPE_MAX_MARKET_PRICE = 0.70   # Raised to 0.70 to capture high-conviction signals matching executor taker cap
+SNIPE_MAX_MARKET_PRICE = 0.82   # Raised from 0.70 to 0.82 to capture high-certainty (85%+) late-candle trades with positive EV
 SNIPE_MIN_ENTRY_PRICE  = 0.45   # Hard floor at 0.45 — completely blocks low-probability underdog traps
 # Minimum spot-vs-threshold distance to consider a directional signal.
-# 0.180% ensures the asset has genuinely broken away from the strike price,
-# permanently preventing entering micro-distance coin flips (<0.10% was 44.7% WR).
-SNIPE_MIN_DISTANCE_PCT = 0.0018  # 0.180% minimum distance (raised from 0.060%)
+# 0.10% allows entering before market makers blow the spread past 0.85
+SNIPE_MIN_DISTANCE_PCT = 0.0010  # 0.10% minimum distance (calibrated from 0.18%)
 
 # FX-specific
 FX_SESSION_UTC = {

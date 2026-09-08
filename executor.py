@@ -421,10 +421,15 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         # Theoretical midpoint bidding (sig.market_price) always lands below the ask and
         # causes 100% zero-fill FAK cancellations.
         time_in_force = "FAK"
-        cap = (
-            0.75 if is_oracle_arb
-            else (0.93 if (sig.strategy == "PAIRED_SNIPER" and sig.certainty >= 0.85) else 0.70)
-        )
+        # Dynamic EV cap: scales with model win probability, bounded by 0.84 hard safety ceiling
+        eff_fee_est = _effective_fee(fee_rate, sig.market_price)
+        dynamic_cap = sig.win_prob / ((1.0 + target_margin) * (1.0 + eff_fee_est))
+        cap = min(0.84, max(0.65, dynamic_cap))
+        if is_oracle_arb:
+            cap = min(0.85, max(cap, 0.75))
+        elif sig.strategy == "PAIRED_SNIPER" and sig.certainty >= 0.85:
+            cap = 0.93
+
         limit_price = round(min(sig.market_price + max(0.012, sig.market_price * slippage), cap, max_valid), 3)
         try:
             ob = await asyncio.wait_for(client.get_orderbook(sig.outcome_id, depth=5), timeout=1.5)
@@ -463,6 +468,36 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
                 f"[{chat_id}] CLOB Book Match: best_ask={best_ask:.3f} -> limit_price={limit_price:.3f} "
                 f"(EV={ev_at_ask:+.1%})"
             )
+
+            # ── Depth-Aware Sizing (Zero-Fill Eliminator) ─────────────────────
+            avail_ngn = 0.0
+            for ask_entry in asks:
+                ask_p = float(ask_entry.get("price", 0))
+                if ask_p <= limit_price:
+                    tot = float(ask_entry.get("total") or 0.0)
+                    if tot <= 0:
+                        tot = float(ask_entry.get("quantity", 0)) * ask_p * (100.0 if CURRENCY == "NGN" else 1.0)
+                    avail_ngn += tot
+                else:
+                    break
+
+            min_trade_req = float(settings.get("mintrade", 100.0))
+            if avail_ngn < min_trade_req:
+                log.info(
+                    f"[{chat_id}] SKIP {sig.strategy} {sig.asset} {sig.outcome} — "
+                    f"insufficient resting depth (available ₦{avail_ngn:,.0f} < min ₦{min_trade_req:,.0f})"
+                )
+                _trade_cooldown[sig.market_id] = time.time()
+                return
+
+            # Clip order size to resting liquidity so FAK orders fill with 100% reliability
+            if amount > avail_ngn:
+                clipped = max(min_trade_req, round(avail_ngn * 0.95, 2))
+                log.info(
+                    f"[{chat_id}] Depth-Aware Sizing: clipped order ₦{amount:,.0f} -> ₦{clipped:,.0f} "
+                    f"to match resting book depth (₦{avail_ngn:,.0f})"
+                )
+                amount = clipped
         except Exception as obe:
             log.warning(f"[{chat_id}] CLOB orderbook fetch error: {obe}, using estimated limit {limit_price:.3f}")
     elif is_oracle_arb:
@@ -475,9 +510,10 @@ async def _execute_logic(chat_id: str, sig, client, risk, settings: dict,
         cap = 0.93 if sig.certainty >= 0.85 else 0.75
         limit_price   = round(min(sig.market_price + taker_buffer, cap, max_valid), 3)
     else:
-        time_in_force = "FAK"   # Fill-And-Kill (instant taker fill, hard cap at 0.70)
+        time_in_force = "FAK"   # Fill-And-Kill (instant taker fill)
         taker_buffer  = max(0.012, sig.market_price * slippage)
-        limit_price   = round(min(sig.market_price + taker_buffer, 0.70, max_valid), 3)
+        cap = 0.84 if sig.certainty >= 0.50 else 0.75
+        limit_price   = round(min(sig.market_price + taker_buffer, cap, max_valid), 3)
 
     log.info(
         f"[{chat_id}] PLACING {sig.strategy} {sig.asset} {sig.timeframe} "
@@ -966,3 +1002,155 @@ async def _execute_arb_logic(chat_id: str, sig, client, market: dict, free_cash:
             await asyncio.to_thread(database.resolve_trade, trade_id, False, est_loss)
         except Exception as db_err:
             log.error(f"[{chat_id}] ARB failure could not be recorded: {db_err}")
+
+
+# ── Active Mid-Market Market Making Execution ─────────────────────────────────
+
+async def execute_midmarket_maker(
+    chat_id: str, sig, client, risk, equity: float, free_cash: float, settings: dict
+):
+    """
+    Executes simultaneous dual-sided resting limit orders near mid-market
+    on dislocated or wide orderbooks to capture locked arbitrage spread.
+    """
+    market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
+    if not market:
+        return
+
+    last = _trade_cooldown.get(sig.market_id, 0.0)
+    if time.time() - last < TRADE_COOLDOWN_SEC:
+        return
+
+    if not hasattr(sig, "converged_with") or len(sig.converged_with) < 4:
+        return
+
+    bid_yes, bid_no, yes_id, no_id = sig.converged_with[:4]
+    min_leg = max(MIN_TRADE_NGN, float(settings.get("mintrade", MIN_TRADE_NGN))) if settings else MIN_TRADE_NGN
+
+    if free_cash < min_leg * 2.0:
+        log.info(f"[{chat_id}] MIDMARKET_MAKER SKIP: free_cash ₦{free_cash:.1f} < 2 legs (₦{min_leg*2:.1f})")
+        return
+
+    amount_leg = min_leg
+    _trade_cooldown[sig.market_id] = time.time()
+
+    try:
+        t0 = time.time()
+        order_yes, order_no = await asyncio.gather(
+            client.place_order(
+                sig.event_id, sig.market_id, yes_id,
+                side="BUY", amount=amount_leg, order_type="LIMIT",
+                price=bid_yes, time_in_force="GTC", currency=CURRENCY,
+            ),
+            client.place_order(
+                sig.event_id, sig.market_id, no_id,
+                side="BUY", amount=amount_leg, order_type="LIMIT",
+                price=bid_no, time_in_force="GTC", currency=CURRENCY,
+            ),
+            return_exceptions=True,
+        )
+        rtt_ms = (time.time() - t0) * 1000
+
+        id_yes = order_yes.get("id") or order_yes.get("orderId") if isinstance(order_yes, dict) else None
+        id_no  = order_no.get("id") or order_no.get("orderId") if isinstance(order_no, dict) else None
+
+        if not id_yes and not id_no:
+            log.warning(f"[{chat_id}] MIDMARKET_MAKER dual orders failed: yes={order_yes}, no={order_no}")
+            return
+
+        log.info(
+            f"[{chat_id}] MIDMARKET_MAKER DUAL ORDERS PLACED | {sig.asset} {sig.timeframe} | "
+            f"YES@{bid_yes:.3f} (id={id_yes}) + NO@{bid_no:.3f} (id={id_no}) | "
+            f"Locked Spread=+{sig.edge_at_entry:.1%} | rtt={rtt_ms:.0f}ms"
+        )
+
+        if _tg_app:
+            try:
+                await telegram_bot.notify_midmarket(_tg_app, chat_id, sig, bid_yes, bid_no, amount_leg)
+            except Exception as te:
+                log.warning(f"[{chat_id}] Telegram notify midmarket error: {te}")
+
+        # Record each placed leg in DB & risk manager
+        for oid, bid_p, outcome, token_id in [
+            (id_yes, bid_yes, "YES", yes_id),
+            (id_no, bid_no, "NO", no_id),
+        ]:
+            if oid:
+                try:
+                    trade_id = await asyncio.to_thread(
+                        database.record_trade,
+                        chat_id=chat_id,
+                        strategy="MIDMARKET_MAKER",
+                        asset=sig.asset,
+                        timeframe=sig.timeframe,
+                        outcome=outcome,
+                        outcome_id=token_id,
+                        market_id=sig.market_id,
+                        event_id=sig.event_id,
+                        order_id=oid,
+                        entry_price=_safe_float(bid_p),
+                        amount_ngn=_safe_float(amount_leg),
+                        certainty=0.95,
+                        secs_to_close=_safe_float(market.get("secs_to_close", 0)),
+                        spot_vs_threshold_pct=0.0,
+                        market_price_at_entry=_safe_float(bid_p),
+                        engine="CLOB_LIMIT",
+                    )
+                    risk.add_position(sig.market_id + f"_{outcome}", {
+                        "trade_id": trade_id, "event_id": sig.event_id,
+                        "order_id": oid, "outcome": outcome, "outcome_id": token_id,
+                        "entry_price": bid_p, "amount_ngn": amount_leg,
+                        "strategy": "MIDMARKET_MAKER", "asset": sig.asset,
+                        "timeframe": sig.timeframe,
+                        "threshold": market.get("threshold"),
+                        "closing_date": market.get("closing_date", ""),
+                    })
+                except Exception as dbe:
+                    log.error(f"[{chat_id}] DB record midmarket leg failed: {dbe}")
+
+        # Start 45s adverse selection watchdog
+        if id_yes and id_no:
+            asyncio.create_task(
+                _midmarket_watchdog(client, chat_id, sig.market_id, id_yes, id_no, bid_yes, bid_no)
+            )
+
+    except Exception as e:
+        log.error(f"[{chat_id}] execute_midmarket_maker error: {e}", exc_info=True)
+
+
+async def _midmarket_watchdog(client, chat_id: str, market_id: str, id_yes: str, id_no: str, bid_yes: float, bid_no: float):
+    """
+    Guards against adverse selection in dual-sided market making:
+    After 45s, checks if only one leg was filled.
+    If one leg filled and the other is still resting, cancels the resting order
+    to prevent directional run-away drift into trending moves.
+    """
+    await asyncio.sleep(45.0)
+    try:
+        o_yes, o_no = await asyncio.gather(
+            client.get_order(id_yes),
+            client.get_order(id_no),
+            return_exceptions=True,
+        )
+        status_yes = str(o_yes.get("status", "")).lower() if isinstance(o_yes, dict) else "unknown"
+        status_no  = str(o_no.get("status", "")).lower() if isinstance(o_no, dict) else "unknown"
+
+        filled_yes = status_yes in ("filled", "completed")
+        filled_no  = status_no in ("filled", "completed")
+
+        if filled_yes and filled_no:
+            log.info(f"[{chat_id}] 🏆 MIDMARKET DUAL FILL SUCCESS on {market_id}! +{(1.0-(bid_yes+bid_no)):.1%} locked")
+        elif filled_yes and not filled_no:
+            log.warning(f"[{chat_id}] ⚠️ MIDMARKET partial fill: YES filled, NO unfilled. Cancelling NO order {id_no}")
+            try:
+                await client.cancel_order(id_no)
+            except Exception as ce:
+                log.error(f"[{chat_id}] Failed to cancel unhedged NO order: {ce}")
+        elif filled_no and not filled_yes:
+            log.warning(f"[{chat_id}] ⚠️ MIDMARKET partial fill: NO filled, YES unfilled. Cancelling YES order {id_yes}")
+            try:
+                await client.cancel_order(id_yes)
+            except Exception as ce:
+                log.error(f"[{chat_id}] Failed to cancel unhedged YES order: {ce}")
+    except Exception as we:
+        log.error(f"[{chat_id}] Midmarket watchdog error: {we}")

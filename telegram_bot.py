@@ -919,3 +919,13 @@ async def notify_deposit_detected(app, cid, amount, currency):
         f"💸 *Deposit detected* +{currency} {amount:,.0f}\n"
         f"Drawdown baseline reset. Send /resume if trading was paused.",
         parse_mode="Markdown")
+
+async def notify_midmarket(app, cid, sig, bid_yes, bid_no, amount_leg):
+    await send_message(app, cid,
+        f"🎯 *MID-MARKET LIQUIDITY TRAP*\n"
+        f"Asset: *{sig.asset} {sig.timeframe}*\n"
+        f"• YES Bid: *{bid_yes:.3f}* (₦{amount_leg:,.0f})\n"
+        f"• NO Bid: *{bid_no:.3f}* (₦{amount_leg:,.0f})\n"
+        f"• Locked Return: *+{sig.edge_at_entry:.1%}*\n"
+        f"• 45s adverse selection watchdog active",
+        parse_mode="Markdown")
