@@ -682,6 +682,18 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                             await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
                         except Exception:
                             pass
+                    if _tg_app:
+                        try:
+                            await telegram_bot.notify_unfilled(
+                                _tg_app, chat_id,
+                                pos.get("strategy", "MAKER"),
+                                pos.get("asset", "?"),
+                                pos.get("timeframe", ""),
+                                pos.get("outcome", ""),
+                                pos.get("amount_ngn", 0),
+                            )
+                        except Exception as ne:
+                            log.warning(f"[{chat_id}] notify_unfilled (phantom exit) failed: {ne}")
                 else:
                     # Order WAS filled but market resolved before we could exit.
                     # Do NOT touch resolved_at/won here — resolution_monitor will
@@ -707,7 +719,7 @@ async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: 
 
     # Always re-fetch settings from DB — the user dict passed in may be a
     # stale cached copy with paused=True even after /resume was called.
-    fresh_user = await asyncio.to_thread(database.get_user, chat_id)
+    fresh_user = await asyncio.to_thread(database.get_user, chat_id, force_fresh=True)
     if not fresh_user or not fresh_user.get("is_active"):
         return
     settings = fresh_user.get("settings", {})

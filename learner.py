@@ -121,6 +121,34 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                     event   = await client.get_event(trade["event_id"])
                     status  = event.get("status", "").lower()
 
+                    # Early check: if the order itself is already cancelled/expired with 0 fill,
+                    # resolve as unfilled immediately without waiting 15m/1h for the entire event to close.
+                    if trade.get("order_id"):
+                        try:
+                            order_data   = await client.get_order(trade["order_id"])
+                            order_status = str(order_data.get("status") or "").lower()
+                            shares       = client.parse_filled_shares(order_data)
+                            if shares <= 0 and order_status in ("cancelled", "expired", "rejected", "killed"):
+                                log.info(f"[{chat_id}] Order {trade['order_id']} was cancelled on exchange ({order_status}) — resolving with 0.0 PnL")
+                                await asyncio.to_thread(database.resolve_trade, trade["trade_id"], None, 0.0)
+                                if user_risks and chat_id in user_risks:
+                                    user_risks[chat_id].remove_position(trade["market_id"])
+                                if tg_app:
+                                    try:
+                                        await tgb.notify_unfilled(
+                                            tg_app, chat_id,
+                                            trade.get("strategy", "MAKER"),
+                                            trade.get("asset", "?"),
+                                            trade.get("timeframe", ""),
+                                            trade.get("outcome", ""),
+                                            trade.get("amount_ngn", 0),
+                                        )
+                                    except Exception as ne:
+                                        log.warning(f"[{chat_id}] notify_unfilled failed: {ne}")
+                                continue
+                        except Exception as oe:
+                            log.debug(f"early get_order check: {oe}")
+
                     # Not resolved yet
                     if status not in ("resolved", "settled", "closed"):
                         continue

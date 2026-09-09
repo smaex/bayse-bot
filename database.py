@@ -69,9 +69,10 @@ def _dec(text: str) -> str:
 
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
-# Simple in-memory caches
-_USER_CACHE: dict[str, dict] = {}
-_ACTIVE_USERS_CACHE: list[dict] | None = None
+# Simple in-memory caches with 15-second TTL
+_USER_CACHE: dict[str, tuple[float, dict]] = {}  # chat_id -> (timestamp, data)
+_ACTIVE_USERS_CACHE: tuple[float, list[dict]] | None = None
+_CACHE_TTL = 15.0  # seconds
 
 
 def _init_pool():
@@ -284,26 +285,32 @@ def add_user(chat_id: str, public_key: str, secret_key: str) -> dict:
     return get_user(chat_id)
 
 
-def get_user(chat_id: str) -> dict | None:
-    if chat_id in _USER_CACHE:
-        return copy.deepcopy(_USER_CACHE[chat_id])
+def get_user(chat_id: str, force_fresh: bool = False) -> dict | None:
+    now = time.time()
+    if not force_fresh and chat_id in _USER_CACHE:
+        ts, data = _USER_CACHE[chat_id]
+        if (now - ts) < _CACHE_TTL:
+            return copy.deepcopy(data)
     row = _fetch_one("SELECT * FROM users WHERE chat_id = %s", (chat_id,))
     if row:
         h = _hydrate(row)
-        _USER_CACHE[chat_id] = copy.deepcopy(h)
+        _USER_CACHE[chat_id] = (now, copy.deepcopy(h))
         return h
     return None
 
 
-def get_all_active() -> list[dict]:
+def get_all_active(force_fresh: bool = False) -> list[dict]:
     global _ACTIVE_USERS_CACHE
-    if _ACTIVE_USERS_CACHE is not None:
-        return copy.deepcopy(_ACTIVE_USERS_CACHE)
+    now = time.time()
+    if not force_fresh and _ACTIVE_USERS_CACHE is not None:
+        ts, data = _ACTIVE_USERS_CACHE
+        if (now - ts) < _CACHE_TTL:
+            return copy.deepcopy(data)
     rows = _fetch_all("SELECT * FROM users WHERE is_active = 1")
     result = [_hydrate(r) for r in rows if str(r.get("chat_id", "")) != "0"]
     for u in result:
-        _USER_CACHE[u["chat_id"]] = copy.deepcopy(u)
-    _ACTIVE_USERS_CACHE = copy.deepcopy(result)
+        _USER_CACHE[u["chat_id"]] = (now, copy.deepcopy(u))
+    _ACTIVE_USERS_CACHE = (now, copy.deepcopy(result))
     return result
 
 
@@ -313,12 +320,17 @@ def update_settings(chat_id: str, settings: dict):
         "UPDATE users SET settings = %s WHERE chat_id = %s",
         (json.dumps(settings), chat_id),
     )
+    now = time.time()
     if chat_id in _USER_CACHE:
-        _USER_CACHE[chat_id]["settings"] = copy.deepcopy(settings)
+        ts, u = _USER_CACHE[chat_id]
+        u["settings"] = copy.deepcopy(settings)
+        _USER_CACHE[chat_id] = (now, u)
     if _ACTIVE_USERS_CACHE:
-        for u in _ACTIVE_USERS_CACHE:
+        ts, users_list = _ACTIVE_USERS_CACHE
+        for u in users_list:
             if u["chat_id"] == chat_id:
                 u["settings"] = copy.deepcopy(settings)
+        _ACTIVE_USERS_CACHE = (now, users_list)
 
 
 def invalidate_user_cache(chat_id: str = None):
