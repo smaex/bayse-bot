@@ -1,5 +1,9 @@
 # Production performance findings
 
+> Follow-up: the 2026-09-10 SNIPE rewrite, fee/execution hardening,
+> complete-set shadow research, and Monte Carlo results are documented in
+> `reports/snipe_hardening_findings.md`.
+
 Audit date: 2026-09-10  
 Scope: 515 resolved production records supplied through the read-only aggregate reports. All observed records were BTC, ETH, or SOL on the 15-minute timeframe. No 5-minute, EURUSD, GBPUSD, or XAUUSD record appeared.
 

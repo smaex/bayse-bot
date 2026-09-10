@@ -9,7 +9,11 @@ from learner import (
     adjusted_combo_size_multiplier,
     capital_weighted_break_even,
 )
-from strategies import _STRUCTURAL_STRATEGIES, _route_strategy_names
+from strategies import (
+    _STRUCTURAL_STRATEGIES,
+    _performance_adjusted_probability,
+    _route_strategy_names,
+)
 
 
 def test_break_even_rate_depends_on_paid_prices_not_fixed_strategy_target():
@@ -50,6 +54,18 @@ def test_combo_loss_control_multiplies_strategy_size_control():
 
 def test_single_leg_maker_uses_directional_performance_learning():
     assert "MAKER" not in _STRUCTURAL_STRATEGIES
+
+
+def test_settled_underperformance_reduces_directional_probability_and_edge():
+    original = 0.70
+    adjusted = _performance_adjusted_probability(original, 0.72)
+
+    assert abs(adjusted - 0.644) < 1e-12
+    assert adjusted - 0.62 < 0.03  # no longer clears SNIPE's edge gate
+
+
+def test_historical_performance_never_inflates_fresh_model_probability():
+    assert _performance_adjusted_probability(0.70, 1.20) == 0.70
 
 
 def test_liquidity_router_never_auto_enables_quarantined_midmarket_maker():

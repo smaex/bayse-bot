@@ -6,6 +6,7 @@ import math
 import re
 import time
 import uuid
+from datetime import datetime
 from typing import Optional
 
 import config
@@ -118,8 +119,76 @@ async def _infer_engine(client, market: dict) -> str:
 
 
 def _effective_fee(fee_rate: float, price: float) -> float:
-    """Bayse fee formula: fee = feeRate × max(1 - price, 0.5)."""
+    """Bayse fee as a fraction of fill notional."""
     return fee_rate * max(1.0 - price, FEE_FLOOR)
+
+
+def _clob_buy_effective_price(price: float, fee_rate: float) -> float:
+    """Exact wallet cost per net share for a fee-bearing CLOB BUY."""
+    return price / max(1.0 - _effective_fee(fee_rate, price), 1e-9)
+
+
+def _book_is_stale(
+    book: dict, *, max_age: float | None = None, now: float | None = None
+) -> bool:
+    """Reject an explicitly stale/malformed book timestamp when one is present.
+
+    Bayse's documented order-book level schema does not promise a timestamp,
+    so absence cannot safely be interpreted as stale. A supplied timestamp is
+    nonetheless enforced and supports seconds, milliseconds, or ISO-8601.
+    """
+    timestamp = next(
+        (
+            book.get(key)
+            for key in ("timestamp", "updatedAt", "updated_at")
+            if book.get(key) is not None
+        ),
+        None,
+    )
+    if timestamp is None:
+        return False
+    try:
+        if isinstance(timestamp, (int, float)):
+            updated = float(timestamp)
+        else:
+            value = str(timestamp).strip()
+            try:
+                updated = float(value)
+            except ValueError:
+                updated = datetime.fromisoformat(
+                    value.replace("Z", "+00:00")
+                ).timestamp()
+        if updated > 10_000_000_000:
+            updated /= 1000.0
+        age = (time.time() if now is None else now) - updated
+        limit = (
+            config.CLOB_MAX_BOOK_AGE_SECONDS
+            if max_age is None else max_age
+        )
+        return age < -1.0 or age > limit
+    except (TypeError, ValueError, OverflowError):
+        return True
+
+
+def _quote_effective_buy_price(quote: dict) -> float:
+    """Derive wallet cost per normalized share from a Bayse quote.
+
+    Bayse defines BUY ``amount`` as total wallet spend and ``quantity`` as
+    shares received. This handles both AMM embedded fees and CLOB share-
+    reducing fees without guessing from a configured fee rate.
+    """
+    quantity = float(quote.get("quantity") or 0.0)
+    if quantity <= 0:
+        return 0.0
+    amount = float(quote.get("amount") or 0.0)
+    if amount <= 0:
+        amount = float(quote.get("costOfShares") or 0.0)
+        amount += float(quote.get("fee") or 0.0)
+    multiplier = float(
+        quote.get("currencyBaseMultiplier")
+        or config.CURRENCY_BASE_MULTIPLIER
+    )
+    return amount / (quantity * multiplier) if amount > 0 else 0.0
 
 
 # ── Main trade execution ──────────────────────────────────────────────────────
@@ -308,8 +377,6 @@ async def _execute_logic(
                 )
                 q_price = float(quote.get("price") or sig.market_price)
                 q_qty = float(quote.get("quantity") or 0)
-                q_fee = float(quote.get("fee") or 0)
-                q_cost = float(quote.get("costOfShares") or 0)
                 if quote.get("completeFill") is not True or q_qty <= 0:
                     log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — quote does not confirm a complete fill")
                     return
@@ -317,13 +384,12 @@ async def _execute_logic(
                     log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — quote exceeds market liability")
                     return
 
-                if q_qty > 0 and q_cost > 0:
-                    total_cost = q_cost + q_fee
-                    quote_price = total_cost / (q_qty * 100.0) if CURRENCY == "NGN" else total_cost / q_qty
-                else:
+                quote_price = _quote_effective_buy_price(quote)
+                if quote_price <= 0:
+                    # Compatibility fallback for old quote payloads that omit
+                    # amount/cost but still expose a quoted marginal price.
                     fee_rate = _get_market_fee(sig.market_id)
-                    eff_fee = _effective_fee(fee_rate, q_price)
-                    quote_price = q_price * (1.0 + eff_fee)
+                    quote_price = _clob_buy_effective_price(q_price, fee_rate)
 
                 if quote_price <= 0:
                     log.warning(f"[{chat_id}] Invalid quote price {quote_price} returned. Skipping EV calculation.")
@@ -353,15 +419,14 @@ async def _execute_logic(
                             sq_qty = float(scaled_quote.get("quantity") or 0)
                             if sq_qty <= 0:
                                 continue
-                            sq_fee = float(scaled_quote.get("fee") or 0)
-                            sq_cost = float(scaled_quote.get("costOfShares") or 0)
-
-                            if sq_qty > 0 and sq_cost > 0:
-                                scaled_price = (sq_cost + sq_fee) / (sq_qty * 100.0) if CURRENCY == "NGN" else (sq_cost + sq_fee) / sq_qty
-                            else:
+                            scaled_price = _quote_effective_buy_price(
+                                scaled_quote
+                            )
+                            if scaled_price <= 0:
                                 fee_rate = _get_market_fee(sig.market_id)
-                                eff_fee = _effective_fee(fee_rate, sq_price)
-                                scaled_price = sq_price * (1.0 + eff_fee)
+                                scaled_price = _clob_buy_effective_price(
+                                    sq_price, fee_rate
+                                )
 
                             scaled_ev = sig.win_prob / scaled_price - 1.0
                             if scaled_ev >= target_margin:
@@ -391,9 +456,11 @@ async def _execute_logic(
             slip_map_ev = {"safe": 0.008, "balanced": 0.015, "aggressive": 0.020, "full_send": 0.025, "custom": 0.015}
             slip_ev = slip_map_ev.get(mode, 0.015) if not is_maker else 0.0
             taker_buf = max(0.012, sig.market_price * slip_ev) if not is_maker else 0.0
-            worst_case_p = min(sig.market_price + taker_buf, 0.650)
-            eff_fee  = _effective_fee(fee_rate, worst_case_p)
-            ev = sig.win_prob / (worst_case_p * (1.0 + eff_fee)) - 1.0
+            worst_case_p = min(sig.market_price + taker_buf, 0.99)
+            effective_worst_p = _clob_buy_effective_price(
+                worst_case_p, fee_rate
+            )
+            ev = sig.win_prob / effective_worst_p - 1.0
             if not is_probe and ev < target_margin:
                 log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — worst-case EV {ev:+.1%} < {target_margin:.0%} (worst_price={worst_case_p:.3f})")
                 return
@@ -428,8 +495,11 @@ async def _execute_logic(
             )
             if quote.get("completeFill") is False or quote.get("tradeGoesOverMaxLiability") is True:
                 return
-            quote_price = float(quote.get("price") or sig.market_price)
-            oracle_cap = min(0.75, sig.win_prob / (1.0 + _effective_fee(_get_market_fee(sig.market_id), quote_price)))
+            quote_price = (
+                _quote_effective_buy_price(quote)
+                or float(quote.get("price") or sig.market_price)
+            )
+            oracle_cap = min(0.75, sig.win_prob / 1.03)
             if quote_price > oracle_cap:
                 log.info(
                     f"[{chat_id}] SKIP ORACLE_ARB {sig.asset} — executable price "
@@ -479,10 +549,9 @@ async def _execute_logic(
     # (Fill-And-Kill / IOC) with a strict price ceiling passed directly to the exchange.
     # This physically FORBIDS the exchange from ever filling orders at 0.990 or 0.830!
     fee_rate      = _get_market_fee(sig.market_id)
-    eff_fee       = _effective_fee(fee_rate, sig.market_price)
     slip_map      = {"safe": 0.008, "balanced": 0.015, "aggressive": 0.020, "full_send": 0.025, "custom": 0.015}
     slippage      = slip_map.get(mode, 0.015)
-    max_valid     = (1.0 - eff_fee) / 1.01
+    max_valid     = 0.99
     order_type    = "LIMIT" if engine == "CLOB" else "MARKET"
     post_only     = False
 
@@ -499,18 +568,40 @@ async def _execute_logic(
         # Theoretical midpoint bidding (sig.market_price) always lands below the ask and
         # causes 100% zero-fill FAK cancellations.
         time_in_force = "FAK"
-        # Dynamic EV cap: scales with model win probability, bounded by 0.84 hard safety ceiling
-        eff_fee_est = _effective_fee(fee_rate, sig.market_price)
-        dynamic_cap = sig.win_prob / ((1.0 + target_margin) * (1.0 + eff_fee_est))
-        cap = min(0.84, max(0.65, dynamic_cap))
-        if is_oracle_arb:
-            cap = min(0.85, max(cap, 0.75))
-        elif sig.strategy == "PAIRED_SNIPER" and sig.certainty >= 0.85:
-            cap = 0.93
+        # Exact CLOB BUY cap: taker fees reduce shares, so effective price is
+        # p/(1-fee_fraction). Never impose a minimum cap that can exceed EV.
+        fee_fraction = _effective_fee(fee_rate, sig.market_price)
+        dynamic_cap = (
+            sig.win_prob * (1.0 - fee_fraction) / (1.0 + target_margin)
+        )
+        strategy_cap = (
+            config.SNIPE_MAX_MARKET_PRICE
+            if sig.strategy == "SNIPE" else 0.75
+        )
+        cap = min(strategy_cap, dynamic_cap, max_valid)
+        if cap <= 0.01:
+            return
 
-        limit_price = round(min(sig.market_price + max(0.012, sig.market_price * slippage), cap, max_valid), 3)
+        limit_price = round(
+            min(
+                sig.market_price + max(0.012, sig.market_price * slippage),
+                cap,
+            ),
+            3,
+        )
         try:
-            ob = await asyncio.wait_for(client.get_orderbook(sig.outcome_id, depth=5), timeout=1.5)
+            ob = await asyncio.wait_for(
+                client.get_orderbook(sig.outcome_id, depth=5), timeout=1.5
+            )
+            if _book_is_stale(ob):
+                log.info(
+                    f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — "
+                    "CLOB orderbook timestamp is stale or invalid"
+                )
+                _trade_cooldown[
+                    _cooldown_key(chat_id, sig.market_id)
+                ] = time.time()
+                return
             asks = ob.get("asks", [])
             if not asks:
                 log.info(
@@ -529,9 +620,10 @@ async def _execute_logic(
                 _trade_cooldown[_cooldown_key(chat_id, sig.market_id)] = time.time()
                 return
 
-            # Verify EV against the real fill price on the book
-            eff_fee_ask = _effective_fee(fee_rate, best_ask)
-            ev_at_ask = sig.win_prob / (best_ask * (1.0 + eff_fee_ask)) - 1.0
+            # Verify EV against the real fill price on the book. CLOB BUY fees
+            # reduce shares received, so use p/(1-fee_fraction), not p*(1+fee).
+            effective_ask = _clob_buy_effective_price(best_ask, fee_rate)
+            ev_at_ask = sig.win_prob / effective_ask - 1.0
             if ev_at_ask < target_margin:
                 log.info(
                     f"[{chat_id}] SKIP {sig.strategy} {sig.asset} {sig.outcome} — "
@@ -577,7 +669,14 @@ async def _execute_logic(
                 )
                 amount = clipped
         except Exception as obe:
-            log.warning(f"[{chat_id}] CLOB orderbook fetch error: {obe}, using estimated limit {limit_price:.3f}")
+            # A displayed midpoint is not executable liquidity. Never place a
+            # taker order when the CLOB book cannot be verified.
+            log.warning(
+                f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — "
+                f"CLOB orderbook unavailable: {obe}"
+            )
+            _trade_cooldown[_cooldown_key(chat_id, sig.market_id)] = time.time()
+            return
     else:
         # AMM markets execute immediately and do not have a resting book.
         # Bayse documents MARKET/FAK for this engine; LIMIT/FAK caused rejects.

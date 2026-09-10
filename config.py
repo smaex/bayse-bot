@@ -33,6 +33,16 @@ def _env_int(name: str, default: int) -> int:
     except ValueError as exc:
         raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
 
+
+def _env_csv_set(name: str, default: set[str]) -> set[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return set(default)
+    values = {item.strip().upper() for item in raw.split(",") if item.strip()}
+    if not values:
+        raise RuntimeError(f"{name} must contain at least one comma-separated value")
+    return values
+
 # ── Credentials ───────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ENCRYPTION_KEY  = os.getenv("ENCRYPTION_KEY", "")
@@ -123,15 +133,29 @@ SNIPE_ENTRY_WINDOWS = {
     "6h":    7200,
     "1d":    21600,
 }
-# Conservative guardrails, not a profitability claim. The production audit
-# found SNIPE negative overall; these bounds exclude the worst underdog and
-# very-expensive payoff traps while new out-of-sample evidence accumulates.
-SNIPE_MIN_CERTAINTY    = 0.45   # Maps internally to estimated win probability of about 70%.
-SNIPE_MAX_MARKET_PRICE = 0.75   # Avoid strongly asymmetric payoff/fee drag.
+# Conservative guardrails, not a profitability claim. Production SNIPE was
+# negative overall; only SOL was approximately break-even. Until fresh policy-
+# compliant fills prove otherwise, SNIPE is restricted to the observed scope
+# with the least-bad economics. Operators can broaden this explicitly for paper
+# testing, but should not infer profitability from doing so.
+SNIPE_ALLOWED_ASSETS = _env_csv_set("SNIPE_ALLOWED_ASSETS", {"SOL"})
+SNIPE_ALLOWED_TIMEFRAMES = _env_csv_set(
+    "SNIPE_ALLOWED_TIMEFRAMES", {"15MIN"}
+)
+SNIPE_MIN_SECS_TO_CLOSE = 60
+SNIPE_MIN_CERTAINTY    = 0.45   # Maps to a conservative win probability of about 70%.
+SNIPE_MAX_MARKET_PRICE = 0.65   # Avoid expensive, strongly asymmetric payoffs.
 SNIPE_MIN_ENTRY_PRICE  = 0.45   # Block low-probability underdog entries.
-# Minimum spot-vs-threshold distance to consider a directional signal.
-# 0.10% allows entering before market makers blow the spread past 0.85
-SNIPE_MIN_DISTANCE_PCT = 0.0010  # 0.10% minimum distance (calibrated from 0.18%)
+SNIPE_MIN_DISTANCE_PCT = 0.0010 # Require at least 0.10% spot/threshold separation.
+SNIPE_MIN_RAW_MODEL_EDGE = 0.08 # Independent model must disagree materially with market.
+SNIPE_MIN_BLENDED_EDGE = 0.03   # Required after shrinking toward market consensus.
+SNIPE_MODEL_WEIGHT = 0.35       # Market gets 65% weight until calibration improves.
+SNIPE_VOL_SAFETY_MULTIPLIER = 1.25
+
+# Complete-set arbitrage remains shadow-only. The edge must clear two taker
+# fees plus execution uncertainty before an observation is counted.
+COMPLETE_SET_MIN_EDGE     = _env_float("COMPLETE_SET_MIN_EDGE", 0.02)
+CLOB_MAX_BOOK_AGE_SECONDS = _env_float("CLOB_MAX_BOOK_AGE_SECONDS", 5.0)
 
 # FX-specific
 FX_SESSION_UTC = {
@@ -168,11 +192,13 @@ EXIT_EV_THRESHOLD = -0.15          # Exit if EV drops below -15% (thesis wrong)
 MIN_EXIT_TIME_REMAINING = 45       # Allow exits down to 45s remaining (was 90s)
                                    # Audit showed profitable exits happen in 60-90s window before resolution
 
-# Take-profit exit: if a position gains > 35% and < 300s remain, lock in the gain.
+# Take-profit exit: trigger on market price, then require a fee-adjusted quote
+# that realizes at least MIN_TAKE_PROFIT_NET_GAIN.
 # This is how MAKER exits generated PROFITS (not just cut losses):
 #   Entry at 0.35, price rises to 0.72 → exit at 0.72 locks +₦106 instead of gambling on resolution.
-TAKE_PROFIT_GAIN_PCT      = 0.35   # 35% gain from entry_price triggers profit lock
-TAKE_PROFIT_MIN_SECS_REMAINING = 300  # Only lock profit when < 5 mins remain (trend is confirming)
+TAKE_PROFIT_GAIN_PCT      = 0.15   # Trigger only on executable market-price gain.
+TAKE_PROFIT_MIN_SECS_REMAINING = 450
+MIN_TAKE_PROFIT_NET_GAIN  = 0.05   # Quote must lock at least 5% after costs.
 
 
 # ── Risk ─────────────────────────────────────────────────────────────────────

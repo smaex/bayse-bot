@@ -9,9 +9,12 @@ from risk import RiskManager
 class FakeExitClient:
     parse_filled_shares = staticmethod(BayseClient.parse_filled_shares)
 
-    def __init__(self, *, order_state=None, sold_shares=10):
+    def __init__(self, *, order_state=None, sold_shares=10,
+                 current_value=500, sell_price=0.5):
         self.order_state = order_state or {"status": "open", "quantity": 10}
         self.sold_shares = sold_shares
+        self.current_value = current_value
+        self.sell_price = sell_price
         self.cancelled = []
         self.sell_calls = []
 
@@ -23,7 +26,11 @@ class FakeExitClient:
         return self.order_state
 
     async def get_position(self, _outcome_id):
-        return {"availableBalance": 10, "sellPrice": 0.5, "currentValue": 500}
+        return {
+            "availableBalance": 10,
+            "sellPrice": self.sell_price,
+            "currentValue": self.current_value,
+        }
 
     async def get_quote(self, *_args):
         return {"completeFill": True, "quantity": 10, "price": 0.5}
@@ -123,3 +130,31 @@ def test_partial_exit_keeps_unsold_shares_under_risk(monkeypatch):
     assert remaining["amount_ngn"] == 300
     assert risk.current_free_cash == 247.5
     assert risk.daily_realized_pnl == -52.5
+
+
+def test_model_probability_cannot_invent_an_executable_take_profit(monkeypatch):
+    _install_market(monkeypatch)
+    bot.active_markets[0]["yes_price"] = 0.59
+    monkeypatch.setattr(bot.feeds_direct, "get_direct_price", lambda _asset: (101, time.time()))
+    monkeypatch.setattr(bot, "win_probability", lambda *_a, **_kw: 0.99)
+    risk = _risk_with_position()
+    client = FakeExitClient(current_value=700, sell_price=0.70)
+
+    asyncio.run(bot._evaluate_and_exit_positions("chat", client, risk, {}))
+
+    assert client.sell_calls == []
+    assert "market-1" in risk.open_positions
+
+
+def test_take_profit_requires_at_least_five_percent_net_quote(monkeypatch):
+    _install_market(monkeypatch)
+    bot.active_markets[0]["yes_price"] = 0.70
+    monkeypatch.setattr(bot.feeds_direct, "get_direct_price", lambda _asset: (101, time.time()))
+    monkeypatch.setattr(bot, "win_probability", lambda *_a, **_kw: 0.90)
+    risk = _risk_with_position()
+    client = FakeExitClient(current_value=620, sell_price=0.62)
+
+    asyncio.run(bot._evaluate_and_exit_positions("chat", client, risk, {}))
+
+    assert client.sell_calls == []
+    assert "market-1" in risk.open_positions

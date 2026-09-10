@@ -11,6 +11,8 @@ New in this version:
 import logging
 import time
 from typing import List
+
+import config
 from strategies.base import TradeSignal
 from strategies.snipe      import SnipeStrategy
 from strategies.arb        import ArbStrategy
@@ -49,6 +51,19 @@ def _route_strategy_names(active_names, liquidity_regime: str) -> set[str]:
     if liquidity_regime in {"DISLOCATED_WIDE", "THIN_ONE_SIDED"}:
         routed = {name for name in routed if name not in _TAKER_STRATEGIES}
     return routed
+
+
+def _performance_adjusted_probability(
+    win_prob: float, performance_multiplier: float
+) -> float:
+    """Shrink directional probability toward 50% after poor settled results.
+
+    Performance evidence may make the model less trustworthy, but historical
+    results never inflate a fresh model estimate above its original value.
+    """
+    p = min(1.0, max(0.0, float(win_prob)))
+    multiplier = min(1.0, max(0.0, float(performance_multiplier)))
+    return 0.5 + (p - 0.5) * multiplier
 
 
 async def evaluate_all(
@@ -122,9 +137,31 @@ async def evaluate_all(
             combo_key  = f"{sig.strategy}:{sig.asset}:{sig.timeframe}"
             combo_mult = cert_mults.get(combo_key, 1.0)
 
+            performance_mult = min(1.0, max(0.0, meta_mult * combo_mult))
+            if performance_mult < 1.0:
+                original_prob = sig.win_prob
+                sig.win_prob = _performance_adjusted_probability(
+                    original_prob, performance_mult
+                )
+                min_edge = (
+                    config.SNIPE_MIN_BLENDED_EDGE
+                    if name == "SNIPE" else 0.01
+                )
+                if sig.win_prob - sig.market_price < min_edge:
+                    log.info(
+                        f"PERFORMANCE SKIP {name} {asset}: adjusted probability "
+                        f"{sig.win_prob:.3f} no longer clears price "
+                        f"{sig.market_price:.3f} by {min_edge:.1%}"
+                    )
+                    continue
+                sig.edge_at_entry = sig.win_prob - sig.market_price
+                sig.reason += (
+                    f" | PERF_P({original_prob:.3f}->{sig.win_prob:.3f})"
+                )
+
             final_mult = mult * meta_mult * combo_mult
-            # Floor: never reduce certainty by more than 20% via multipliers.
-            # Without this, 0.85 × 0.85 × 0.85 = 0.61 kills good signals.
+            # Certainty is presentation/admission confidence; unlike the EV
+            # probability above, it also reflects the current market regime.
             final_mult = max(0.80, final_mult)
             if final_mult != 1.0:
                 sig.certainty = min(1.0, max(0.0, sig.certainty * final_mult))

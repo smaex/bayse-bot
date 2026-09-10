@@ -1,30 +1,35 @@
-import math
 import logging
+import math
+
 import config
 
 log = logging.getLogger("strategies.manager")
 
 
 def _effective_fee(fee_rate: float, market_price: float) -> float:
-    """
-    Bayse effective fee rate applied to the trade cost:
-    eff_fee_rate = feeRate × max(1 - price, 0.5)
-    """
+    """Bayse fee as a fraction of fill notional."""
     return fee_rate * max(1.0 - market_price, config.FEE_FLOOR)
+
+
+def clob_buy_effective_price(market_price: float, fee_rate: float) -> float:
+    """Cost per net share when a CLOB BUY fee reduces shares received."""
+    fee_fraction = _effective_fee(fee_rate, market_price)
+    return market_price / max(1.0 - fee_fraction, 1e-9)
 
 
 def kelly_size(win_prob: float, market_price: float, fee_rate: float = 0.02,
                fraction: float = 0.25, cap: float = 0.08,
-               asset: str = None, state=None, learned: dict = None,
-               strategy_name: str = None) -> float:
+               asset: str | None = None, state=None,
+               learned: dict | None = None,
+               strategy_name: str | None = None) -> float:
     """
     Quarter-Kelly position size with:
       - Drawdown-adjusted fraction
       - Bayesian sample-size penalty (new strategies start small)
       - Dynamic volatility scaling via GARCH
     """
-    eff_fee = _effective_fee(fee_rate, market_price)
-    b = 1.0 / (market_price * (1.0 + eff_fee)) - 1.0
+    effective_price = clob_buy_effective_price(market_price, fee_rate)
+    b = 1.0 / effective_price - 1.0
     if b <= 0:
         return 0.0
 
@@ -65,6 +70,8 @@ def max_ev_price(win_prob: float, market_price: float,
     """
     skew             = market_price - 0.50
     convexity_factor = 1.0 + skew            # 1.4× at 0.90, 0.6× at 0.10
-    dynamic_margin   = max(0.01, min_margin * convexity_factor)
-    eff_fee          = _effective_fee(fee_rate, market_price)
-    return win_prob / ((1.0 + dynamic_margin) * (1.0 + eff_fee))
+    dynamic_margin = max(0.01, min_margin * convexity_factor)
+    fee_fraction = _effective_fee(fee_rate, market_price)
+    # For CLOB BUY, the fee reduces shares. The exact effective price is
+    # p/(1-fee_fraction), so p_max = q*(1-fee_fraction)/(1+margin).
+    return win_prob * (1.0 - fee_fraction) / (1.0 + dynamic_margin)

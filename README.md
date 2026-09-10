@@ -12,7 +12,8 @@ The production path is intentionally narrow:
 - A trade requires fresh data, a complete executable quote, sufficient modeled edge, and room under both per-trade and portfolio limits.
 - Requested order size is never treated as proof of a fill; exposure is created only from exchange-confirmed filled quantity.
 - The default global ceilings are 2% per trade, 15% total exposure, and a 3% daily realized-loss stop.
-- Single-leg CLOB MAKER is permitted and remains subject to per-asset performance controls. ARB, paired-sniper, oracle-arb, and dual-leg midmarket-maker remain experimental and are blocked unless the operator explicitly sets `ALLOW_EXPERIMENTAL_STRATEGIES=true`.
+- Single-leg CLOB MAKER is permitted and remains subject to per-asset performance controls. SNIPE is available only in the conservative SOL/15-minute scope by default; broaden it only during paper validation. ARB, paired-sniper, oracle-arb, and dual-leg midmarket-maker remain experimental and are blocked unless the operator explicitly sets `ALLOW_EXPERIMENTAL_STRATEGIES=true`.
+- A read-only complete-set monitor looks for fee-adjusted BUY→BURN and MINT→SELL CLOB discrepancies. It never submits orders because Bayse batches are best-effort rather than atomic.
 - Telegram polling, feed tasks, scanning, and user loops are supervised. `/live` reports process liveness; `/ready` reports whether startup and the singleton lease are healthy.
 - One database-backed owner lease prevents two deployments from trading the same users at once.
 
@@ -69,6 +70,8 @@ Users connect their own Bayse API keys through `/start`. Keys are encrypted befo
 | `/resume` | Allow new entries |
 | `/rekey` | Replace Bayse API credentials |
 | `/debug` | Show feed, strategy, and risk diagnostics |
+| `/shadow` | Show the legacy two-sided price-touch paper study |
+| `/arbshadow` | Show read-only complete-set CLOB opportunity observations |
 
 ## Risk and execution controls
 
@@ -108,6 +111,15 @@ Point the deployment platform's liveness probe at `/live` and readiness probe at
 | Account controls | `telegram_bot.py`, `risk.py`, `config.py` |
 | Regression checks | `tests/` |
 
+## Simulation and read-only API verification
+
+```bash
+python tools/simulate_economics.py --output reports/monte_carlo_simulation.md
+python tools/bayse_contract_probe.py
+```
+
+The Monte Carlo report illustrates loss probability from audited aggregate economics; it is not a tick-level backtest of the new policy. The API probe makes only public series/event/quote/order-book reads, loads no credentials, and submits no orders.
+
 ## Profitability standard
 
-Do not evaluate the bot using win rate alone. A high win rate can still lose money when entries are expensive. Use net realized PnL after fees/slippage, return on deployed capital, maximum drawdown, fill rate, partial-fill/orphan frequency, and results split by strategy/asset/timeframe. No experimental strategy should be enabled from backtest claims alone; require exchange-confirmed out-of-sample evidence.
+Do not evaluate the bot using win rate alone. A high win rate can still lose money when entries are expensive. Use net realized PnL after fees/slippage, return on deployed capital, maximum drawdown, fill rate, partial-fill/orphan frequency, and results split by strategy/asset/timeframe. No experimental strategy should be enabled from backtest claims alone; require exchange-confirmed out-of-sample evidence. No directional strategy can guarantee profit every day.

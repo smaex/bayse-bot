@@ -11,7 +11,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # pyrefly: ignore [missing-import]
-from aiohttp import web, ClientSession, ClientTimeout
+from aiohttp import ClientSession, ClientTimeout
 
 import database
 import feeds
@@ -525,12 +525,12 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         else:
             current_price = entry_price
 
-        # Dynamic Thesis Value based on continuous spot diffusion:
-        # If orderbook quotes are lagging, w_est gives the true statistical fair value of the position
-        effective_val = w_est
-
-        # Track the highest price/valuation reached during the position's life
-        pos["peak_price"] = max(pos.get("peak_price", entry_price), current_price, effective_val)
+        # The diffusion estimate is useful for thesis invalidation, but it is
+        # not executable cash. Profit locks and trailing peaks must use market
+        # price only; otherwise model optimism can label a loss as take-profit.
+        pos["peak_price"] = max(
+            pos.get("peak_price", entry_price), current_price
+        )
         peak_price = pos["peak_price"]
 
         # ── Proactive Threat Warning Nudge (Spot Compression Alert) ───────────
@@ -554,14 +554,25 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
 
         # ── 1. DYNAMIC TAKE-PROFIT & TRAILING PROFIT LOCK ─────────────────────
         # Locks in profit whenever:
-        # A) Live price or diffusion model shows >= +15% profit with < 450s remaining
-        # B) Position peaked >= +15% profit, and spot/price is now declining (trailing lock)
-        gain_pct = max((current_price - entry_price) / entry_price if entry_price > 0 else 0.0,
-                       (effective_val - entry_price) / entry_price if entry_price > 0 else 0.0)
-        peak_gain_pct = (peak_price - entry_price) / entry_price if entry_price > 0 else 0.0
-        dropped_from_peak = (peak_price - max(current_price, effective_val)) / peak_price if peak_price > 0 else 0.0
+        # A) Executable market price shows the configured gain near close.
+        # B) Market price peaked >= +12% and then declines by >= 8%.
+        gain_pct = (
+            (current_price - entry_price) / entry_price
+            if entry_price > 0 else 0.0
+        )
+        peak_gain_pct = (
+            (peak_price - entry_price) / entry_price
+            if entry_price > 0 else 0.0
+        )
+        dropped_from_peak = (
+            (peak_price - current_price) / peak_price
+            if peak_price > 0 else 0.0
+        )
 
-        if secs < 450 and gain_pct >= 0.15:
+        if (
+            secs < TAKE_PROFIT_MIN_SECS_REMAINING
+            and gain_pct >= TAKE_PROFIT_GAIN_PCT
+        ):
             positions_to_exit.append({
                 "market_id": market_id,
                 "position_key": position_key,
@@ -574,7 +585,11 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             })
             continue
 
-        if peak_gain_pct >= 0.12 and dropped_from_peak >= 0.08 and max(current_price, effective_val) >= entry_price:
+        if (
+            peak_gain_pct >= 0.12
+            and dropped_from_peak >= 0.08
+            and current_price >= entry_price
+        ):
             positions_to_exit.append({
                 "market_id": market_id,
                 "position_key": position_key,
@@ -726,6 +741,22 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                     f"[{chat_id}] EXIT deferred for {market_id}: position value "
                     f"₦{sell_amount:,.2f} is below sell minimum ₦{min_sell:,.0f}"
                 )
+                continue
+
+            if (
+                exit_reason == "TAKE_PROFIT"
+                and sell_amount
+                < amount_ngn * (1.0 + config.MIN_TAKE_PROFIT_NET_GAIN)
+            ):
+                log.info(
+                    f"[{chat_id}] TAKE-PROFIT deferred for {market_id}: "
+                    f"executable value ₦{sell_amount:,.2f} does not lock "
+                    f"{config.MIN_TAKE_PROFIT_NET_GAIN:.0%} net"
+                )
+                continue
+            if exit_reason == "REVERSAL_EXIT" and sell_amount < amount_ngn:
+                # A trailing "profit lock" may not realize a net loss. The
+                # ordinary stop-loss path remains available if thesis breaks.
                 continue
 
             sell_quote = await client.get_quote(
@@ -1006,6 +1037,8 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
         skipped_trigger = 0
         skipped_stale_feed = 0
         now = time.time()
+        # Degraded relay/oracle agreement raises directional edge requirements.
+        learned["oracle_penalty"] = max(0.0, float(penalty or 0.0))
         for market in active_markets:
             if market.get("status") != "open":
                 skipped_status += 1
@@ -1107,6 +1140,14 @@ async def _scan_loop():
                 shadow_tracker.on_market_scan(active_markets)
             except Exception as se:
                 log.debug(f"Shadow tracker scan hook: {se}")
+            try:
+                import complete_set_shadow
+                await complete_set_shadow.scan_markets(
+                    _scan_client, active_markets
+                )
+            except Exception as se:
+                # Shadow research must never interrupt market discovery.
+                log.debug(f"Complete-set shadow scan hook: {se}")
         except Exception as e:
             health.fail("scanner", e)
             log.warning(f"Scan failed: {e}")
