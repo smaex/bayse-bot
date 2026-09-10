@@ -92,17 +92,19 @@ ACTIVE_STRATEGIES = [
     "SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER",
     "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
 ]
-# These strategies have multi-leg/resting-order risk and must be promoted only
-# after live fill/reconciliation data proves them profitable.  New accounts do
-# not enable them automatically.
-# Single-leg MAKER is permitted because it is post-only, fee-free on CLOB,
-# independently reconciled, and has operator-reported positive history. It is
-# still opt-in for new accounts. Multi-leg/latency variants remain quarantined
-# until their exchange-confirmed records can be analysed.
+# These strategies have multi-leg/resting-order/latency risk and must be
+# promoted only after exchange-confirmed fill and PnL data validates them.
+# Single-leg MAKER is different: it is a directional post-only CLOB order, not
+# a supposedly locked-in pair. It remains permitted because 273 production
+# records were profitable overall and Bayse documents makers as fee-free.
 EXPERIMENTAL_STRATEGIES = {
     "ARB", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
 }
-DEFAULT_STRATEGIES = ["SNIPE"]
+# Production evidence currently supports MAKER on BTC/SOL 15-minute markets.
+# New accounts still start paused; existing saved settings are not overwritten.
+DEFAULT_STRATEGIES = ["MAKER"]
+DEFAULT_ASSETS = ["BTC", "SOL"]
+DEFAULT_TIMEFRAMES = ["15min"]
 ALLOW_EXPERIMENTAL_STRATEGIES = _env_bool("ALLOW_EXPERIMENTAL_STRATEGIES", False)
 PERMITTED_STRATEGIES = [
     name for name in ACTIVE_STRATEGIES
@@ -121,13 +123,12 @@ SNIPE_ENTRY_WINDOWS = {
     "6h":    7200,
     "1d":    21600,
 }
-# DATA-DRIVEN TUNING (Calibrated from 2-week DB forensics):
-# SNIPE only trades high-conviction directional entries between 0.45 and 0.70.
-# - Underdog entries (<0.45) have poor win-rates and lose 77%+ of the time.
-# - High-certainty entries (>=0.45, win_prob >= 70%) have 100% historical win-rate.
-SNIPE_MIN_CERTAINTY    = 0.45   # 70%+ win-rate floor (calibrated from 2-week forensics: cert >= 0.60 was 100% WR)
-SNIPE_MAX_MARKET_PRICE = 0.75   # Avoid asymmetric payoff/fee drag at very expensive entries.
-SNIPE_MIN_ENTRY_PRICE  = 0.45   # Hard floor at 0.45 — completely blocks low-probability underdog traps
+# Conservative guardrails, not a profitability claim. The production audit
+# found SNIPE negative overall; these bounds exclude the worst underdog and
+# very-expensive payoff traps while new out-of-sample evidence accumulates.
+SNIPE_MIN_CERTAINTY    = 0.45   # Maps internally to estimated win probability of about 70%.
+SNIPE_MAX_MARKET_PRICE = 0.75   # Avoid strongly asymmetric payoff/fee drag.
+SNIPE_MIN_ENTRY_PRICE  = 0.45   # Block low-probability underdog entries.
 # Minimum spot-vs-threshold distance to consider a directional signal.
 # 0.10% allows entering before market makers blow the spread past 0.85
 SNIPE_MIN_DISTANCE_PCT = 0.0010  # 0.10% minimum distance (calibrated from 0.18%)

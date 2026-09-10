@@ -33,6 +33,15 @@ def test_explicit_partial_fill_is_counted_even_while_order_is_open():
     assert BayseClient.parse_filled_shares(order) == 2.5
 
 
+def test_documented_clob_quantity_is_preferred_as_received_shares():
+    order = {
+        "status": "partial_filled",
+        "quantity": "1.5",
+        "filledSize": "45",
+    }
+    assert BayseClient.parse_filled_shares(order) == 1.5
+
+
 def test_rejected_order_quantity_is_not_counted_as_fill():
     assert BayseClient.parse_filled_shares(
         {"status": "rejected", "quantity": 12}

@@ -360,35 +360,39 @@ class BayseClient:
 
     @staticmethod
     def parse_filled_shares(order: dict) -> float:
-        """
-        Extract filled quantity from an order response.
-        AMM orders use 'quantity'; CLOB uses 'filledSize'/'sharesMatched'.
-        Check AMM field first.
-        """
-        # CLOB's `size`/`amount` are requested quantities, not fills. Prefer
-        # explicit fill fields and never infer a fill for an open/cancelled GTC
-        # order. AMM confirmations use `quantity` and status=filled.
-        for field in ("filledSize", "sharesFilled", "sharesMatched",
-                      "amountMatched", "filledQuantity"):
-            v = order.get(field)
-            if v is not None:
-                try:
-                    return max(0.0, float(v))
-                except (TypeError, ValueError):
-                    continue
+        """Extract normalized shares actually received from an order response.
 
+        Bayse documents CLOB ``quantity`` as shares received, while
+        ``filledSize`` is the amount filled so far. Prefer positive quantity on
+        a filled/partial order; retain explicit fill fields as a compatibility
+        fallback for responses that omit quantity.
+        """
         status = str(order.get("status") or "").strip().lower()
-        if status in {
+        non_filled_statuses = {
             "pending", "open", "new", "cancelled", "canceled", "killed",
             "rejected", "expired",
-        }:
-            return 0.0
+        }
 
-        for field in ("quantity", "shares"):
-            v = order.get(field)
-            if v is not None:
+        if status not in non_filled_statuses:
+            for field in ("quantity", "shares"):
                 try:
-                    return max(0.0, float(v))
+                    value = float(order.get(field) or 0.0)
                 except (TypeError, ValueError):
                     continue
+                if value > 0:
+                    return value
+
+        # Partial CLOB responses may remain status=open while exposing an
+        # explicit filled field. Never use requested `size` or `amount`.
+        for field in (
+            "filledSize", "sharesFilled", "sharesMatched",
+            "amountMatched", "filledQuantity",
+        ):
+            try:
+                value = float(order.get(field) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+
         return 0.0

@@ -36,10 +36,19 @@ _strategies = {
     "MIDMARKET_MAKER": MidmarketMakerStrategy(),
 }
 
-# Structural strategies that bypass the regime/certainty multiplier system.
-# They fire based on market structure (spread, oracle lag, locked-in mid-market), not directional bets.
-_STRUCTURAL_STRATEGIES = {"MAKER", "ORACLE_ARB", "MIDMARKET_MAKER"}
+# Only genuinely structural/latency strategies bypass directional performance
+# learning. Single-leg MAKER is a directional binary bet placed passively; it
+# must remain subject to per-strategy and per-asset learning.
+_STRUCTURAL_STRATEGIES = {"ORACLE_ARB", "MIDMARKET_MAKER"}
 _TAKER_STRATEGIES = {"SNIPE", "FRONTRUN", "CORRELATE", "ARB"}
+
+
+def _route_strategy_names(active_names, liquidity_regime: str) -> set[str]:
+    """Apply liquidity routing without ever enabling an unrequested strategy."""
+    routed = set(active_names)
+    if liquidity_regime in {"DISLOCATED_WIDE", "THIN_ONE_SIDED"}:
+        routed = {name for name in routed if name not in _TAKER_STRATEGIES}
+    return routed
 
 
 async def evaluate_all(
@@ -56,9 +65,6 @@ async def evaluate_all(
     regime_mults = regime_controller.get_multipliers(asset, state)
     cert_mults   = learned.get("certainty_multipliers", {})
 
-    # Respect the active strategies set configured by the user
-    all_names = set(active_names)
-
     # ── Liquidity Regime Switching Orchestrator ──────────────────────────────
     ob_yes = market.get("ob_yes")
     ob_no  = market.get("ob_no")
@@ -71,16 +77,20 @@ async def evaluate_all(
     elif (yes_p + no_p > 1.15) or (min(yes_p, no_p) < 0.20 and max(yes_p, no_p) > 0.80):
         liq_regime = "DISLOCATED_WIDE"
 
+    # A liquidity regime may suppress unsafe takers, but may never promote a
+    # quarantined or user-disabled strategy. Previously DISLOCATED_WIDE silently
+    # added MIDMARKET_MAKER even when global policy had blocked it.
+    all_names = _route_strategy_names(active_names, liq_regime)
     if liq_regime == "DISLOCATED_WIDE":
-        # Block naive taker snipes (would pay 0.95+ or suffer zero-fills)
-        # Enable active mid-market dual limit orders
-        all_names = {n for n in all_names if n not in _TAKER_STRATEGIES}
-        all_names.add("MIDMARKET_MAKER")
-        log.debug(f"Market {asset}/{market.get('timeframe')} classified DISLOCATED_WIDE: routing to makers")
+        log.debug(
+            f"Market {asset}/{market.get('timeframe')} classified "
+            "DISLOCATED_WIDE: suppressing takers"
+        )
     elif liq_regime == "THIN_ONE_SIDED":
-        # Block taker snipes on empty books to prevent FAK zero-fills
-        all_names = {n for n in all_names if n not in _TAKER_STRATEGIES}
-        log.debug(f"Market {asset}/{market.get('timeframe')} classified THIN_ONE_SIDED: suppressing takers")
+        log.debug(
+            f"Market {asset}/{market.get('timeframe')} classified "
+            "THIN_ONE_SIDED: suppressing takers"
+        )
 
     signals = []
     # Stable order makes signal selection reproducible across process restarts.
@@ -96,8 +106,8 @@ async def evaluate_all(
             if not sig:
                 continue
 
-            # Structural strategies (MAKER, ORACLE_ARB) and matched-pair hedges (PAIRED_SNIPER)
-            # bypass regime and certainty multipliers — they exploit market structure / locked-in spread.
+            # Genuinely structural strategies and matched-pair hedges bypass
+            # directional multipliers. Single-leg MAKER deliberately does not.
             if name in _STRUCTURAL_STRATEGIES or "PAIR_HEDGE" in getattr(sig, "reason", ""):
                 sig.mode_floor = 0.0   # always allowed through
                 signals.append(sig)

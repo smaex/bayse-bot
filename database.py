@@ -20,6 +20,8 @@ import psycopg2.extras
 import psycopg2.pool
 from cryptography.fernet import Fernet
 
+import config
+
 log = logging.getLogger(__name__)
 
 try:
@@ -32,11 +34,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 
 DEFAULT_SETTINGS: dict = {
-    # New accounts start deliberately narrow. Existing users keep their saved
-    # choices because saved settings override these defaults in _hydrate().
-    "assets":           ["BTC"],
-    "timeframes":       ["15min", "5min"],
-    "strategies":       ["SNIPE"],
+    # New accounts start deliberately narrow and paused. Existing users keep
+    # their saved choices because saved settings override these defaults.
+    "assets":           list(config.DEFAULT_ASSETS),
+    "timeframes":       list(config.DEFAULT_TIMEFRAMES),
+    "strategies":       list(config.DEFAULT_STRATEGIES),
     "risk_pct":         1.0,
     "mintrade":         100,
     "maxtrade":         5_000,
@@ -532,6 +534,13 @@ def recent_stats(chat_id: str, days: int = 30, after_dt=None) -> list[dict]:
                SUM(won)       AS wins,
                SUM(pnl_ngn)   AS total_pnl,
                SUM(amount_ngn) AS total_deployed,
+               SUM(CASE
+                       WHEN filled_quantity > 0
+                           THEN filled_quantity * 100.0
+                       WHEN entry_price > 0
+                           THEN amount_ngn / entry_price
+                       ELSE 0
+                   END) AS potential_payout,
                AVG(entry_price) AS avg_entry_price,
                AVG(certainty) AS avg_certainty
         FROM trades
@@ -570,7 +579,15 @@ def get_combo_stats(chat_id: str, days: int = 14, after_dt=None) -> list[dict]:
     rows = _fetch_all("""
         SELECT strategy, asset, timeframe,
                COUNT(*) AS total, SUM(won) AS wins, SUM(pnl_ngn) AS total_pnl,
-               SUM(amount_ngn) AS total_deployed, AVG(entry_price) AS avg_entry_price
+               SUM(amount_ngn) AS total_deployed,
+               SUM(CASE
+                       WHEN filled_quantity > 0
+                           THEN filled_quantity * 100.0
+                       WHEN entry_price > 0
+                           THEN amount_ngn / entry_price
+                       ELSE 0
+                   END) AS potential_payout,
+               AVG(entry_price) AS avg_entry_price
         FROM trades
         WHERE chat_id = %s AND won IS NOT NULL
           AND created_at > %s::TIMESTAMPTZ

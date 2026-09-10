@@ -512,8 +512,8 @@ async def cmd_resetlearning(update: Update, _ctx):
     # Resetting model memory must not silently resume trading or broaden the
     # account's market universe.
     s["strategies"] = list(config.DEFAULT_STRATEGIES)
-    s["timeframes"] = ["15min", "5min"]
-    s["assets"]     = ["BTC"]
+    s["timeframes"] = list(config.DEFAULT_TIMEFRAMES)
+    s["assets"]     = list(config.DEFAULT_ASSETS)
     await asyncio.to_thread(database.update_settings, cid, s)
     await asyncio.to_thread(database.invalidate_user_cache, cid)
     risk = _user_risks.get(cid)
@@ -664,8 +664,9 @@ _MODES = {
     "mode_safe": {
         "label": "🟢 *Safe mode applied.*",
         "settings": {
-            "mode": "safe", "assets": ["BTC"],
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE"],
+            "mode": "safe", "assets": list(config.DEFAULT_ASSETS),
+            "timeframes": list(config.DEFAULT_TIMEFRAMES),
+            "strategies": list(config.DEFAULT_STRATEGIES),
             "risk_pct": min(0.5, config.MAX_TRADE_RISK * 100),
             "mintrade": MIN_TRADE_NGN,
             "maxexposure": min(5.0, config.MAX_PORTFOLIO_EXPOSURE * 100),
@@ -675,8 +676,9 @@ _MODES = {
     "mode_balanced": {
         "label": "🔵 *Balanced mode applied.*",
         "settings": {
-            "mode": "balanced", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE"],
+            "mode": "balanced", "assets": list(config.DEFAULT_ASSETS),
+            "timeframes": list(config.DEFAULT_TIMEFRAMES),
+            "strategies": list(config.DEFAULT_STRATEGIES),
             "risk_pct": min(1.0, config.MAX_TRADE_RISK * 100),
             "mintrade": MIN_TRADE_NGN,
             "maxexposure": min(10.0, config.MAX_PORTFOLIO_EXPOSURE * 100),
@@ -686,9 +688,9 @@ _MODES = {
     "mode_aggressive": {
         "label": "🟠 *Aggressive mode applied within operator limits.*",
         "settings": {
-            "mode": "aggressive", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min"],
-            "strategies": ["SNIPE", "FRONTRUN", "CORRELATE"],
+            "mode": "aggressive", "assets": list(config.DEFAULT_ASSETS),
+            "timeframes": list(config.DEFAULT_TIMEFRAMES),
+            "strategies": ["MAKER", "SNIPE", "FRONTRUN", "CORRELATE"],
             "risk_pct": min(2.0, config.MAX_TRADE_RISK * 100),
             "mintrade": MIN_TRADE_NGN,
             "maxexposure": config.MAX_PORTFOLIO_EXPOSURE * 100,

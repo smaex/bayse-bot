@@ -1,13 +1,4 @@
-"""
-Trade executor — places orders, records trades, handles AMM + CLOB routing.
-
-Key fixes vs previous version:
-  - Fee floor corrected to 0.3 (was 0.5)
-  - Always MARKET orders — Bayse CLOB has no book depth
-  - Telegram notification fires BEFORE DB write — user always notified even if DB fails
-  - Float sanitization before every DB write — prevents PostgreSQL REAL underflow
-    from subnormal GARCH/Kalman values (e.g. 9.4e-64 crashes psycopg2)
-"""
+"""Trade executor for fail-closed AMM and CLOB order routing."""
 
 import asyncio
 import logging
@@ -89,6 +80,21 @@ def _safe_float(val, default: float = 0.0) -> float:
     return float(val)
 
 
+def _performance_size_multiplier(learned: dict, sig) -> float:
+    """Combine strategy-wide and strategy/asset/timeframe loss controls."""
+    multipliers = learned.get("size_multipliers", {})
+    combo_key = f"{sig.strategy}:{sig.asset}:{sig.timeframe}"
+    try:
+        strategy_mult = float(multipliers.get(sig.strategy, 1.0))
+        combo_mult = float(multipliers.get(combo_key, 1.0))
+        combined = strategy_mult * combo_mult
+    except (AttributeError, TypeError, ValueError):
+        combined = 1.0
+    if not math.isfinite(combined):
+        combined = 1.0
+    return min(1.50, max(0.0, combined))
+
+
 # ── Engine detection ──────────────────────────────────────────────────────────
 
 async def _infer_engine(client, market: dict) -> str:
@@ -160,7 +166,7 @@ async def _execute_logic(
         config.MAX_PORTFOLIO_EXPOSURE,
     )
     learned   = settings.get("learned", {})
-    mult      = learned.get("size_multipliers", {}).get(sig.strategy, 1.0)
+    mult      = _performance_size_multiplier(learned, sig)
     user_risk = min(
         settings.get("risk_pct", 2.0) / 100.0,
         config.MAX_TRADE_RISK,
