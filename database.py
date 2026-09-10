@@ -34,21 +34,23 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 
 DEFAULT_SETTINGS: dict = {
-    # New accounts start deliberately narrow and paused. Existing users keep
-    # their saved choices because saved settings override these defaults.
+    # New accounts start paused on the default multi-strategy scope. Existing
+    # users keep their saved choices because saved settings override these
+    # defaults (non-custom modes additionally union in current defaults at
+    # evaluation time so they pick up newly enabled scope automatically).
     "assets":           list(config.DEFAULT_ASSETS),
     "timeframes":       list(config.DEFAULT_TIMEFRAMES),
     "strategies":       list(config.DEFAULT_STRATEGIES),
     "risk_pct":         1.0,
     "mintrade":         100,
     "maxtrade":         5_000,
-    "maxexposure":      10.0,
+    "maxexposure":      15.0,
     "daily_multiplier": 3,
     "daily_target_ngn": 0,
-    "daily_loss_limit_pct": 3.0,
+    "daily_loss_limit_pct": 5.0,
     "paused":           True,
     "learned":          {},
-    "mode":             "safe",
+    "mode":             "balanced",
 }
 
 # ── Encryption ────────────────────────────────────────────────────────────────
