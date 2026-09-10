@@ -6,19 +6,17 @@ services:
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    healthCheckPath: /ping
+    healthCheckPath: /ready
 
     envVars:
       # Required — set these in the Render dashboard
       - key: TELEGRAM_TOKEN
         sync: false
+      # Generate with:
+      # python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
       - key: ENCRYPTION_KEY
         sync: false
-        # Generate with:
-        # python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-
-      # Optional — enables NEWS strategy (free at newsapi.org)
-      - key: NEWSAPI_KEY
+      - key: DASHBOARD_PASSWORD
         sync: false
 
       # Supabase PostgreSQL — add your connection string in the Render dashboard
@@ -28,3 +26,9 @@ services:
       # Render sets RENDER_EXTERNAL_URL automatically — the bot uses it for self-ping
       - key: PYTHON_VERSION
         value: "3.11.0"
+      - key: LIVE_TRADING
+        value: "false"
+      - key: ALLOW_EXPERIMENTAL_STRATEGIES
+        value: "false"
+      - key: TRADING_TIMEZONE
+        value: "Africa/Lagos"

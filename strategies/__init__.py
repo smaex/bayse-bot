@@ -83,7 +83,8 @@ async def evaluate_all(
         log.debug(f"Market {asset}/{market.get('timeframe')} classified THIN_ONE_SIDED: suppressing takers")
 
     signals = []
-    for name in all_names:
+    # Stable order makes signal selection reproducible across process restarts.
+    for name in (n for n in _strategies if n in all_names):
         strat = _strategies.get(name)
         if not strat:
             continue
@@ -151,44 +152,66 @@ async def evaluate_all(
 
 
 def merge_signals(all_signals: List[TradeSignal], state=None) -> List[TradeSignal]:
-    """
-    Convergence engine: if multiple strategies agree on the same asset+outcome,
-    boost certainty by +15%.  Also applies cross-asset risk parity.
+    """Merge genuinely agreeing directional signals without dropping hedges.
+
+    Structural/multi-leg signals keep their own execution slot. Directional
+    strategies converge only when they select the *same* outcome; disagreement
+    never receives a confidence boost.
     """
     merged: dict[str, TradeSignal] = {}
 
     for sig in all_signals:
-        key = f"{sig.market_id}"
+        is_structural = (
+            sig.strategy in _STRUCTURAL_STRATEGIES
+            or sig.strategy == "ARB"
+            or "PAIR_HEDGE" in getattr(sig, "reason", "")
+        )
+        key = f"{sig.market_id}:{sig.strategy}" if is_structural else sig.market_id
+
         if key not in merged:
             merged[key] = sig
-        else:
-            existing = merged[key]
-            if existing.strategy != sig.strategy:
-                # Convergence — boost the stronger signal
-                existing.certainty = min(1.0, existing.certainty + 0.15)
-                existing.reason   += f" | CONVERGENCE({sig.strategy})"
-                existing.converged_with.append(sig.timeframe)
-            if sig.certainty > existing.certainty:
-                sig.certainty      = existing.certainty  # keep the boost
-                merged[key]        = sig
+            continue
+
+        existing = merged[key]
+        if existing.outcome == sig.outcome and existing.strategy != sig.strategy:
+            # Convergence means independent methods agree on direction.
+            stronger = existing if existing.certainty >= sig.certainty else sig
+            other = sig if stronger is existing else existing
+            stronger.certainty = min(1.0, max(existing.certainty, sig.certainty) + 0.10)
+            stronger.reason += f" | CONVERGENCE({other.strategy})"
+            stronger.converged_with.append(other.strategy)
+            merged[key] = stronger
+            continue
+
+        # Opposite directions are not convergence. Keep only the signal with
+        # larger model edge; certainty is the tie-breaker.
+        existing_edge = existing.win_prob - existing.market_price
+        incoming_edge = sig.win_prob - sig.market_price
+        if (incoming_edge, sig.certainty) > (existing_edge, existing.certainty):
+            merged[key] = sig
 
     final = list(merged.values())
 
-    # Cross-asset risk parity: if two highly-correlated assets both have YES signals,
-    # halve each position to avoid doubling up on the same market move.
+    # Cross-asset risk parity: if highly-correlated assets carry the same
+    # direction, reduce both sizes rather than treating them as independent.
     if state and len(final) > 1:
         from strategies.utils import realized_correlation
+        adjusted_pairs: set[tuple[str, str, str]] = set()
         for outcome in ("YES", "NO"):
-            group = [s for s in final if s.outcome == outcome and s.strategy != "ARB"]
-            if len(group) < 2:
-                continue
+            group = [
+                signal for signal in final
+                if signal.outcome == outcome and signal.strategy not in _STRUCTURAL_STRATEGIES | {"ARB"}
+            ]
             for i, sig_a in enumerate(group):
                 for sig_b in group[i + 1:]:
-                    corr = realized_correlation(sig_a.asset, sig_b.asset, state)
-                    if corr > 0.85:
+                    pair = tuple(sorted((sig_a.asset, sig_b.asset))) + (outcome,)
+                    if pair in adjusted_pairs:
+                        continue
+                    if realized_correlation(sig_a.asset, sig_b.asset, state) > 0.85:
                         sig_a.size_pct /= 2
                         sig_b.size_pct /= 2
-                        sig_a.reason  += f" | RISK_PARITY({sig_b.asset})"
-                        sig_b.reason  += f" | RISK_PARITY({sig_a.asset})"
+                        sig_a.reason += f" | RISK_PARITY({sig_b.asset})"
+                        sig_b.reason += f" | RISK_PARITY({sig_a.asset})"
+                        adjusted_pairs.add(pair)
 
     return final

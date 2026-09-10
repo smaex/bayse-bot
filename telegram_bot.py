@@ -25,6 +25,7 @@ def _safe_get_user(cid: str):
     return None
 import learner
 import config
+import health
 from config import TELEGRAM_TOKEN
 
 log = logging.getLogger("telegram_bot")
@@ -109,9 +110,16 @@ def build_app() -> Application:
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if "Conflict" in str(err):
-        log.warning("Telegram Conflict — ghost instance polling. Waiting.")
+        # Repeated 409s look alive from the outside but make the bot silent.
+        # Stop polling so the main supervisor exits and the platform restarts it.
+        health.fail("telegram", "polling conflict")
+        log.critical("Telegram polling conflict; stopping this instance")
+        updater = context.application.updater
+        if updater and updater.running:
+            asyncio.create_task(updater.stop())
         return
-    log.error(f"Telegram error: {err}", exc_info=err)
+    health.fail("telegram_updates", type(err).__name__)
+    log.error("Telegram update failed", exc_info=err)
 
 
 # ── Setup flow ────────────────────────────────────────────────────────────────
@@ -154,7 +162,11 @@ async def on_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             return
         pub = _temp_pub.pop(cid, "")
         _setup_state.pop(cid, None)
-        msg = await update.message.reply_text("🔄 Connecting…")
+        try:
+            await update.message.delete()  # remove the secret from chat history
+        except Exception:
+            log.warning(f"[{cid}] Could not delete API secret message")
+        msg = await update.effective_chat.send_message("🔄 Connecting…")
         try:
             from client import BayseClient
             client  = BayseClient(pub, text)
@@ -175,7 +187,10 @@ async def on_text(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
             _setup_state[cid] = _NEED_PUBLIC
             await msg.delete()
             log.warning(f"[{cid}] Connection failed: {e}")
-            await update.message.reply_text(f"❌ *Connection failed*\n\n`{e}`\n\nCheck your keys and try /start again.", parse_mode="Markdown")
+            await update.message.reply_text(
+                "❌ *Connection failed*\n\nCheck your keys and try /start again.",
+                parse_mode="Markdown",
+            )
         return
 
     if not await asyncio.to_thread(_safe_get_user, cid):
@@ -392,14 +407,23 @@ async def cmd_set(update: Update, _ctx):
         bad = [v for v in norm_strats if v not in _VALID_STRATEGIES]
         if bad:
             await update.message.reply_text(f"Unknown: {bad}\nValid: {', '.join(sorted(_VALID_STRATEGIES))}"); return
+        blocked = [v for v in norm_strats if v not in config.PERMITTED_STRATEGIES]
+        if blocked:
+            await update.message.reply_text(
+                "Blocked by the operator safety policy: " + ", ".join(blocked)
+            )
+            return
         s["strategies"] = norm_strats; msg = f"Strategies: {s['strategies']}"
     elif key == "risk":
         try:
             pct = float(vals[0])
-            if not 0.1 <= pct <= 10: raise ValueError
+            max_risk_pct = config.MAX_TRADE_RISK * 100
+            if not 0.1 <= pct <= max_risk_pct: raise ValueError
             s["risk_pct"] = pct; msg = f"Risk per trade: {pct}%"
         except ValueError:
-            await update.message.reply_text("Risk must be 0.1–10."); return
+            await update.message.reply_text(
+                f"Risk must be 0.1–{config.MAX_TRADE_RISK * 100:g}% under the operator policy."
+            ); return
     elif key == "mintrade":
         try:
             amt = float(vals[0])
@@ -410,16 +434,22 @@ async def cmd_set(update: Update, _ctx):
             await update.message.reply_text("Enter a number."); return
     elif key == "maxtrade":
         try:
-            s["maxtrade"] = float(vals[0]); msg = f"Max trade: ₦{s['maxtrade']:,.0f}"
+            amount = float(vals[0])
+            if amount < MIN_TRADE_NGN:
+                raise ValueError
+            s["maxtrade"] = amount; msg = f"Max trade: ₦{amount:,.0f}"
         except ValueError:
-            await update.message.reply_text("Enter a number."); return
+            await update.message.reply_text(f"Maximum trade must be at least ₦{MIN_TRADE_NGN}."); return
     elif key == "maxexposure":
         try:
             pct = float(vals[0])
-            if not 5 <= pct <= 100: raise ValueError
+            max_exposure_pct = config.MAX_PORTFOLIO_EXPOSURE * 100
+            if not 1 <= pct <= max_exposure_pct: raise ValueError
             s["maxexposure"] = pct; msg = f"Max exposure: {pct}%"
         except ValueError:
-            await update.message.reply_text("Exposure must be 5–100."); return
+            await update.message.reply_text(
+                f"Exposure must be 1–{config.MAX_PORTFOLIO_EXPOSURE * 100:g}% under the operator policy."
+            ); return
     elif key == "dailymultiplier":
         try:
             m = float(vals[0])
@@ -476,25 +506,26 @@ async def cmd_resetlearning(update: Update, _ctx):
     s    = user["settings"]
     s["learned"] = {}
     s["reset_learning_at"] = datetime.now(timezone.utc).isoformat()
-    s["paused"] = False
-    s["strategies"] = list(config.ACTIVE_STRATEGIES)
+    # Resetting model memory must not silently resume trading or broaden the
+    # account's market universe.
+    s["strategies"] = list(config.DEFAULT_STRATEGIES)
     s["timeframes"] = ["15min", "5min"]
-    s["assets"]     = list(config.ALL_ASSETS)
+    s["assets"]     = ["BTC"]
     await asyncio.to_thread(database.update_settings, cid, s)
     await asyncio.to_thread(database.invalidate_user_cache, cid)
     risk = _user_risks.get(cid)
     if risk:
-        risk.paused = False
+        risk.paused = bool(s.get("paused", True))
         risk.peak_balance = 0
-    strat_list = ', '.join(s.replace('_', '\\_') for s in config.ACTIVE_STRATEGIES)
-    log.info(f"[{cid}] /resetlearning — cleared learned + synced strategies to {config.ACTIVE_STRATEGIES}")
+    strat_list = ', '.join(name.replace('_', '\\_') for name in config.DEFAULT_STRATEGIES)
+    log.info(f"[{cid}] /resetlearning — cleared learned; safe strategies={config.DEFAULT_STRATEGIES}")
     await update.message.reply_text(
         "🔄 *Learning Reset Complete*\n\n"
         "✅ All certainty/size multipliers reset\n"
         "✅ All strategy suspensions cleared\n"
         "✅ Trade history horizon reset to now\n"
-        f"✅ Active strategies: {strat_list}\n\n"
-        "The bot will now evaluate all strategies with fresh data.",
+        f"✅ Safe strategy set: {strat_list}\n\n"
+        f"Trading remains {'paused' if s.get('paused', True) else 'active'}.",
         parse_mode="Markdown",
     )
 
@@ -630,37 +661,35 @@ _MODES = {
     "mode_safe": {
         "label": "🟢 *Safe mode applied.*",
         "settings": {
-            "mode": "safe", "assets": ["BTC", "EURUSD", "GBPUSD"],
-            "timeframes": ["5min", "15min", "1h"], "strategies": ["SNIPE", "ARB", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"],
-            "risk_pct": 0.5, "mintrade": MIN_TRADE_NGN,
-            "maxexposure": 15.0, "daily_multiplier": 5,
+            "mode": "safe", "assets": ["BTC"],
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE"],
+            "risk_pct": min(0.5, config.MAX_TRADE_RISK * 100),
+            "mintrade": MIN_TRADE_NGN,
+            "maxexposure": min(5.0, config.MAX_PORTFOLIO_EXPOSURE * 100),
+            "daily_multiplier": 3,
         },
     },
     "mode_balanced": {
         "label": "🔵 *Balanced mode applied.*",
         "settings": {
             "mode": "balanced", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"],
-            "risk_pct": 1.5, "mintrade": MIN_TRADE_NGN,
-            "maxexposure": 20.0, "daily_multiplier": 10,
+            "timeframes": ["5min", "15min"], "strategies": ["SNIPE"],
+            "risk_pct": min(1.0, config.MAX_TRADE_RISK * 100),
+            "mintrade": MIN_TRADE_NGN,
+            "maxexposure": min(10.0, config.MAX_PORTFOLIO_EXPOSURE * 100),
+            "daily_multiplier": 3,
         },
     },
     "mode_aggressive": {
-        "label": "🟠 *Aggressive mode applied.*",
+        "label": "🟠 *Aggressive mode applied within operator limits.*",
         "settings": {
             "mode": "aggressive", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"],
-            "risk_pct": 3.0, "mintrade": MIN_TRADE_NGN,
-            "maxexposure": 30.0, "daily_multiplier": 20,
-        },
-    },
-    "mode_degen": {
-        "label": "🔴 *Full Send mode applied.*",
-        "settings": {
-            "mode": "full_send", "assets": ["BTC", "ETH", "SOL"],
-            "timeframes": ["5min", "15min"], "strategies": ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"],
-            "risk_pct": 5.0, "mintrade": MIN_TRADE_NGN,
-            "maxexposure": 50.0, "daily_multiplier": 50,
+            "timeframes": ["5min", "15min"],
+            "strategies": ["SNIPE", "FRONTRUN", "CORRELATE"],
+            "risk_pct": min(2.0, config.MAX_TRADE_RISK * 100),
+            "mintrade": MIN_TRADE_NGN,
+            "maxexposure": config.MAX_PORTFOLIO_EXPOSURE * 100,
+            "daily_multiplier": 3,
         },
     },
 }
@@ -671,8 +700,7 @@ async def cmd_mode(update: Update, _ctx):
     kb = [
         [InlineKeyboardButton("🟢 Safe",       callback_data="mode_safe"),
          InlineKeyboardButton("🔵 Balanced",   callback_data="mode_balanced")],
-        [InlineKeyboardButton("🟠 Aggressive", callback_data="mode_aggressive"),
-         InlineKeyboardButton("🔴 Full Send",  callback_data="mode_degen")],
+        [InlineKeyboardButton("🟠 Aggressive", callback_data="mode_aggressive")],
     ]
     await update.message.reply_text(
         "⚙️ *Choose a Risk Mode*\n\nEach mode sets a full recommended config.",
@@ -747,8 +775,8 @@ async def _balance_text(cid: str) -> str:
         return "Still starting up."
     try:
         return f"💰 Balance: ₦{(await client.get_balance_ngn()):,.2f}"
-    except Exception as e:
-        return f"Could not fetch balance: {e}"
+    except Exception:
+        return "Could not fetch balance right now. Please try again shortly."
 
 
 async def _markets_text(cid: str) -> str:
@@ -837,7 +865,7 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
         "MAKER":         ("📊", "*MAKER* (Limit Order)" if engine == "CLOB_LIMIT" else "*MAKER*"),
         "FRONTRUN":      ("🏎️", "*FRONTRUN* (Binance Impulse)"),
         "CORRELATE":     ("🔗", "*CORRELATION* (Lead-Lag)"),
-        "ARB":             ("⚖️", "*RISK-FREE ARB*"),
+        "ARB":             ("⚖️", "*TWO-SIDED ARB* (Experimental)"),
         "PAIRED_SNIPER":   ("⚡", "*PAIRED SNIPER* (Ohioism Engine)"),
         "MIDMARKET_MAKER": ("🎯", "*MID-MARKET MAKER* (Dual Liquidity Trap)"),
     }
@@ -876,7 +904,7 @@ _STRAT_ICONS = {
     "MAKER":           ("📊", "MAKER"),
     "FRONTRUN":        ("🏎️", "FRONTRUN"),
     "CORRELATE":       ("🔗", "CORRELATION"),
-    "ARB":             ("⚖️", "RISK-FREE ARB"),
+    "ARB":             ("⚖️", "TWO-SIDED ARB"),
     "PAIRED_SNIPER":   ("⚡", "PAIRED SNIPER"),
     "MIDMARKET_MAKER": ("🎯", "MID-MARKET MAKER"),
 }

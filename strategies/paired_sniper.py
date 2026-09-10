@@ -1,19 +1,8 @@
-"""
-PAIRED_SNIPER — Directional Taker & Matched-Pair Hedging Engine
-================================================================
-Synthesized from @ohioism's verified $5.52M Polymarket trading architecture.
+"""Experimental directional and matched-pair strategy.
 
-Core Mathematical Principles:
-1. Directional Momentum Taking:
-   - Evaluates short-horizon continuous Geometric Brownian Motion (GBM) diffusion.
-   - Leverages sub-second Binance oracle feeds vs Polymarket/Bayse CLOB state.
-   - Sizing scales dynamically with calculated statistical certainty (probes on cheap OTM,
-     fractional Kelly on core momentum, full conviction on near-settlement locks).
-
-2. Matched-Pair Lock-in Hedging:
-   - If an open position is held on Outcome 1 at cost basis C1, and market volatility allows
-     acquiring Outcome 2 at cost C2 such that C1 + C2 + Fees <= 0.950, it fires a hedge order.
-   - Redeems at $1.00 at candle close, locking in a guaranteed risk-free spread (+5.0% Net EV).
+A modeled pair spread is not guaranteed: quote movement, fees, partial fills,
+and cancellation failures can leave directional exposure. The operator policy
+keeps this strategy disabled until exchange-confirmed performance validates it.
 """
 
 import logging
@@ -70,11 +59,15 @@ class PairedSniperStrategy(BaseStrategy):
         # ── 3. Check for Matched-Pair Hedging Opportunity ─────────────────────
         yes_price = float(market.get("yes_price") or 0.5)
         no_price  = float(market.get("no_price") or 0.5)
-        fee_rate  = float(market.get("feePercentage", 2.0)) / 100.0
+        fee_rate  = float(market.get("fee_rate", 0.02))
 
-        open_pos = None
-        if hasattr(state, "open_positions") and market_id in state.open_positions:
-            open_pos = state.open_positions[market_id]
+        # Open positions are per-user, so they are supplied in the learned/user
+        # context. Global market state must never contain one user's portfolio.
+        open_positions = learned.get("open_positions", {}) if learned else {}
+        open_pos = next(
+            (p for p in open_positions.values() if p.get("market_id") == market_id),
+            None,
+        )
 
         if open_pos:
             existing_outcome = open_pos.get("outcome", "").upper()
@@ -82,7 +75,10 @@ class PairedSniperStrategy(BaseStrategy):
 
             if existing_outcome == "YES":
                 c2 = no_price
-                eff_fee = fee_rate * (max(1.0 - c1, 0.5) + max(1.0 - c2, 0.5))
+                eff_fee = fee_rate * (
+                    c1 * max(1.0 - c1, config.FEE_FLOOR)
+                    + c2 * max(1.0 - c2, config.FEE_FLOOR)
+                )
                 total_cost = c1 + c2 + eff_fee
                 if total_cost <= 0.950 and c2 <= 0.50:
                     locked_edge = 1.0 - total_cost
@@ -95,7 +91,7 @@ class PairedSniperStrategy(BaseStrategy):
                         asset=asset,
                         timeframe=tf,
                         outcome="NO",
-                        outcome_id=market.get("no_token_id") or market.get("outcome2Id", ""),
+                        outcome_id=market.get("no_id") or market.get("outcome2Id", ""),
                         market_id=market_id,
                         event_id=market.get("event_id", ""),
                         market_price=c2,
@@ -110,7 +106,10 @@ class PairedSniperStrategy(BaseStrategy):
 
             elif existing_outcome == "NO":
                 c2 = yes_price
-                eff_fee = fee_rate * (max(1.0 - c1, 0.5) + max(1.0 - c2, 0.5))
+                eff_fee = fee_rate * (
+                    c1 * max(1.0 - c1, config.FEE_FLOOR)
+                    + c2 * max(1.0 - c2, config.FEE_FLOOR)
+                )
                 total_cost = c1 + c2 + eff_fee
                 if total_cost <= 0.950 and c2 <= 0.50:
                     locked_edge = 1.0 - total_cost
@@ -123,7 +122,7 @@ class PairedSniperStrategy(BaseStrategy):
                         asset=asset,
                         timeframe=tf,
                         outcome="YES",
-                        outcome_id=market.get("yes_token_id") or market.get("outcome1Id", ""),
+                        outcome_id=market.get("yes_id") or market.get("outcome1Id", ""),
                         market_id=market_id,
                         event_id=market.get("event_id", ""),
                         market_price=c2,
@@ -164,12 +163,12 @@ class PairedSniperStrategy(BaseStrategy):
 
         if dist_pct >= min_dist and w_yes >= 0.55:
             chosen_outcome = "YES"
-            chosen_token_id = market.get("yes_token_id") or market.get("outcome1Id", "")
+            chosen_token_id = market.get("yes_id") or market.get("outcome1Id", "")
             win_prob = w_yes
             quote_price = yes_price
         elif dist_pct <= -min_dist and w_no >= 0.55:
             chosen_outcome = "NO"
-            chosen_token_id = market.get("no_token_id") or market.get("outcome2Id", "")
+            chosen_token_id = market.get("no_id") or market.get("outcome2Id", "")
             win_prob = w_no
             quote_price = no_price
         else:

@@ -166,11 +166,19 @@
     <script>
         async function fetchData() {
             try {
-                const password = new URLSearchParams(window.location.search).get('pass') || '';
-                const response = await fetch(`/api/stats?pass=${password}`);
-                
+                let password = sessionStorage.getItem('dashboardPassword') || '';
+                if (!password) {
+                    password = window.prompt('Dashboard password') || '';
+                    if (password) sessionStorage.setItem('dashboardPassword', password);
+                }
+                const response = await fetch('/api/stats', {
+                    headers: { 'Authorization': `Bearer ${password}` },
+                    cache: 'no-store'
+                });
+
                 if (response.status === 401) {
-                    alert("Unauthorized. Append ?pass=YOUR_PASSWORD to the URL.");
+                    sessionStorage.removeItem('dashboardPassword');
+                    document.getElementById('loading').textContent = 'Unauthorized';
                     return;
                 }
                 

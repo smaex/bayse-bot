@@ -1,12 +1,12 @@
 """
 Shadow Tracker: Pre-Order / Mid-Market Strategy Empirical Evaluator
 ===================================================================
-Zero-capital, risk-free shadow paper-trading monitor for Idea 2.
+Zero-capital shadow monitor for the experimental two-sided maker idea.
 
 Monitors every 5min and 15min candle open for BTC, ETH, and SOL on Bayse.
 Simulates two-sided passive limit bids at mid-market (e.g. 0.475 on YES, 0.475 on NO).
 Measures:
-  1. Both Legs Filled Rate (<= 45s and <= 90s) -> Guaranteed Arbitrage Spread (+5.26% Net EV)
+  1. Both Legs Filled Rate (<= 45s and <= 90s) and modeled gross pair spread
   2. One-Legged Adverse Selection Rate -> When one leg fills because spot is dumping into it,
      while the other leg runs away, leaving naked unhedged exposure.
   3. Net Simulated PnL across all candles.

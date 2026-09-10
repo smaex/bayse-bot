@@ -14,6 +14,9 @@ import time
 from typing import Tuple
 import aiohttp
 import websockets
+
+import health
+
 log = logging.getLogger("feeds_direct")
 # Ground-truth prices: { "BTC": {"price": float, "time": float} }
 direct_spot: dict[str, dict] = {}
@@ -29,14 +32,19 @@ _BINANCE_WS_URLS = [
     "wss://stream.binance.us:9443",
 ]
 def get_direct_price(asset: str) -> Tuple[float, float]:
+    """Return the independent oracle sample and its real timestamp.
+
+    Never substitute the Bayse relay here. The old fallback stamped relay data
+    with ``time.time()``, making a dead Binance feed look permanently fresh to
+    every strategy and to the watchdog.
+    """
     data = direct_spot.get(asset)
-    if data and (time.time() - data.get("time", 0) < 15.0):
-        return data["price"], data["time"]
-    import feeds
-    sp = feeds.spot.get(asset, 0.0)
-    if sp > 0:
-        return sp, time.time()
-    return 0.0, 0.0
+    if not data:
+        return 0.0, 0.0
+    try:
+        return float(data.get("price") or 0.0), float(data.get("time") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
 def get_latency_bias(asset: str, bayse_price: float) -> float:
     """
     Returns (oracle - bayse) / bayse.
@@ -58,7 +66,13 @@ def check_lag(asset: str, relay_price: float) -> dict:
         return {"status": "ok", "price": relay_price, "reason": "startup_grace"}
     p, t = get_direct_price(asset)
     if not p:
-        return {"status": "ok", "price": relay_price, "reason": "no_direct_feed"}
+        # FX/commodities intentionally have no Binance oracle.
+        if asset not in _CRYPTO_SYMBOLS.values():
+            return {"status": "ok", "price": relay_price, "reason": "relay_only_asset"}
+        return {
+            "status": "stale", "price": relay_price,
+            "reason": "independent_oracle_missing", "lag_sec": float("inf"),
+        }
     diff_pct = abs(p - relay_price) / relay_price
     lag_sec  = time.time() - t
     best     = p if lag_sec < 2.0 else relay_price
@@ -77,7 +91,9 @@ async def binance_feed():
         url  = f"{base}/stream?streams={streams}"
         try:
             log.info(f"Binance oracle connecting ({base})…")
-            async with websockets.connect(url, ping_interval=20) as ws:
+            async with websockets.connect(
+                url, ping_interval=20, ping_timeout=20, open_timeout=10, close_timeout=5
+            ) as ws:
                 log.info("Binance oracle connected")
                 backoff = 1
                 async for raw in ws:
@@ -89,7 +105,9 @@ async def binance_feed():
                     asset = _CRYPTO_SYMBOLS.get(sym)
                     if asset and bid and ask:
                         mid = (float(bid) + float(ask)) / 2
-                        direct_spot[asset] = {"price": mid, "time": time.time()}
+                        now = time.time()
+                        direct_spot[asset] = {"price": mid, "time": now}
+                        health.touch("direct_feed", asset=asset)
         except Exception as e:
             if "451" in str(e) and url_idx == 0:
                 log.warning("Binance.com geo-blocked — switching to Binance.US")
@@ -126,6 +144,7 @@ async def binance_rest_fallback():
                                     old_t = direct_spot.get(asset, {}).get("time", 0)
                                     if (time.time() - old_t) > 15:
                                         direct_spot[asset] = {"price": mid, "time": time.time()}
+                                        health.touch("direct_feed", asset=asset, source="rest")
                             break
                 except Exception as e:
                     log.debug(f"Binance REST fallback {url}: {e}")

@@ -155,9 +155,10 @@ class MakerStrategy(BaseStrategy):
         market_id     = market["market_id"]
         engine        = market.get("engine", "AMM")
 
-        # Log engine type but allow all market types.
-        if engine == "CLOB":
-            log.info(f"MAKER {asset} — CLOB market, will place LIMIT order")
+        # Passive maker orders only exist on a CLOB. Sending LIMIT/GTC to an
+        # AMM is invalid and was a major source of repeated zero execution.
+        if str(engine).upper() != "CLOB":
+            return None
 
         # Time window guard.
         # Don't make-market in the final 45s of a candle (settlement risk)
@@ -273,7 +274,7 @@ class MakerStrategy(BaseStrategy):
         competitive_bid = max(market_bid + 0.01, target_fv - 0.05, 0.540)
         our_bid = round(min(target_fv - HALF_SPREAD, competitive_bid), 3)
 
-        # Entry price bounds: 0.50 to 0.65 (guarantees >= 54% to 100% profit on win)
+        # Entry price bounds limit poor payoff asymmetry; losing shares can still settle at zero.
         if our_bid < 0.50 or our_bid > 0.65:
             log.info(f"MAKER SKIP {asset} — bid price out of bounds ({our_bid:.3f})")
             return None

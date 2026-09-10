@@ -221,6 +221,12 @@ class SnipeStrategy(BaseStrategy):
                 f"({direction} @ {market_price_check:.3f} < {config.SNIPE_MIN_ENTRY_PRICE:.2f} floor)"
             )
             return None
+        if market_price_check > config.SNIPE_MAX_MARKET_PRICE:
+            log.info(
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — entry price too expensive "
+                f"({direction} @ {market_price_check:.3f} > {config.SNIPE_MAX_MARKET_PRICE:.2f} cap)"
+            )
+            return None
 
         # ── Learned certainty gate ─────────────────────────────────────────
         learned_min = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
