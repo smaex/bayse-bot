@@ -675,8 +675,29 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                         await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
                     log.info(f"[{chat_id}] Cancelled unfilled maker order {maker_order_id}")
                     continue
+                confirmed_entry = float(
+                    order_state.get("avgFillPrice")
+                    or order_state.get("price")
+                    or entry_price
+                )
+                confirmed_fee = float(order_state.get("fee") or 0.0)
+                confirmed_cost = (
+                    confirmed_qty * confirmed_entry
+                    * config.CURRENCY_BASE_MULTIPLIER
+                    + confirmed_fee
+                )
                 pos["confirmed_filled"] = True
                 pos["filled_quantity"] = confirmed_qty
+                pos["entry_price"] = confirmed_entry
+                pos["amount_ngn"] = confirmed_cost
+                entry_price = confirmed_entry
+                amount_ngn = confirmed_cost
+                trade_id = pos.get("trade_id")
+                if trade_id:
+                    await asyncio.to_thread(
+                        database.update_trade_fill,
+                        trade_id, confirmed_cost, confirmed_qty, confirmed_entry,
+                    )
 
             # Bayse SELL amount is desired currency proceeds, not a number of
             # shares. Reconcile against the exchange portfolio before sending.

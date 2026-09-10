@@ -1,6 +1,18 @@
 import database
 
 
+def test_resting_order_is_replaced_with_confirmed_fill(monkeypatch):
+    calls = []
+    monkeypatch.setattr(database, "_execute", lambda query, params=(): calls.append((query, params)))
+
+    database.update_trade_fill("trade-1", 285.0, 5.0, 0.57)
+
+    query, params = calls[0]
+    assert "filled_quantity = %s" in query
+    assert "entry_price = %s" in query
+    assert params == (285.0, 5.0, 0.57, "trade-1")
+
+
 def test_partial_exit_persists_remaining_cost_and_realized_pnl(monkeypatch):
     calls = []
     monkeypatch.setattr(database, "_execute", lambda query, params=(): calls.append((query, params)))

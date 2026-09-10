@@ -229,9 +229,25 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                         log.warning(f"[{chat_id}] notify_unfilled failed: {ne}")
                                 continue
 
-                            # Save fill data for precise PnL calculation below
+                            # Replace the original resting-order budget with
+                            # exchange-confirmed fill quantity and cost. For a
+                            # CLOB BUY, Bayse deducts taker fees from shares;
+                            # quantity×price + fee reconstructs wallet spend.
                             actual_shares = shares
-                            actual_fill_price = float(order_data.get("avgFillPrice") or order_data.get("price") or 0)
+                            actual_fill_price = float(
+                                order_data.get("avgFillPrice") or order_data.get("price") or 0
+                            )
+                            fill_fee = float(order_data.get("fee") or 0)
+                            confirmed_cost = (
+                                actual_shares * actual_fill_price
+                                * config.CURRENCY_BASE_MULTIPLIER
+                                + fill_fee
+                            )
+                            await asyncio.to_thread(
+                                database.update_trade_fill,
+                                trade["trade_id"], confirmed_cost,
+                                actual_shares, actual_fill_price,
+                            )
 
                             # If Bayse directly provides realized PnL, use it
                             raw = (order_data.get("profit") or order_data.get("pnl")

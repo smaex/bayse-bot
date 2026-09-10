@@ -444,6 +444,21 @@ def resolve_trade(trade_id: str, won: bool | None, pnl_ngn: float):
     )
 
 
+def update_trade_fill(
+    trade_id: str, amount_ngn: float, filled_quantity: float,
+    entry_price: float,
+) -> None:
+    """Replace a resting order's requested values with its confirmed fill."""
+    _execute(
+        """UPDATE trades
+              SET amount_ngn = %s,
+                  filled_quantity = %s,
+                  entry_price = %s
+            WHERE trade_id = %s AND resolved_at IS NULL""",
+        (amount_ngn, filled_quantity, entry_price, trade_id),
+    )
+
+
 def update_trade_remaining(
     trade_id: str, amount_ngn: float, filled_quantity: float,
     realized_pnl: float = 0.0,
