@@ -12,7 +12,7 @@ The production path is intentionally narrow:
 - A trade requires fresh data, a complete executable quote, sufficient modeled edge, and room under both per-trade and portfolio limits.
 - Requested order size is never treated as proof of a fill; exposure is created only from exchange-confirmed filled quantity.
 - The default global ceilings are 2% per trade, 15% total exposure, and a 3% daily realized-loss stop.
-- ARB, maker, paired-sniper, oracle-arb, and midmarket-maker remain experimental and are blocked unless the operator explicitly sets `ALLOW_EXPERIMENTAL_STRATEGIES=true`.
+- Single-leg CLOB MAKER is available as an opt-in user strategy. ARB, paired-sniper, oracle-arb, and dual-leg midmarket-maker remain experimental and are blocked unless the operator explicitly sets `ALLOW_EXPERIMENTAL_STRATEGIES=true`.
 - Telegram polling, feed tasks, scanning, and user loops are supervised. `/live` reports process liveness; `/ready` reports whether startup and the singleton lease are healthy.
 - One database-backed owner lease prevents two deployments from trading the same users at once.
 

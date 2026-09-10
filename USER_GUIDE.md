@@ -32,4 +32,4 @@ Paused accounts do not open new positions. Existing positions are still monitore
 
 ## Expectations
 
-No mode guarantees profit. Prediction-market positions can lose their entire stake, and high win rate alone does not prove profitability. Judge results by realized net PnL after fees and slippage, return on capital, and drawdown over a meaningful sample. Experimental arbitrage/maker strategies are unavailable unless the operator explicitly enables them.
+No mode guarantees profit. Prediction-market positions can lose their entire stake, and high win rate alone does not prove profitability. Judge results by realized net PnL after fees and slippage, return on capital, and drawdown over a meaningful sample. Single-leg CLOB MAKER is available as an opt-in strategy; experimental multi-leg and latency strategies require operator approval.

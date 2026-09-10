@@ -95,8 +95,12 @@ ACTIVE_STRATEGIES = [
 # These strategies have multi-leg/resting-order risk and must be promoted only
 # after live fill/reconciliation data proves them profitable.  New accounts do
 # not enable them automatically.
+# Single-leg MAKER is permitted because it is post-only, fee-free on CLOB,
+# independently reconciled, and has operator-reported positive history. It is
+# still opt-in for new accounts. Multi-leg/latency variants remain quarantined
+# until their exchange-confirmed records can be analysed.
 EXPERIMENTAL_STRATEGIES = {
-    "ARB", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
+    "ARB", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
 }
 DEFAULT_STRATEGIES = ["SNIPE"]
 ALLOW_EXPERIMENTAL_STRATEGIES = _env_bool("ALLOW_EXPERIMENTAL_STRATEGIES", False)

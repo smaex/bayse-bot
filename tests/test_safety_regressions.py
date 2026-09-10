@@ -98,6 +98,10 @@ def test_fresh_install_is_dry_run_and_experimental_strategies_are_blocked():
     assert result.stdout.strip() == "False"
     if not config.ALLOW_EXPERIMENTAL_STRATEGIES:
         assert not (set(config.PERMITTED_STRATEGIES) & config.EXPERIMENTAL_STRATEGIES)
+        assert "MAKER" in config.PERMITTED_STRATEGIES
+        assert {
+            "ARB", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
+        }.isdisjoint(config.PERMITTED_STRATEGIES)
 
 
 def test_readiness_requires_declared_startup_and_recent_core_progress():

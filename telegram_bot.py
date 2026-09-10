@@ -363,7 +363,10 @@ async def cmd_strategies(update: Update, _ctx):
     lines = ["⚙️ *Bot Strategy Status*\n"]
     for strat in sorted(_VALID_STRATEGIES):
         icon, name = _STRAT_ICONS.get(strat, ("🔔", strat))
-        status = "✅ ACTIVE" if strat in active else "⚪ OFF"
+        if strat in active and strat not in config.PERMITTED_STRATEGIES:
+            status = "🛑 SAVED BUT OPERATOR-BLOCKED"
+        else:
+            status = "✅ ACTIVE" if strat in active else "⚪ OFF"
         lines.append(f"{icon} *{strat}*: {status}")
     lines.append("\n*To enable or set strategies:*\n`/set strategies SNIPE MAKER MIDMARKET_MAKER PAIRED_SNIPER`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
