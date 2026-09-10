@@ -6,6 +6,43 @@ try:
 except ImportError:
     pass
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be numeric, got {raw!r}") from exc
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
+
+
+def _env_csv_set(name: str, default: set[str]) -> set[str]:
+    raw = os.getenv(name)
+    if raw is None:
+        return set(default)
+    values = {item.strip().upper() for item in raw.split(",") if item.strip()}
+    if not values:
+        raise RuntimeError(f"{name} must contain at least one comma-separated value")
+    return values
+
 # ── Credentials ───────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ENCRYPTION_KEY  = os.getenv("ENCRYPTION_KEY", "")
@@ -60,11 +97,29 @@ ASSET_ORACLE = {
     "EURUSD": "TWELVEDATA", "GBPUSD": "TWELVEDATA", "XAUUSD": "TWELVEDATA",
 }
 
-# ── Active strategies (only what's implemented and working) ───────────────────
-ACTIVE_STRATEGIES = ["SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"]
+# ── Strategies ────────────────────────────────────────────────────────────────
+ACTIVE_STRATEGIES = [
+    "SNIPE", "MAKER", "ORACLE_ARB", "FRONTRUN", "CORRELATE",
+    "ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
+]
+# Multi-leg strategies with non-atomic dual-order execution risk are quarantined
+# until exchange-confirmed paired fills validate them.
+EXPERIMENTAL_STRATEGIES = {
+    "ARB", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
+}
+# Default scope for new accounts (which start paused).
+DEFAULT_STRATEGIES = ["MAKER"]
+DEFAULT_ASSETS = ["BTC", "SOL"]
+DEFAULT_TIMEFRAMES = ["15min"]
+ALLOW_EXPERIMENTAL_STRATEGIES = _env_bool("ALLOW_EXPERIMENTAL_STRATEGIES", False)
+PERMITTED_STRATEGIES = [
+    name for name in ACTIVE_STRATEGIES
+    if ALLOW_EXPERIMENTAL_STRATEGIES or name not in EXPERIMENTAL_STRATEGIES
+]
 
 # ── Currency ──────────────────────────────────────────────────────────────────
 CURRENCY = "NGN"
+CURRENCY_BASE_MULTIPLIER = 100.0 if CURRENCY == "NGN" else 1.0
 
 # ── Sniping ───────────────────────────────────────────────────────────────────
 SNIPE_ENTRY_WINDOWS = {
@@ -74,16 +129,28 @@ SNIPE_ENTRY_WINDOWS = {
     "6h":    7200,
     "1d":    21600,
 }
-# DATA-DRIVEN TUNING (Calibrated from 2-week DB forensics):
-# SNIPE only trades high-conviction directional entries between 0.45 and 0.70.
-# - Underdog entries (<0.45) have poor win-rates and lose 77%+ of the time.
-# - High-certainty entries (>=0.45, win_prob >= 70%) have 100% historical win-rate.
-SNIPE_MIN_CERTAINTY    = 0.45   # 70%+ win-rate floor (calibrated from 2-week forensics: cert >= 0.60 was 100% WR)
-SNIPE_MAX_MARKET_PRICE = 0.82   # Raised from 0.70 to 0.82 to capture high-certainty (85%+) late-candle trades with positive EV
-SNIPE_MIN_ENTRY_PRICE  = 0.45   # Hard floor at 0.45 — completely blocks low-probability underdog traps
-# Minimum spot-vs-threshold distance to consider a directional signal.
-# 0.10% allows entering before market makers blow the spread past 0.85
-SNIPE_MIN_DISTANCE_PCT = 0.0010  # 0.10% minimum distance (calibrated from 0.18%)
+# SNIPE is enabled on BTC, ETH, and SOL with asset-calibrated strike distance buffers,
+# momentum confirmation, and fee-adjusted expected value gates.
+SNIPE_ALLOWED_ASSETS = _env_csv_set("SNIPE_ALLOWED_ASSETS", {"BTC", "ETH", "SOL"})
+SNIPE_ALLOWED_TIMEFRAMES = _env_csv_set(
+    "SNIPE_ALLOWED_TIMEFRAMES", {"15MIN", "5MIN"}
+)
+SNIPE_MIN_SECS_TO_CLOSE = 60
+SNIPE_MIN_CERTAINTY    = 0.27   # Maps to a conservative win probability of >= 62%.
+SNIPE_MAX_MARKET_PRICE = 0.65   # Avoid expensive, strongly asymmetric payoffs.
+SNIPE_MIN_ENTRY_PRICE  = 0.40   # Block low-probability underdog entries.
+SNIPE_MIN_DISTANCE_PCT = 0.0010 # Base minimum spot/threshold separation (calibrated by asset).
+SNIPE_MIN_RAW_MODEL_EDGE = 0.06 # Independent model must disagree materially with market.
+SNIPE_MIN_BLENDED_EDGE = 0.025  # Required after shrinking toward market consensus.
+SNIPE_MODEL_WEIGHT = 0.35       # Market gets 65% weight until calibration improves.
+SNIPE_VOL_SAFETY_MULTIPLIER = 1.25
+MAKER_ORDER_TIMEOUT = 120       # Seconds before cancelling stale resting maker quote.
+TAKE_PROFIT_PRICE_TARGET = 0.82 # Absolute take-profit price target.
+
+# Complete-set arbitrage remains shadow-only. The edge must clear two taker
+# fees plus execution uncertainty before an observation is counted.
+COMPLETE_SET_MIN_EDGE     = _env_float("COMPLETE_SET_MIN_EDGE", 0.02)
+CLOB_MAX_BOOK_AGE_SECONDS = _env_float("CLOB_MAX_BOOK_AGE_SECONDS", 5.0)
 
 # FX-specific
 FX_SESSION_UTC = {
@@ -120,16 +187,29 @@ EXIT_EV_THRESHOLD = -0.15          # Exit if EV drops below -15% (thesis wrong)
 MIN_EXIT_TIME_REMAINING = 45       # Allow exits down to 45s remaining (was 90s)
                                    # Audit showed profitable exits happen in 60-90s window before resolution
 
-# Take-profit exit: if a position gains > 35% and < 300s remain, lock in the gain.
+# Take-profit exit: trigger on market price, then require a fee-adjusted quote
+# that realizes at least MIN_TAKE_PROFIT_NET_GAIN.
 # This is how MAKER exits generated PROFITS (not just cut losses):
 #   Entry at 0.35, price rises to 0.72 → exit at 0.72 locks +₦106 instead of gambling on resolution.
-TAKE_PROFIT_GAIN_PCT      = 0.35   # 35% gain from entry_price triggers profit lock
-TAKE_PROFIT_MIN_SECS_REMAINING = 300  # Only lock profit when < 5 mins remain (trend is confirming)
+TAKE_PROFIT_GAIN_PCT      = 0.15   # Trigger only on executable market-price gain.
+TAKE_PROFIT_MIN_SECS_REMAINING = 450
+MIN_TAKE_PROFIT_NET_GAIN  = 0.05   # Quote must lock at least 5% after costs.
 
 
 # ── Risk ─────────────────────────────────────────────────────────────────────
-MAX_DRAWDOWN_STOP      = 0.15
-MAX_PORTFOLIO_EXPOSURE = 0.20
+# Environment overrides are fractions: 0.10 means 10%.
+MAX_DRAWDOWN_STOP      = _env_float("MAX_DRAWDOWN_STOP", 0.10)
+MAX_PORTFOLIO_EXPOSURE = _env_float("MAX_PORTFOLIO_EXPOSURE", 0.15)
+MAX_TRADE_RISK         = _env_float("MAX_TRADE_RISK", 0.02)
+DEFAULT_DAILY_LOSS_LIMIT_PCT = _env_float("DEFAULT_DAILY_LOSS_LIMIT_PCT", 3.0)
+MAX_DAILY_LOSS_LIMIT_PCT = _env_float("MAX_DAILY_LOSS_LIMIT_PCT", 5.0)
+TRADING_TIMEZONE = os.getenv("TRADING_TIMEZONE", "Africa/Lagos")
+
+# Fail closed on crypto entries if the independent Binance oracle is missing.
+# The Bayse relay remains useful for market pricing, but it must not be its own
+# independent cross-check.
+REQUIRE_DIRECT_ORACLE = _env_bool("REQUIRE_DIRECT_ORACLE", True)
+FEED_STALE_SEC        = _env_float("FEED_STALE_SEC", 30.0)
 
 # ── Hourly volatility baselines ───────────────────────────────────────────────
 ASSET_HOURLY_VOL = {
@@ -148,10 +228,14 @@ ASSET_HOURLY_VOL = {
 DYNAMIC_KELLY_MIN = 0.03
 DYNAMIC_KELLY_MAX = 0.50
 
-# ── Rate limits ───────────────────────────────────────────────────────────────
+# ── Rate limits / request bounds ──────────────────────────────────────────────
 WRITE_RATE_LIMIT      = 15
 READ_RATE_LIMIT       = 25
 SCAN_INTERVAL_SECONDS = 15
+API_REQUEST_TIMEOUT_SEC = _env_float("API_REQUEST_TIMEOUT_SEC", 12.0)
+API_CONNECT_TIMEOUT_SEC = _env_float("API_CONNECT_TIMEOUT_SEC", 4.0)
+API_READ_RETRIES        = max(1, _env_int("API_READ_RETRIES", 3))
+LOCK_LEASE_SEC          = max(20, _env_int("LOCK_LEASE_SEC", 45))
 
 # ── Infra guard ───────────────────────────────────────────────────────────────
 INFRA_STALE_LAG_SEC      = 120.0  # crypto: >120s of no oracle data = hard block
@@ -172,10 +256,46 @@ SYSTEMIC_RISK_VOL_MULT        = 3.0
 MIN_PAYOUT_RATIO   = 0.06
 PROFIT_ALERT_NGN   = 20_000
 
-# ── Test Mode ─────────────────────────────────────────────────────────────────
-# When True, ALL trades are capped at TEST_MAX_TRADE_NGN regardless of Kelly/mode.
-# Purpose: gather strategy performance data with minimal bankroll risk.
-# Set to False once enough data is collected and strategies are validated.
-TEST_MODE          = False
-TEST_MAX_TRADE_NGN = 500    # ₦500 max per trade during test runs if enabled
-TEST_MIN_BANKROLL  = 1000   # Stop all trading if bankroll drops below ₦1,000
+# ── Live/Test mode ────────────────────────────────────────────────────────────
+# Fail safe: an omitted environment variable must never place real orders.
+# Operators must deliberately enable live trading after dry-run validation.
+LIVE_TRADING       = _env_bool("LIVE_TRADING", False)
+TEST_MODE          = _env_bool("TEST_MODE", False)
+TEST_MAX_TRADE_NGN = _env_float("TEST_MAX_TRADE_NGN", 500.0)
+TEST_MIN_BANKROLL  = _env_float("TEST_MIN_BANKROLL", 1_000.0)
+
+
+def validate() -> None:
+    """Fail startup on missing secrets or internally unsafe settings."""
+    errors = []
+    if not TELEGRAM_TOKEN:
+        errors.append("TELEGRAM_TOKEN is required")
+    if not ENCRYPTION_KEY:
+        errors.append("ENCRYPTION_KEY is required")
+    else:
+        try:
+            from cryptography.fernet import Fernet
+            Fernet(ENCRYPTION_KEY.encode())
+        except (ImportError, ValueError):
+            errors.append("ENCRYPTION_KEY is not a valid Fernet key")
+    if not 0 < MAX_DRAWDOWN_STOP <= 0.50:
+        errors.append("MAX_DRAWDOWN_STOP must be in (0, 0.50]")
+    if not 0 < MAX_PORTFOLIO_EXPOSURE <= 0.50:
+        errors.append("MAX_PORTFOLIO_EXPOSURE must be in (0, 0.50]")
+    if not 0 < MAX_TRADE_RISK <= 0.10:
+        errors.append("MAX_TRADE_RISK must be in (0, 0.10]")
+    if not 0 < DEFAULT_DAILY_LOSS_LIMIT_PCT <= MAX_DAILY_LOSS_LIMIT_PCT:
+        errors.append("DEFAULT_DAILY_LOSS_LIMIT_PCT must not exceed MAX_DAILY_LOSS_LIMIT_PCT")
+    if not 0 < MAX_DAILY_LOSS_LIMIT_PCT <= 20:
+        errors.append("MAX_DAILY_LOSS_LIMIT_PCT must be in (0, 20]")
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(TRADING_TIMEZONE)
+    except (ImportError, KeyError):
+        errors.append("TRADING_TIMEZONE is invalid")
+    if SNIPE_MIN_ENTRY_PRICE >= SNIPE_MAX_MARKET_PRICE:
+        errors.append("SNIPE_MIN_ENTRY_PRICE must be below SNIPE_MAX_MARKET_PRICE")
+    if not 0 < ARB_TRIGGER < 1:
+        errors.append("ARB_TRIGGER must be between 0 and 1")
+    if errors:
+        raise RuntimeError("Invalid configuration: " + "; ".join(errors))

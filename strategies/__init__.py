@@ -11,6 +11,8 @@ New in this version:
 import logging
 import time
 from typing import List
+
+import config
 from strategies.base import TradeSignal
 from strategies.snipe      import SnipeStrategy
 from strategies.arb        import ArbStrategy
@@ -36,10 +38,32 @@ _strategies = {
     "MIDMARKET_MAKER": MidmarketMakerStrategy(),
 }
 
-# Structural strategies that bypass the regime/certainty multiplier system.
-# They fire based on market structure (spread, oracle lag, locked-in mid-market), not directional bets.
-_STRUCTURAL_STRATEGIES = {"MAKER", "ORACLE_ARB", "MIDMARKET_MAKER"}
+# Only genuinely structural/latency strategies bypass directional performance
+# learning. Single-leg MAKER is a directional binary bet placed passively; it
+# must remain subject to per-strategy and per-asset learning.
+_STRUCTURAL_STRATEGIES = {"ORACLE_ARB", "MIDMARKET_MAKER"}
 _TAKER_STRATEGIES = {"SNIPE", "FRONTRUN", "CORRELATE", "ARB"}
+
+
+def _route_strategy_names(active_names, liquidity_regime: str) -> set[str]:
+    """Apply liquidity routing without ever enabling an unrequested strategy."""
+    routed = set(active_names)
+    if liquidity_regime in {"DISLOCATED_WIDE", "THIN_ONE_SIDED"}:
+        routed = {name for name in routed if name not in _TAKER_STRATEGIES}
+    return routed
+
+
+def _performance_adjusted_probability(
+    win_prob: float, performance_multiplier: float
+) -> float:
+    """Shrink directional probability toward 50% after poor settled results.
+
+    Performance evidence may make the model less trustworthy, but historical
+    results never inflate a fresh model estimate above its original value.
+    """
+    p = min(1.0, max(0.0, float(win_prob)))
+    multiplier = min(1.0, max(0.0, float(performance_multiplier)))
+    return 0.5 + (p - 0.5) * multiplier
 
 
 async def evaluate_all(
@@ -56,9 +80,6 @@ async def evaluate_all(
     regime_mults = regime_controller.get_multipliers(asset, state)
     cert_mults   = learned.get("certainty_multipliers", {})
 
-    # Respect the active strategies set configured by the user
-    all_names = set(active_names)
-
     # ── Liquidity Regime Switching Orchestrator ──────────────────────────────
     ob_yes = market.get("ob_yes")
     ob_no  = market.get("ob_no")
@@ -71,19 +92,24 @@ async def evaluate_all(
     elif (yes_p + no_p > 1.15) or (min(yes_p, no_p) < 0.20 and max(yes_p, no_p) > 0.80):
         liq_regime = "DISLOCATED_WIDE"
 
+    # A liquidity regime may suppress unsafe takers, but may never promote a
+    # quarantined or user-disabled strategy. Previously DISLOCATED_WIDE silently
+    # added MIDMARKET_MAKER even when global policy had blocked it.
+    all_names = _route_strategy_names(active_names, liq_regime)
     if liq_regime == "DISLOCATED_WIDE":
-        # Block naive taker snipes (would pay 0.95+ or suffer zero-fills)
-        # Enable active mid-market dual limit orders
-        all_names = {n for n in all_names if n not in _TAKER_STRATEGIES}
-        all_names.add("MIDMARKET_MAKER")
-        log.debug(f"Market {asset}/{market.get('timeframe')} classified DISLOCATED_WIDE: routing to makers")
+        log.debug(
+            f"Market {asset}/{market.get('timeframe')} classified "
+            "DISLOCATED_WIDE: suppressing takers"
+        )
     elif liq_regime == "THIN_ONE_SIDED":
-        # Block taker snipes on empty books to prevent FAK zero-fills
-        all_names = {n for n in all_names if n not in _TAKER_STRATEGIES}
-        log.debug(f"Market {asset}/{market.get('timeframe')} classified THIN_ONE_SIDED: suppressing takers")
+        log.debug(
+            f"Market {asset}/{market.get('timeframe')} classified "
+            "THIN_ONE_SIDED: suppressing takers"
+        )
 
     signals = []
-    for name in all_names:
+    # Stable order makes signal selection reproducible across process restarts.
+    for name in (n for n in _strategies if n in all_names):
         strat = _strategies.get(name)
         if not strat:
             continue
@@ -95,8 +121,8 @@ async def evaluate_all(
             if not sig:
                 continue
 
-            # Structural strategies (MAKER, ORACLE_ARB) and matched-pair hedges (PAIRED_SNIPER)
-            # bypass regime and certainty multipliers — they exploit market structure / locked-in spread.
+            # Genuinely structural strategies and matched-pair hedges bypass
+            # directional multipliers. Single-leg MAKER deliberately does not.
             if name in _STRUCTURAL_STRATEGIES or "PAIR_HEDGE" in getattr(sig, "reason", ""):
                 sig.mode_floor = 0.0   # always allowed through
                 signals.append(sig)
@@ -111,9 +137,31 @@ async def evaluate_all(
             combo_key  = f"{sig.strategy}:{sig.asset}:{sig.timeframe}"
             combo_mult = cert_mults.get(combo_key, 1.0)
 
+            performance_mult = min(1.0, max(0.0, meta_mult * combo_mult))
+            if performance_mult < 1.0:
+                original_prob = sig.win_prob
+                sig.win_prob = _performance_adjusted_probability(
+                    original_prob, performance_mult
+                )
+                min_edge = (
+                    config.SNIPE_MIN_BLENDED_EDGE
+                    if name == "SNIPE" else 0.01
+                )
+                if sig.win_prob - sig.market_price < min_edge:
+                    log.info(
+                        f"PERFORMANCE SKIP {name} {asset}: adjusted probability "
+                        f"{sig.win_prob:.3f} no longer clears price "
+                        f"{sig.market_price:.3f} by {min_edge:.1%}"
+                    )
+                    continue
+                sig.edge_at_entry = sig.win_prob - sig.market_price
+                sig.reason += (
+                    f" | PERF_P({original_prob:.3f}->{sig.win_prob:.3f})"
+                )
+
             final_mult = mult * meta_mult * combo_mult
-            # Floor: never reduce certainty by more than 20% via multipliers.
-            # Without this, 0.85 × 0.85 × 0.85 = 0.61 kills good signals.
+            # Certainty is presentation/admission confidence; unlike the EV
+            # probability above, it also reflects the current market regime.
             final_mult = max(0.80, final_mult)
             if final_mult != 1.0:
                 sig.certainty = min(1.0, max(0.0, sig.certainty * final_mult))
@@ -151,44 +199,66 @@ async def evaluate_all(
 
 
 def merge_signals(all_signals: List[TradeSignal], state=None) -> List[TradeSignal]:
-    """
-    Convergence engine: if multiple strategies agree on the same asset+outcome,
-    boost certainty by +15%.  Also applies cross-asset risk parity.
+    """Merge genuinely agreeing directional signals without dropping hedges.
+
+    Structural/multi-leg signals keep their own execution slot. Directional
+    strategies converge only when they select the *same* outcome; disagreement
+    never receives a confidence boost.
     """
     merged: dict[str, TradeSignal] = {}
 
     for sig in all_signals:
-        key = f"{sig.market_id}"
+        is_structural = (
+            sig.strategy in _STRUCTURAL_STRATEGIES
+            or sig.strategy == "ARB"
+            or "PAIR_HEDGE" in getattr(sig, "reason", "")
+        )
+        key = f"{sig.market_id}:{sig.strategy}" if is_structural else sig.market_id
+
         if key not in merged:
             merged[key] = sig
-        else:
-            existing = merged[key]
-            if existing.strategy != sig.strategy:
-                # Convergence — boost the stronger signal
-                existing.certainty = min(1.0, existing.certainty + 0.15)
-                existing.reason   += f" | CONVERGENCE({sig.strategy})"
-                existing.converged_with.append(sig.timeframe)
-            if sig.certainty > existing.certainty:
-                sig.certainty      = existing.certainty  # keep the boost
-                merged[key]        = sig
+            continue
+
+        existing = merged[key]
+        if existing.outcome == sig.outcome and existing.strategy != sig.strategy:
+            # Convergence means independent methods agree on direction.
+            stronger = existing if existing.certainty >= sig.certainty else sig
+            other = sig if stronger is existing else existing
+            stronger.certainty = min(1.0, max(existing.certainty, sig.certainty) + 0.10)
+            stronger.reason += f" | CONVERGENCE({other.strategy})"
+            stronger.converged_with.append(other.strategy)
+            merged[key] = stronger
+            continue
+
+        # Opposite directions are not convergence. Keep only the signal with
+        # larger model edge; certainty is the tie-breaker.
+        existing_edge = existing.win_prob - existing.market_price
+        incoming_edge = sig.win_prob - sig.market_price
+        if (incoming_edge, sig.certainty) > (existing_edge, existing.certainty):
+            merged[key] = sig
 
     final = list(merged.values())
 
-    # Cross-asset risk parity: if two highly-correlated assets both have YES signals,
-    # halve each position to avoid doubling up on the same market move.
+    # Cross-asset risk parity: if highly-correlated assets carry the same
+    # direction, reduce both sizes rather than treating them as independent.
     if state and len(final) > 1:
         from strategies.utils import realized_correlation
+        adjusted_pairs: set[tuple[str, str, str]] = set()
         for outcome in ("YES", "NO"):
-            group = [s for s in final if s.outcome == outcome and s.strategy != "ARB"]
-            if len(group) < 2:
-                continue
+            group = [
+                signal for signal in final
+                if signal.outcome == outcome and signal.strategy not in _STRUCTURAL_STRATEGIES | {"ARB"}
+            ]
             for i, sig_a in enumerate(group):
                 for sig_b in group[i + 1:]:
-                    corr = realized_correlation(sig_a.asset, sig_b.asset, state)
-                    if corr > 0.85:
+                    pair = tuple(sorted((sig_a.asset, sig_b.asset))) + (outcome,)
+                    if pair in adjusted_pairs:
+                        continue
+                    if realized_correlation(sig_a.asset, sig_b.asset, state) > 0.85:
                         sig_a.size_pct /= 2
                         sig_b.size_pct /= 2
-                        sig_a.reason  += f" | RISK_PARITY({sig_b.asset})"
-                        sig_b.reason  += f" | RISK_PARITY({sig_a.asset})"
+                        sig_a.reason += f" | RISK_PARITY({sig_b.asset})"
+                        sig_b.reason += f" | RISK_PARITY({sig_a.asset})"
+                        adjusted_pairs.add(pair)
 
     return final

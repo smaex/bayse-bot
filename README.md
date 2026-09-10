@@ -1,158 +1,125 @@
 # Bayse Markets Trading Bot
 
-Automated prediction market trading bot for [Bayse Markets](https://bayse.markets) — trades BTC, ETH, and SOL UP/DOWN markets using four strategies, learns from every trade, and is fully controlled via Telegram.
+A multi-user prediction-market trading service controlled through Telegram. It watches Bayse markets, checks fresh market/oracle data, sizes orders under global risk limits, records fills in PostgreSQL, and monitors open positions.
 
----
+> **Important:** this software cannot guarantee profit or zero losses. Directional prediction-market trades can lose their entire stake. Fresh installations are therefore **dry-run by default** (`LIVE_TRADING=false`).
 
-## How it works
+## Safe operating model
 
-### Market structure
-Bayse runs automated binary markets every 5, 15, 60, 360, and 1440 minutes:
+The production path is intentionally narrow:
 
-> "Will BTC be **UP or DOWN** from its opening price in the next 5 minutes?"
+- New accounts start **paused**, limited to BTC/SOL 15-minute single-leg MAKER—the combinations supported by the current production audit.
+- A trade requires fresh data, a complete executable quote, sufficient modeled edge, and room under both per-trade and portfolio limits.
+- Requested order size is never treated as proof of a fill; exposure is created only from exchange-confirmed filled quantity.
+- The default global ceilings are 2% per trade, 15% total exposure, and a 3% daily realized-loss stop.
+- Single-leg CLOB MAKER is permitted and remains subject to per-asset performance controls. SNIPE is available only in the conservative SOL/15-minute scope by default; broaden it only during paper validation. ARB, paired-sniper, oracle-arb, and dual-leg midmarket-maker remain experimental and are blocked unless the operator explicitly sets `ALLOW_EXPERIMENTAL_STRATEGIES=true`.
+- A read-only complete-set monitor looks for fee-adjusted BUY→BURN and MINT→SELL CLOB discrepancies. It never submits orders because Bayse batches are best-effort rather than atomic.
+- Telegram polling, feed tasks, scanning, and user loops are supervised. `/live` reports process liveness; `/ready` reports whether startup and the singleton lease are healthy.
+- One database-backed owner lease prevents two deployments from trading the same users at once.
 
-- **YES/UP wins** → BTC closes above the opening Binance price
-- **NO/DOWN wins** → BTC closes below the opening Binance price
-- Resolution: verified on Binance (BTC/ETH) or Chainlink oracle (SOL)
-- Fee: variance-based, ~1–1.8% effective per trade
+These are ceilings, not profit targets. Start smaller, review exchange fills and realized net PnL, and promote strategies only after enough out-of-sample evidence.
 
-### Four trading strategies
+## Setup
 
-| Strategy | How it works | Edge |
-|----------|-------------|------|
-| 🎯 **SNIPE** | In the last 90 seconds of a candle, compare live Binance/Chainlink price to the opening threshold. If BTC is clearly above, buy UP with near-certainty | 80–99% certainty near close |
-| 🔗 **CORRELATE** | BTC, ETH, SOL move together (~0.85 correlation). When BTC's market reprices sharply, the bot immediately trades ETH and SOL in the same direction before they catch up | 60–70% edge, 30–120s window |
-| ⚖️ **ARB** | If YES + NO prices sum to less than ₦1.00, buy both sides then burn for ₦1.00 — guaranteed risk-free profit | 100% certainty, zero risk |
-| 📰 **NEWS** | Polls CryptoPanic for breaking crypto news, scores sentiment with VADER AI, trades bullish/bearish direction before the market reprices | ~60% edge, 10-min decay |
+Requires Python 3.11+ and PostgreSQL.
 
-### Intelligence loop (daily self-improvement)
-Every night at midnight UTC, the bot:
-1. Analyses all trades from the last 30 days per strategy/asset/timeframe
-2. Computes win rate and expected value for each combination
-3. Tightens or loosens thresholds based on performance (e.g. raises SNIPE certainty if win rate drops below 60%)
-4. Scales position sizes up (2×) for strategies performing well, down (0.25×) for underperformers
-5. Suspends any strategy with win rate below 48% for 20+ trades
-6. Sends a full report to your Telegram
-
-### Rate limits
-- 30 read requests/second → bot uses 25/sec (buffer)
-- 20 write requests/second (orders) → bot uses 15/sec
-- 429 responses handled with automatic exponential backoff
-
----
-
-## Setup (5 minutes)
-
-### 1. Clone the repo
 ```bash
-git clone https://github.com/YOUR_USERNAME/bayse-bot.git
+git clone https://github.com/smaex/bayse-bot.git
 cd bayse-bot
+python -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 2. Get your API keys
-Go to [app.bayse.markets](https://app.bayse.markets) → More → Account Settings → API Keys → Create
-
-### 3. Create your Telegram bot
-1. Open Telegram → search `@BotFather` → `/newbot`
-2. Choose name + username → copy the token
-3. Search `@userinfobot` → `/start` → copy your ID
-
-### 4. Configure
-```bash
 cp .env.example .env
-# Edit .env with your keys
 ```
 
-### 5. Run
+Set at least:
+
+- `TELEGRAM_TOKEN`
+- `DATABASE_URL`
+- `ENCRYPTION_KEY` (a Fernet key; the example file includes a generation command)
+- `DASHBOARD_PASSWORD`
+
+Run the test suite before starting:
+
 ```bash
+pytest -q
 python bot.py
 ```
 
-See [SETUP.md](SETUP.md) for full detailed instructions.
+Leave `LIVE_TRADING=false` while validating feeds, market discovery, Telegram, and portfolio reconciliation. Enabling real orders is a deliberate operator action:
 
----
-
-## Telegram commands
-
-| Command | What it does |
-|---------|-------------|
-| `/start` | Welcome screen with quick-action buttons |
-| `/status` | Balance, PnL, drawdown, active positions |
-| `/balance` | Wallet balance |
-| `/trades` | Last 10 trades |
-| `/markets` | Active markets being watched right now |
-| `/analysis` | Full performance report |
-| `/learning` | Run the intelligence cycle now + show what changed |
-| `/learnstats` | Win rate and PnL per strategy (7-day breakdown) |
-| `/settings` | Show current configuration |
-| `/set assets BTC` | Trade BTC only |
-| `/set assets BTC ETH SOL` | Trade all three (default) |
-| `/set timeframes 5min 15min` | Short-term candles only |
-| `/set timeframes 5min 15min 1h` | Short + medium (default) |
-| `/set strategies SNIPE ARB` | Safest mode — no directional risk |
-| `/set strategies SNIPE CORRELATE ARB NEWS` | All strategies (default) |
-| `/set risk 1` | 1% of bankroll per trade (conservative) |
-| `/set risk 3` | 3% per trade (default) |
-| `/set risk 5` | 5% per trade (aggressive) |
-| `/set mintrade 100` | Minimum ₦100 per trade |
-| `/set maxtrade 50000` | Maximum ₦50,000 per trade |
-| `/set maxexposure 25` | Max 25% of bankroll deployed at once |
-| `/pause` | Pause all trading |
-| `/resume` | Resume trading |
-
----
-
-## Risk controls
-
-- **Max drawdown stop**: trading pauses automatically at 20% loss from peak balance
-- **Position exposure cap**: never deploys more than 30% of bankroll simultaneously
-- **Per-trade cap**: maximum 3% of bankroll per trade (Kelly-conservative)
-- **Minimum trade**: ₦100 (Bayse platform minimum — configurable)
-- **Maximum trade**: ₦5,000 default (configurable via `/set maxtrade`)
-- **Fee drag**: ~1–1.8% effective per trade (lower than the displayed 4% base rate)
-
----
-
-## What moves these markets
-
-| Event | Reaction time | Bot response |
-|-------|--------------|-------------|
-| FOMC / CPI data release | 2–5 minutes | NEWS strategy enters next candle |
-| Crypto exchange hack | 10–20 minutes | NEWS + SNIPE on next candle |
-| Whale transfer (>$10M) | 5–15 minutes | CORRELATE fires across all assets |
-| Geopolitical shock | 15–60 minutes | NEWS + CORRELATE |
-| Normal price movement | Continuous | SNIPE in final 90s of each candle |
-
----
-
-## For multiple users
-
-Each user runs their **own instance** with their **own `.env`** file:
+```env
+LIVE_TRADING=true
 ```
-User 1: BAYSE_PUBLIC_KEY=pk_live_user1... TELEGRAM_CHAT_ID=111111
-User 2: BAYSE_PUBLIC_KEY=pk_live_user2... TELEGRAM_CHAT_ID=222222
-```
-Trade history, learned parameters, and Telegram notifications are fully isolated per instance. The `.env` and `data/` folder are in `.gitignore` and will never be pushed to GitHub.
 
----
+Users connect their own Bayse API keys through `/start`. Keys are encrypted before being stored. New users must explicitly `/resume` because accounts start paused.
 
-## File structure
+## Main Telegram commands
 
+| Command | Purpose |
+|---|---|
+| `/start` | Connect a Bayse account |
+| `/status` | Equity, free cash, PnL, drawdown, and open positions |
+| `/balance` | Fetch wallet balance |
+| `/trades` | Show recent trades |
+| `/markets` | Show currently watched markets |
+| `/settings` | Show account configuration |
+| `/mode` | Apply a bounded safe, balanced, or aggressive preset |
+| `/set ...` | Change assets, timeframes, strategies, or risk within operator limits |
+| `/pause` | Stop new entries; position monitoring continues |
+| `/resume` | Allow new entries |
+| `/rekey` | Replace Bayse API credentials |
+| `/debug` | Show feed, strategy, and risk diagnostics |
+| `/shadow` | Show the legacy two-sided price-touch paper study |
+| `/arbshadow` | Show read-only complete-set CLOB opportunity observations |
+
+## Risk and execution controls
+
+Environment-level controls override looser saved user preferences:
+
+```env
+MAX_TRADE_RISK=0.02
+MAX_PORTFOLIO_EXPOSURE=0.15
+DEFAULT_DAILY_LOSS_LIMIT_PCT=3.0
+MAX_DAILY_LOSS_LIMIT_PCT=5.0
+MAX_DRAWDOWN_STOP=0.10
+REQUIRE_DIRECT_ORACLE=true
+ALLOW_EXPERIMENTAL_STRATEGIES=false
+TRADING_TIMEZONE=Africa/Lagos
 ```
-bayse-bot/
-├── bot.py          — main orchestration loop
-├── client.py       — Bayse REST API client (auth, all endpoints)
-├── feeds.py        — Binance WS + Chainlink poll + Bayse WS price feeds
-├── scanner.py      — discovers active BTC/ETH/SOL markets
-├── strategy.py     — SNIPE, CORRELATE, ARB, NEWS signal generators
-├── risk.py         — position sizing, drawdown control, exposure limits
-├── learner.py      — SQLite trade history + daily self-improvement loop
-├── news.py         — CryptoPanic feed + VADER sentiment + econ calendar
-├── analysis.py     — performance reports
-├── telegram_bot.py — Telegram interface (commands + trade alerts)
-├── config.py       — all settings and constants
-├── .env.example    — template for your credentials
-├── SETUP.md        — step-by-step setup guide
-└── requirements.txt
+
+Additional safeguards include bounded HTTP/WebSocket waits, conservative retries, user-scoped cooldowns, per-user evaluation locks, market-specific minimum orders, stale-feed rejection, fee-aware EV checks, capped slippage, partial-fill reconciliation, and exchange-side portfolio checks before exits.
+
+## Health and dashboard
+
+- `GET /live` (or legacy `/ping`): event loop is reachable.
+- `GET /ready`: startup finished and core ownership/main-loop heartbeats are fresh.
+- `GET /dashboard`: static dashboard.
+- `GET /api/stats`: requires `Authorization: Bearer <DASHBOARD_PASSWORD>`.
+
+Point the deployment platform's liveness probe at `/live` and readiness probe at `/ready`. A process can be alive while Telegram or trading tasks are dead, so these signals are intentionally separate.
+
+## Architecture
+
+| Area | Files |
+|---|---|
+| Orchestration and supervision | `bot.py`, `health.py`, `server.py` |
+| Exchange API and persistence | `client.py`, `database.py` |
+| Market/oracle inputs | `feeds.py`, `feeds_direct.py`, `scanner.py` |
+| Signals and aggregation | `strategies/`, `strategy.py` |
+| Orders and reconciliation | `executor.py`, `learner.py` |
+| Account controls | `telegram_bot.py`, `risk.py`, `config.py` |
+| Regression checks | `tests/` |
+
+## Simulation and read-only API verification
+
+```bash
+python tools/simulate_economics.py --output reports/monte_carlo_simulation.md
+python tools/bayse_contract_probe.py
 ```
+
+The Monte Carlo report illustrates loss probability from audited aggregate economics; it is not a tick-level backtest of the new policy. The API probe makes only public series/event/quote/order-book reads, loads no credentials, and submits no orders.
+
+## Profitability standard
+
+Do not evaluate the bot using win rate alone. A high win rate can still lose money when entries are expensive. Use net realized PnL after fees/slippage, return on deployed capital, maximum drawdown, fill rate, partial-fill/orphan frequency, and results split by strategy/asset/timeframe. No experimental strategy should be enabled from backtest claims alone; require exchange-confirmed out-of-sample evidence. No directional strategy can guarantee profit every day.

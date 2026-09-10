@@ -1,15 +1,16 @@
 """
 Shadow Tracker: Pre-Order / Mid-Market Strategy Empirical Evaluator
 ===================================================================
-Zero-capital, risk-free shadow paper-trading monitor for Idea 2.
+Zero-capital shadow monitor for the experimental two-sided maker idea.
 
 Monitors every 5min and 15min candle open for BTC, ETH, and SOL on Bayse.
 Simulates two-sided passive limit bids at mid-market (e.g. 0.475 on YES, 0.475 on NO).
 Measures:
-  1. Both Legs Filled Rate (<= 45s and <= 90s) -> Guaranteed Arbitrage Spread (+5.26% Net EV)
-  2. One-Legged Adverse Selection Rate -> When one leg fills because spot is dumping into it,
-     while the other leg runs away, leaving naked unhedged exposure.
-  3. Net Simulated PnL across all candles.
+  1. Both displayed prices touched (<= 45s and <= 90s) and modeled gross pair spread.
+  2. One-sided price-touch adverse-selection proxy.
+  3. Gross modeled PnL before book position, queue, fees, and fill uncertainty.
+
+A price touch is not proof that a passive order would have filled.
 
 Outputs empirical proof to data/shadow_midmarket.jsonl and Telegram /shadow.
 """
@@ -49,17 +50,17 @@ class ShadowCandle:
         self.price_no_45s:  Optional[float] = None
         
         self.status = "TRACKING"  # TRACKING, COMPLETED
-        self.result = "PENDING"   # BOTH_FILLED_45S, BOTH_FILLED_90S, ONE_LEG_YES, ONE_LEG_NO, NEITHER_FILLED
+        self.result = "PENDING"   # BOTH_TOUCHED, ONE_LEG proxy, or NEITHER
         self.simulated_pnl = 0.0
 
     def update_prices(self, yes_p: float, no_p: float):
         elapsed = time.time() - self.t0
         
-        # Check fill for YES bid (market ask traded at or below our bid)
+        # Record displayed YES price touching the hypothetical bid.
         if self.yes_filled_at is None and yes_p <= self.bid_yes:
             self.yes_filled_at = round(elapsed, 1)
             
-        # Check fill for NO bid (market ask traded at or below our bid)
+        # Record displayed NO price touching the hypothetical bid.
         if self.no_filled_at is None and no_p <= self.bid_no:
             self.no_filled_at = round(elapsed, 1)
 
@@ -81,12 +82,18 @@ class ShadowCandle:
         size_per_leg = 100.0
 
         if yes_45 and no_45:
-            self.result = "BOTH_FILLED_45S"
-            # Cost = 0.475 + 0.475 = 0.950. Redemption = 1.000. Profit = +₦5.26
-            self.simulated_pnl = round(size_per_leg * ((1.0 / (self.bid_yes + self.bid_no)) - 1.0), 2)
+            self.result = "BOTH_TOUCHED_45S"
+            # Equal ₦ stakes at equal prices acquire equal share quantities.
+            # ₦100 per leg at 0.475 costs ₦200 and pays ₦210.53 as a complete
+            # set, for ₦10.53 gross—not the previous, incorrect ₦5.26.
+            self.simulated_pnl = round(
+                size_per_leg * (1.0 / self.bid_yes - 2.0), 2
+            )
         elif yes_90 and no_90:
-            self.result = "BOTH_FILLED_90S"
-            self.simulated_pnl = round(size_per_leg * ((1.0 / (self.bid_yes + self.bid_no)) - 1.0), 2)
+            self.result = "BOTH_TOUCHED_90S"
+            self.simulated_pnl = round(
+                size_per_leg * (1.0 / self.bid_yes - 2.0), 2
+            )
         elif yes_90 and not no_90:
             self.result = "ONE_LEG_YES_ADVERSE"
             # Leg 1 filled, Leg 2 failed. If dumped at 45s/90s:
@@ -214,8 +221,14 @@ def get_summary_report() -> str:
         )
 
     total = len(records)
-    both_45 = sum(1 for r in records if r.get("result") == "BOTH_FILLED_45S")
-    both_90 = sum(1 for r in records if r.get("result") == "BOTH_FILLED_90S")
+    both_45 = sum(
+        1 for r in records
+        if r.get("result") in {"BOTH_TOUCHED_45S", "BOTH_FILLED_45S"}
+    )
+    both_90 = sum(
+        1 for r in records
+        if r.get("result") in {"BOTH_TOUCHED_90S", "BOTH_FILLED_90S"}
+    )
     one_yes = sum(1 for r in records if r.get("result") == "ONE_LEG_YES_ADVERSE")
     one_no  = sum(1 for r in records if r.get("result") == "ONE_LEG_NO_ADVERSE")
     neither = sum(1 for r in records if r.get("result") == "NEITHER_FILLED")
@@ -227,14 +240,18 @@ def get_summary_report() -> str:
     both_pct = (total_both / total) * 100.0 if total > 0 else 0.0
     adverse_pct = (total_one_leg / total) * 100.0 if total > 0 else 0.0
 
-    verdict = "🟢 SAFE TO DEPLOY (Dual fills dominate)" if both_pct >= 65.0 and total_sim_pnl > 0 else "⚠️ HIGH ADVERSE SELECTION (Do NOT deploy yet)"
+    verdict = (
+        "🟡 PRICE-TOUCH CANDIDATE — order-book fill validation still required"
+        if both_pct >= 65.0 and total_sim_pnl > 0
+        else "⚠️ HIGH ADVERSE-SELECTION RISK"
+    )
 
     lines = [
         "🕶️ *Shadow Tracker: Pre-Order / Mid-Market*",
         f"Sample: *{total} candles* monitored (BTC, ETH, SOL)",
         "",
-        f"✅ *Both Legs Filled (<=45s)*: {both_45} ({both_45/total:.1%})",
-        f"✅ *Both Legs Filled (45-90s)*: {both_90} ({both_90/total:.1%})",
+        f"✅ *Both Prices Touched (<=45s)*: {both_45} ({both_45/total:.1%})",
+        f"✅ *Both Prices Touched (45-90s)*: {both_90} ({both_90/total:.1%})",
         f"⚠️ *One-Legged Trapped (Adverse)*: {total_one_leg} ({adverse_pct:.1%})",
         f"⚪ *Neither Leg Filled*: {neither} ({neither/total:.1%})",
         "",
@@ -242,7 +259,8 @@ def get_summary_report() -> str:
         f"📊 *Dual-Fill Success Rate*: *{both_pct:.1f}%*",
         "",
         f"*Verdict*: {verdict}",
-        "_(Zero real capital used. 100% paper observation)_"
+        "_(Zero capital used. Displayed-price touches are not confirmed fills; "
+        "never promote from this report alone.)_"
     ]
     return "\n".join(lines)
 

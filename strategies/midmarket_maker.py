@@ -1,20 +1,8 @@
-"""
-MIDMARKET_MAKER — Active Mid-Market Two-Sided Liquidity Trapping
-================================================================
-Exploits wide and dislocated orderbooks (e.g. 0.05 bids vs 0.95 asks) on Bayse.
+"""Experimental two-sided CLOB maker strategy.
 
-Key Principles:
-1. Two-Sided Resting Quotes:
-   - Places simultaneous resting LIMIT bids near statistical mid-market:
-     e.g., YES bid @ 0.470, NO bid @ 0.470 (Total pair cost = 0.940).
-2. Guaranteed Locked Spread:
-   - If both legs fill: Total investment = ₦0.94 per share.
-   - Guaranteed redemption at settlement = ₦1.00 per share.
-   - Net profit = +6.38% locked arbitrage with ZERO directional market risk.
-3. Adverse Selection Protection:
-   - Evaluates only when candle has > 180s remaining.
-   - Guarded by an automated 45-second execution monitor: if only 1 leg fills within
-     45s, the opposite unfilled leg is cancelled and a defensive hedge is evaluated.
+Two resting bids are not atomic. One side can fill while the other is cancelled
+or moves away, leaving directional and adverse-selection risk. This strategy is
+blocked by default until fill and orphan-reconciliation evidence supports it.
 """
 
 import time
@@ -37,6 +25,8 @@ class MidmarketMakerStrategy(BaseStrategy):
 
     async def evaluate(self, market: dict, learned: dict, state,
                        spot_price: float = None) -> Optional[TradeSignal]:
+        if str(market.get("engine") or "").upper() != "CLOB":
+            return None
         secs = market.get("secs_to_close", 0)
         if secs < MIN_SECS_TO_CLOSE:
             return None

@@ -7,7 +7,15 @@ import asyncio
 import logging
 import aiohttp
 from typing import Optional
-from config import BASE_URL, WRITE_RATE_LIMIT, READ_RATE_LIMIT, CURRENCY
+from config import (
+    API_CONNECT_TIMEOUT_SEC,
+    API_READ_RETRIES,
+    API_REQUEST_TIMEOUT_SEC,
+    BASE_URL,
+    CURRENCY,
+    READ_RATE_LIMIT,
+    WRITE_RATE_LIMIT,
+)
 
 log = logging.getLogger(__name__)
 
@@ -25,7 +33,10 @@ class RateLimiter:
             self._tokens = min(self._rate, self._tokens + (now - self._last) * self._rate)
             self._last   = now
             if self._tokens < 1:
-                await asyncio.sleep((1 - self._tokens) / self._rate)
+                wait = (1 - self._tokens) / self._rate
+                await asyncio.sleep(wait)
+                # One newly generated token is consumed by this request.
+                self._last = time.monotonic()
                 self._tokens = 0
             else:
                 self._tokens -= 1
@@ -41,8 +52,23 @@ class BayseClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(
+                total=API_REQUEST_TIMEOUT_SEC,
+                connect=API_CONNECT_TIMEOUT_SEC,
+                sock_connect=API_CONNECT_TIMEOUT_SEC,
+            )
+            connector = aiohttp.TCPConnector(
+                limit=50,
+                ttl_dns_cache=300,
+                enable_cleanup_closed=True,
+            )
             self._session = aiohttp.ClientSession(
-                headers={"Content-Type": "application/json"}
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "bayse-bot/production",
+                },
+                timeout=timeout,
+                connector=connector,
             )
         return self._session
 
@@ -68,59 +94,112 @@ class BayseClient:
     def _read_headers(self) -> dict:
         return {"X-Public-Key": self.public_key}
 
+    @staticmethod
+    async def _retry_delay(response: aiohttp.ClientResponse, attempt: int) -> float:
+        try:
+            data = await response.json()
+        except (aiohttp.ContentTypeError, json.JSONDecodeError):
+            data = {}
+        raw = data.get("retryAfter") or response.headers.get("Retry-After")
+        try:
+            return max(0.05, min(float(raw), 30.0))
+        except (TypeError, ValueError):
+            return min(2 ** attempt, 8.0)
+
     async def _get(self, path: str, params: dict = None, auth: str = "read") -> dict:
-        await self._read_rl.acquire()
         session = await self._get_session()
         headers = self._read_headers() if auth == "read" else {}
-        for attempt in range(3):
-            async with session.get(f"{BASE_URL}{path}", params=params, headers=headers) as r:
-                if r.status == 429:
-                    data = await r.json()
-                    await asyncio.sleep(data.get("retryAfter", 2 ** attempt))
-                    continue
-                r.raise_for_status()
-                return await r.json()
-        raise RuntimeError(f"GET {path} failed after retries")
+        last_error: Exception | None = None
+        for attempt in range(API_READ_RETRIES):
+            await self._read_rl.acquire()
+            try:
+                async with session.get(f"{BASE_URL}{path}", params=params, headers=headers) as r:
+                    if r.status == 429:
+                        await asyncio.sleep(await self._retry_delay(r, attempt))
+                        continue
+                    if 500 <= r.status < 600 and attempt + 1 < API_READ_RETRIES:
+                        await r.read()
+                        await asyncio.sleep(min(0.25 * (2 ** attempt), 2.0))
+                        continue
+                    r.raise_for_status()
+                    return await r.json()
+            except (aiohttp.ClientConnectionError, aiohttp.ServerTimeoutError, asyncio.TimeoutError) as exc:
+                last_error = exc
+                if attempt + 1 >= API_READ_RETRIES:
+                    break
+                await asyncio.sleep(min(0.25 * (2 ** attempt), 2.0))
+        raise RuntimeError(f"GET {path} failed after {API_READ_RETRIES} attempts: {last_error}")
 
-    async def _post(self, path: str, body: dict) -> dict:
-        await self._write_rl.acquire()
+    async def _post(self, path: str, body: dict, extra_headers: dict | None = None) -> dict:
+        """Send a signed write.
+
+        Network/5xx failures are deliberately *not* retried here because a
+        single-order write has no documented idempotency key. Retrying an
+        ambiguous order response can double the position. A 429 is safe to
+        retry because Bayse rejects it before execution.
+        """
         session  = await self._get_session()
         body_str = json.dumps(body, separators=(",", ":"))
-        headers  = self._auth_headers("POST", path, body_str)
-        for attempt in range(3):
+        for attempt in range(API_READ_RETRIES):
+            await self._write_rl.acquire()
+            # Regenerate timestamp/signature after every rate-limit wait.
+            headers = self._auth_headers("POST", path, body_str)
+            if extra_headers:
+                headers.update(extra_headers)
             async with session.post(f"{BASE_URL}{path}", data=body_str, headers=headers) as r:
                 if r.status == 429:
-                    data = await r.json()
-                    await asyncio.sleep(data.get("retryAfter", 2 ** attempt))
+                    await asyncio.sleep(await self._retry_delay(r, attempt))
                     continue
                 if r.status >= 400:
                     try:
                         err = await r.json()
-                        msg = err.get("message") or err.get("error")
-                        if msg:
-                            raise ValueError(msg)
-                    except ValueError:
-                        raise
-                    except Exception:
-                        text = await r.text()
-                        log.error(f"API {r.status} on {path}: {text}")
-                r.raise_for_status()
+                    except (aiohttp.ContentTypeError, json.JSONDecodeError):
+                        err = {"message": await r.text()}
+                    msg = err.get("message") or err.get("error") or str(err)
+                    raise ValueError(f"API {r.status} {path}: {msg}")
                 return await r.json()
-        raise RuntimeError(f"POST {path} failed after retries")
+        raise RuntimeError(f"POST {path} remained rate-limited after retries")
+
+    async def _public_post(self, path: str, body: dict) -> dict:
+        """Retry-safe public POST used for quote calculation (no mutation)."""
+        session = await self._get_session()
+        last_error: Exception | None = None
+        for attempt in range(API_READ_RETRIES):
+            await self._read_rl.acquire()
+            try:
+                async with session.post(
+                    f"{BASE_URL}{path}", json=body, headers=self._read_headers()
+                ) as r:
+                    if r.status == 429:
+                        await asyncio.sleep(await self._retry_delay(r, attempt))
+                        continue
+                    if 500 <= r.status < 600 and attempt + 1 < API_READ_RETRIES:
+                        await r.read()
+                        await asyncio.sleep(min(0.25 * (2 ** attempt), 2.0))
+                        continue
+                    r.raise_for_status()
+                    return await r.json()
+            except (aiohttp.ClientConnectionError, aiohttp.ServerTimeoutError, asyncio.TimeoutError) as exc:
+                last_error = exc
+                if attempt + 1 >= API_READ_RETRIES:
+                    break
+                await asyncio.sleep(min(0.25 * (2 ** attempt), 2.0))
+        raise RuntimeError(f"QUOTE {path} failed after retries: {last_error}")
 
     async def _delete(self, path: str) -> dict:
-        await self._write_rl.acquire()
         session = await self._get_session()
-        headers = self._auth_headers("DELETE", path)
-        for attempt in range(3):
+        for attempt in range(API_READ_RETRIES):
+            await self._write_rl.acquire()
+            headers = self._auth_headers("DELETE", path)
             async with session.delete(f"{BASE_URL}{path}", headers=headers) as r:
                 if r.status == 429:
-                    data = await r.json()
-                    await asyncio.sleep(data.get("retryAfter", 2 ** attempt))
+                    await asyncio.sleep(await self._retry_delay(r, attempt))
                     continue
                 r.raise_for_status()
+                if r.status == 204:
+                    return {}
                 return await r.json()
-        raise RuntimeError(f"DELETE {path} failed after retries")
+        raise RuntimeError(f"DELETE {path} remained rate-limited after retries")
 
     # ── Market data ───────────────────────────────────────────────────────────
 
@@ -156,7 +235,7 @@ class BayseClient:
 
     async def get_quote(self, event_id: str, market_id: str, outcome_id: str,
                         side: str, amount: float, currency: str = CURRENCY) -> dict:
-        return await self._post(
+        return await self._public_post(
             f"/v1/pm/events/{event_id}/markets/{market_id}/quote",
             {"outcomeId": outcome_id, "side": side, "amount": amount, "currency": currency},
         )
@@ -165,7 +244,9 @@ class BayseClient:
                           side: str, amount: float, order_type: str = "MARKET",
                           price: float = None, currency: str = CURRENCY,
                           max_slippage: float = 0.05,
-                          time_in_force: str = "FAK") -> dict:
+                          time_in_force: str = "FAK",
+                          post_only: bool = False,
+                          stp_mode: str = "SKIP") -> dict:
         body: dict = {
             "outcomeId": outcome_id,
             "side":      side,
@@ -176,11 +257,23 @@ class BayseClient:
         if order_type == "LIMIT" and price is not None:
             body["price"]       = round(price, 3)
             body["timeInForce"] = time_in_force
+            body["postOnly"]    = bool(post_only)
+            body["stpMode"]     = stp_mode
         else:
             body["maxSlippage"] = max_slippage
             body["timeInForce"] = time_in_force
         return await self._post(
             f"/v1/pm/events/{event_id}/markets/{market_id}/orders", body
+        )
+
+    async def place_batch_orders(self, orders: list[dict], idempotency_key: str) -> dict:
+        """Place a CLOB batch with Bayse's documented 24-hour idempotency."""
+        if not orders or len(orders) > 20:
+            raise ValueError("orders must contain between 1 and 20 items")
+        return await self._post(
+            "/v1/pm/orders/batch",
+            {"orders": orders},
+            extra_headers={"Idempotency-Key": idempotency_key},
         )
 
     async def cancel_order(self, order_id: str) -> dict:
@@ -244,6 +337,11 @@ class BayseClient:
     async def get_portfolio(self) -> dict:
         return await self._get("/v1/pm/portfolio")
 
+    async def get_position(self, outcome_id: str) -> dict | None:
+        portfolio = await self.get_portfolio()
+        rows = portfolio.get("outcomeBalances", []) if isinstance(portfolio, dict) else []
+        return next((row for row in rows if row.get("outcomeId") == outcome_id), None)
+
     # ── Share operations ──────────────────────────────────────────────────────
 
     async def burn_shares(self, market_id: str, quantity: float, currency: str = CURRENCY) -> dict:
@@ -262,19 +360,39 @@ class BayseClient:
 
     @staticmethod
     def parse_filled_shares(order: dict) -> float:
+        """Extract normalized shares actually received from an order response.
+
+        Bayse documents CLOB ``quantity`` as shares received, while
+        ``filledSize`` is the amount filled so far. Prefer positive quantity on
+        a filled/partial order; retain explicit fill fields as a compatibility
+        fallback for responses that omit quantity.
         """
-        Extract filled quantity from an order response.
-        AMM orders use 'quantity'; CLOB uses 'filledSize'/'sharesMatched'.
-        Check AMM field first.
-        """
-        for field in ("quantity", "filledSize", "shares", "sharesFilled",
-                      "sharesMatched", "amountMatched", "filledQuantity"):
-            v = order.get(field)
-            if v is not None:
+        status = str(order.get("status") or "").strip().lower()
+        non_filled_statuses = {
+            "pending", "open", "new", "cancelled", "canceled", "killed",
+            "rejected", "expired",
+        }
+
+        if status not in non_filled_statuses:
+            for field in ("quantity", "shares"):
                 try:
-                    val = float(v)
-                    if val > 0:
-                        return val
+                    value = float(order.get(field) or 0.0)
                 except (TypeError, ValueError):
-                    pass
+                    continue
+                if value > 0:
+                    return value
+
+        # Partial CLOB responses may remain status=open while exposing an
+        # explicit filled field. Never use requested `size` or `amount`.
+        for field in (
+            "filledSize", "sharesFilled", "sharesMatched",
+            "amountMatched", "filledQuantity",
+        ):
+            try:
+                value = float(order.get(field) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+
         return 0.0

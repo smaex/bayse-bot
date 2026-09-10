@@ -142,6 +142,15 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
         return None
 
     fee_pct = float(market.get("feePercentage", 2)) / 100
+    status = str(full.get("status") or "open").strip().lower()
+    if status == "active":
+        status = "open"
+    engine = str(full.get("engine") or market.get("engine") or "AMM").upper()
+    minimum_order = float(
+        market.get("minimumOrderAmount")
+        or full.get("minimumOrderAmount")
+        or (100.0 if CURRENCY == "NGN" else 1.0)
+    )
 
     return {
         "event_id":    event_id,
@@ -160,8 +169,9 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
         "opening_date": opening_date,
         "closing_date": closing_date,
         "secs_to_close": secs_to_close,
-        "status":      full.get("status", "open"),
-        "engine":      full.get("engine") or market.get("engine", "AMM"),
+        "status":      status,
+        "engine":      engine,
+        "minimum_order_amount": minimum_order,
         "oracle":      ASSET_ORACLE.get(asset, "BINANCE"),
     }
 

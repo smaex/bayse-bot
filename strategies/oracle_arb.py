@@ -1,34 +1,15 @@
-"""
-ORACLE_ARB — Oracle Latency Arbitrage
-=======================================
-Exploits the lag between Binance (the resolution oracle) and the Bayse
-AMM price in the final seconds of a market's life.
+"""Experimental oracle-latency strategy.
 
-How it works:
- - Every market resolves based on the Binance candlestick close at endTime.
- - We subscribe to the same Binance feed Bayse uses (wss bookTicker).
- - In the final WINDOW_SECS seconds before closingDate, if the live
-   Binance price has already crossed the threshold, the outcome is
-   mathematically certain — but the Bayse AMM price may still show 0.70.
- - We instantly buy the winning outcome at the stale AMM price, lock in
-   a guaranteed ~0.30 per share profit.
+A pre-close spot observation does not make a binary outcome certain: the price
+can cross again, clocks can differ, and execution can move. The global policy
+blocks this strategy until timing and fill data demonstrate positive net edge.
 
-This is identical to how Kalshi quants trade resolution events: they
-pay for ultra-low-latency data feeds and only execute when the outcome
-is essentially certain.
+Expected Bayse fields:
+ - market has ``closingDate``
+ - market may have ``resolutionDate``
 
-Bayse API Compatibility (VERIFIED):
- - market has "closingDate" field with millisecond precision ✅
- - market has "resolutionDate" field (usually closingDate + 90s) ✅
- - market "engine" = "CLOB" → MARKET orders route to AMM curve ✅
- - resolution oracle: Binance 1-min OHLCV candle close ✅
-
-Key Constraints:
- - We do NOT know if Bayse locks the CLOB before closingDate.
-   First live test with min trade (₦100) will verify the lock window.
- - We compare against eventThreshold (stored in scanner as "threshold").
- - Only trade if our certainty is > 0.95 to avoid false triggers near
-   the threshold.
+The implementation compares a fresh direct price with the scanner threshold,
+but field timing and the exchange lock window still require validation.
 """
 
 import asyncio
@@ -45,8 +26,8 @@ log = logging.getLogger("strat.oracle_arb")
 # ── Parameters ────────────────────────────────────────────────────────────────
 
 # Only activate in the final N seconds before market closing.
-# 120s: at 2 minutes out, if Binance is clearly 0.3%+ past the threshold,
-# that outcome is virtually certain given remaining price volatility.
+# Two minutes leaves meaningful reversal risk; distance and probability gates
+# are necessary but do not guarantee the outcome.
 WINDOW_SECS = 120
 
 # Minimum certainty to fire. Certainty formula now returns 0.92-0.99.

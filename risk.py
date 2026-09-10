@@ -4,7 +4,7 @@ Risk manager: position sizing, drawdown control, exposure limits.
 
 import logging
 import time
-from config import MAX_DRAWDOWN_STOP, MAX_PORTFOLIO_EXPOSURE
+from config import MAX_DRAWDOWN_STOP, MAX_PORTFOLIO_EXPOSURE, TRADING_TIMEZONE
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +45,8 @@ class RiskManager:
 
     def reset_daily_if_needed(self):
         import datetime
-        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        from zoneinfo import ZoneInfo
+        today = datetime.datetime.now(ZoneInfo(TRADING_TIMEZONE)).strftime("%Y-%m-%d")
         if self.last_reset_date != today:
             log.info(f"Daily risk reset: profit was ₦{self.daily_realized_pnl:,.0f}")
             self.daily_realized_pnl = 0.0
@@ -96,6 +97,7 @@ class RiskManager:
         return sum(p["amount_ngn"] for p in self.open_positions.values())
 
     def can_trade(self, balance: float, amount: float, max_exposure: float = 0.30) -> bool:
+        max_exposure = min(max_exposure, MAX_PORTFOLIO_EXPOSURE)
         if (self.deployed() + amount) > balance * max_exposure:
             log.debug(
                 f"Exposure cap: deployed=₦{self.deployed():,.0f} + "
@@ -127,6 +129,7 @@ class RiskManager:
 
     def add_position(self, market_id: str, pos: dict):
         pos.setdefault("placed_at", time.time())  # always stamp entry time
+        pos.setdefault("market_id", market_id)
         self.open_positions[market_id] = pos
         log.info(
             f"Position opened [{pos['strategy']}] "
@@ -134,7 +137,18 @@ class RiskManager:
             f"₦{pos['amount_ngn']:,.0f}"
         )
 
-    def remove_position(self, market_id: str):
+    def remove_position(self, market_id: str, *, order_id: str = "", outcome_id: str = ""):
+        """Remove one tracked position without deleting sibling hedge legs."""
+        if order_id or outcome_id:
+            for key, pos in list(self.open_positions.items()):
+                if pos.get("market_id", key) != market_id:
+                    continue
+                if order_id and pos.get("order_id") != order_id:
+                    continue
+                if outcome_id and pos.get("outcome_id") != outcome_id:
+                    continue
+                self.open_positions.pop(key, None)
+                return
         self.open_positions.pop(market_id, None)
 
     def has_correlated_open_position(self, asset: str, outcome: str, timeframe: str = "15min", certainty: float = 0.0) -> bool:

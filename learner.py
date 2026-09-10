@@ -41,7 +41,67 @@ def binomial_cdf(k: int, n: int, p: float) -> float:
     return cdf
 
 
+_BINARY_SETTLEMENT_STRATEGIES = {
+    "SNIPE", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB",
+}
+
+
+def capital_weighted_break_even(rows: list[dict], default: float = 0.55) -> float:
+    """Return the hit rate needed to break even at the recorded entry prices.
+
+    For stake A at effective binary price p, a win pays A/p and a loss pays
+    zero. Across varying stakes/prices, q_break_even = ΣA / Σ(A/p). AMM fees
+    are already embedded in effective fill price; confirmed CLOB makers are
+    fee-free. This is more honest than a strategy-wide fixed win-rate target.
+    """
+    deployed = 0.0
+    potential_payout = 0.0
+    for row in rows:
+        amount = float(row.get("total_deployed") or 0.0)
+        payout = row.get("potential_payout")
+        if payout is None:
+            avg_price = float(row.get("avg_entry_price") or 0.0)
+            payout = amount / avg_price if avg_price > 0 else 0.0
+        deployed += amount
+        potential_payout += float(payout or 0.0)
+
+    if deployed <= 0 or potential_payout <= 0:
+        return default
+    return min(0.99, max(0.01, deployed / potential_payout))
+
+
+def adjusted_combo_size_multiplier(
+    current: float, *, total: int, roi: float,
+    win_rate: float, break_even_rate: float,
+) -> float:
+    """Throttle losing combinations and cautiously reward profitable ones."""
+    if total >= 10 and roi <= -0.02:
+        return max(0.10, current - 0.25)
+    if total >= 20 and roi >= 0.02 and win_rate >= break_even_rate:
+        return min(1.10, current + 0.05)
+    return current
+
+
 # ── Resolution ────────────────────────────────────────────────────────────────
+
+def _settlement_pnl(
+    *, won: bool, amount_ngn: float, entry_price: float,
+    filled_quantity: float = 0.0,
+) -> float:
+    """Compute settlement PnL with no synthetic fee at resolution.
+
+    ``amount_ngn`` is the exchange-confirmed wallet cost. AMM fees are already
+    embedded in that fill; Bayse documents confirmed CLOB makers as fee-free.
+    """
+    amount = float(amount_ngn)
+    if not won:
+        return -amount
+    shares = float(filled_quantity) or (
+        amount / (float(entry_price) * config.CURRENCY_BASE_MULTIPLIER)
+        if entry_price > 0 else 0.0
+    )
+    return shares * config.CURRENCY_BASE_MULTIPLIER - amount
+
 
 def _resolved_won(resolved_label: str, trade: dict, market: dict) -> bool:
     """Determine win/loss from the resolved outcome label."""
@@ -132,7 +192,9 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                 log.info(f"[{chat_id}] Order {trade['order_id']} was cancelled on exchange ({order_status}) — resolving with 0.0 PnL")
                                 await asyncio.to_thread(database.resolve_trade, trade["trade_id"], None, 0.0)
                                 if user_risks and chat_id in user_risks:
-                                    user_risks[chat_id].remove_position(trade["market_id"])
+                                    user_risks[chat_id].remove_position(
+                                        trade["market_id"], order_id=trade.get("order_id", "")
+                                    )
                                 if tg_app:
                                     try:
                                         await tgb.notify_unfilled(
@@ -158,7 +220,9 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                         log.info(f"[{chat_id}] Trade {trade['trade_id']} voided — skipping")
                         await asyncio.to_thread(database.resolve_trade, trade["trade_id"], None, 0.0)
                         if user_risks and chat_id in user_risks:
-                            user_risks[chat_id].remove_position(trade["market_id"])
+                            user_risks[chat_id].remove_position(
+                                trade["market_id"], order_id=trade.get("order_id", "")
+                            )
                         if tg_app:
                             try:
                                 await tgb.notify_unfilled(
@@ -193,7 +257,9 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                 log.info(f"[{chat_id}] Order {trade['order_id']} was unfilled (status={order_status}, shares={shares}) — resolving with 0.0 PnL")
                                 await asyncio.to_thread(database.resolve_trade, trade["trade_id"], None, 0.0)
                                 if user_risks and chat_id in user_risks:
-                                    user_risks[chat_id].remove_position(trade["market_id"])
+                                    user_risks[chat_id].remove_position(
+                                        trade["market_id"], order_id=trade.get("order_id", "")
+                                    )
                                 if tg_app:
                                     try:
                                         await tgb.notify_unfilled(
@@ -208,9 +274,25 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                         log.warning(f"[{chat_id}] notify_unfilled failed: {ne}")
                                 continue
 
-                            # Save fill data for precise PnL calculation below
+                            # Replace the original resting-order budget with
+                            # exchange-confirmed fill quantity and cost. For a
+                            # CLOB BUY, Bayse deducts taker fees from shares;
+                            # quantity×price + fee reconstructs wallet spend.
                             actual_shares = shares
-                            actual_fill_price = float(order_data.get("avgFillPrice") or order_data.get("price") or 0)
+                            actual_fill_price = float(
+                                order_data.get("avgFillPrice") or order_data.get("price") or 0
+                            )
+                            fill_fee = float(order_data.get("fee") or 0)
+                            confirmed_cost = (
+                                actual_shares * actual_fill_price
+                                * config.CURRENCY_BASE_MULTIPLIER
+                                + fill_fee
+                            )
+                            await asyncio.to_thread(
+                                database.update_trade_fill,
+                                trade["trade_id"], confirmed_cost,
+                                actual_shares, actual_fill_price,
+                            )
 
                             # If Bayse directly provides realized PnL, use it
                             raw = (order_data.get("profit") or order_data.get("pnl")
@@ -218,28 +300,34 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                             if raw is not None:
                                 pnl = float(raw)
                             elif actual_shares > 0 and actual_fill_price > 0:
-                                # Precise PnL from actual fill data:
-                                # WIN: redeemed at ₦1.00/share → profit = shares × (1 - fill_price) - fee
-                                # LOSS: lost the cost basis → pnl = -amount_ngn
-                                fee_ngn = float(order_data.get("fee") or 0)
-                                if won:
-                                    pnl = actual_shares * (1.0 - actual_fill_price) - fee_ngn
-                                else:
-                                    pnl = -(actual_shares * actual_fill_price + fee_ngn)
+                                # NGN has a base multiplier of 100: one winning
+                                # share pays ₦100 and costs price×₦100. The old
+                                # path omitted this multiplier and understated
+                                # both wins and losses by roughly 100x.
+                                fee = float(order_data.get("fee") or 0)
+                                cost = (
+                                    actual_shares * actual_fill_price
+                                    * config.CURRENCY_BASE_MULTIPLIER
+                                    + fee
+                                )
+                                pnl = (
+                                    actual_shares * config.CURRENCY_BASE_MULTIPLIER - cost
+                                    if won else -cost
+                                )
                         except Exception as oe:
                             log.debug(f"get_order fallback: {oe}")
 
                     # Fallback PnL estimate (when order API unavailable)
                     if pnl is None:
-                        fr     = float((market or {}).get("feePercentage", 2)) / 100
                         entry  = trade["entry_price"]
                         amount = trade["amount_ngn"]
-                        if won:
-                            shares_est  = amount / entry if entry > 0 else 0
-                            fee_amt = fr * shares_est * entry * max(1 - entry, config.FEE_FLOOR)
-                            pnl     = shares_est * (1.0 - entry) - fee_amt
-                        else:
-                            pnl = -amount
+                        filled_quantity = float(trade.get("filled_quantity") or 0.0)
+                        pnl = _settlement_pnl(
+                            won=won,
+                            amount_ngn=amount,
+                            entry_price=entry,
+                            filled_quantity=filled_quantity,
+                        )
 
                     await asyncio.to_thread(database.resolve_trade, trade["trade_id"], won, pnl)
 
@@ -252,7 +340,9 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                     if user_risks and chat_id in user_risks:
                         rm = user_risks[chat_id]
                         rm.add_pnl(pnl)
-                        rm.remove_position(trade["market_id"])
+                        rm.remove_position(
+                            trade["market_id"], order_id=trade.get("order_id", "")
+                        )
 
                     # Stamp the resolution time so bot.py's quiet-state guard
                     # suppresses deposit/withdrawal detection for the next 60 s
@@ -318,76 +408,105 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         total    = int(sum(r["total"] for r in rows))
         wins     = int(sum(r.get("wins") or 0 for r in rows))
         win_rate = wins / total if total > 0 else None
+        strat_pnl = float(sum(r.get("total_pnl") or 0.0 for r in rows))
         counts[strat] = total
 
         if total < 10:
             continue
 
-        expected_wr = 0.65 if strat == "SNIPE" else 0.55
-        p_value     = binomial_cdf(wins, total, expected_wr)
-        c           = cmults.get(strat, 1.0)
+        total_deployed = float(sum(r.get("total_deployed") or 0.0 for r in rows))
+        roi = strat_pnl / total_deployed if total_deployed > 0 else 0.0
+        expected_wr = (
+            capital_weighted_break_even(rows)
+            if strat in _BINARY_SETTLEMENT_STRATEGIES else 0.55
+        )
+        p_value = binomial_cdf(wins, total, expected_wr)
+        c = cmults.get(strat, 1.0)
 
-        if p_value < 0.05:
-            # Certainty multiplier floor at 0.85 — this is a gentle nudge,
-            # not a gate.  Size multipliers handle real throttling.
-            # Symmetric rate: penalty and recovery both ±0.15 so strategies
-            # recover at the same pace they're penalised.
+        if p_value < 0.05 and strat_pnl < 0:
+            # Certainty multiplier is a gentle nudge; size multipliers handle
+            # actual throttling. Compare against price-dependent break-even,
+            # not a hardcoded strategy win rate.
             c = max(0.85, c - 0.15)
-            warnings.append(f"⚠️ {strat} certainty penalised (p={p_value:.3f})")
-        elif win_rate is not None and win_rate >= expected_wr:
-            c = min(1.5, c + 0.15)
+            warnings.append(
+                f"⚠️ {strat} certainty penalised "
+                f"(WR {win_rate:.1%} < BE {expected_wr:.1%}, p={p_value:.3f})"
+            )
+        elif win_rate is not None and win_rate >= expected_wr and strat_pnl > 0:
+            c = min(1.20, c + 0.05)
         cmults[strat] = round(c, 2)
 
         m = mults.get(strat, 1.0)
-        if win_rate is not None:
-            if win_rate >= 0.75:   m = min(1.5, m + 0.25)  # cap lowered from 3.0 — 1.5x is sufficient reward
-            elif win_rate >= 0.60: m = min(1.3, m + 0.15)  # cap lowered from 1.5
-            elif win_rate < 0.55:  m = max(0.50, m - 0.15)
+        # Win rate alone is not profitability in a binary market: buying at
+        # 0.85 can lose money with a high hit rate. Only positive net PnL/ROI
+        # can increase size; negative PnL always decreases it.
+        if strat_pnl < 0 or roi < 0:
+            m = max(0.25, m - 0.20)
+        elif total >= 30 and roi >= 0.02 and win_rate >= expected_wr:
+            m = min(1.25, m + 0.10)
         mults[strat] = round(m, 2)
 
-        # SNIPE threshold tuning
+        # SNIPE threshold tuning follows its observed payoff break-even point.
         if strat == "SNIPE" and win_rate is not None:
             cur = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
-            if win_rate < 0.50:
+            if strat_pnl < 0 and win_rate < expected_wr:
                 new = min(round(cur + 0.02, 2), 0.70)
                 learned["snipe_min_certainty"] = new
                 changes.append(f"🎯 SNIPE certainty raised {cur} → {new}")
-            elif win_rate > 0.70 and cur > 0.20:
+            elif roi >= 0.02 and win_rate >= expected_wr + 0.05 and cur > 0.20:
                 new = max(round(cur - 0.02, 2), 0.20)
                 learned["snipe_min_certainty"] = new
                 changes.append(f"🎯 SNIPE certainty eased {cur} → {new}")
 
-    # Combo-level self-correction
-    combos = await asyncio.to_thread(database.get_combo_stats, chat_id, days=14, after_dt=reset_dt)
-    for c in combos:
-        key    = f"{c['strategy']}:{c['asset']}:{c['timeframe']}"
-        wr     = c["win_rate"]
-        total  = int(c["total"])
-        pnl    = c.get("total_pnl") or 0
-        exp_wr = 0.65 if c["strategy"] == "SNIPE" else 0.55
-        wins_n = int(wr * total)
-        pv     = binomial_cdf(wins_n, total, exp_wr)
-        cv     = cmults.get(key, 1.0)
+    # Combo-level self-correction. A profitable BTC/SOL strategy must not hide
+    # the same strategy losing on ETH, or vice versa.
+    combos = await asyncio.to_thread(
+        database.get_combo_stats, chat_id, days=30, after_dt=reset_dt
+    )
+    for combo in combos:
+        key = f"{combo['strategy']}:{combo['asset']}:{combo['timeframe']}"
+        wr = float(combo["win_rate"])
+        total = int(combo["total"])
+        pnl = float(combo.get("total_pnl") or 0.0)
+        deployed = float(combo.get("total_deployed") or 0.0)
+        roi = pnl / deployed if deployed > 0 else 0.0
+        exp_wr = (
+            capital_weighted_break_even([combo])
+            if combo["strategy"] in _BINARY_SETTLEMENT_STRATEGIES else 0.55
+        )
+        wins_n = int(round(wr * total))
+        pv = binomial_cdf(wins_n, total, exp_wr)
+        cv = cmults.get(key, 1.0)
+        size_mult = mults.get(key, 1.0)
 
         if total >= 10 and pv < 0.05 and pnl < 0:
             cv = max(0.85, cv - 0.15)
-            warnings.append(f"🔴 SELF-CORRECT: {key} penalised (-15%) — p={pv:.3f}")
-        elif total >= 10 and pv > 0.20 and wr >= exp_wr:  # raised from 5 — 10 trades min for boost
-            cv = min(1.5, cv + 0.20)
+        elif total >= 20 and pv > 0.20 and wr >= exp_wr and pnl > 0:
+            cv = min(1.20, cv + 0.05)
         cmults[key] = round(cv, 2)
+
+        # Repeated daily evidence can reduce a losing combination to 10% size.
+        # Mean reversion permits cautious recovery once old evidence expires.
+        previous_size_mult = size_mult
+        size_mult = adjusted_combo_size_multiplier(
+            size_mult, total=total, roi=roi,
+            win_rate=wr, break_even_rate=exp_wr,
+        )
+        if size_mult < previous_size_mult:
+            warnings.append(
+                f"🔴 SELF-CORRECT: {key} size reduced "
+                f"(ROI {roi:+.1%}, WR {wr:.1%}, BE {exp_wr:.1%})"
+            )
+        mults[key] = round(size_mult, 2)
 
     learned["size_multipliers"]     = mults
     learned["certainty_multipliers"] = cmults
     learned["trade_counts"]         = counts
 
-    # Pantry raid: if no trades in the past 24h, lower mode_floor by 0.03
-    # to allow more signals through during droughts. Checked via trade_counts total.
-    total_recent = sum(counts.values())
-    if total_recent == 0:
-        learned["pantry_raid_active"] = True
-        changes.append("🍞 Pantry raid active — lowering certainty floor (no trades in 24h)")
-    else:
-        learned["pantry_raid_active"] = False
+    # Never lower standards merely because no trade appeared. A drought is not
+    # evidence of alpha; the previous "pantry raid" introduced selection bias
+    # precisely when the model found no qualifying edge.
+    learned["pantry_raid_active"] = False
 
     s["learned"] = learned
     await asyncio.to_thread(database.update_settings, chat_id, s)
@@ -403,10 +522,17 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
         "📈 30-day breakdown:",
     ]
     for row in stats:
-        pnl = row.get("total_pnl") or 0
+        pnl = float(row.get("total_pnl") or 0.0)
+        deployed = float(row.get("total_deployed") or 0.0)
+        roi = pnl / deployed if deployed > 0 else 0.0
+        be_text = ""
+        if row["strategy"] in _BINARY_SETTLEMENT_STRATEGIES:
+            be = capital_weighted_break_even([row])
+            be_text = f" (BE {be:.0%})"
         lines.append(
             f"  {row['strategy']} {row['asset']} {row['timeframe']}: "
-            f"{row['total']} trades | {row['win_rate']:.0%} WR | ₦{pnl:,.0f}"
+            f"{row['total']} trades | {row['win_rate']:.0%} WR{be_text} | "
+            f"ROI {roi:+.1%} | ₦{pnl:,.0f}"
         )
     if changes:
         lines += ["", "⚙️ Changes:"] + [f"  {c}" for c in changes]
