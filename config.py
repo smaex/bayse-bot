@@ -103,14 +103,16 @@ ACTIVE_STRATEGIES = [
     "ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
 ]
 # Multi-leg strategies with non-atomic dual-order execution risk are quarantined
-# until exchange-confirmed paired fills validate them.
+# until exchange-confirmed paired fills validate them. ORACLE_ARB is a
+# single-leg final-seconds latency strategy and is permitted alongside the
+# other active single-leg strategies.
 EXPERIMENTAL_STRATEGIES = {
-    "ARB", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
+    "ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
 }
 # Default scope for new accounts (which start paused).
-DEFAULT_STRATEGIES = ["MAKER"]
-DEFAULT_ASSETS = ["BTC", "SOL"]
-DEFAULT_TIMEFRAMES = ["15min"]
+DEFAULT_STRATEGIES = ["SNIPE", "MAKER", "ORACLE_ARB", "FRONTRUN", "CORRELATE"]
+DEFAULT_ASSETS = ["BTC", "ETH", "SOL"]
+DEFAULT_TIMEFRAMES = ["15min", "5min"]
 ALLOW_EXPERIMENTAL_STRATEGIES = _env_bool("ALLOW_EXPERIMENTAL_STRATEGIES", False)
 PERMITTED_STRATEGIES = [
     name for name in ACTIVE_STRATEGIES

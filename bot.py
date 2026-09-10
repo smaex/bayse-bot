@@ -1132,6 +1132,20 @@ async def _evaluate_single_user_locked(user: dict, trigger_asset: str = None, pe
     user_assets = settings.get("assets",     config.ALL_ASSETS)
     raw_tfs     = settings.get("timeframes",  ["15min", "5min"])
     requested_strats = settings.get("strategies", config.DEFAULT_STRATEGIES)
+    # Non-custom modes follow the platform default scope: union the saved
+    # choices with the current defaults so existing database users
+    # automatically evaluate newly enabled strategies, assets, and
+    # timeframes. Custom mode keeps exact user control (no expansion).
+    if settings.get("mode", "balanced") != "custom":
+        requested_strats = list(dict.fromkeys(
+            [*requested_strats, *config.DEFAULT_STRATEGIES]
+        ))
+        user_assets = list(dict.fromkeys(
+            [*user_assets, *config.DEFAULT_ASSETS]
+        ))
+        raw_tfs = list(dict.fromkeys(
+            [*raw_tfs, *config.DEFAULT_TIMEFRAMES]
+        ))
     user_strats = [s for s in requested_strats if s in config.PERMITTED_STRATEGIES]
     blocked = sorted(set(requested_strats) - set(user_strats))
     if blocked:

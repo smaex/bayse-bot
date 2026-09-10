@@ -766,6 +766,7 @@ async def _execute_logic(
                         "timeframe":   sig.timeframe,
                         "threshold":   market.get("threshold") if market else getattr(sig, "threshold", None),
                         "closing_date": market.get("closing_date") if market else "",
+                        "placed_at":   time.time(),
                     })
                 except Exception as db_err:
                     log.error(f"[{chat_id}] MAKER DB record failed: {db_err}; cancelling untracked order")
@@ -928,6 +929,7 @@ async def _execute_logic(
         "timeframe":   sig.timeframe,
         "threshold":   market.get("threshold") if market else getattr(sig, "threshold", None),
         "closing_date": market.get("closing_date") if market else "",
+        "placed_at":   time.time(),
     })
     risk.current_free_cash -= actual_ngn
     _trade_cooldown[_cooldown_key(chat_id, sig.market_id)] = time.time()
@@ -1398,6 +1400,7 @@ async def execute_midmarket_maker(
                         "timeframe": sig.timeframe,
                         "threshold": market.get("threshold"),
                         "closing_date": market.get("closing_date", ""),
+                        "placed_at": time.time(),
                     })
                 except Exception as dbe:
                     log.error(f"[{chat_id}] DB record midmarket leg failed: {dbe}; cancelling {oid}")

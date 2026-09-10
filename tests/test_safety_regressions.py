@@ -108,8 +108,14 @@ def test_fresh_install_is_dry_run_and_experimental_strategies_are_blocked():
     if not config.ALLOW_EXPERIMENTAL_STRATEGIES:
         assert not (set(config.PERMITTED_STRATEGIES) & config.EXPERIMENTAL_STRATEGIES)
         assert "MAKER" in config.PERMITTED_STRATEGIES
+        # Single-leg ORACLE_ARB is promoted to permitted active strategies;
+        # only multi-leg / pair strategies remain quarantined.
+        assert "ORACLE_ARB" in config.PERMITTED_STRATEGIES
+        assert config.EXPERIMENTAL_STRATEGIES == {
+            "ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
+        }
         assert {
-            "ARB", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
+            "ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
         }.isdisjoint(config.PERMITTED_STRATEGIES)
 
 
