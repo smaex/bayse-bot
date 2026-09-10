@@ -1,6 +1,7 @@
 -- Read-only Bayse bot performance audit.
--- Run this in the Supabase/PostgreSQL SQL editor after replacing the value
--- below with your own Telegram chat ID. The result grids do not output it.
+-- Run this in the Supabase/PostgreSQL SQL editor after replacing ALL THREE
+-- occurrences of REPLACE_WITH_YOUR_TELEGRAM_CHAT_ID with your own Telegram
+-- chat ID. The result grids do not output it.
 -- This query never reads or returns API credentials.
 
 -- 1) Data coverage: confirms what assets/strategies actually traded.
@@ -18,7 +19,17 @@ SELECT
     COUNT(*) FILTER (WHERE won IS NOT NULL) AS resolved_trades,
     COUNT(*) FILTER (WHERE resolved_at IS NULL) AS unresolved_trades,
     COUNT(*) FILTER (WHERE won IS NULL AND resolved_at IS NOT NULL) AS void_or_unfilled,
-    COUNT(*) FILTER (WHERE filled_quantity > 0) AS rows_with_confirmed_quantity,
+    -- Production databases created before the safety migration do not yet
+    -- have trades.filled_quantity. Report schema capability without directly
+    -- referencing that optional column, so this audit remains read-only and
+    -- compatible before and after deployment.
+    EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'trades'
+          AND column_name = 'filled_quantity'
+    ) AS has_filled_quantity_column,
     STRING_AGG(DISTINCT asset, ', ' ORDER BY asset) AS assets_seen,
     STRING_AGG(DISTINCT strategy, ', ' ORDER BY strategy) AS strategies_seen,
     STRING_AGG(DISTINCT timeframe, ', ' ORDER BY timeframe) AS timeframes_seen
