@@ -348,6 +348,15 @@ class MakerStrategy(BaseStrategy):
             return True
         return False
 
+    def is_stale(self, market_id: str, timeout_sec: float = 120.0) -> bool:
+        """True if order has been resting too long without fill or oracle moved."""
+        info = self.open_orders.get(market_id)
+        if not info:
+            return False
+        if time.time() - info.get("placed_at", 0) > timeout_sec:
+            return True
+        return self.should_requote(market_id)
+
 
 # Singleton used by executor.py and bot.py
 maker_strategy = MakerStrategy()
