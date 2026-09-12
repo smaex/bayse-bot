@@ -121,11 +121,22 @@ jobs:
           # final newline that pastes often drop — both would break the PEM.
           printf '%s\n' "$VPS_SSH_KEY" | tr -d '\r' > "$KEY"
           chmod 600 "$KEY"
-          SSH_OPTS=(-i "$KEY" -p "$PORT" -o StrictHostKeyChecking=accept-new
+          # -v: when SSH fails, the verbose handshake/auth log lines are what
+          # actually say why; they land in $LOG and in the annotations.
+          SSH_OPTS=(-v -i "$KEY" -p "$PORT" -o StrictHostKeyChecking=accept-new
                     -o ConnectTimeout=20 -o ServerAliveInterval=15 -o BatchMode=yes)
 
           diagnose() {  # $1 = summary line; goes to annotations AND Telegram
             echo "::error::$1"
+            if [ -f "$LOG" ]; then
+              # The last ssh -v lines name the failure ("Permission denied",
+              # "invalid format", "kex_exchange_identification", …). Emit them
+              # as annotations so they are readable without downloading logs.
+              grep -E "Permission denied|publickey|invalid format|kex_exchange|Host key|Connection (reset|closed)|banner|authentications that can continue|debug1: (Authenticating|Connecting|SSH2_MSG)" "$LOG" \
+                | tail -15 | while IFS= read -r line; do
+                  echo "::error::ssh: $line"
+                done
+            fi
             {
               echo 'ssh_diag<<BAYSE_DIAG_EOF'
               echo "$1"
