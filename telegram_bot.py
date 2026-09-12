@@ -912,11 +912,15 @@ async def _set_paused(cid: str, paused: bool):
         risk = _user_risks.get(cid)
         if risk is not None:
             risk.paused = bool(paused)
-        import stall
+        try:
+            import stall
 
-        stall.note_state(cid, paused=bool(paused),
-                         paused_reason="manual" if paused else "",
-                         manual_pause=True if paused else None)
+            stall.note_state(cid, paused=bool(paused),
+                             paused_reason="manual" if paused else "",
+                             manual_pause=True if paused else None)
+        except Exception as telemetry_err:
+            # The pause switch must work even if diagnostics cannot.
+            log.warning(f"[{cid}] pause-state telemetry failed: {telemetry_err}")
         await asyncio.to_thread(database.update_settings, cid, s)
         await asyncio.to_thread(database.invalidate_user_cache, cid)
         # Also bust bot.py's own user cache so _evaluate_single_user
