@@ -197,3 +197,40 @@ error visible in the run log, linked from the Telegram failure notice. Until a d
 succeeds, the single fastest recovery is on the VPS itself:
 `sudo systemctl status bayse-bot` → if stopped, `sudo systemctl restart bayse-bot`,
 then `/why` in Telegram.
+
+### Third pass — the pipeline is now self-diagnosing; the remaining blocker is the host
+
+PR #5–#8 removed every black box from the deploy path (no `files:` input, no
+ssh-action wrapper: native `ssh` with staged DNS → TCP → SSH pre-flight, `ssh -v`,
+unfiltered log tails as run annotations and in the Telegram failure notice). The
+verdicts from the resulting runs:
+
+* **secrets exist** — the config pre-check passes (`VPS_HOST/USER/SSH_KEY` set);
+* **DNS resolves** and **TCP connects** to the host:port — a machine is there;
+* that machine answers the SSH banner as `OpenSSH_8.9p1 Ubuntu-3ubuntu0.17` (Ubuntu
+  22.04), completes the full key exchange, presents an ED25519 host key that is
+  **unknown** to a fresh runner, and then **drops the session silently between NEWKEYS
+  and authentication** — exit 255 with no `Permission denied`, no protocol error,
+  at a slightly different point each attempt.
+
+A host that completes the handshake and then kills the session before userauth is not
+"wrong credentials" (that prints `Permission denied`). The consistent explanation is
+that **the address behind `VPS_HOST` is no longer the bot's server**: the VPS was
+terminated or reprovisioned and its old address now belongs to someone else (or a
+honeypot), or a middlebox/firewall is killing encrypted sessions after handshake.
+Note the deploy pipeline was *already* failing identically in early August while the
+bot kept trading — deploys never mattered until the stall fixes needed them, so SSH
+failure alone does not date the outage.
+
+Operator checks, in order:
+
+1. Open the **VPS provider's console/dashboard**: does the server still exist and is
+   it running? Does its current IP/hostname match the `VPS_HOST` secret?
+2. From your own machine: `ssh -p <port> <user>@<host>`. If this also dies after the
+   banner, the server/address is the problem (provider ticket / reprovision via
+   `deploy_vps.sh`). If it connects fine, the GitHub Actions secrets are stale —
+   re-set `VPS_HOST/VPS_USER/VPS_SSH_KEY/VPS_PORT` and re-run Actions.
+3. Once on the box: `sudo systemctl status bayse-bot`; if stopped,
+   `sudo systemctl restart bayse-bot`; then `/why` in Telegram. Note that positions
+   opened since the outage have already resolved on-exchange (15-minute binaries);
+   nothing accumulates, but exit management was absent while the bot was down.
