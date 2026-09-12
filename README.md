@@ -15,6 +15,7 @@ The production path is intentionally narrow:
 - Single-leg CLOB MAKER is permitted and remains subject to per-asset performance controls. SNIPE is available only in the conservative SOL/15-minute scope by default; broaden it only during paper validation. ARB, paired-sniper, oracle-arb, and dual-leg midmarket-maker remain experimental and are blocked unless the operator explicitly sets `ALLOW_EXPERIMENTAL_STRATEGIES=true`.
 - A read-only complete-set monitor looks for fee-adjusted BUY→BURN and MINT→SELL CLOB discrepancies. It never submits orders because Bayse batches are best-effort rather than atomic.
 - Telegram polling, feed tasks, scanning, and user loops are supervised. `/live` reports process liveness; `/ready` reports whether startup and the singleton lease are healthy.
+- A trading drought is a reported condition, not a mystery. Per-gate rejection counters plus a prioritised verdict (`/why`) distinguish "no candidate cleared its edge and risk gates" from "the account is paused", "feeds are stale", "no markets were discovered", and "LIVE_TRADING=false means we never send orders". Day-scoped safety stops (`daily_loss_limit`, `daily_target`, `drawdown`) expire at the configured trading-day boundary; a manual `/pause` never expires by itself.
 - One database-backed owner lease prevents two deployments from trading the same users at once.
 
 These are ceilings, not profit targets. Start smaller, review exchange fills and realized net PnL, and promote strategies only after enough out-of-sample evidence.
@@ -70,6 +71,7 @@ Users connect their own Bayse API keys through `/start`. Keys are encrypted befo
 | `/resume` | Allow new entries |
 | `/rekey` | Replace Bayse API credentials |
 | `/debug` | Show feed, strategy, and risk diagnostics |
+| `/why` | The specific reason nothing has traded, with the gate counters behind it |
 | `/shadow` | Show the legacy two-sided price-touch paper study |
 | `/arbshadow` | Show read-only complete-set CLOB opportunity observations |
 
@@ -97,7 +99,25 @@ Additional safeguards include bounded HTTP/WebSocket waits, conservative retries
 - `GET /dashboard`: static dashboard.
 - `GET /api/stats`: requires `Authorization: Bearer <DASHBOARD_PASSWORD>`.
 
-Point the deployment platform's liveness probe at `/live` and readiness probe at `/ready`. A process can be alive while Telegram or trading tasks are dead, so these signals are intentionally separate.
+Point the deployment platform's liveness probe at `/live` and readiness probe at `/ready`. A process can be alive while Telegram or trading tasks are dead, so these signals are intentionally separate. `/api/stats` additionally carries a per-account stall report and the current `live_trading` flag.
+
+### When the bot goes quiet
+
+Run `/why` first. Then, in order: is the process up (`/ready`), is `LIVE_TRADING` what you
+think it is, can the account's equity cover the platform minimum order inside the per-trade
+risk ceiling, and are the feeds fresh. Absence of a qualifying edge is a normal outcome for
+these gates and is reported as such — it is not an invitation to lower a gate.
+`reports/trading_stall_runbook.md` is the full procedure.
+
+### Deploys
+
+`Deploy to VPS` runs the suite and an import/config sanity check first, then executes
+`scripts/zero_downtime_deploy.sh` on the host. That script's invariant is that it never
+exits with the service stopped: it verifies `/live` and `/ready` and, on any failure, rolls
+the checkout back to the previously running commit and restarts before reporting the
+failure. `Bot watchdog` re-checks `/ready` every 15 minutes, restarts an unresponsive unit,
+and alerts only when something was actually wrong. Neither workflow places, cancels, or
+modifies orders.
 
 ## Architecture
 

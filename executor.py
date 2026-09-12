@@ -13,6 +13,7 @@ import config
 import database
 import feeds
 import scanner
+import stall
 import telegram_bot
 import strategy
 from config import ARB_MAX_SIZE_NGN, CURRENCY, MIN_PAYOUT_RATIO, FEE_FLOOR
@@ -34,6 +35,21 @@ def _cooldown_key(chat_id: str, market_id: str) -> tuple[str, str]:
     # A market-wide key caused user A's order to silence every other user for
     # 60 seconds in this multi-user service.
     return str(chat_id), market_id
+
+
+def _stall_skip(chat_id: str, sig, code: str, detail: str = "") -> None:
+    """Record why an otherwise-valid signal never became an order.
+
+    Telemetry only — the decision to skip stays exactly as the risk logic made
+    it. This exists because a dry-run flag, a balance too small for the platform
+    minimum, and a genuinely edge-free market all looked the same from outside.
+    """
+    try:
+        stall.note_order(chat_id, getattr(sig, "strategy", "?"), placed=False, reason=code)
+        stall.reject(chat_id, "exec", code, detail)
+    except Exception:
+        pass
+
 
 # MAKER singleton — needed to track open limit orders for requoting.
 # Imported lazily to avoid circular imports.
@@ -197,17 +213,23 @@ async def execute_trade(chat_id: str, sig, client, risk, settings: dict,
                         equity: float, free_cash: float):
     if not config.LIVE_TRADING:
         log.info(f"[{chat_id}] DRY RUN {sig.strategy} {sig.asset} — LIVE_TRADING=false")
+        stall.note_state(chat_id, dry_run=True)
+        _stall_skip(chat_id, sig, "dry_run_live_trading_false",
+                    "signal was valid; LIVE_TRADING=false means no order is ever sent")
         return
     if strategy.global_state.systemic_halt_until > time.time():
+        _stall_skip(chat_id, sig, "systemic_halt")
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — systemic halt active")
         return
     is_hedge = "PAIR_HEDGE" in getattr(sig, "reason", "")
     if risk.already_in(sig.market_id, asset=sig.asset, is_hedge=is_hedge):
+        _stall_skip(chat_id, sig, "already_in_or_pending")
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — already in/pending on {sig.market_id}")
         return
     last = _trade_cooldown.get(_cooldown_key(chat_id, sig.market_id), 0.0)
     remaining = TRADE_COOLDOWN_SEC - (time.time() - last)
     if remaining > 0:
+        _stall_skip(chat_id, sig, "market_cooldown", f"{remaining:.0f}s left")
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — cooldown {remaining:.0f}s left on {sig.market_id}")
         return
 
@@ -249,6 +271,8 @@ async def _execute_logic(
     }.get(mode, 0.01)
 
     if risk.is_in_strict_mode() and sig.certainty < 0.40:
+        _stall_skip(chat_id, sig, "strict_mode_near_daily_target",
+                    f"certainty {sig.certainty:.0%} < 40%")
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — strict mode (near daily target), certainty {sig.certainty:.0%} < 40%")
         return
 
@@ -303,6 +327,9 @@ async def _execute_logic(
 
     if hard_cap < effective_min:
         min_equity = effective_min / allowed_pct if allowed_pct > 0 else float("inf")
+        _stall_skip(chat_id, sig, "risk_budget_below_platform_minimum",
+                    f"min ₦{effective_min:,.0f} > budget ₦{hard_cap:,.0f}; "
+                    f"needs ≈ ₦{min_equity:,.0f} equity at {allowed_pct:.1%} risk")
         log.info(
             f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — platform/user minimum "
             f"₦{effective_min:,.0f} exceeds the {allowed_pct:.1%} risk budget "
@@ -312,6 +339,8 @@ async def _execute_logic(
 
     amount = min(equity * final_pct, hard_cap)
     if amount < effective_min:
+        _stall_skip(chat_id, sig, "size_below_market_minimum",
+                    f"₦{amount:,.0f} < ₦{effective_min:,.0f}")
         log.info(
             f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — Kelly amount "
             f"₦{amount:,.0f} is below minimum ₦{effective_min:,.0f}"
@@ -361,6 +390,8 @@ async def _execute_logic(
         if is_probe:
             # Live-money exploration turns uncertainty into losses. Shadow
             # tracking can collect calibration data without placing an order.
+            _stall_skip(chat_id, sig, "below_mode_floor",
+                        f"{sig.certainty:.1%} < {sig.mode_floor:.1%}")
             log.info(
                 f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — certainty "
                 f"{sig.certainty:.1%} below mode floor {sig.mode_floor:.1%}"
@@ -378,9 +409,11 @@ async def _execute_logic(
                 q_price = float(quote.get("price") or sig.market_price)
                 q_qty = float(quote.get("quantity") or 0)
                 if quote.get("completeFill") is not True or q_qty <= 0:
+                    _stall_skip(chat_id, sig, "quote_not_complete_fill")
                     log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — quote does not confirm a complete fill")
                     return
                 if quote.get("tradeGoesOverMaxLiability") is True:
+                    _stall_skip(chat_id, sig, "quote_over_max_liability")
                     log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — quote exceeds market liability")
                     return
 
@@ -443,11 +476,13 @@ async def _execute_logic(
                             log.debug(f"Sizing down quote failed for size ₦{scaled_amount}: {q_err}")
 
                     if not scaled_success:
+                        _stall_skip(chat_id, sig, "no_profitable_size", f"EV {ev:.2%}")
                         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — no profitable size (quoted_price={quote_price:.3f} EV={ev:.2%})")
                         return
             except Exception as e:
                 # A stale displayed price is not an executable price. Trading
                 # through a quote outage converts unknown slippage into risk.
+                _stall_skip(chat_id, sig, "quote_request_failed", str(e)[:120])
                 log.warning(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — executable quote failed: {e}")
                 return
         else:
@@ -462,6 +497,7 @@ async def _execute_logic(
             )
             ev = sig.win_prob / effective_worst_p - 1.0
             if not is_probe and ev < target_margin:
+                _stall_skip(chat_id, sig, "worst_case_ev_below_margin", f"{ev:+.1%} < {target_margin:.0%}")
                 log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — worst-case EV {ev:+.1%} < {target_margin:.0%} (worst_price={worst_case_p:.3f})")
                 return
 
@@ -472,6 +508,7 @@ async def _execute_logic(
         # Hard cap at 0.75 — SNIPE_MAX_MARKET_PRICE is now 0.65, so this is a
         # final backstop that catches any unexpected rounding or overrides.
         if quote_price > 0.75:
+            _stall_skip(chat_id, sig, "price_above_ev_ceiling", f"{quote_price:.3f} > 0.75")
             log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — price {quote_price:.3f} > 0.75 ceiling (fee drag kills EV above 0.75)")
             return
 
@@ -557,6 +594,7 @@ async def _execute_logic(
 
     if is_maker:
         if engine != "CLOB":
+            _stall_skip(chat_id, sig, "maker_requires_clob_engine", f"engine={engine}")
             log.info(f"[{chat_id}] SKIP MAKER {sig.asset} — passive orders require CLOB")
             return
         time_in_force = "GTC"
@@ -726,6 +764,8 @@ async def _execute_logic(
                     f"[{chat_id}] MAKER LIMIT PLACED | {sig.asset} {sig.outcome} "
                     f"@ {limit_price:.3f} ₦{amount:,.0f} | order={order_id} | rtt={rtt_ms:.0f}ms"
                 )
+                stall.note_order(chat_id, sig.strategy, placed=True, reason="clob_limit_resting")
+                stall.note_trade(chat_id, market_id=sig.market_id)
                 if _tg_app:
                     try:
                         await telegram_bot.notify_trade(
@@ -850,6 +890,7 @@ async def _execute_logic(
 
     except Exception as e:
         err = str(e)
+        _stall_skip(chat_id, sig, "order_rejected_by_exchange", err[:150])
         m = re.search(r'Minimum buy amount is [A-Z]+ ([\d,]+(?:\.\d+)?)', err)
         if m:
             market_min = float(m.group(1).replace(",", ""))

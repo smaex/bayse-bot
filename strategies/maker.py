@@ -35,7 +35,7 @@ from typing import Optional
 import feeds_direct
 import feeds
 from strategies.base import TradeSignal, BaseStrategy
-from strategies.utils import gbm_win_probability, realized_vol_hourly
+from strategies.utils import gbm_win_probability, note_reject, realized_vol_hourly
 
 log = logging.getLogger("strat.maker")
 
@@ -158,16 +158,19 @@ class MakerStrategy(BaseStrategy):
         # Passive maker orders only exist on a CLOB. Sending LIMIT/GTC to an
         # AMM is invalid and was a major source of repeated zero execution.
         if str(engine).upper() != "CLOB":
+            note_reject(learned, "MAKER", "engine_not_clob", str(engine))
             return None
 
         # Time window guard.
         # Don't make-market in the final 45s of a candle (settlement risk)
         if secs_to_close < MIN_SECS_TO_CLOSE:
+            note_reject(learned, "MAKER", "too_close_to_settle", f"secs={secs_to_close:.0f}")
             return None
 
         # Volatility guard: don't make-market in very volatile conditions.
         rvol = self._realized_vol(asset)
         if rvol > HIGH_VOL_THRESHOLD:
+            note_reject(learned, "MAKER", "high_realized_volatility", f"{rvol:.4f}")
             log.info(f"MAKER SKIP {asset} — high vol {rvol:.4f}")
             return None
 
@@ -177,6 +180,7 @@ class MakerStrategy(BaseStrategy):
             spot = feeds.spot.get(asset, 0.0)
         threshold = market.get("threshold", 0.0)
         if not spot or not threshold:
+            note_reject(learned, "MAKER", "missing_spot_or_threshold")
             return None
 
         dist_pct = (spot - threshold) / threshold
@@ -185,12 +189,14 @@ class MakerStrategy(BaseStrategy):
         # - Don't quote in the first 4.0 minutes (secs > 660): trend hasn't settled yet.
         # - Don't open new maker limit bids in the final 3 minutes (secs < 180): settlement risk.
         if secs_to_close > 660:
+            note_reject(learned, "MAKER", "candle_warmup_window", f"secs={secs_to_close:.0f}")
             log.info(
                 f"MAKER SKIP {asset} — candle warm-up window "
                 f"(secs={secs_to_close:.0f} > 660, waiting for trend formation)"
             )
             return None
         if secs_to_close < 180:
+            note_reject(learned, "MAKER", "late_candle_window", f"secs={secs_to_close:.0f}")
             log.info(
                 f"MAKER SKIP {asset} — late-candle window "
                 f"(secs={secs_to_close:.0f} < 180, risk of settlement volatility)"
@@ -200,6 +206,7 @@ class MakerStrategy(BaseStrategy):
         # Calculate Drift-Aware Fair Value
         fv_yes = self._fair_value(asset, market, state=state)
         if fv_yes is None:
+            note_reject(learned, "MAKER", "fair_value_unavailable")
             return None
         fv_no = 1.0 - fv_yes
 
@@ -232,6 +239,8 @@ class MakerStrategy(BaseStrategy):
         eth_edge_cushion = 0.020 if asset == "ETH" else 0.0
 
         if abs(dist_pct) < min_dist_req:
+            note_reject(learned, "MAKER", "distance_below_calibration",
+                        f"{abs(dist_pct):.4%} < {min_dist_req:.4%}")
             log.info(
                 f"MAKER SKIP {asset} — below calibrated distance threshold "
                 f"(dist={dist_pct:+.4%} < {min_dist_req:+.4%})"
@@ -259,6 +268,8 @@ class MakerStrategy(BaseStrategy):
             market_bid  = no_bid_price
             outcome_id  = market.get("no_id", "")
         else:
+            note_reject(learned, "MAKER", "no_trend_or_edge_alignment",
+                        f"edge_yes={edge_yes:+.3f} edge_no={edge_no:+.3f}")
             log.info(
                 f"MAKER SKIP {asset} — trend/edge guard "
                 f"(fv_yes={fv_yes:.3f}, fv_no={fv_no:.3f}, edge_yes={edge_yes:+.3f}, "
@@ -282,6 +293,7 @@ class MakerStrategy(BaseStrategy):
         # Data-driven certainty calibration: combines true statistical win probability and spread edge
         cert = min(0.95, max(target_fv, 0.50 + chosen_edge * 3.5))
         if cert < 0.65:
+            note_reject(learned, "MAKER", "certainty_below_floor", f"{cert:.1%} < 65%")
             log.info(f"MAKER SKIP {asset} — certainty {cert:.1%} below 65% conviction floor")
             return None
 
