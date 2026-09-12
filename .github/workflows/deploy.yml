@@ -98,34 +98,74 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Deploy script encoded: $(wc -c < scripts/zero_downtime_deploy.sh) bytes"
 
+      # Native ssh instead of appleboy/ssh-action: every historical failure of
+      # this pipeline died inside that action's black box, and its error text
+      # is only reachable through run logs. With plain ssh we control the
+      # flags, pre-flight each layer (DNS → TCP → SSH), and surface the exact
+      # failure in both the run annotations and the Telegram notice.
       - name: Deploy & restart bot
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host:     ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          port:     ${{ secrets.VPS_PORT || '22' }}
-          timeout:  30
-          # The script's recovery path (rollback + restart + health probes) can
-          # legitimately take a couple of minutes; ssh-action's 60s default
-          # would kill the SSH session mid-recovery.
-          command_timeout: 600
-          script_stop: false
-          script: |
-            set -u
-            cat > "$HOME/.bayse_deploy.b64" <<'BAYSE_DEPLOY_B64_EOF'
-            ${{ steps.prep.outputs.b64 }}
-            BAYSE_DEPLOY_B64_EOF
-            if ! base64 -d "$HOME/.bayse_deploy.b64" > "$HOME/zero_downtime_deploy.sh"; then
-              echo "ERROR: could not decode the deploy script on the host"
-              exit 1
-            fi
-            rm -f "$HOME/.bayse_deploy.b64"
-            export BRANCH="${{ github.ref_name }}"
-            bash "$HOME/zero_downtime_deploy.sh"
-            rc=$?
-            echo "zero_downtime_deploy.sh finished with exit code $rc"
-            exit $rc
+        id: ssh_deploy
+        timeout-minutes: 15
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+          DEPLOY_SCRIPT_B64: ${{ steps.prep.outputs.b64 }}
+        run: |
+          PORT="${VPS_PORT:-22}"
+          KEY="$RUNNER_TEMP/bayse_deploy_key"
+          LOG="$RUNNER_TEMP/ssh_deploy.log"
+          umask 077
+          # tr -d '\r' forgives a key pasted on Windows; printf appends the
+          # final newline that pastes often drop — both would break the PEM.
+          printf '%s\n' "$VPS_SSH_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          SSH_OPTS=(-i "$KEY" -p "$PORT" -o StrictHostKeyChecking=accept-new
+                    -o ConnectTimeout=20 -o ServerAliveInterval=15 -o BatchMode=yes)
+
+          diagnose() {  # $1 = summary line; goes to annotations AND Telegram
+            echo "::error::$1"
+            {
+              echo 'ssh_diag<<BAYSE_DIAG_EOF'
+              echo "$1"
+              if [ -f "$LOG" ]; then echo "---- last output ----"; tail -30 "$LOG"; fi
+              echo 'BAYSE_DIAG_EOF'
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          echo "── pre-flight: DNS for $VPS_HOST ──"
+          if ! getent hosts "$VPS_HOST"; then
+            diagnose "VPS_HOST '$VPS_HOST' does not resolve (DNS). Check the secret's value (Settings → Secrets → VPS_HOST)."
+            exit 1
+          fi
+
+          echo "── pre-flight: TCP $VPS_HOST:$PORT ──"
+          if ! timeout 15 bash -c "exec 3<>/dev/tcp/$VPS_HOST/$PORT" 2>/dev/null; then
+            diagnose "TCP connect to $VPS_HOST:$PORT failed — VPS down, wrong port, or its firewall rejecting GitHub runners. Verify: ssh -p $PORT $VPS_USER@$VPS_HOST from another machine."
+            exit 1
+          fi
+          echo "TCP connect OK."
+
+          echo "── deploying over SSH ──"
+          set +e
+          {
+            echo "cat > \"\$HOME/.bayse_deploy.b64\" <<'BAYSE_DEPLOY_B64_EOF'"
+            echo "$DEPLOY_SCRIPT_B64"
+            echo "BAYSE_DEPLOY_B64_EOF"
+            echo 'if ! base64 -d "$HOME/.bayse_deploy.b64" > "$HOME/zero_downtime_deploy.sh"; then'
+            echo '  echo "ERROR: could not decode the deploy script on the host"; exit 1; fi'
+            echo 'rm -f "$HOME/.bayse_deploy.b64"'
+            echo "export BRANCH=\"${{ github.ref_name }}\""
+            echo 'bash "$HOME/zero_downtime_deploy.sh"'
+            echo 'rc=$?; echo "zero_downtime_deploy.sh finished with exit code $rc"; exit $rc'
+          } | ssh "${SSH_OPTS[@]}" "$VPS_USER@$VPS_HOST" 'bash -s' 2>&1 | tee "$LOG"
+          rc=${PIPESTATUS[1]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            diagnose "SSH deploy failed (exit $rc). If the error mentions authentication, the VPS_SSH_KEY/VPS_USER secrets do not match the host; if it mentions host key verification, the VPS was reinstalled (remove the old known_hosts entry)."
+            exit "$rc"
+          fi
 
       - name: Notify Telegram on success
         if: success()
@@ -149,9 +189,10 @@ jobs:
           message: |
             ❌ *Bayse Bot deploy FAILED*
             Branch: `${{ github.ref_name }}`
-            Commit: `${{ github.event.head_commit.message }}`
 
-            The deploy script rolls back and restarts the previous commit before
-            reporting failure. Check the bot is running anyway:
+            ${{ steps.ssh_deploy.outputs.ssh_diag || 'The failure happened before the SSH step.' }}
+
+            If the deploy script reached the host, it rolls back and restarts the
+            previous commit before reporting failure. Check the bot anyway:
             `ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} sudo systemctl status bayse-bot`
-            Exact failure: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Full log: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

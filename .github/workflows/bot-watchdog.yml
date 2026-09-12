@@ -55,61 +55,70 @@ jobs:
           fi
           echo "✅ /live answered; /ready: ${ready:-<no response>}"
 
+      # Native ssh (same reasoning as deploy.yml): no action black box between
+      # the probe and the host, and a failure here is visible in annotations.
       - name: Verify the service is running (SSH)
         if: ${{ env.VPS_HOST != '' }}
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host:     ${{ secrets.VPS_HOST }}
-          username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          port:     ${{ secrets.VPS_PORT || '22' }}
-          timeout:  30
-          # The restart-and-reprobe loop below can take ~2.5 minutes; the
-          # 60s default would abort the recovery before it can finish.
-          command_timeout: 300
-          script_stop: false
-          script: |
-            # POSIX-safe flags only: this snippet runs under the remote
-            # user's login shell, which is not guaranteed to be bash
-            # (`pipefail` would abort a dash shell instantly).
-            set -u
-            SERVICE="${SERVICE:-bayse-bot}"
-            PORT="${PORT:-8080}"
-            READY_URL="http://127.0.0.1:${PORT}/ready"
-            LIVE_URL="http://127.0.0.1:${PORT}/live"
+        timeout-minutes: 10
+        env:
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_PORT: ${{ secrets.VPS_PORT }}
+        run: |
+          PORT_SSH="${VPS_PORT:-22}"
+          KEY="$RUNNER_TEMP/bayse_watchdog_key"
+          umask 077
+          printf '%s\n' "$VPS_SSH_KEY" | tr -d '\r' > "$KEY"
+          chmod 600 "$KEY"
+          set +e
+          ssh -i "$KEY" -p "$PORT_SSH" -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=20 -o BatchMode=yes \
+              "$VPS_USER@$VPS_HOST" 'bash -s' <<'WATCHDOG_EOF'
+          set -u
+          SERVICE="bayse-bot"
+          PORT="8080"
+          READY_URL="http://127.0.0.1:${PORT}/ready"
+          LIVE_URL="http://127.0.0.1:${PORT}/live"
 
-            sc() {
-              # Prefer the verbs the deploy user's sudoers allows (restart,
-              # status, is-active); fall back to a plain call when running as root.
-              if [ "$(id -u)" = "0" ]; then systemctl "$@"
-              else sudo -n systemctl "$@" 2>/dev/null || systemctl "$@"; fi
-            }
-            state="$(sc is-active "$SERVICE" 2>/dev/null || echo unknown)"
-            live="$(curl -fsS --max-time 8 "$LIVE_URL" 2>/dev/null || echo '')"
+          sc() {
+            # Prefer the verbs the deploy user's sudoers allows (restart,
+            # status, is-active); fall back to a plain call when running as root.
+            if [ "$(id -u)" = "0" ]; then systemctl "$@"
+            else sudo -n systemctl "$@" 2>/dev/null || systemctl "$@"; fi
+          }
+          state="$(sc is-active "$SERVICE" 2>/dev/null || echo unknown)"
+          live="$(curl -fsS --max-time 8 "$LIVE_URL" 2>/dev/null || echo '')"
+          ready="$(curl -fsS --max-time 8 "$READY_URL" 2>/dev/null || echo '')"
+          echo "unit=$state live=${live:-none} ready=${ready:-none}"
+
+          if [ -n "$ready" ]; then
+            echo "✅ healthy: $ready"
+            exit 0
+          fi
+
+          echo "/ready unavailable (unit=$state) — restarting $SERVICE"
+          # Recent failures matter more than uptime: show them before the fix.
+          journalctl -u "$SERVICE" -n 25 --no-pager 2>/dev/null | tail -25 \
+            || sudo -n journalctl -u "$SERVICE" -n 25 --no-pager 2>/dev/null | tail -25 || true
+          sc restart "$SERVICE" >/dev/null 2>&1 || sc start "$SERVICE" >/dev/null 2>&1 || true
+
+          for i in $(seq 1 20); do
+            sleep 6
             ready="$(curl -fsS --max-time 8 "$READY_URL" 2>/dev/null || echo '')"
-            echo "unit=$state live=${live:-none} ready=${ready:-none}"
-
             if [ -n "$ready" ]; then
-              echo "✅ healthy: $ready"
+              echo "✅ recovered after restart: $ready"
               exit 0
             fi
-
-            echo "::warning::/ready unavailable (unit=$state) — restarting $SERVICE"
-            # Recent failures matter more than uptime: show them before the fix.
-            journalctl -u "$SERVICE" -n 25 --no-pager 2>/dev/null | tail -25 \
-              || sudo -n journalctl -u "$SERVICE" -n 25 --no-pager 2>/dev/null | tail -25 || true
-            sc restart "$SERVICE" >/dev/null 2>&1 || sc start "$SERVICE" >/dev/null 2>&1 || true
-
-            for i in $(seq 1 20); do
-              sleep 6
-              ready="$(curl -fsS --max-time 8 "$READY_URL" 2>/dev/null || echo '')"
-              if [ -n "$ready" ]; then
-                echo "✅ recovered after restart: $ready"
-                exit 0
-              fi
-            done
-            echo "::error::service still not ready after restart"
-            exit 1
+          done
+          echo "service still not ready after restart"
+          exit 1
+          WATCHDOG_EOF
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Watchdog SSH probe/recovery failed (exit $rc) — host unreachable, SSH key mismatch, or service will not start."
+            exit "$rc"
+          fi
 
       - name: Alert on failure
         if: ${{ failure() && env.NOTIFY_CHAT != '' }}
