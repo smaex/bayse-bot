@@ -1338,10 +1338,14 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
             is_crypto = asset in {"BTC", "ETH", "SOL"}
 
             if is_crypto and config.REQUIRE_DIRECT_ORACLE:
-                if not direct_price or now - direct_time > config.FEED_STALE_SEC:
+                if direct_price and (now - direct_time <= config.FEED_STALE_SEC):
+                    spot_price = direct_price
+                elif relay_price and (now - relay_time <= config.FEED_STALE_SEC):
+                    # Graceful fallback: direct oracle has temporary lag, fall back to Bayse relay price
+                    spot_price = relay_price
+                else:
                     skipped_stale_feed += 1
                     continue
-                spot_price = direct_price
             else:
                 spot_price = relay_price
                 if not spot_price or now - relay_time > config.FEED_STALE_SEC:
