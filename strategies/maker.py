@@ -185,22 +185,14 @@ class MakerStrategy(BaseStrategy):
 
         dist_pct = (spot - threshold) / threshold
 
-        # ── Quoting Window Guard (Minutes 4.0 to 12.0 of a 15-min candle) ─────────
-        # - Don't quote in the first 4.0 minutes (secs > 660): trend hasn't settled yet.
-        # - Don't open new maker limit bids in the final 3 minutes (secs < 180): settlement risk.
-        if secs_to_close > 660:
+        # ── Quoting Window Guard (Minutes 2.5 to 13.5 of a 15-min candle) ─────────
+        # - Don't quote in the first 2.5 minutes (secs > 750): wait for initial direction.
+        # - Don't open new maker limit bids in the final 90 seconds (secs < 90): settlement risk.
+        if secs_to_close > 750:
             note_reject(learned, "MAKER", "candle_warmup_window", f"secs={secs_to_close:.0f}")
-            log.info(
-                f"MAKER SKIP {asset} — candle warm-up window "
-                f"(secs={secs_to_close:.0f} > 660, waiting for trend formation)"
-            )
             return None
-        if secs_to_close < 180:
+        if secs_to_close < 90:
             note_reject(learned, "MAKER", "late_candle_window", f"secs={secs_to_close:.0f}")
-            log.info(
-                f"MAKER SKIP {asset} — late-candle window "
-                f"(secs={secs_to_close:.0f} < 180, risk of settlement volatility)"
-            )
             return None
 
         # Calculate Drift-Aware Fair Value
