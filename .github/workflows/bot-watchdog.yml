@@ -62,10 +62,17 @@ jobs:
           host:     ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key:      ${{ secrets.VPS_SSH_KEY }}
-          port:     ${{ secrets.VPS_PORT }}
+          port:     ${{ secrets.VPS_PORT || '22' }}
+          timeout:  30
+          # The restart-and-reprobe loop below can take ~2.5 minutes; the
+          # 60s default would abort the recovery before it can finish.
+          command_timeout: 300
           script_stop: false
           script: |
-            set -uo pipefail
+            # POSIX-safe flags only: this snippet runs under the remote
+            # user's login shell, which is not guaranteed to be bash
+            # (`pipefail` would abort a dash shell instantly).
+            set -u
             SERVICE="${SERVICE:-bayse-bot}"
             PORT="${PORT:-8080}"
             READY_URL="http://127.0.0.1:${PORT}/ready"
