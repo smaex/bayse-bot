@@ -126,7 +126,7 @@ CURRENCY_BASE_MULTIPLIER = 100.0 if CURRENCY == "NGN" else 1.0
 # ── Sniping ───────────────────────────────────────────────────────────────────
 SNIPE_ENTRY_WINDOWS = {
     "5min":  240,    # evaluate in final 4 minutes of 5min market
-    "15min": 450,    # evaluate in final 7.5 minutes of 15min market (not minute-0)
+    "15min": 660,    # evaluate in final 11 minutes of 15min market (gives trend 4 mins to form)
     "1h":    1800,   # evaluate in final 30 minutes of 1h market
     "6h":    7200,
     "1d":    21600,
@@ -202,7 +202,7 @@ MIN_TAKE_PROFIT_NET_GAIN  = 0.05   # Quote must lock at least 5% after costs.
 # Environment overrides are fractions: 0.10 means 10%.
 MAX_DRAWDOWN_STOP      = _env_float("MAX_DRAWDOWN_STOP", 0.10)
 MAX_PORTFOLIO_EXPOSURE = _env_float("MAX_PORTFOLIO_EXPOSURE", 0.15)
-MAX_TRADE_RISK         = _env_float("MAX_TRADE_RISK", 0.02)
+MAX_TRADE_RISK         = _env_float("MAX_TRADE_RISK", 0.05)
 DEFAULT_DAILY_LOSS_LIMIT_PCT = _env_float("DEFAULT_DAILY_LOSS_LIMIT_PCT", 3.0)
 MAX_DAILY_LOSS_LIMIT_PCT = _env_float("MAX_DAILY_LOSS_LIMIT_PCT", 5.0)
 TRADING_TIMEZONE = os.getenv("TRADING_TIMEZONE", "Africa/Lagos")
