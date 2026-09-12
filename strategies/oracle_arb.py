@@ -26,9 +26,7 @@ log = logging.getLogger("strat.oracle_arb")
 # ── Parameters ────────────────────────────────────────────────────────────────
 
 # Only activate in the final N seconds before market closing.
-# Two minutes leaves meaningful reversal risk; distance and probability gates
-# are necessary but do not guarantee the outcome.
-WINDOW_SECS = 120
+WINDOW_SECS = 180
 
 # Minimum certainty to fire. Certainty formula now returns 0.92-0.99.
 MIN_CERTAINTY = 0.90
