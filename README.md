@@ -111,6 +111,11 @@ these gates and is reported as such — it is not an invitation to lower a gate.
 
 ### Deploys
 
+Watchdog configuration (GitHub → Settings → Secrets and variables → Actions):
+`VPS_HOST`/`VPS_USER`/`VPS_SSH_KEY`/`VPS_PORT` secrets for a systemd host, and/or an
+`APP_URL` **variable** for a platform that exposes `/live` publicly. Missing
+configuration degrades to a warning rather than a failing run.
+
 `Deploy to VPS` runs the suite and an import/config sanity check first, then executes
 `scripts/zero_downtime_deploy.sh` on the host. That script's invariant is that it never
 exits with the service stopped: it verifies `/live` and `/ready` and, on any failure, rolls

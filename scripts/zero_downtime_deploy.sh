@@ -62,8 +62,23 @@ systemd_available() {
 service_active() { [ "$(sc is-active "$SERVICE" 2>/dev/null || true)" = "active" ]; }
 
 start_service() {
+    # `restart` is the verb the shipped sudoers rule already allows, and it is
+    # also the correct verb when the unit is still active (a plain start would
+    # be a no-op and the new code would never load). Falling back through it
+    # means a deploy from an unprivileged user still works without extra sudo
+    # grants — and a denied verb is reported instead of silently ignored.
     sc reset-failed "$SERVICE" >/dev/null 2>&1 || true
-    sc start "$SERVICE" 2>&1 | tail -3 || sc restart "$SERVICE" 2>&1 | tail -3
+    if [ "$(sc is-active "$SERVICE" 2>/dev/null || true)" = "active" ]; then
+        log "Unit is active; using restart to load the new code."
+        sc restart "$SERVICE" >/dev/null 2>&1 \
+            && return 0
+        log "WARN: 'systemctl restart $SERVICE' failed — the deploy user may lack a sudoers rule."
+        return 1
+    fi
+    sc start "$SERVICE" >/dev/null 2>&1 && return 0
+    sc restart "$SERVICE" >/dev/null 2>&1 && return 0
+    log "WARN: could not start $SERVICE with available privileges (need start or restart)."
+    return 1
 }
 
 probe() {  # probe URL [retries]
@@ -111,7 +126,7 @@ ensure_running() {
             || log "WARN: rollback reset failed"
         ROLLBACK_COMMIT="$PREV_COMMIT"
     fi
-    start_service
+    start_service || log "WARN: recovery start did not confirm; probing anyway."
     sleep 5
     if probe "$LIVE_URL" 10; then
         log "✅ Recovery complete — bot is live again${ROLLBACK_COMMIT:+ (running previous commit)}."
@@ -179,7 +194,10 @@ PY
 stop_service() {
     systemd_available || { log "No systemd unit; skipping stop."; return 0; }
     log "Stopping $SERVICE …"
-    sc stop "$SERVICE" >/dev/null 2>&1 || log "(stop returned non-zero; continuing)"
+    # A stop we are not allowed to perform must not abort the deploy: the unit
+    # ends up restarted below either way, and the invariant is "left running".
+    sc stop "$SERVICE" >/dev/null 2>&1 \
+        || log "(stop unavailable or not permitted; continuing — a restart will load the new code)"
     # Kill only *this* bot's processes — never a broad pattern that could take
     # out an unrelated script or abort the deploy when nothing matched.
     local victims

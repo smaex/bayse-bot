@@ -114,13 +114,21 @@ systemctl enable "$SERVICE_NAME"
 SUDOERS_FILE="/etc/sudoers.d/bayse-bot"
 if [ ! -f "$SUDOERS_FILE" ]; then
     echo "  → Adding sudoers rule for systemctl restart..."
-    echo "$BOT_USER ALL=(ALL) NOPASSWD: /bin/systemctl restart $SERVICE_NAME, /bin/systemctl status $SERVICE_NAME, /bin/systemctl is-active $SERVICE_NAME" > "$SUDOERS_FILE"
+    # The verbs used by scripts/zero_downtime_deploy.sh and the watchdog
+    # workflow. Deliberately limited to service control for THIS unit: no
+    # arbitrary commands, no shell, nothing that can place or cancel an order.
+    echo "$BOT_USER ALL=(ALL) NOPASSWD: /bin/systemctl restart $SERVICE_NAME, /bin/systemctl start $SERVICE_NAME, /bin/systemctl stop $SERVICE_NAME, /bin/systemctl status $SERVICE_NAME, /bin/systemctl is-active $SERVICE_NAME, /usr/bin/systemctl reset-failed $SERVICE_NAME, /bin/journalctl -u $SERVICE_NAME *" > "$SUDOERS_FILE"
     chmod 440 "$SUDOERS_FILE"
     echo "  ✅  Sudoers rule added: $SUDOERS_FILE"
 fi
 
 # If the VPS_USER in GitHub Actions is root, also allow root to restart:
-echo "root ALL=(ALL) NOPASSWD: /bin/systemctl restart $SERVICE_NAME, /bin/systemctl status $SERVICE_NAME" >> "$SUDOERS_FILE" 2>/dev/null || true
+if [ "$(id -u)" != "0" ]; then
+    # A non-root installer cannot rewrite sudoers; tell them what to add rather
+    # than silently leaving the deploy unable to start the service.
+    echo "  ⚠️  Re-run as root, or append to $SUDOERS_FILE:"
+    echo "      root ALL=(ALL) NOPASSWD: /bin/systemctl restart $SERVICE_NAME, /bin/systemctl status $SERVICE_NAME"
+fi
 
 # ── 7. Firewall ───────────────────────────────────────────────────────────────
 echo "[7/7] Configuring firewall (UFW)..."

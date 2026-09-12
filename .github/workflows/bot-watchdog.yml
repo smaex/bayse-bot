@@ -6,12 +6,15 @@ name: Bot watchdog (self-heal + outage alert)
 # cannot be observed is not "conservative", it is blind.
 #
 # Every 15 minutes:
-#   * probe /live and /ready (public HTTP if APP_URL is set, otherwise over SSH)
+#   * probe /live and /ready (public HTTP when the APP_URL repo variable is set,
+#     over SSH when the VPS secrets are set)
 #   * if the process is dead or wedged, restart the unit and re-probe
 #   * alert on Telegram only when something was actually wrong
 #
-# It never touches orders, settings, risk limits, or the paused flag: recovery
-# is limited to bringing the *same* code back up.
+# It never touches orders, settings, risk limits, or the paused flag: recovery is
+# limited to bringing the *same* code back up. Missing configuration degrades to a
+# warning instead of a failing run, because a watchdog that cries every 15 minutes
+# is the exact alert-fatigue that let a multi-day stall go unnoticed.
 
 on:
   schedule:
@@ -26,7 +29,17 @@ jobs:
   probe:
     name: Probe and self-heal
     runs-on: ubuntu-latest
+    env:
+      # Exposed as env (not secrets) so step-level `if` can check whether this
+      # deployment is configured for SSH at all.
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      NOTIFY_CHAT: ${{ secrets.TELEGRAM_NOTIFY_CHAT_ID }}
     steps:
+      - name: Note unconfigured deployment
+        if: ${{ env.VPS_HOST == '' && vars.APP_URL == '' }}
+        run: |
+          echo "::warning::Watchdog is not configured: set the VPS_HOST/VPS_USER/VPS_SSH_KEY secrets or the APP_URL repo variable. No liveness check ran."
+
       - name: HTTP probe (APP_URL)
         id: http
         if: ${{ vars.APP_URL != '' }}
@@ -35,7 +48,6 @@ jobs:
           base="${base%/}"
           live=$(curl -fsS --max-time 10 "$base/live" 2>/dev/null || echo "")
           ready=$(curl -fsS --max-time 10 "$base/ready" 2>/dev/null || echo "")
-          echo "live=$live" >> "$GITHUB_OUTPUT"
           echo "ready=$ready" >> "$GITHUB_OUTPUT"
           if [ -z "$live" ]; then
             echo "::warning::/live did not answer on $base"
@@ -44,6 +56,7 @@ jobs:
           echo "✅ /live answered; /ready: ${ready:-<no response>}"
 
       - name: Verify the service is running (SSH)
+        if: ${{ env.VPS_HOST != '' }}
         uses: appleboy/ssh-action@v1.0.3
         with:
           host:     ${{ secrets.VPS_HOST }}
@@ -75,7 +88,7 @@ jobs:
             fi
 
             echo "::warning::/ready unavailable (unit=$state) — restarting $SERVICE"
-            # Recent failures matter more than uptime: show them before the fix
+            # Recent failures matter more than uptime: show them before the fix.
             journalctl -u "$SERVICE" -n 25 --no-pager 2>/dev/null | tail -25 \
               || sudo -n journalctl -u "$SERVICE" -n 25 --no-pager 2>/dev/null | tail -25 || true
             sc restart "$SERVICE" >/dev/null 2>&1 || sc start "$SERVICE" >/dev/null 2>&1 || true
@@ -92,7 +105,7 @@ jobs:
             exit 1
 
       - name: Alert on failure
-        if: failure()
+        if: ${{ failure() && env.NOTIFY_CHAT != '' }}
         uses: appleboy/telegram-action@master
         with:
           to:      ${{ secrets.TELEGRAM_NOTIFY_CHAT_ID }}
@@ -104,3 +117,5 @@ jobs:
             `sudo journalctl -u bayse-bot -n 200` on the VPS.
             Positions stay open on the exchange — if you cannot restore the bot,
             check the Bayse portfolio and close/hedge manually if needed.
+            (Trading itself reports *why* it is quiet via /why; this alert is
+            about the process being unreachable.)

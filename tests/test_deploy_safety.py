@@ -22,7 +22,14 @@ SCRIPT = REPO / "scripts" / "zero_downtime_deploy.sh"
 FAKE_SYSTEMCTL = """#!/usr/bin/env bash
 STATE="$STATE_DIR/service_state"
 case "$1" in
-  start|restart) echo active > "$STATE"; echo "started" ;;
+  start)
+      if [ -f "$STATE_DIR/deny_start" ]; then exit 1; fi
+      echo active > "$STATE"; echo "started" ;;
+  restart)
+      if [ -f "$STATE_DIR/deny_start" ] && [ ! -f "$STATE_DIR/restart_once" ]; then
+        touch "$STATE_DIR/restart_once"
+      fi
+      echo active > "$STATE"; echo "restarted" ;;
   stop)          echo inactive > "$STATE"; echo "stopped" ;;
   is-active)     cat "$STATE" 2>/dev/null || echo inactive ;;
   cat)           exit 0 ;;
@@ -181,6 +188,18 @@ def test_broken_config_is_caught_before_orders_could_be_sent(env):
     assert result.returncode != 0
     # The bot is still restored, and nothing was left half-deployed and silent.
     assert _service_state(env) == "active"
+
+
+def test_unprivileged_deploy_still_leaves_bot_running(env):
+    """A deploy user whose sudoers only allows `restart` must still work."""
+    (env["state"] / "deny_start").write_text("1")
+    result = _run(env)
+    assert _service_state(env) == "active", (
+        "the script gave up when `systemctl start` was denied instead of restarting"
+    )
+    calls = (env["state"] / "git_calls").read_text() if (env["state"] / "git_calls").exists() else ""
+    assert "rev-parse" in calls  # reached the end of the flow rather than aborting
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_skip_update_only_restarts_current_code(env):
