@@ -59,29 +59,73 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Fail fast and self-explanatory when the host is not configured. Every
+      # historical deploy failure of this repo aborted inside the SSH step
+      # with no context; this makes "missing secrets" impossible to confuse
+      # with "host unreachable" or "remote script failed".
+      - name: Check deploy configuration
+        env:
+          VPS_HOST:     ${{ secrets.VPS_HOST }}
+          VPS_USER:     ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY:  ${{ secrets.VPS_SSH_KEY }}
+          VPS_PORT_SET: ${{ secrets.VPS_PORT != '' }}
+        run: |
+          missing=""
+          [ -n "$VPS_HOST" ]    || missing="$missing VPS_HOST"
+          [ -n "$VPS_USER" ]    || missing="$missing VPS_USER"
+          [ -n "$VPS_SSH_KEY" ] || missing="$missing VPS_SSH_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Deploy is not configured — missing repository secrets:$missing"
+            echo "Add them under Settings → Secrets and variables → Actions."
+            echo "VPS_PORT is optional (defaults to 22); currently set: ${VPS_PORT_SET:-false}"
+            exit 1
+          fi
+          echo "Deploy configuration present (host/user/key set; port set: ${VPS_PORT_SET:-false})."
+
+      # appleboy/ssh-action v1 has no `files:` input — the previous workflow
+      # passed one, it was ignored with a warning, and the deploy step then
+      # failed on a host that never received the script. Instead the script is
+      # base64-encoded here and written on the remote over the command
+      # channel itself, which cannot be dropped by env-forwarding or scp.
+      - name: Encode deploy script
+        id: prep
+        run: |
+          {
+            echo 'b64<<BAYSE_DEPLOY_B64_EOF'
+            base64 -w0 scripts/zero_downtime_deploy.sh
+            echo
+            echo 'BAYSE_DEPLOY_B64_EOF'
+          } >> "$GITHUB_OUTPUT"
+          echo "Deploy script encoded: $(wc -c < scripts/zero_downtime_deploy.sh) bytes"
+
       - name: Deploy & restart bot
         uses: appleboy/ssh-action@v1.0.3
-        env:
-          # Forwarded into the remote script by `envs` below.
-          BRANCH: ${{ github.ref_name }}
         with:
           host:     ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key:      ${{ secrets.VPS_SSH_KEY }}
-          port:     ${{ secrets.VPS_PORT }}
-          # Copied to the remote home directory first, so the deploy does not
-          # depend on the code that is currently checked out on the server.
-          files: scripts/zero_downtime_deploy.sh
+          port:     ${{ secrets.VPS_PORT || '22' }}
+          timeout:  30
+          # The script's recovery path (rollback + restart + health probes) can
+          # legitimately take a couple of minutes; ssh-action's 60s default
+          # would kill the SSH session mid-recovery.
+          command_timeout: 600
           script_stop: false
-          envs: BRANCH
           script: |
-            set -uo pipefail
-            if [ -f ./zero_downtime_deploy.sh ]; then
-              bash ./zero_downtime_deploy.sh
-            else
-              echo "WARN: copied script missing; falling back to the checkout's copy"
-              bash /opt/bayse-bot/scripts/zero_downtime_deploy.sh
+            set -u
+            cat > "$HOME/.bayse_deploy.b64" <<'BAYSE_DEPLOY_B64_EOF'
+            ${{ steps.prep.outputs.b64 }}
+            BAYSE_DEPLOY_B64_EOF
+            if ! base64 -d "$HOME/.bayse_deploy.b64" > "$HOME/zero_downtime_deploy.sh"; then
+              echo "ERROR: could not decode the deploy script on the host"
+              exit 1
             fi
+            rm -f "$HOME/.bayse_deploy.b64"
+            export BRANCH="${{ github.ref_name }}"
+            bash "$HOME/zero_downtime_deploy.sh"
+            rc=$?
+            echo "zero_downtime_deploy.sh finished with exit code $rc"
+            exit $rc
 
       - name: Notify Telegram on success
         if: success()
@@ -110,4 +154,4 @@ jobs:
             The deploy script rolls back and restarts the previous commit before
             reporting failure. Check the bot is running anyway:
             `ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} sudo systemctl status bayse-bot`
-            and read the Actions log for the exact step.
+            Exact failure: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}

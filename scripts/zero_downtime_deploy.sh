@@ -61,6 +61,23 @@ systemd_available() {
 
 service_active() { [ "$(sc is-active "$SERVICE" 2>/dev/null || true)" = "active" ]; }
 
+confirm_restarted() {
+    # True when the unit's ActiveEnterTimestamp is at or after this deploy
+    # started. A probe of /live only proves *something* answers; if the unit
+    # was already active and a restart was silently not applied (e.g. a
+    # sudoers rule written for /bin/systemctl on a merged-/usr host where the
+    # binary resolves to /usr/bin/systemctl), the OLD code keeps answering
+    # and the deploy would falsely report success. This check makes that case
+    # loud instead of silent. Best-effort by design: if the timestamp cannot
+    # be read or parsed, do not fail the deploy on telemetry alone.
+    local since epoch
+    since="$(sc show "$SERVICE" -p ActiveEnterTimestamp --value 2>/dev/null | tr -d '\r' || true)"
+    [ -n "$since" ] || return 0
+    epoch="$(date -d "$since" +%s 2>/dev/null || echo "")"
+    [ -n "$epoch" ] || return 0
+    [ "$epoch" -ge "$DEPLOY_START_EPOCH" ]
+}
+
 start_service() {
     # `restart` is the verb the shipped sudoers rule already allows, and it is
     # also the correct verb when the unit is still active (a plain start would
@@ -228,6 +245,10 @@ else
     ALREADY_DOWN=0
 fi
 
+# Epoch marker used by confirm_restarted to prove the unit actually
+# (re)started during this run rather than merely answering on the old code.
+DEPLOY_START_EPOCH="$(date +%s)"
+
 update_code
 STOP_FAILED=0
 stop_service || STOP_FAILED=1
@@ -239,6 +260,16 @@ start_service
 if ! probe "$LIVE_URL" 10; then
     [ $STOP_FAILED -eq 0 ] || true
     fail_hard "service did not answer $LIVE_URL after start"
+fi
+if ! confirm_restarted; then
+    log "WARN: $SERVICE did not (re)start during this deploy — running code would stay stale. Retrying once."
+    sc restart "$SERVICE" >/dev/null 2>&1 || true
+    sleep 4
+    if probe "$LIVE_URL" 5 && confirm_restarted; then
+        log "Second restart took effect — the unit now runs the deployed code."
+    else
+        fail_hard "unit never restarted with the new code (check the deploy user's sudoers verbs)"
+    fi
 fi
 if ! probe "$READY_URL" "$READY_TRIES"; then
     log "WARN: /ready is not green yet (startup still running or not ready)."

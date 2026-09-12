@@ -21,17 +21,27 @@ SCRIPT = REPO / "scripts" / "zero_downtime_deploy.sh"
 
 FAKE_SYSTEMCTL = """#!/usr/bin/env bash
 STATE="$STATE_DIR/service_state"
+ACTIVE_ENTER="$STATE_DIR/active_enter"
+mark_entered() { date -u '+%a %Y-%m-%d %H:%M:%S UTC' > "$ACTIVE_ENTER"; }
 case "$1" in
   start)
-      if [ -f "$STATE_DIR/deny_start" ]; then exit 1; fi
-      echo active > "$STATE"; echo "started" ;;
+      if [ -f "$STATE_DIR/deny_start" ] || [ -f "$STATE_DIR/deny_restart_effect" ]; then exit 1; fi
+      echo active > "$STATE"; mark_entered; echo "started" ;;
   restart)
       if [ -f "$STATE_DIR/deny_start" ] && [ ! -f "$STATE_DIR/restart_once" ]; then
         touch "$STATE_DIR/restart_once"
       fi
-      echo active > "$STATE"; echo "restarted" ;;
-  stop)          echo inactive > "$STATE"; echo "stopped" ;;
+      echo active > "$STATE"
+      # deny_restart_effect models the sudoers/path-mismatch failure: the
+      # command is accepted and "succeeds", but the unit never actually
+      # restarts, so the old code keeps answering health probes.
+      if [ ! -f "$STATE_DIR/deny_restart_effect" ]; then mark_entered; fi
+      echo "restarted" ;;
+  stop)
+      if [ -f "$STATE_DIR/deny_restart_effect" ]; then exit 1; fi
+      echo inactive > "$STATE"; echo "stopped" ;;
   is-active)     cat "$STATE" 2>/dev/null || echo inactive ;;
+  show)          cat "$ACTIVE_ENTER" 2>/dev/null || echo "" ;;
   cat)           exit 0 ;;
   reset-failed)  exit 0 ;;
   *)             exit 0 ;;
@@ -118,6 +128,12 @@ def env(tmp_path: Path):
     (state_dir / "curl_mode").write_text("all_ok")
     (state_dir / "git_fetch_rc").write_text("0")
     (state_dir / "sanity_rc").write_text("0")
+    # The unit has been up since an hour before this deploy starts, so the
+    # ActiveEnterTimestamp check must see a *newer* timestamp after a real
+    # restart to consider the new code loaded.
+    import datetime as _dt
+    past = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=1)
+    (state_dir / "active_enter").write_text(past.strftime("%a %Y-%m-%d %H:%M:%S UTC"))
 
     bot_dir = tmp_path / "bayse-bot"
     (bot_dir / ".git").mkdir(parents=True)
@@ -208,3 +224,18 @@ def test_skip_update_only_restarts_current_code(env):
     calls = (env["state"] / "git_calls").read_text() if (env["state"] / "git_calls").exists() else ""
     assert "fetch --all" not in calls
     assert _service_state(env) == "active"
+
+
+def test_silently_denied_restart_fails_loudly(env):
+    """sudoers accepts the restart verb but it never takes effect (the classic
+    /bin vs /usr/bin path-mismatch denial): the OLD code keeps answering
+    /live. The deploy must fail loudly instead of reporting success while the
+    running service never loaded the new commit."""
+    (env["state"] / "deny_restart_effect").write_text("1")
+    result = _run(env)
+    assert result.returncode != 0, (
+        "deploy reported success although the unit never restarted:\n"
+        + result.stdout + result.stderr
+    )
+    assert _service_state(env) == "active", "the bot must stay running either way"
+    assert "did not (re)start" in result.stdout, result.stdout

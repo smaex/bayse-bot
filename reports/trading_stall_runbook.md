@@ -161,3 +161,39 @@ mid-script abort, and the new `verify`-then-deploy split will tell those apart i
    silence.
 4. Keep `LIVE_TRADING` and every risk ceiling exactly as they are. This change set does
    not need a risk decision, and if `/why` reports `NO_EDGE`, the correct action is none.
+
+## Addendum — same day, second pass: the fix set itself never shipped
+
+After the above was merged (PR #4), the bot was *still* not trading. Diagnosis:
+
+* `gh run list` shows **every** `Deploy to VPS` run failing across the entire retained
+  history (100+ runs back to 2026-08-05) — including PR #4's own merge run, which died
+  9 s into the SSH step. **No commit ever reached the VPS through CI.** The stall fixes
+  above existed only in the repository; production kept running the code that contains
+  the permanent-pause bug and the stop-first deploy script.
+* The PR #4 failure's own annotation named the bug: `Unexpected input(s) 'files'` —
+  `appleboy/ssh-action@v1.0.3` has no `files:` input, so the deploy script was never
+  copied to the host, and the fallback path (`/opt/bayse-bot/scripts/…`) does not exist
+  there either (that script was added by PR #4, which never deployed).
+* `port: ${{ secrets.VPS_PORT }}` with an unset secret also feeds an empty port into the
+  action — another guaranteed fast failure.
+* The 2026-09-10 deploy failures line up with the start of the two-day outage: the old
+  stop-first script could stop the unit and fail before restarting it.
+
+Fixed (PR #5): the deploy workflow now fails fast with an explicit message when the VPS
+secrets are absent, encodes `zero_downtime_deploy.sh` as base64 and writes it over the
+SSH command channel (no `files:`, no env-forwarding dependency), defaults the port to 22,
+and raises `command_timeout` so a recovery path cannot be killed at 60 s. The deploy
+script additionally verifies via `ActiveEnterTimestamp` that the unit actually
+(re)started — a silently denied restart (e.g. sudoers written for `/bin/systemctl` on a
+merged-`/usr` host) no longer masquerades as a successful deploy; it fails loudly while
+leaving the bot running. `deploy_vps.sh` now grants every allowed verb under both
+`/bin` and `/usr/bin`.
+
+**If the deploy still fails after this:** the workflow now tells you which case it is —
+"missing repository secrets: …" (set them under Settings → Secrets and variables →
+Actions: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, optionally `VPS_PORT`) or an SSH/remote
+error visible in the run log, linked from the Telegram failure notice. Until a deploy
+succeeds, the single fastest recovery is on the VPS itself:
+`sudo systemctl status bayse-bot` → if stopped, `sudo systemctl restart bayse-bot`,
+then `/why` in Telegram.

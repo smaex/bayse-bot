@@ -113,13 +113,24 @@ systemctl enable "$SERVICE_NAME"
 # This sudoers rule allows that without a password prompt blocking Actions.
 SUDOERS_FILE="/etc/sudoers.d/bayse-bot"
 if [ ! -f "$SUDOERS_FILE" ]; then
-    echo "  → Adding sudoers rule for systemctl restart..."
+    echo "  → Adding sudoers rules for systemctl service control..."
     # The verbs used by scripts/zero_downtime_deploy.sh and the watchdog
     # workflow. Deliberately limited to service control for THIS unit: no
     # arbitrary commands, no shell, nothing that can place or cancel an order.
-    echo "$BOT_USER ALL=(ALL) NOPASSWD: /bin/systemctl restart $SERVICE_NAME, /bin/systemctl start $SERVICE_NAME, /bin/systemctl stop $SERVICE_NAME, /bin/systemctl status $SERVICE_NAME, /bin/systemctl is-active $SERVICE_NAME, /usr/bin/systemctl reset-failed $SERVICE_NAME, /bin/journalctl -u $SERVICE_NAME *" > "$SUDOERS_FILE"
+    #
+    # Every verb is granted under BOTH /bin and /usr/bin: on merged-/usr
+    # systems (Ubuntu 22.04+) systemctl resolves to /usr/bin/systemctl, and a
+    # rule written only for /bin/systemctl is then silently denied — the
+    # deploy "restarts" the unit and nothing happens. Denials there are the
+    # kind of silent failure this setup exists to prevent.
+    {
+        for verb in restart start stop status is-active reset-failed; do
+            echo "$BOT_USER ALL=(ALL) NOPASSWD: /bin/systemctl $verb $SERVICE_NAME, /usr/bin/systemctl $verb $SERVICE_NAME"
+        done
+        echo "$BOT_USER ALL=(ALL) NOPASSWD: /bin/journalctl -u $SERVICE_NAME *, /usr/bin/journalctl -u $SERVICE_NAME *"
+    } > "$SUDOERS_FILE"
     chmod 440 "$SUDOERS_FILE"
-    echo "  ✅  Sudoers rule added: $SUDOERS_FILE"
+    echo "  ✅  Sudoers rules added: $SUDOERS_FILE"
 fi
 
 # If the VPS_USER in GitHub Actions is root, also allow root to restart:
