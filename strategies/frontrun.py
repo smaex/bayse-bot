@@ -42,12 +42,9 @@ class FrontrunStrategy(BaseStrategy):
         if not bayse_spot:
             return None
 
-        # BUG FIX: compute live_spot here so the latency-bias comparison uses
-        # the freshest available price, not the (potentially older) cached feed
-        # value. Previously live_spot was defined below and bias was computed
-        # with bayse_spot — defeating the purpose of passing spot_price in.
+        # Compare fast Binance oracle against the slower Bayse relay price
+        bias = (oracle_p - bayse_spot) / bayse_spot
         live_spot = spot_price if spot_price is not None else bayse_spot
-        bias = (oracle_p - live_spot) / live_spot
 
         trigger = config.FRONTRUN_BIAS_TRIGGER
         if abs(bias) < trigger:
