@@ -258,6 +258,15 @@ SYSTEMIC_RISK_VOL_MULT        = 3.0
 MIN_PAYOUT_RATIO   = 0.06
 PROFIT_ALERT_NGN   = 20_000
 
+# ── Trading-drought visibility ────────────────────────────────────────────────
+# Silence is not a safe failure mode: a stopped deployment and a legitimate
+# "no qualifying edge" day both look like an empty log. This watchdog reads the
+# stall telemetry and tells the operator which one it is. It never forces a
+# trade, loosens a gate, or lifts a manual pause.
+TRADE_STALL_ALERT_MIN     = max(15.0, _env_float("TRADE_STALL_ALERT_MINUTES", 120.0))
+TRADE_STALL_ALERT_REPEAT_MIN = max(5.0, _env_float("TRADE_STALL_ALERT_REPEAT_MINUTES", 360.0))
+STALL_EVAL_MAX_AGE_SEC     = max(60.0, _env_float("STALL_EVAL_MAX_AGE_SEC", 180.0))
+
 # ── Live/Test mode ────────────────────────────────────────────────────────────
 # Fail safe: an omitted environment variable must never place real orders.
 # Operators must deliberately enable live trading after dry-run validation.

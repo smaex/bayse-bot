@@ -94,6 +94,8 @@ def build_app() -> Application:
         ("resetlearning", cmd_resetlearning),
         ("learnstats",    cmd_learnstats),
         ("debug",         cmd_debug),
+        ("why",           cmd_why),
+        ("whytrading",    cmd_why),
         ("disconnect",    cmd_disconnect),
         ("rekey",         cmd_rekey),
         ("wallet",        cmd_wallet),
@@ -549,6 +551,39 @@ async def cmd_learnstats(update: Update, _ctx):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 @_guard
+async def cmd_why(update: Update, _ctx):
+    """Answer one question with evidence: why has this account not traded?"""
+    import time
+    import stall
+    import config
+
+    cid = str(update.effective_chat.id)
+    equity = 0.0
+    min_viable = 0.0
+    feed_age = None
+    risk = _user_risks.get(cid)
+    if risk is not None:
+        try:
+            equity = float(risk.current_free_cash or 0.0) + risk.deployed()
+        except Exception:
+            equity = 0.0
+    try:
+        import bot as _bot
+        feed_age = _bot._worst_feed_age_sec(time.time())
+        min_viable = float(getattr(_bot, "_MIN_VIABLE_BALANCE", 0.0))
+    except Exception:
+        pass
+    text = stall.format_report(
+        cid,
+        equity=equity,
+        min_viable=min_viable,
+        feed_age_sec=feed_age,
+        eval_max_age_sec=float(config.STALL_EVAL_MAX_AGE_SEC),
+    )
+    await update.message.reply_text(text[:3900], parse_mode="Markdown")
+
+
+@_guard
 async def cmd_debug(update: Update, _ctx):
     import feeds
     import feeds_direct
@@ -618,6 +653,21 @@ async def cmd_debug(update: Update, _ctx):
     if hasattr(config, 'TEST_MODE') and config.TEST_MODE:
         lines.append(f"\n🧪 *TEST MODE ON:* trades capped at ₦{config.TEST_MAX_TRADE_NGN}")
 
+    # The verdict belongs here too: /debug used to describe the parts of the
+    # system that are fine, and stay silent on the part that is not trading.
+    try:
+        import stall
+        verdict_data = stall.verdict(
+            cid, eval_max_age_sec=float(config.STALL_EVAL_MAX_AGE_SEC)
+        )
+        lines.append(f"\n🎯 *Current blocker:* {verdict_data['headline']}")
+        lines.append(f"`{verdict_data['code']}`")
+        if verdict_data.get("action"):
+            lines.append(f"→ {verdict_data['action']}")
+        lines.append("\n_/why gives the full breakdown (gate counters, skips, recent events)_")
+    except Exception as why_err:
+        log.debug(f"[{cid}] /debug verdict unavailable: {why_err}")
+
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 @_guard
@@ -664,6 +714,7 @@ async def cmd_help(update: Update, _ctx):
         "/shadow — view mid-market shadow tracker report\n"
         "/arbshadow — view read-only complete-set arbitrage observations\n"
         "/debug — diagnose why trades aren't firing\n"
+        "/why — the single reason nothing has traded, with evidence\n"
         "/disconnect — remove account",
         parse_mode="Markdown",
     )
@@ -844,10 +895,32 @@ def _calc_target(s: dict, start: float) -> float:
 
 
 async def _set_paused(cid: str, paused: bool):
+    """Persist the manual pause switch.
+
+    A manual pause carries an explicit reason so the trading-day rollover can
+    tell it apart from an expiring daily stop. Session pauses expire on their
+    own; an operator's /pause never does.
+    """
     user = await asyncio.to_thread(_safe_get_user, cid)
     if user:
         s = user["settings"]
         s["paused"] = paused
+        if paused:
+            s["paused_reason"] = "manual"
+        else:
+            s.pop("paused_reason", None)
+        risk = _user_risks.get(cid)
+        if risk is not None:
+            risk.paused = bool(paused)
+        try:
+            import stall
+
+            stall.note_state(cid, paused=bool(paused),
+                             paused_reason="manual" if paused else "",
+                             manual_pause=True if paused else None)
+        except Exception as telemetry_err:
+            # The pause switch must work even if diagnostics cannot.
+            log.warning(f"[{cid}] pause-state telemetry failed: {telemetry_err}")
         await asyncio.to_thread(database.update_settings, cid, s)
         await asyncio.to_thread(database.invalidate_user_cache, cid)
         # Also bust bot.py's own user cache so _evaluate_single_user

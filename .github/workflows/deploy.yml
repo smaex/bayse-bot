@@ -1,120 +1,113 @@
 name: Deploy to VPS
 
+# A deploy must never be able to leave the bot down. Two guards enforce that:
+#   1. `verify` runs the regression suite and a config/import sanity check, so
+#      code that cannot start never reaches the server at all.
+#   2. `deploy` shells out to scripts/zero_downtime_deploy.sh, which verifies
+#      /live and /ready and — on any failure — rolls the checkout back to the
+#      previously running commit and restarts before reporting anything.
+
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  deploy:
+  verify:
+    name: Tests and config sanity
     runs-on: ubuntu-latest
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Deploy & restart bot
-      uses: appleboy/ssh-action@v1.0.3
-      with:
-        host:     ${{ secrets.VPS_HOST }}
-        username: ${{ secrets.VPS_USER }}
-        key:      ${{ secrets.VPS_SSH_KEY }}
-        port:     ${{ secrets.VPS_PORT }}
-        script: |
-          set -e
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
 
-          BOT_DIR="/opt/bayse-bot"
-          SERVICE="bayse-bot"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio
 
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  Step 1 — Hard kill any ghost instances"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      - name: Regression suite
+        run: python -m pytest -q
 
-          # Stop the systemd service first
-          sudo systemctl stop $SERVICE 2>/dev/null || true
+      - name: Config and import sanity
+        env:
+          TELEGRAM_TOKEN: "123456:sanity-check-token"
+          ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+          DATABASE_URL: "postgresql://sanity:sanity@127.0.0.1:5432/sanity"
+        run: |
+          python - <<'PY'
+          import config
+          import bot            # import-time wiring only: no DB, no orders
+          import executor
+          import strategies
+          print("imports ok; live_trading =", config.LIVE_TRADING)
+          print("permitted strategies   =", config.PERMITTED_STRATEGIES)
+          PY
 
-          # Kill any stray bot.py processes that survived
-          pkill -9 -f "python.*bot\.py" 2>/dev/null || true
-          sleep 3
+  deploy:
+    name: Deploy & restart bot
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-          # Confirm nothing is left
-          if pgrep -f "bot\.py" > /dev/null; then
-            echo "ERROR: bot.py process still alive after kill attempt"
-            pgrep -a -f "bot\.py"
-            exit 1
-          fi
-          echo "✅ All old instances stopped"
+      - name: Deploy & restart bot
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          # Forwarded into the remote script by `envs` below.
+          BRANCH: ${{ github.ref_name }}
+        with:
+          host:     ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key:      ${{ secrets.VPS_SSH_KEY }}
+          port:     ${{ secrets.VPS_PORT }}
+          # Copied to the remote home directory first, so the deploy does not
+          # depend on the code that is currently checked out on the server.
+          files: scripts/zero_downtime_deploy.sh
+          script_stop: false
+          envs: BRANCH
+          script: |
+            set -uo pipefail
+            if [ -f ./zero_downtime_deploy.sh ]; then
+              bash ./zero_downtime_deploy.sh
+            else
+              echo "WARN: copied script missing; falling back to the checkout's copy"
+              bash /opt/bayse-bot/scripts/zero_downtime_deploy.sh
+            fi
 
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  Step 2 — Pull latest code"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          cd $BOT_DIR
-          git fetch --all
-          git reset --hard origin/main 2>/dev/null || git reset --hard origin/master
-          echo "✅ Code updated"
+      - name: Notify Telegram on success
+        if: success()
+        uses: appleboy/telegram-action@master
+        with:
+          to:      ${{ secrets.TELEGRAM_NOTIFY_CHAT_ID }}
+          token:   ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            ✅ *Bayse Bot deployed*
+            Branch: `${{ github.ref_name }}`
+            Commit: `${{ github.event.head_commit.message }}`
+            By: ${{ github.actor }}
+            `/ready` verified after start.
 
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  Step 3 — Install/update dependencies"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          $BOT_DIR/.venv/bin/pip install --quiet -r $BOT_DIR/requirements.txt
-          echo "✅ Dependencies installed"
+      - name: Notify Telegram on failure
+        if: failure()
+        uses: appleboy/telegram-action@master
+        with:
+          to:    ${{ secrets.TELEGRAM_NOTIFY_CHAT_ID }}
+          token:   ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            ❌ *Bayse Bot deploy FAILED*
+            Branch: `${{ github.ref_name }}`
+            Commit: `${{ github.event.head_commit.message }}`
 
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  Step 4 — Start bot fresh"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          sudo systemctl start $SERVICE
-          sleep 8
-
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  Step 5 — Verify it started correctly"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          if sudo systemctl is-active --quiet $SERVICE; then
-            echo "✅ $SERVICE is running"
-          else
-            echo "❌ $SERVICE failed to start — showing last 30 lines of logs:"
-            sudo journalctl -u $SERVICE -n 30 --no-pager
-            exit 1
-          fi
-
-          # Count running bot processes — should be exactly 1
-          COUNT=$(pgrep -c -f "python.*bot\.py" || true)
-          if [ "$COUNT" -eq 1 ]; then
-            echo "✅ Exactly 1 bot instance running (no ghosts)"
-          elif [ "$COUNT" -gt 1 ]; then
-            echo "⚠️  WARNING: $COUNT bot instances detected — killing extras"
-            # Keep the newest, kill the rest
-            pgrep -f "python.*bot\.py" | head -n -1 | xargs kill -9 2>/dev/null || true
-          else
-            echo "❌ No bot process found after start"
-            exit 1
-          fi
-
-          echo ""
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "  ✅ Deploy complete"
-          echo "  Service: $SERVICE"
-          echo "  Instances running: $(pgrep -c -f 'python.*bot\.py' || echo 0)"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-    - name: Notify Telegram on success
-      if: success()
-      uses: appleboy/telegram-action@master
-      with:
-        to:      ${{ secrets.TELEGRAM_NOTIFY_CHAT_ID }}
-        token:   ${{ secrets.TELEGRAM_TOKEN }}
-        message: |
-          ✅ *Bayse Bot deployed*
-          Branch: `${{ github.ref_name }}`
-          Commit: `${{ github.event.head_commit.message }}`
-          By: ${{ github.actor }}
-
-    - name: Notify Telegram on failure
-      if: failure()
-      uses: appleboy/telegram-action@master
-      with:
-        to:    ${{ secrets.TELEGRAM_NOTIFY_CHAT_ID }}
-        token: ${{ secrets.TELEGRAM_TOKEN }}
-        message: |
-          ❌ *Bayse Bot deploy FAILED*
-          Branch: `${{ github.ref_name }}`
-          Commit: `${{ github.event.head_commit.message }}`
-          Check GitHub Actions for the error log.
+            The deploy script rolls back and restarts the previous commit before
+            reporting failure. Check the bot is running anyway:
+            `ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} sudo systemctl status bayse-bot`
+            and read the Actions log for the exact step.

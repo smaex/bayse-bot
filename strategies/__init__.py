@@ -66,6 +66,16 @@ def _performance_adjusted_probability(
     return 0.5 + (p - 0.5) * multiplier
 
 
+def _perf_note(name: str, learned: dict, code: str, detail: str = "") -> None:
+    """Attribute an orchestrator-level rejection to the evaluating account."""
+    try:
+        from strategies.utils import note_reject
+
+        note_reject(learned, name, code, detail)
+    except Exception:
+        pass
+
+
 async def evaluate_all(
     market: dict, learned: dict, state, spot_price: float = None
 ) -> List[TradeSignal]:
@@ -98,6 +108,14 @@ async def evaluate_all(
     # quarantined or user-disabled strategy. Previously DISLOCATED_WIDE silently
     # added MIDMARKET_MAKER even when global policy had blocked it.
     all_names = _route_strategy_names(active_names, liq_regime)
+    # A liquidity regime can suppress takers; say so, because "no signals" from
+    # routing looks identical to "no signals" from absent edge in the logs.
+    if not all_names:
+        _perf_note("ORCHESTRATOR", learned, "no_enabled_strategies",
+                   f"requested={list(active_names)} regime={liq_regime}")
+    elif all_names != set(active_names):
+        _perf_note("ORCHESTRATOR", learned, f"takers_suppressed_{liq_regime}",
+                   ",".join(sorted(set(active_names) - set(all_names))))
     if liq_regime == "DISLOCATED_WIDE":
         log.debug(
             f"Market {asset}/{market.get('timeframe')} classified "
@@ -150,6 +168,9 @@ async def evaluate_all(
                     if name == "SNIPE" else 0.01
                 )
                 if sig.win_prob - sig.market_price < min_edge:
+                    _perf_note(name, learned,
+                              f"adjusted {sig.win_prob:.3f} price {sig.market_price:.3f} "
+                              f"needs {min_edge:.1%}")
                     log.info(
                         f"PERFORMANCE SKIP {name} {asset}: adjusted probability "
                         f"{sig.win_prob:.3f} no longer clears price "
@@ -193,8 +214,12 @@ async def evaluate_all(
             if sig.certainty >= mode_floor or sig.certainty >= discovery_floor:
                 sig.mode_floor = mode_floor
                 signals.append(sig)
+            else:
+                _perf_note(name, learned, "below_mode_floor",
+                           f"certainty {sig.certainty:.1%} < floor {mode_floor:.1%}")
 
         except Exception as e:
+            _perf_note(name, learned, "strategy_error", str(e)[:150])
             log.error(f"Strategy {name} error on {asset}: {e}", exc_info=True)
 
     return sorted(signals, key=lambda s: s.certainty, reverse=True)

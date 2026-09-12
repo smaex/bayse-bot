@@ -15,10 +15,10 @@ from strategies.base import BaseStrategy, TradeSignal, global_state
 from strategies.manager import kelly_size, max_ev_price
 from strategies.utils import (
     gbm_win_probability,
+    note_reject,
     probability_to_certainty,
     realized_vol_hourly,
 )
-
 log = logging.getLogger("strat.snipe")
 
 
@@ -56,17 +56,22 @@ class SnipeStrategy(BaseStrategy):
 
         # ── Evidence-backed scope restriction ──────────────────────────────
         if asset.upper() not in config.SNIPE_ALLOWED_ASSETS:
+            note_reject(learned, "SNIPE", "asset_not_in_allowed_scope", asset)
             return None
         if tf.upper() not in config.SNIPE_ALLOWED_TIMEFRAMES:
+            note_reject(learned, "SNIPE", "timeframe_not_in_allowed_scope", tf)
             return None
 
         # ── Entry window check ────────────────────────────────────────────
         window = config.SNIPE_ENTRY_WINDOWS.get(tf)
         if window is None or secs > window:
+            note_reject(learned, "SNIPE", "outside_entry_window",
+                        f"secs={secs:.0f} window={window}")
             return None
         # Never open inside the final minute. Settlement/oracle timing and
         # order round-trip uncertainty dominate any apparent last-second edge.
         if secs < config.SNIPE_MIN_SECS_TO_CLOSE:
+            note_reject(learned, "SNIPE", "too_close_to_settle", f"secs={secs:.0f}")
             return None
 
         # ── Price data ────────────────────────────────────────────────────
@@ -79,15 +84,18 @@ class SnipeStrategy(BaseStrategy):
                 live_spot = oracle_p
 
         if not threshold:
+            note_reject(learned, "SNIPE", "no_settlement_threshold")
             log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no threshold in market data")
             return None
         if not live_spot:
+            note_reject(learned, "SNIPE", "no_live_spot")
             log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no live spot price available")
             return None
 
         # ── Chaos guard ───────────────────────────────────────────────────
         flips = global_state.market_flips.get(mkt_id, 0)
         if secs < 210 and flips >= 5:
+            note_reject(learned, "SNIPE", "chaos_veto_flips", f"{flips} flips")
             log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — chaos veto ({flips} flips)")
             return None
 
@@ -102,6 +110,7 @@ class SnipeStrategy(BaseStrategy):
         # none of which could ever have filled.
         price_sum = market.get("yes_price", 0) + market.get("no_price", 0)
         if not (0.90 <= price_sum <= 1.05):
+            note_reject(learned, "SNIPE", "market_prices_unusable", f"sum={price_sum:.3f}")
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — bad market data "
                 f"(yes={market.get('yes_price',0):.3f} no={market.get('no_price',0):.3f} "
@@ -174,6 +183,8 @@ class SnipeStrategy(BaseStrategy):
             raw_probability = raw_w_no
             market_price = no_price
         else:
+            note_reject(learned, "SNIPE", "no_raw_edge_or_trend_alignment",
+                        f"yes={raw_w_yes:.1%}/{yes_price:.3f} no={raw_w_no:.1%}/{no_price:.3f}")
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no raw edge/trend alignment "
                 f"(raw_yes={raw_w_yes:.1%} vs {yes_price:.3f}, "
@@ -190,6 +201,8 @@ class SnipeStrategy(BaseStrategy):
         }.get(asset.upper(), config.SNIPE_MIN_DISTANCE_PCT)
 
         if abs(distance_pct) < min_dist_req:
+            note_reject(learned, "SNIPE", "distance_below_calibration",
+                        f"{abs(distance_pct):.4%} < {min_dist_req:.4%}")
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — insufficient distance "
                 f"({abs(distance_pct):.4%} < {min_dist_req:.4%})"
@@ -200,6 +213,7 @@ class SnipeStrategy(BaseStrategy):
             <= market_price
             <= config.SNIPE_MAX_MARKET_PRICE
         ):
+            note_reject(learned, "SNIPE", "entry_price_out_of_band", f"{market_price:.3f}")
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — entry outside "
                 f"[{config.SNIPE_MIN_ENTRY_PRICE:.2f}, "
@@ -216,6 +230,8 @@ class SnipeStrategy(BaseStrategy):
         required_edge = config.SNIPE_MIN_BLENDED_EDGE + degraded_oracle_penalty
         blended_edge = w_est - market_price
         if blended_edge < required_edge:
+            note_reject(learned, "SNIPE", "shrunk_edge_below_requirement",
+                        f"{blended_edge:.1%} < {required_edge:.1%}")
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — shrunk edge "
                 f"{blended_edge:.1%} < {required_edge:.1%}"
@@ -228,6 +244,8 @@ class SnipeStrategy(BaseStrategy):
         )
         effective_floor = max(config.SNIPE_MIN_CERTAINTY, float(learned_min))
         if composite < effective_floor:
+            note_reject(learned, "SNIPE", "certainty_below_floor",
+                        f"{composite:.3f} < {effective_floor:.3f}")
             return None
 
         # The strategy gate uses the same fee-adjusted economics as sizing.
@@ -244,6 +262,8 @@ class SnipeStrategy(BaseStrategy):
             max_ev_price(w_est, market_price, fee_rate, min_margin=margin),
         )
         if market_price >= ev_ceil:
+            note_reject(learned, "SNIPE", "price_at_or_above_ev_ceiling",
+                        f"price={market_price:.3f} ceiling={ev_ceil:.3f}")
             return None
 
         # ── Size ──────────────────────────────────────────────────────────

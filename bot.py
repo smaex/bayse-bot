@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 # pyrefly: ignore [missing-import]
@@ -24,6 +24,7 @@ import executor
 import server
 import recorder
 import config
+import stall
 import feeds_direct
 import health
 from risk import RiskManager
@@ -120,32 +121,107 @@ def _session_date() -> str:
     return datetime.now(ZoneInfo(config.TRADING_TIMEZONE)).date().isoformat()
 
 
-def _daily(chat_id: str, balance: float, settings: dict) -> dict:
+# Safety stops that are scoped to one trading day and must expire with it.
+# A manual pause (no reason, or "manual") is deliberately absent: only the
+# operator can lift that one.
+_SESSION_PAUSE_REASONS = ("daily_target", "daily_loss_limit", "drawdown")
+
+
+def _advance_trading_day(chat_id: str, balance: float, settings: dict) -> tuple[dict, str]:
+    """Roll the daily record forward and lift *session-scoped* safety pauses.
+
+    Returns ``(day_state, resumed_reason)``. A non-empty ``resumed_reason`` means
+    this call re-opened entries that a previous day's stop had closed.
+
+    This must run on every cycle *before* the paused gate in ``_user_loop``.
+    It used to live only inside the daily-target section, which sits after
+    ``if settings.get("paused"): continue`` — so the moment the bot paused itself
+    for a daily loss, a daily target, or drawdown, the code that was supposed to
+    release that pause at the next trading day became unreachable. One bad day
+    therefore stopped a live account permanently and silently, which is exactly
+    the "no trades for two days" failure this now prevents.
+    """
     today = _session_date()
     ds = _user_daily.get(chat_id)
-    if not ds or ds.get("date") != today:
-        ds = settings.get("daily_state", {})
-        if ds.get("date") != today:
-            old_target_hit = ds.get("target_hit", False)
-            ds = {"date": today, "start_balance": balance, "target_hit": False}
-            settings["daily_state"] = ds
-            # Automatically unpause if paused due to yesterday's daily target or drawdown
-            if old_target_hit or settings.get("paused_reason") in (
-                "daily_target", "daily_loss_limit", "drawdown"
-            ):
-                settings["paused"] = False
-                settings.pop("paused_reason", None)
-                risk = _user_risks.get(chat_id)
-                if risk:
-                    risk.paused = False
-                    risk.peak_balance = balance
-                    risk._dd_breach_since = 0.0
-            asyncio.create_task(asyncio.to_thread(database.update_settings, chat_id, settings))
+    if ds and ds.get("date") == today:
+        return ds, ""
+
+    ds = settings.get("daily_state", {}) or {}
+    if ds.get("date") == today:
         _user_daily[chat_id] = ds
+        return ds, ""
+
+    old_target_hit = bool(ds.get("target_hit", False))
+    previous_date = ds.get("date") or "the previous session"
+    ds = {"date": today, "start_balance": balance, "target_hit": False}
+    settings["daily_state"] = ds
+    _user_daily[chat_id] = ds
+
+    # The in-memory risk manager has its own drawdown flag that previously only
+    # expired inside ``is_in_strict_mode()``, i.e. only when a trade was already
+    # being placed — so a long-running process could keep blocking every
+    # evaluation with no persisted reason and no way to see it. Expire it with
+    # the same trading-day boundary the persisted stops use.
+    risk = _user_risks.get(chat_id)
+    if risk is not None:
+        try:
+            risk.last_reset_date = today
+            if risk.paused and not settings.get("paused"):
+                log.warning(
+                    f"[{chat_id}] New trading day — expiring the in-memory drawdown pause "
+                    "(settings are not paused); monitoring and limits are unchanged"
+                )
+                risk.paused = False
+                risk.peak_balance = balance
+                risk._dd_breach_since = 0.0
+        except Exception as risk_err:  # never let cleanup break the loop
+            log.error(f"[{chat_id}] Risk daily expiry failed: {risk_err}", exc_info=True)
+
+    reason = str(settings.get("paused_reason") or "")
+    resumed = ""
+    if settings.get("paused") and (reason in _SESSION_PAUSE_REASONS or old_target_hit):
+        settings["paused"] = False
+        settings.pop("paused_reason", None)
+        settings.pop("daily_loss_stopped_at", None)
+        risk = _user_risks.get(chat_id)
+        if risk:
+            risk.paused = False
+            risk.peak_balance = balance
+            risk._dd_breach_since = 0.0
+            risk.daily_realized_pnl = 0.0
+            risk.last_reset_date = today
+        resumed = reason or "daily_target"
+        log.warning(
+            f"[{chat_id}] TRADING DAY ROLLOVER — cleared the '{resumed}' pause set on "
+            f"{previous_date}; entries are open again"
+        )
+    asyncio.create_task(asyncio.to_thread(database.update_settings, chat_id, settings))
+    return ds, resumed
+
+
+def _daily(chat_id: str, balance: float, settings: dict) -> dict:
+    ds, _ = _advance_trading_day(chat_id, balance, settings)
     return ds
 
 
+async def _roll_trading_day(chat_id: str, equity: float, settings: dict) -> None:
+    """Advance the trading day and tell the operator if entries just re-opened."""
+    _, resumed = _advance_trading_day(chat_id, equity, settings)
+    if not resumed:
+        return
+    stall.reject(chat_id, "cycle", "auto_resumed_new_trading_day", f"cleared '{resumed}'")
+    if _tg_app:
+        await telegram_bot.send_message(
+            _tg_app, chat_id,
+            "🌅 *New trading day — entries re-opened*\n\n"
+            f"The previous session was stopped by the *{resumed.replace('_', ' ')}* safety limit.\n"
+            "Risk limits, scope and monitoring are unchanged; this is only the daily stop expiring.",
+            parse_mode="Markdown",
+        )
+
+
 def _daily_target(settings: dict, start: float) -> float:
+
     abs_ = settings.get("daily_target_ngn", 0)
     if abs_ > 0:
         return float(abs_)
@@ -342,10 +418,31 @@ async def _user_loop(chat_id: str):
         except Exception as exit_err:
             log.error(f"[{chat_id}] Position exit eval error: {exit_err}", exc_info=True)
 
+        # ── Trading-day rollover (BEFORE the paused gate, on purpose) ───────
+        # A safety pause that is scoped to one trading day has to be released by
+        # the day changing, and that release cannot hide behind the paused
+        # check — otherwise a paused account never reaches the code that lifts
+        # the pause and stays dark forever. Runs on every cycle; cheap and
+        # idempotent inside a trading day.
+        try:
+            await _roll_trading_day(chat_id, equity, settings)
+        except Exception as roll_err:
+            log.error(f"[{chat_id}] Trading-day rollover failed: {roll_err}", exc_info=True)
+
+        stall.note_state(
+            chat_id,
+            paused=bool(settings.get("paused")),
+            paused_reason=str(settings.get("paused_reason") or ""),
+            dry_run=not config.LIVE_TRADING,
+        )
+
         # ── Paused check ───────────────────────────────────────────────────
         if settings.get("paused"):
             if iter_count % 6 == 0:   # log every 3 minutes when paused
-                log.info(f"[{chat_id}] PAUSED — skipping evaluation")
+                log.info(
+                    f"[{chat_id}] PAUSED ({settings.get('paused_reason') or 'manual'}) "
+                    "— skipping evaluation"
+                )
             continue
 
         # ── Low balance guard ──────────────────────────────────────────────
@@ -1107,6 +1204,12 @@ async def _evaluate_single_user_locked(user: dict, trigger_asset: str = None, pe
         return
     settings = fresh_user.get("settings", {})
     risk.mode = settings.get("mode", "balanced")
+    stall.note_state(
+        chat_id,
+        paused=bool(settings.get("paused")),
+        paused_reason=str(settings.get("paused_reason") or ""),
+        dry_run=not config.LIVE_TRADING,
+    )
     if settings.get("paused"):
         return
 
@@ -1116,10 +1219,14 @@ async def _evaluate_single_user_locked(user: dict, trigger_asset: str = None, pe
             free_cash = await client.get_balance_ngn()
             risk.current_free_cash = free_cash
         except Exception:
+            stall.reject(chat_id, "cycle", "balance_unavailable",
+                         "exchange balance request failed; no equity figure to size against")
             return
 
     equity = free_cash + risk.deployed()
     if risk.target_hit or risk.max_drawdown_hit:
+        stall.reject(chat_id, "cycle", "risk_gate",
+                     f"target_hit={risk.target_hit} drawdown_pause={risk.max_drawdown_hit}")
         return
 
     learned = await asyncio.to_thread(learner.get_learned_overrides, chat_id)
@@ -1150,6 +1257,7 @@ async def _evaluate_single_user_locked(user: dict, trigger_asset: str = None, pe
     blocked = sorted(set(requested_strats) - set(user_strats))
     if blocked:
         log.warning(f"[{chat_id}] Strategies blocked by global safety policy: {blocked}")
+        stall.reject(chat_id, "scope", "blocked_by_policy", ",".join(blocked))
     max_exp = min(
         settings.get("maxexposure", 20.0) / 100.0,
         config.MAX_PORTFOLIO_EXPOSURE,
@@ -1164,7 +1272,15 @@ async def _evaluate_single_user_locked(user: dict, trigger_asset: str = None, pe
     suspended = learned.get("suspended_strategies", [])
     if suspended:
         log.warning(f"[{chat_id}] Strategies SUSPENDED by learner: {suspended}")
+        stall.reject(chat_id, "scope", "suspended_by_learner", ",".join(suspended))
     learned["strategies"] = [s for s in user_strats if s not in suspended]
+    if not learned["strategies"]:
+        # Nothing left to evaluate: this is a configuration state, not an
+        # absence of edge, and the two need different operator actions.
+        stall.reject(
+            chat_id, "scope", "no_enabled_strategies",
+            f"requested={requested_strats} permitted={config.PERMITTED_STRATEGIES} suspended={suspended}",
+        )
 
     return await _evaluate_markets(
         chat_id, settings, client, risk, equity, free_cash,
@@ -1189,6 +1305,9 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
         now = time.time()
         # Degraded relay/oracle agreement raises directional edge requirements.
         learned["oracle_penalty"] = max(0.0, float(penalty or 0.0))
+        # Strategies attribute their gate rejections to this evaluation's user.
+        learned["chat_id"] = chat_id
+        in_scope = 0
         for market in active_markets:
             if market.get("status") != "open":
                 skipped_status += 1
@@ -1196,11 +1315,14 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
             if market["asset"] not in user_assets:
                 skipped_asset += 1
                 continue
-            if trigger_asset and market["asset"] != trigger_asset:
-                skipped_trigger += 1
-                continue
             if market["timeframe"] not in user_tfs:
                 skipped_tf += 1
+                continue
+            # In scope for this account (a feed-triggered partial pass filters
+            # further below, but the account's scope itself is not empty).
+            in_scope += 1
+            if trigger_asset and market["asset"] != trigger_asset:
+                skipped_trigger += 1
                 continue
             if strategy.is_halted(market["asset"]):
                 skipped_halted += 1
@@ -1254,6 +1376,30 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
                 f"user_assets={user_assets} user_tfs={user_tfs} | spot={spot_summary}"
             )
 
+        skips = {
+            "status": skipped_status,
+            "asset": skipped_asset,
+            "timeframe": skipped_tf,
+            "trigger": skipped_trigger,
+            "halted": skipped_halted,
+            "stale_feed": skipped_stale_feed,
+            "no_spot": skipped_no_spot,
+        }
+        stall.note_evaluation(
+            chat_id,
+            markets_total=len(active_markets),
+            in_scope=in_scope,
+            evaluated=evaluated,
+            signals=len(all_signals),
+            skips=skips,
+            detail=(
+                f"strategies={learned.get('strategies', [])} assets={user_assets} "
+                f"tfs={user_tfs} max_exposure={max_exp:.0%}"
+            ),
+        )
+        for sig in all_signals:
+            stall.note_signal(chat_id, sig.strategy, sig.asset)
+
         final = strategies.merge_signals(all_signals, strategy.global_state)
         for sig in final:
             if sig.strategy == "ARB":
@@ -1281,6 +1427,7 @@ async def _scan_loop():
         try:
             active_markets = await scanner.scan_all(_scan_client)
             health.touch("scanner", markets=len(active_markets))
+            stall.note_scan(len(active_markets))
             telegram_bot._active_markets = active_markets
             executor.init_executor(active_markets, _tg_app)
             log.info(f"Scan: {len(active_markets)} markets")
@@ -1300,6 +1447,9 @@ async def _scan_loop():
                 log.debug(f"Complete-set shadow scan hook: {se}")
         except Exception as e:
             health.fail("scanner", e)
+            # Keep the last known market count honest (the loop may still be
+            # trading against a cached scan) while recording why it is stale.
+            stall.note_scan(len(active_markets), error=str(e))
             log.warning(f"Scan failed: {e}")
 
 
@@ -1394,7 +1544,12 @@ async def _heartbeat_loop():
                 *(_evaluate_single_user(user, penalty=0.0) for user in _active_users_cache),
                 return_exceptions=True,
             )
-            if any(result is True for result in results):
+            # Dead-man switch: "is the engine still turning at all". A completed
+            # pass where every account deliberately short-circuited (paused, dry
+            # run) still counts as progress — that state gets its own, far more
+            # useful alert from the trading-drought watchdog below. Conflating
+            # the two is how alerts become wallpaper a real outage hides behind.
+            if all(not isinstance(r, Exception) for r in results):
                 _last_successful_eval = time.time()
             health.touch("heartbeat", users=len(_active_users_cache))
         except Exception as e:
@@ -1409,7 +1564,7 @@ _DEAD_MAN_THRESHOLD = 300  # 5 minutes with no evaluation = alert
 
 async def _feed_watchdog():
     """Runs every 30s. Alerts via Telegram if feeds go stale or bot is dead."""
-    global _last_feed_alert, _last_successful_eval
+    global _last_feed_alert
     while True:
         await asyncio.sleep(30)
         now = time.time()
@@ -1450,6 +1605,138 @@ async def _feed_watchdog():
                         await telegram_bot.send_message(_tg_app, user_id, msg)
                     except Exception:
                         pass
+
+# ── Trading-drought watchdog ─────────────────────────────────────────────────
+
+_STALL_CHECK_SEC = 60.0
+
+
+def _worst_feed_age_sec(now: float) -> float | None:
+    """Oldest oracle/relay sample across the crypto assets we trade."""
+    ages: list[float] = []
+    for asset in ("BTC", "ETH", "SOL"):
+        _, direct_time = feeds_direct.get_direct_price(asset)
+        if direct_time:
+            ages.append(now - direct_time)
+            continue
+        relay_time = feeds.spot_updated_at.get(asset, 0.0)
+        ages.append(now - relay_time if relay_time else now - feeds_direct._startup_time)
+    return max(ages) if ages else None
+
+
+async def _seed_stall_clocks(users: list[dict]) -> None:
+    """Backdate drought clocks from the ledger so a restart is not amnesia.
+
+    Without this, deploying clears "minutes since last order" to zero and a
+    multi-day stall would be invisible for the first two hours of every restart —
+    which is precisely when an operator is busiest reading deploy output.
+    """
+    for user in users or []:
+        chat_id = user.get("chat_id")
+        if not chat_id:
+            continue
+        try:
+            settings = user.get("settings", {}) or {}
+            stall.note_state(
+                chat_id,
+                paused=bool(settings.get("paused")),
+                paused_reason=str(settings.get("paused_reason") or ""),
+                dry_run=not config.LIVE_TRADING,
+            )
+            rows = await asyncio.to_thread(database.recent_trades, chat_id, 1)
+            created = rows[0].get("created_at") if rows else None
+            if created is not None:
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                stall.seed_last_trade(chat_id, created.timestamp())
+                log.info(
+                    f"[{chat_id}] Stall clock seeded from ledger "
+                    f"(last order {(time.time() - created.timestamp()) / 3600:.1f}h ago)"
+                )
+        except Exception as seed_err:
+            log.debug(f"[{chat_id}] Stall clock seeding skipped: {seed_err}")
+
+
+def _stall_context(chat_id: str, user: dict | None = None) -> dict:
+    """Keyword arguments for :func:`stall.report` / :func:`stall.verdict`.
+
+    Only keys those functions accept. Pause and dry-run state are *recorded*
+    separately via ``stall.note_state`` when it changes, so the verdict can be
+    built from any call site without every caller threading it through.
+    """
+    risk = _user_risks.get(chat_id)
+    equity = 0.0
+    if risk is not None:
+        try:
+            equity = float(getattr(risk, "current_free_cash", 0.0) or 0.0) + risk.deployed()
+        except Exception:
+            equity = 0.0
+    return {
+        "equity": equity,
+        "min_viable": _MIN_VIABLE_BALANCE,
+        "feed_age_sec": _worst_feed_age_sec(time.time()),
+        "eval_max_age_sec": config.STALL_EVAL_MAX_AGE_SEC,
+    }
+
+
+async def _check_trading_stalls() -> None:
+    """Name the reason an account has not traded, and alert on it.
+
+    This is deliberately a *reporting* loop. It never resizes, never lowers a
+    gate, and never resumes a manual pause: silence caused by "no qualifying
+    edge" is the correct outcome and stays a single informational line. Silence
+    caused by a dead task, a stale feed, a config state, or a dry-run flag is a
+    fault, and a fault that nobody can see is how an account sits dark for days.
+    """
+    users = _active_users_cache or []
+    if not users:
+        return
+    limit = float(config.TRADE_STALL_ALERT_MIN)
+    for user in users:
+        chat_id = user.get("chat_id")
+        if not chat_id:
+            continue
+        try:
+            context = _stall_context(chat_id, user)
+            data = stall.report(chat_id, **context)
+            verdict = data["verdict"]
+            gap = stall.trade_gap_minutes(chat_id)
+            severe = verdict.get("severity") == "critical"
+            if gap < limit and not severe:
+                health.touch("trading_stall", chat_id=chat_id, verdict=verdict["code"],
+                             gap_min=round(gap, 1))
+                continue
+            if not stall.note_alert(chat_id, verdict["code"]):
+                continue
+            log.warning(
+                f"[{chat_id}] TRADING STALL after {gap:.0f} min — {verdict['code']}: "
+                f"{verdict['headline']} | {verdict['detail']} | action: {verdict['action']}"
+            )
+            if severe:
+                health.fail("trading_stall", f"{chat_id}: {verdict['code']}", gap_min=round(gap))
+            if _tg_app:
+                text = stall.format_report(chat_id, **{k: v for k, v in context.items()
+                                                       if k in ("equity", "min_viable", "feed_age_sec",
+                                                               "eval_max_age_sec")})
+                await telegram_bot.send_message(
+                    _tg_app, chat_id,
+                    f"🩺 *Trading stall — {gap:.0f} min without an order*\n\n{text[:3500]}",
+                    parse_mode="Markdown",
+                )
+        except Exception as stall_err:
+            # Diagnostics must never take down the loop that trades.
+            log.debug(f"[{chat_id}] Stall check error: {stall_err}", exc_info=True)
+
+
+async def _stall_watchdog():
+    log.info(
+        "Trading-drought watchdog started (alert after %.0f min without an order)",
+        config.TRADE_STALL_ALERT_MIN,
+    )
+    while True:
+        await asyncio.sleep(_STALL_CHECK_SEC)
+        await _check_trading_stalls()
+
 
 # ── Self-ping ─────────────────────────────────────────────────────────────────
 
@@ -1496,8 +1783,21 @@ async def _dashboard_loop():
                 a: {"price": d["price"], "lag": time.time() - d["time"]}
                 for a, d in feeds_direct.direct_spot.items()
             }
+            # "Why is this account quiet?" belongs in the same read-only view as
+            # balances: a dashboard that shows money but not stalls invites the
+            # wrong conclusion that quiet == broken money rather than quiet == gate.
+            stall_reports = {}
+            for cid in list(_user_clients.keys()):
+                try:
+                    stall_reports[cid] = stall.report(cid, **_stall_context(cid))
+                except Exception as stall_err:
+                    log.debug(f"[{cid}] Stall report failed: {stall_err}")
             server.stats_cache.update({
-                "users": user_stats, "oracles": oracle_stats, "last_update": time.time()
+                "users": user_stats,
+                "oracles": oracle_stats,
+                "stalls": stall_reports,
+                "live_trading": bool(config.LIVE_TRADING),
+                "last_update": time.time(),
             })
         except Exception as e:
             log.error(f"Dashboard update error: {e}")
@@ -1585,10 +1885,12 @@ async def main():
     _start_supervised("scanner_loop", _scan_loop)
     _start_supervised("dashboard", _dashboard_loop)
     _start_supervised("feed_watchdog", _feed_watchdog)
+    _start_supervised("stall_watchdog", _stall_watchdog)
 
     # ── Reconnect existing users with CORRECT status message ─────────────────
     existing = await asyncio.to_thread(_safe_get_all_active)
     log.info(f"Reconnecting {len(existing)} existing user(s)")
+    await _seed_stall_clocks(existing)
 
     for user in existing:
         cid      = user["chat_id"]
@@ -1613,11 +1915,22 @@ async def main():
         # Tell user what state the bot is actually in — not a blanket "resumed"
         try:
             if is_paused:
+                pause_reason = str(settings.get("paused_reason") or "manual")
+                if pause_reason == "manual":
+                    guidance = (
+                        "It was a manual pause, so only /resume will clear it."
+                    )
+                else:
+                    guidance = (
+                        f"Reason: `{pause_reason.replace('_', ' ')}` — that kind of stop "
+                        "expires by itself at the next trading-day rollover. "
+                        "/resume overrides it now, /why explains the account state."
+                    )
                 await telegram_bot.send_message(
                     _tg_app, cid,
                     f"🔄 *Bot restarted* (update deployed)\n\n"
-                    f"⏸ Your trading was *paused* before the restart — "
-                    f"it is still paused.\nSend /resume when you're ready.",
+                    f"⏸ Your trading was *paused* before the restart and is still paused.\n"
+                    f"{guidance}",
                     parse_mode="Markdown",
                 )
                 log.info(f"[{cid}] Reconnected | mode={mode} | PAUSED — notified")
