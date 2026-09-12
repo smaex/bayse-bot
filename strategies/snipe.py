@@ -109,13 +109,15 @@ class SnipeStrategy(BaseStrategy):
             )
             return None
 
-        # ── Conservative probability model ────────────────────────────────
-        # Use zero drift. An instantaneous Kalman velocity is too unstable to
-        # extrapolate into a settlement probability and was a source of false
-        # confidence. Inflate observed volatility instead, with an additional
-        # near-close cushion for oracle and microstructure uncertainty.
+        # ── Asset-Calibrated Volatility & Safety ──────────────────────────
+        vol_mult = {
+            "BTC": 1.15,
+            "ETH": 1.30,
+            "SOL": 1.20,
+        }.get(asset.upper(), config.SNIPE_VOL_SAFETY_MULTIPLIER)
+
         rv = realized_vol_hourly(asset, state)
-        rv *= config.SNIPE_VOL_SAFETY_MULTIPLIER
+        rv *= vol_mult
         if secs < 300:
             rv *= 1.0 + 0.5 * ((300.0 - secs) / 240.0)
 
@@ -136,12 +138,28 @@ class SnipeStrategy(BaseStrategy):
         raw_edge_no = raw_w_no - no_price
         distance_pct = (live_spot - threshold) / threshold
 
+        # ── 5-Minute Momentum Check ───────────────────────────────────────
+        mom_5m = 0.0
+        try:
+            hist = getattr(state, "price_history", {}).get(asset, []) if state else []
+            if not hist:
+                hist = global_state.price_history.get(asset, [])
+            if hist and len(hist) >= 5:
+                now_t = time.time()
+                old_prices = [p for t, p in hist if 240 <= (now_t - t) <= 360]
+                if old_prices and live_spot:
+                    mom_5m = (live_spot - old_prices[-1]) / old_prices[-1]
+        except Exception:
+            mom_5m = 0.0
+
         # Direction must agree with spot's side of the settlement threshold;
         # never buy the apparent underdog against the current oracle position.
+        # Momentum must not be actively opposing the thesis.
         if (
             distance_pct > 0
             and raw_w_yes >= 0.55
             and raw_edge_yes >= config.SNIPE_MIN_RAW_MODEL_EDGE
+            and mom_5m >= -0.0008
         ):
             direction = "YES"
             raw_probability = raw_w_yes
@@ -150,20 +168,32 @@ class SnipeStrategy(BaseStrategy):
             distance_pct < 0
             and raw_w_no >= 0.55
             and raw_edge_no >= config.SNIPE_MIN_RAW_MODEL_EDGE
+            and mom_5m <= 0.0008
         ):
             direction = "NO"
             raw_probability = raw_w_no
             market_price = no_price
         else:
             log.info(
-                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no raw edge "
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no raw edge/trend alignment "
                 f"(raw_yes={raw_w_yes:.1%} vs {yes_price:.3f}, "
                 f"raw_no={raw_w_no:.1%} vs {no_price:.3f}, "
-                f"dist={distance_pct:+.3%})"
+                f"dist={distance_pct:+.3%}, mom_5m={mom_5m:+.4f})"
             )
             return None
 
-        if abs(distance_pct) < config.SNIPE_MIN_DISTANCE_PCT:
+        # Asset-specific distance clearance
+        min_dist_req = {
+            "BTC": 0.0012,
+            "ETH": 0.0018,
+            "SOL": 0.0015,
+        }.get(asset.upper(), config.SNIPE_MIN_DISTANCE_PCT)
+
+        if abs(distance_pct) < min_dist_req:
+            log.info(
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — insufficient distance "
+                f"({abs(distance_pct):.4%} < {min_dist_req:.4%})"
+            )
             return None
         if not (
             config.SNIPE_MIN_ENTRY_PRICE
@@ -245,7 +275,7 @@ class SnipeStrategy(BaseStrategy):
                 f"secs={secs:.0f}"
             ),
             title=market.get("title", ""),
-            momentum_at_entry=0.0,
+            momentum_at_entry=mom_5m,
             regime_at_entry=0.0,
             edge_at_entry=w_est - market_price,
             realized_vol_at_entry=rv,

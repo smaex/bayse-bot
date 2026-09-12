@@ -333,6 +333,11 @@ async def _user_loop(chat_id: str):
         # Even if trading is paused, low balance, daily target hit, or in drawdown,
         # existing open positions must ALWAYS be actively monitored, stopped-out on reversals, or profit-locked!
         try:
+            await _manage_unfilled_maker_orders(chat_id, client, risk, settings)
+        except Exception as maker_err:
+            log.error(f"[{chat_id}] Maker order management error: {maker_err}", exc_info=True)
+
+        try:
             await _evaluate_and_exit_positions(chat_id, client, risk, settings)
         except Exception as exit_err:
             log.error(f"[{chat_id}] Position exit eval error: {exit_err}", exc_info=True)
@@ -446,6 +451,123 @@ async def _user_loop(chat_id: str):
         await _evaluate_single_user(user, penalty=0.0)
 
 
+async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: dict):
+    """
+    Actively monitors resting maker limit orders on the CLOB:
+    - If filled: updates DB, records position as confirmed filled, notifies user via notify_fill.
+    - If cancelled/expired: removes from tracker, resolves DB trade as won=None (0.0 PnL), notifies user.
+    - If stale (>120s or oracle moved > 0.15% or secs < 180): cancels order, frees capital, resolves trade as 0.0 PnL, notifies user via notify_unfilled.
+    """
+    if not risk.open_positions:
+        return
+
+    from strategies.maker import maker_strategy
+
+    for position_key, pos in list(risk.open_positions.items()):
+        if pos.get("confirmed_filled"):
+            continue
+        order_id = pos.get("order_id")
+        if not order_id:
+            continue
+
+        market_id = pos.get("market_id", "")
+        market = next((m for m in active_markets if m["market_id"] == market_id), None)
+        secs = market.get("secs_to_close", 0) if market else 0
+
+        try:
+            order_data = await client.get_order(order_id)
+            status = str(order_data.get("status") or "").lower()
+            shares = client.parse_filled_shares(order_data)
+
+            if status in ("filled", "completed") or shares > 0:
+                fill_price = float(
+                    order_data.get("avgFillPrice")
+                    or order_data.get("price")
+                    or pos.get("entry_price", 0.5)
+                )
+                fill_fee = float(order_data.get("fee") or 0.0)
+                confirmed_cost = (
+                    shares * fill_price * config.CURRENCY_BASE_MULTIPLIER + fill_fee
+                )
+                pos["confirmed_filled"] = True
+                pos["filled_quantity"] = shares
+                pos["entry_price"] = fill_price
+                pos["amount_ngn"] = confirmed_cost
+
+                trade_id = pos.get("trade_id")
+                if trade_id:
+                    await asyncio.to_thread(
+                        database.update_trade_fill,
+                        trade_id, confirmed_cost, shares, fill_price,
+                    )
+                log.info(
+                    f"[{chat_id}] MAKER LIMIT ORDER FILLED | {pos.get('asset')} {pos.get('outcome')} "
+                    f"@ {fill_price:.3f} | {shares:.2f} shares (₦{confirmed_cost:,.0f})"
+                )
+                if _tg_app:
+                    try:
+                        await telegram_bot.notify_fill(
+                            _tg_app, chat_id, pos.get("strategy", "MAKER"),
+                            pos.get("asset", ""), pos.get("timeframe", ""),
+                            pos.get("outcome", ""), fill_price, confirmed_cost,
+                        )
+                    except Exception as ne:
+                        log.debug(f"notify_fill failed: {ne}")
+                continue
+
+            if status in ("cancelled", "expired", "rejected", "killed"):
+                risk.remove_position(position_key)
+                trade_id = pos.get("trade_id")
+                if trade_id:
+                    await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
+                log.info(f"[{chat_id}] Cleaned {status} maker order {order_id} on {market_id}")
+                if _tg_app:
+                    try:
+                        await telegram_bot.notify_unfilled(
+                            _tg_app, chat_id, pos.get("strategy", "MAKER"),
+                            pos.get("asset", ""), pos.get("timeframe", ""),
+                            pos.get("outcome", ""), pos.get("amount_ngn", 0),
+                        )
+                    except Exception as ne:
+                        log.debug(f"notify_unfilled failed: {ne}")
+                continue
+
+            # If still open, check if stale / needs requote / late in candle
+            order_age = time.time() - pos.get("placed_at", time.time())
+            timeout_sec = getattr(config, "MAKER_ORDER_TIMEOUT", 120.0)
+            is_stale_quote = (
+                order_age > timeout_sec
+                or maker_strategy.should_requote(market_id)
+                or (secs > 0 and secs < 180)
+            )
+
+            if is_stale_quote:
+                log.info(
+                    f"[{chat_id}] Cancelling stale resting maker order {order_id} on {market_id} "
+                    f"(age={order_age:.0f}s, secs_to_close={secs:.0f}s)"
+                )
+                try:
+                    await client.cancel_order(order_id)
+                except Exception as ce:
+                    log.debug(f"cancel_order check: {ce}")
+                risk.remove_position(position_key)
+                trade_id = pos.get("trade_id")
+                if trade_id:
+                    await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
+                if _tg_app:
+                    try:
+                        await telegram_bot.notify_unfilled(
+                            _tg_app, chat_id, pos.get("strategy", "MAKER"),
+                            pos.get("asset", ""), pos.get("timeframe", ""),
+                            pos.get("outcome", ""), pos.get("amount_ngn", 0),
+                        )
+                    except Exception as ne:
+                        log.debug(f"notify_unfilled failed: {ne}")
+
+        except Exception as e:
+            log.debug(f"[{chat_id}] Order management check error for {order_id}: {e}")
+
+
 async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dict):
     """
     Soft model-based exit: re-evaluate every open position using the diffusion
@@ -554,8 +676,9 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
 
         # ── 1. DYNAMIC TAKE-PROFIT & TRAILING PROFIT LOCK ─────────────────────
         # Locks in profit whenever:
-        # A) Executable market price shows the configured gain near close.
-        # B) Market price peaked >= +12% and then declines by >= 8%.
+        # A) Near-close profit target: secs < 450 and gain_pct >= TAKE_PROFIT_GAIN_PCT (15%).
+        # B) Absolute high price target: current_price >= TAKE_PROFIT_PRICE_TARGET (0.82) with gain_pct >= 20%.
+        # C) Trailing reversal protection: Market price peaked >= +15% and then declines by >= 8%.
         gain_pct = (
             (current_price - entry_price) / entry_price
             if entry_price > 0 else 0.0
@@ -568,10 +691,11 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             (peak_price - current_price) / peak_price
             if peak_price > 0 else 0.0
         )
+        target_tp_price = getattr(config, "TAKE_PROFIT_PRICE_TARGET", 0.82)
 
         if (
-            secs < TAKE_PROFIT_MIN_SECS_REMAINING
-            and gain_pct >= TAKE_PROFIT_GAIN_PCT
+            (secs < TAKE_PROFIT_MIN_SECS_REMAINING and gain_pct >= TAKE_PROFIT_GAIN_PCT)
+            or (current_price >= target_tp_price and gain_pct >= 0.20)
         ):
             positions_to_exit.append({
                 "market_id": market_id,
@@ -586,7 +710,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             continue
 
         if (
-            peak_gain_pct >= 0.12
+            peak_gain_pct >= 0.15
             and dropped_from_peak >= 0.08
             and current_price >= entry_price
         ):
@@ -603,17 +727,29 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             continue
 
         # ── 2. DYNAMIC REAL-TIME STOP-LOSS (SPOT INVALIDATION) ─────────────────
-        # Instantly dumps the position if:
-        # A) Spot price crosses to the losing side of threshold by >= 0.005%
-        # B) Win probability (w_est) drops below 40% (thesis mathematically broken)
-        # C) Current loss >= 15%
-        adverse_flip = (outcome == "YES" and dist_pct < -0.00005) or (outcome == "NO" and dist_pct > +0.00005)
-        thesis_broken = (w_est < 0.40)
+        # Dumps position if thesis is mathematically broken or risk is severe:
+        # A) Early/Mid-candle (secs > 300): only exit if w_est < 0.30 and loss_pct >= 0.15, or loss_pct >= 0.30
+        # B) Late-candle (secs <= 300): exit if spot is on losing side by >= 0.03% AND w_est < 0.40, or loss_pct >= 0.20
+        # C) Late unconfirmed MAKER limit order: cancel resting order before close
         loss_pct = (entry_price - current_price) / entry_price if entry_price > 0 else 0.0
-        # MAKER Late-Candle Protection: cancel resting limit orders in the final 5 mins (<300s) to prevent adverse selection dumps
         is_maker_late = (pos.get("strategy") == "MAKER" and secs < 300 and not pos.get("confirmed_filled"))
 
-        if adverse_flip or thesis_broken or is_maker_late or (loss_pct >= 0.15 and current_price >= 0.05):
+        late_adverse_flip = (
+            secs <= 300
+            and ((outcome == "YES" and dist_pct < -0.0003) or (outcome == "NO" and dist_pct > 0.0003))
+            and w_est < 0.40
+        )
+        early_thesis_broken = (
+            secs > 300
+            and w_est < 0.30
+            and loss_pct >= 0.15
+        )
+        hard_loss_stop = (
+            (secs <= 300 and loss_pct >= 0.20 and current_price >= 0.05)
+            or (secs > 300 and loss_pct >= 0.30 and current_price >= 0.05)
+        )
+
+        if is_maker_late or late_adverse_flip or early_thesis_broken or hard_loss_stop:
             positions_to_exit.append({
                 "market_id": market_id,
                 "position_key": position_key,
@@ -996,6 +1132,20 @@ async def _evaluate_single_user_locked(user: dict, trigger_asset: str = None, pe
     user_assets = settings.get("assets",     config.ALL_ASSETS)
     raw_tfs     = settings.get("timeframes",  ["15min", "5min"])
     requested_strats = settings.get("strategies", config.DEFAULT_STRATEGIES)
+    # Non-custom modes follow the platform default scope: union the saved
+    # choices with the current defaults so existing database users
+    # automatically evaluate newly enabled strategies, assets, and
+    # timeframes. Custom mode keeps exact user control (no expansion).
+    if settings.get("mode", "balanced") != "custom":
+        requested_strats = list(dict.fromkeys(
+            [*requested_strats, *config.DEFAULT_STRATEGIES]
+        ))
+        user_assets = list(dict.fromkeys(
+            [*user_assets, *config.DEFAULT_ASSETS]
+        ))
+        raw_tfs = list(dict.fromkeys(
+            [*raw_tfs, *config.DEFAULT_TIMEFRAMES]
+        ))
     user_strats = [s for s in requested_strats if s in config.PERMITTED_STRATEGIES]
     blocked = sorted(set(requested_strats) - set(user_strats))
     if blocked:

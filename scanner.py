@@ -145,7 +145,16 @@ async def _enrich(client: BayseClient, lean_event: dict, asset: str, timeframe: 
     status = str(full.get("status") or "open").strip().lower()
     if status == "active":
         status = "open"
-    engine = str(full.get("engine") or market.get("engine") or "AMM").upper()
+    declared_engine = full.get("engine") or market.get("engine")
+    if declared_engine:
+        engine = str(declared_engine).upper()
+    elif asset in {"BTC", "ETH", "SOL"} and timeframe in {"5min", "15min", "1h"}:
+        # The API omits the engine field on crypto short-term series; these
+        # trade on the CLOB. Defaulting them to AMM silently disables MAKER
+        # quoting, so infer CLOB here.
+        engine = "CLOB"
+    else:
+        engine = "AMM"
     minimum_order = float(
         market.get("minimumOrderAmount")
         or full.get("minimumOrderAmount")

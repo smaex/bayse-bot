@@ -75,13 +75,20 @@ def test_liquidity_router_never_auto_enables_quarantined_midmarket_maker():
     assert "MIDMARKET_MAKER" not in routed
 
 
-def test_new_accounts_default_to_evidence_backed_maker_scope_and_stay_paused():
-    assert config.DEFAULT_STRATEGIES == ["MAKER"]
-    assert config.DEFAULT_ASSETS == ["BTC", "SOL"]
-    assert config.DEFAULT_TIMEFRAMES == ["15min"]
-    assert database.DEFAULT_SETTINGS["strategies"] == ["MAKER"]
-    assert database.DEFAULT_SETTINGS["assets"] == ["BTC", "SOL"]
-    assert database.DEFAULT_SETTINGS["timeframes"] == ["15min"]
+def test_new_accounts_default_to_multi_strategy_scope_and_stay_paused():
+    assert config.DEFAULT_STRATEGIES == [
+        "SNIPE", "MAKER", "ORACLE_ARB", "FRONTRUN", "CORRELATE",
+    ]
+    assert config.DEFAULT_ASSETS == ["BTC", "ETH", "SOL"]
+    assert config.DEFAULT_TIMEFRAMES == ["15min", "5min"]
+    assert database.DEFAULT_SETTINGS["strategies"] == [
+        "SNIPE", "MAKER", "ORACLE_ARB", "FRONTRUN", "CORRELATE",
+    ]
+    assert database.DEFAULT_SETTINGS["assets"] == ["BTC", "ETH", "SOL"]
+    assert database.DEFAULT_SETTINGS["timeframes"] == ["15min", "5min"]
+    assert database.DEFAULT_SETTINGS["mode"] == "balanced"
+    assert database.DEFAULT_SETTINGS["maxexposure"] == 15.0
+    assert database.DEFAULT_SETTINGS["daily_loss_limit_pct"] == 5.0
     assert database.DEFAULT_SETTINGS["paused"] is True
 
 

@@ -959,6 +959,28 @@ async def notify_loss(app, cid, _mid, asset, tf, strat, pnl):
         except Exception as e:
             log.error(f"notify_loss failed: {e}")
 
+async def notify_fill(app, cid, strat, asset, tf, outcome, price, amount_ngn):
+    """Notify user when a resting limit order is filled on the exchange."""
+    icon, name = _STRAT_ICONS.get((strat or "").upper(), ("📊", strat or "MAKER"))
+    _esc = lambda s: (s or "").replace("_", "\\_").replace("*", "\\*")
+    msg = (
+        f"⚡ *Limit Order Filled* {icon}\n"
+        f"Strategy: *{_esc(name)}*\n"
+        f"Market: *{_esc(asset)} {_esc(tf)}* (*{_esc(outcome)}*)\n"
+        f"Fill Price: *{price:.3f}*\n"
+        f"Amount: *₦{amount_ngn:,.0f}*\n"
+        f"_Matched by taker on CLOB. Position is now actively tracked._"
+    )
+    try:
+        await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+    except Exception:
+        try:
+            await app.bot.send_message(chat_id=cid,
+                text=f"⚡ FILLED | {name} | {asset} {tf} {outcome} | ₦{amount_ngn:,.0f} @ {price:.3f}")
+        except Exception as e:
+            log.error(f"notify_fill failed: {e}")
+
+
 async def notify_unfilled(app, cid, strat, asset, tf, outcome, amount_ngn):
     """Notify user when a FAK/limit order was cancelled with zero fill.
     This is NOT a loss — no money was deducted. The position was never opened."""

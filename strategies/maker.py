@@ -238,22 +238,22 @@ class MakerStrategy(BaseStrategy):
             )
             return None
 
-        # ── Strict Directional Alignment & Active Momentum Confirmation ────────
+        # ── Strict Directional Alignment & Non-Opposing Momentum ───────────────
         # NEVER trade against the spot side!
         # Requires true high-probability thesis (Fair Value >= 0.62, edge >= 0.020)
-        # AND active momentum in the direction of the trade:
-        # - For YES: spot must be rising (mom_5m >= +0.0002)
-        # - For NO: spot must be falling (mom_5m <= -0.0002)
+        # AND momentum that is not actively opposing the trade:
+        # - For YES: momentum must not be falling (mom_5m >= -0.0005)
+        # - For NO: momentum must not be rising (mom_5m <= +0.0005)
         chosen_side = None
         min_maker_edge = 0.020 + eth_edge_cushion  # at least 2.0 cents of real edge
         if (dist_pct > 0 and edge_yes >= min_maker_edge
-                and fv_yes >= 0.62 and mom_5m >= 0.0002):
+                and fv_yes >= 0.62 and mom_5m >= -0.0005):
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
         elif (dist_pct < 0 and edge_no >= min_maker_edge
-                and fv_no >= 0.62 and mom_5m <= -0.0002):
+                and fv_no >= 0.62 and mom_5m <= 0.0005):
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price
@@ -274,10 +274,10 @@ class MakerStrategy(BaseStrategy):
         competitive_bid = max(market_bid + 0.01, target_fv - 0.05, 0.540)
         our_bid = round(min(target_fv - HALF_SPREAD, competitive_bid), 3)
 
-        # Entry price bounds limit poor payoff asymmetry; losing shares can still settle at zero.
-        if our_bid < 0.50 or our_bid > 0.65:
-            log.info(f"MAKER SKIP {asset} — bid price out of bounds ({our_bid:.3f})")
-            return None
+        # Clamp into the executable band where takers actually trade. Entry
+        # price bounds limit poor payoff asymmetry; losing shares can still
+        # settle at zero.
+        our_bid = round(max(0.50, min(0.65, our_bid)), 3)
 
         # Data-driven certainty calibration: combines true statistical win probability and spread edge
         cert = min(0.95, max(target_fv, 0.50 + chosen_edge * 3.5))
@@ -347,6 +347,15 @@ class MakerStrategy(BaseStrategy):
         if base > 0 and abs(price_now - base) / base > REQUOTE_THRESHOLD:
             return True
         return False
+
+    def is_stale(self, market_id: str, timeout_sec: float = 120.0) -> bool:
+        """True if order has been resting too long without fill or oracle moved."""
+        info = self.open_orders.get(market_id)
+        if not info:
+            return False
+        if time.time() - info.get("placed_at", 0) > timeout_sec:
+            return True
+        return self.should_requote(market_id)
 
 
 # Singleton used by executor.py and bot.py

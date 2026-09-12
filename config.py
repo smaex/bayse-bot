@@ -99,22 +99,20 @@ ASSET_ORACLE = {
 
 # ── Strategies ────────────────────────────────────────────────────────────────
 ACTIVE_STRATEGIES = [
-    "SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER",
-    "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
+    "SNIPE", "MAKER", "ORACLE_ARB", "FRONTRUN", "CORRELATE",
+    "ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
 ]
-# These strategies have multi-leg/resting-order/latency risk and must be
-# promoted only after exchange-confirmed fill and PnL data validates them.
-# Single-leg MAKER is different: it is a directional post-only CLOB order, not
-# a supposedly locked-in pair. It remains permitted because 273 production
-# records were profitable overall and Bayse documents makers as fee-free.
+# Multi-leg strategies with non-atomic dual-order execution risk are quarantined
+# until exchange-confirmed paired fills validate them. ORACLE_ARB is a
+# single-leg final-seconds latency strategy and is permitted alongside the
+# other active single-leg strategies.
 EXPERIMENTAL_STRATEGIES = {
-    "ARB", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
+    "ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
 }
-# Production evidence currently supports MAKER on BTC/SOL 15-minute markets.
-# New accounts still start paused; existing saved settings are not overwritten.
-DEFAULT_STRATEGIES = ["MAKER"]
-DEFAULT_ASSETS = ["BTC", "SOL"]
-DEFAULT_TIMEFRAMES = ["15min"]
+# Default scope for new accounts (which start paused).
+DEFAULT_STRATEGIES = ["SNIPE", "MAKER", "ORACLE_ARB", "FRONTRUN", "CORRELATE"]
+DEFAULT_ASSETS = ["BTC", "ETH", "SOL"]
+DEFAULT_TIMEFRAMES = ["15min", "5min"]
 ALLOW_EXPERIMENTAL_STRATEGIES = _env_bool("ALLOW_EXPERIMENTAL_STRATEGIES", False)
 PERMITTED_STRATEGIES = [
     name for name in ACTIVE_STRATEGIES
@@ -133,24 +131,23 @@ SNIPE_ENTRY_WINDOWS = {
     "6h":    7200,
     "1d":    21600,
 }
-# Conservative guardrails, not a profitability claim. Production SNIPE was
-# negative overall; only SOL was approximately break-even. Until fresh policy-
-# compliant fills prove otherwise, SNIPE is restricted to the observed scope
-# with the least-bad economics. Operators can broaden this explicitly for paper
-# testing, but should not infer profitability from doing so.
-SNIPE_ALLOWED_ASSETS = _env_csv_set("SNIPE_ALLOWED_ASSETS", {"SOL"})
+# SNIPE is enabled on BTC, ETH, and SOL with asset-calibrated strike distance buffers,
+# momentum confirmation, and fee-adjusted expected value gates.
+SNIPE_ALLOWED_ASSETS = _env_csv_set("SNIPE_ALLOWED_ASSETS", {"BTC", "ETH", "SOL"})
 SNIPE_ALLOWED_TIMEFRAMES = _env_csv_set(
-    "SNIPE_ALLOWED_TIMEFRAMES", {"15MIN"}
+    "SNIPE_ALLOWED_TIMEFRAMES", {"15MIN", "5MIN"}
 )
 SNIPE_MIN_SECS_TO_CLOSE = 60
-SNIPE_MIN_CERTAINTY    = 0.45   # Maps to a conservative win probability of about 70%.
+SNIPE_MIN_CERTAINTY    = 0.27   # Maps to a conservative win probability of >= 62%.
 SNIPE_MAX_MARKET_PRICE = 0.65   # Avoid expensive, strongly asymmetric payoffs.
-SNIPE_MIN_ENTRY_PRICE  = 0.45   # Block low-probability underdog entries.
-SNIPE_MIN_DISTANCE_PCT = 0.0010 # Require at least 0.10% spot/threshold separation.
-SNIPE_MIN_RAW_MODEL_EDGE = 0.08 # Independent model must disagree materially with market.
-SNIPE_MIN_BLENDED_EDGE = 0.03   # Required after shrinking toward market consensus.
+SNIPE_MIN_ENTRY_PRICE  = 0.40   # Block low-probability underdog entries.
+SNIPE_MIN_DISTANCE_PCT = 0.0010 # Base minimum spot/threshold separation (calibrated by asset).
+SNIPE_MIN_RAW_MODEL_EDGE = 0.06 # Independent model must disagree materially with market.
+SNIPE_MIN_BLENDED_EDGE = 0.025  # Required after shrinking toward market consensus.
 SNIPE_MODEL_WEIGHT = 0.35       # Market gets 65% weight until calibration improves.
 SNIPE_VOL_SAFETY_MULTIPLIER = 1.25
+MAKER_ORDER_TIMEOUT = 120       # Seconds before cancelling stale resting maker quote.
+TAKE_PROFIT_PRICE_TARGET = 0.82 # Absolute take-profit price target.
 
 # Complete-set arbitrage remains shadow-only. The edge must clear two taker
 # fees plus execution uncertainty before an observation is counted.

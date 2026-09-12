@@ -89,7 +89,9 @@ async def evaluate_all(
     liq_regime = "TIGHT_LIQUID"
     if ob_yes and ob_no:
         liq_regime, _ = classify_regime(ob_yes, ob_no)
-    elif (yes_p + no_p > 1.15) or (min(yes_p, no_p) < 0.20 and max(yes_p, no_p) > 0.80):
+    elif (yes_p + no_p > 1.15) or (yes_p + no_p < 0.85):
+        # Sum dislocation only: a confident-but-valid binary market
+        # (e.g. YES=0.82, NO=0.18, sum=1.00) must NOT be flagged wide.
         liq_regime = "DISLOCATED_WIDE"
 
     # A liquidity regime may suppress unsafe takers, but may never promote a
