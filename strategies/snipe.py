@@ -118,15 +118,17 @@ class SnipeStrategy(BaseStrategy):
             )
             return None
 
-        # ── Asset-Calibrated Volatility & Safety ──────────────────────────
+        # ── Asset-Calibrated Volatility & Safety with Instantaneous EWMA ──
         vol_mult = {
             "BTC": 1.15,
             "ETH": 1.30,
             "SOL": 1.20,
         }.get(asset.upper(), config.SNIPE_VOL_SAFETY_MULTIPLIER)
 
+        import feeds_direct as _fd
+        ewma_v = _fd.get_ewma_hourly_vol(asset, default=0.025)
         rv = realized_vol_hourly(asset, state)
-        rv *= vol_mult
+        rv = (rv * 0.5) + (ewma_v * vol_mult * 0.5)
         if secs < 300:
             rv *= 1.0 + 0.5 * ((300.0 - secs) / 240.0)
 
@@ -193,19 +195,51 @@ class SnipeStrategy(BaseStrategy):
             )
             return None
 
-        # Asset-specific distance clearance
-        min_dist_req = {
+        # ── BTC Lead-Lag Veto & Momentum Boost for ETH & SOL ───────────────
+        if asset.upper() in {"ETH", "SOL"}:
+            btc_velocity = _fd.get_btc_velocity(seconds=5.0)
+            if direction == "YES" and btc_velocity < -0.0015:
+                note_reject(learned, "SNIPE", "lead_lag_btc_opposing_drop", f"btc_vel={btc_velocity:+.3%}")
+                log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — vetoed: BTC lead-lag dumping ({btc_velocity:+.3%})")
+                return None
+            elif direction == "NO" and btc_velocity > 0.0015:
+                note_reject(learned, "SNIPE", "lead_lag_btc_opposing_pump", f"btc_vel={btc_velocity:+.3%}")
+                log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — vetoed: BTC lead-lag pumping ({btc_velocity:+.3%})")
+                return None
+            elif (direction == "YES" and btc_velocity > 0.0010) or (direction == "NO" and btc_velocity < -0.0010):
+                raw_probability = min(0.96, raw_probability + 0.02)
+                log.info(f"SNIPE {asset} {tf} — BTC lead-lag breakout (+{abs(btc_velocity):.2%}) confirmed")
+
+        # ── Microstructure Orderbook Depth Imbalance ──────────────────────
+        imbalance = _fd.get_imbalance(asset)
+        if direction == "YES" and imbalance > 0.20:
+            raw_probability = min(0.96, raw_probability + 0.02 * min(imbalance, 0.8))
+        elif direction == "NO" and imbalance < -0.20:
+            raw_probability = min(0.96, raw_probability + 0.02 * min(abs(imbalance), 0.8))
+        elif direction == "YES" and imbalance < -0.45:
+            raw_probability = max(0.51, raw_probability - 0.03)
+        elif direction == "NO" and imbalance > 0.45:
+            raw_probability = max(0.51, raw_probability - 0.03)
+
+        # Asset-specific distance clearance with EWMA Volatility Adaptation
+        base_dist_req = {
             "BTC": 0.0012,
             "ETH": 0.0018,
             "SOL": 0.0015,
         }.get(asset.upper(), config.SNIPE_MIN_DISTANCE_PCT)
+
+        # Dynamic EWMA regime adaptation:
+        # Calm session (ewma_v < 0.020) -> tighten distance requirement by up to 25% (capture more trades)
+        # High vol spike (ewma_v > 0.040) -> widen distance requirement by up to 30% (protect capital)
+        vol_factor = max(0.75, min(1.30, ewma_v / 0.025))
+        min_dist_req = base_dist_req * vol_factor
 
         if abs(distance_pct) < min_dist_req:
             note_reject(learned, "SNIPE", "distance_below_calibration",
                         f"{abs(distance_pct):.4%} < {min_dist_req:.4%}")
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — insufficient distance "
-                f"({abs(distance_pct):.4%} < {min_dist_req:.4%})"
+                f"({abs(distance_pct):.4%} < {min_dist_req:.4%}, vol_factor={vol_factor:.2f})"
             )
             return None
         if not (
