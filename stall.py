@@ -328,6 +328,41 @@ def verdict(chat_id: str | None, *, now: float | None = None,
             "trade_gap_min": round(trade_gap_min, 1) if trade_gap_min is not None else None,
         }
 
+    # ── Paused / dry-run checks FIRST ──────────────────────────────────
+    # When the account is paused (drawdown, daily target, manual), the
+    # evaluation loop intentionally stops running.  Checking NO_EVALUATION
+    # first would fire a critical "dead process" alert for what is really
+    # a known, safe pause — exactly the false alarm users reported.
+    if snapshot.get("dry_run"):
+        return out(
+            "DRY_RUN",
+            "LIVE_TRADING is false — the bot evaluates and logs signals but never sends orders.",
+            f"{int(snapshot.get('signals', 0))} signal(s) have been produced in this process so far; "
+            "each one ends in a 'DRY RUN' log line instead of an order.",
+            "Deliberately set LIVE_TRADING=true after validating feeds and reconciliation.",
+            "config",
+        )
+    if snapshot.get("paused"):
+        reason = str(snapshot.get("paused_reason") or "") or "unknown"
+        if snapshot.get("manual_pause"):
+            return out(
+                "PAUSED_MANUAL",
+                "Trading is paused by an operator (/pause).",
+                f"paused_reason={reason}. Position monitoring continues; new entries are blocked. "
+                "A manual pause is never cleared automatically.",
+                "Send /resume when the account should trade again.",
+                "warn",
+            )
+        return out(
+            "PAUSED_SESSION",
+            f"Trading is paused by the '{reason}' safety stop.",
+            "This clears itself at the start of the next configured trading day. "
+            "Existing positions remain monitored.",
+            f"Wait for the trading-day rollover, or /resume to override {reason} explicitly.",
+            "warn",
+        )
+
+    # ── NO_EVALUATION — only reachable when the account is NOT paused ──
     if last_eval <= 0 and float(snapshot.get("first_seen", 0.0)) and (
         now - float(snapshot["first_seen"])) > eval_max_age_sec:
         return out(
@@ -357,34 +392,7 @@ def verdict(chat_id: str | None, *, now: float | None = None,
             "Verify series slugs and relay availability; nothing can trade without markets.",
             "critical",
         )
-    if snapshot.get("dry_run"):
-        return out(
-            "DRY_RUN",
-            "LIVE_TRADING is false — the bot evaluates and logs signals but never sends orders.",
-            f"{int(snapshot.get('signals', 0))} signal(s) have been produced in this process so far; "
-            "each one ends in a 'DRY RUN' log line instead of an order.",
-            "Deliberately set LIVE_TRADING=true after validating feeds and reconciliation.",
-            "config",
-        )
-    if snapshot.get("paused"):
-        reason = str(snapshot.get("paused_reason") or "") or "unknown"
-        if snapshot.get("manual_pause"):
-            return out(
-                "PAUSED_MANUAL",
-                "Trading is paused by an operator (/pause).",
-                f"paused_reason={reason}. Position monitoring continues; new entries are blocked. "
-                "A manual pause is never cleared automatically.",
-                "Send /resume when the account should trade again.",
-                "warn",
-            )
-        return out(
-            "PAUSED_SESSION",
-            f"Trading is paused by the '{reason}' safety stop.",
-            "This clears itself at the start of the next configured trading day. "
-            "Existing positions remain monitored.",
-            f"Wait for the trading-day rollover, or /resume to override {reason} explicitly.",
-            "warn",
-        )
+    # (paused and dry_run checks moved above NO_EVALUATION — see top of function)
     if min_viable and equity and equity < min_viable:
         return out(
             "LOW_BALANCE",
