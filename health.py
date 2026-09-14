@@ -85,7 +85,11 @@ def readiness(
     if not declared_ready:
         reasons.append("startup has not completed")
 
-    for name, max_age in (("bot", main_max_age), ("singleton_lock", lock_max_age)):
+    for name, max_age in (
+        ("bot", main_max_age),
+        ("singleton_lock", lock_max_age),
+        ("scanner", 120.0),
+    ):
         item = components.get(name)
         if not item or item.get("age_sec") is None:
             reasons.append(f"{name} has not reported")
