@@ -970,6 +970,11 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             sell_amount = round(current_value * 0.995, 2)
             min_sell = float((market or {}).get("minimum_order_amount", 100.0))
             if available_shares <= 0 or sell_amount < min_sell:
+                # If remaining shares are dust (value < ₦30 or shares < 0.5), clear from tracker
+                if sell_amount < 30.0 or available_shares < 0.5:
+                    risk.remove_position(position_key)
+                    log.info(f"[{chat_id}] Cleared dust position for {market_id} (value=₦{sell_amount:,.2f})")
+                    continue
                 log.warning(
                     f"[{chat_id}] EXIT deferred for {market_id}: position value "
                     f"₦{sell_amount:,.2f} is below sell minimum ₦{min_sell:,.0f}"
@@ -996,6 +1001,22 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 event_id, market_id, outcome_id, "SELL", sell_amount, CURRENCY
             )
             quote_qty = float(sell_quote.get("quantity") or 0.0)
+            if quote_qty > available_shares * 1.001 and quote_qty > 0:
+                # Fast price drop: quote requires more shares than held.
+                # Scale sell_amount down to match available shares so exit can execute!
+                scale = (available_shares / quote_qty) * 0.98
+                scaled_sell = round(sell_amount * scale, 2)
+                if scaled_sell >= min_sell:
+                    log.info(
+                        f"[{chat_id}] Scaling exit amount ₦{sell_amount:,.2f} → "
+                        f"₦{scaled_sell:,.2f} to match {available_shares:.1f} shares"
+                    )
+                    sell_amount = scaled_sell
+                    sell_quote = await client.get_quote(
+                        event_id, market_id, outcome_id, "SELL", sell_amount, CURRENCY
+                    )
+                    quote_qty = float(sell_quote.get("quantity") or 0.0)
+
             if (
                 sell_quote.get("completeFill") is not True
                 or quote_qty <= 0
@@ -1004,11 +1025,10 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 log.warning(f"[{chat_id}] EXIT quote cannot liquidate safely on {market_id}")
                 continue
 
-            # Step 2: Sell held shares at market with calibrated slippage.
+            # Step 2: Sell held shares with calibrated slippage.
             # - TAKE_PROFIT: 0.05 (5%) — refuse to give away locked gains to wide AMM spreads
             # - REVERSAL_EXIT: 0.08 (8%) — profit protection before candle dump
-            # - STOP_LOSS: 0.20 (20%) — urgent but bounded; an 80% allowance
-            #   converted a protective exit into an effectively uncontrolled market dump.
+            # - STOP_LOSS: 0.20 (20%) — urgent but bounded
             if exit_reason == "TAKE_PROFIT":
                 exit_slippage = 0.05
             elif exit_reason == "REVERSAL_EXIT":
@@ -1016,12 +1036,26 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             else:
                 exit_slippage = 0.20
 
-            resp = await client.place_order(
-                event_id=event_id, market_id=market_id,
-                outcome_id=outcome_id, side="SELL",
-                amount=sell_amount, order_type="MARKET",
-                currency=CURRENCY, max_slippage=exit_slippage,
+            is_clob = str((market or {}).get("engine") or "").upper() == "CLOB" or (
+                pos.get("asset") in {"BTC", "ETH", "SOL"} and pos.get("timeframe") in {"15min", "5min"}
             )
+            if is_clob:
+                # CLOB markets reject raw MARKET orders; use LIMIT FAK with slippage buffer
+                limit_sell_price = round(max(0.01, current_price * (1.0 - exit_slippage)), 3)
+                resp = await client.place_order(
+                    event_id=event_id, market_id=market_id,
+                    outcome_id=outcome_id, side="SELL",
+                    amount=sell_amount, order_type="LIMIT",
+                    price=limit_sell_price, time_in_force="FAK",
+                    currency=CURRENCY,
+                )
+            else:
+                resp = await client.place_order(
+                    event_id=event_id, market_id=market_id,
+                    outcome_id=outcome_id, side="SELL",
+                    amount=sell_amount, order_type="MARKET",
+                    currency=CURRENCY, max_slippage=exit_slippage,
+                )
             order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
             order_id = order.get("id") or order.get("orderId") or order.get("order_id")
 
