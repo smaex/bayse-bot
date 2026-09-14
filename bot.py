@@ -242,6 +242,8 @@ async def start_user(chat_id: str):
     client = _get_client(user)
     if _scan_client is None:
         _scan_client = client
+    # Pre-warm TCP/TLS connection for sub-10ms order dispatch
+    asyncio.create_task(client.prewarm())
 
     settings = user.get("settings", {})
     # Persist user preferences unchanged, but enforce global safety ceilings at
