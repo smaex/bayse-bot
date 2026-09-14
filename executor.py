@@ -308,12 +308,12 @@ async def _execute_logic(
         raw_pct *= 0.50
 
     mode_cap_pct = {
-        "safe": 0.01,
-        "balanced": 0.02,
-        "aggressive": 0.03,
-        "full_send": 0.05,
+        "safe": 0.03,
+        "balanced": 0.05,
+        "aggressive": 0.08,
+        "full_send": 0.10,
         "custom": 0.05,
-    }.get(mode, 0.02)
+    }.get(mode, 0.05)
     allowed_pct = min(user_risk, mode_cap_pct)
     final_pct = min(raw_pct, allowed_pct)
 
