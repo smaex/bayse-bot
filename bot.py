@@ -1823,8 +1823,18 @@ async def main():
         database._init_pool()
 
     if hasattr(database, "force_acquire_singleton_lock"):
-        if not database.force_acquire_singleton_lock():
-            log.critical("Could not acquire singleton lock. Exiting.")
+        acquired = False
+        for attempt in range(12):  # 12 × 5s = 60s max wait
+            if database.force_acquire_singleton_lock():
+                acquired = True
+                break
+            log.warning(
+                f"Singleton lease held by another instance — waiting for expiry "
+                f"(attempt {attempt + 1}/12, retrying in 5s)"
+            )
+            await asyncio.sleep(5)
+        if not acquired:
+            log.critical("Could not acquire singleton lock after 60s. Exiting.")
             return
         _owns_singleton = True
         log.info("Singleton lease acquired.")
