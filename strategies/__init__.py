@@ -237,7 +237,7 @@ def merge_signals(all_signals: List[TradeSignal], state=None) -> List[TradeSigna
     for sig in all_signals:
         is_structural = (
             sig.strategy in _STRUCTURAL_STRATEGIES
-            or sig.strategy == "ARB"
+            or sig.strategy in {"ARB", "MAKER", "MIDMARKET_MAKER"}
             or "PAIR_HEDGE" in getattr(sig, "reason", "")
         )
         key = f"{sig.market_id}:{sig.strategy}" if is_structural else sig.market_id
@@ -251,9 +251,17 @@ def merge_signals(all_signals: List[TradeSignal], state=None) -> List[TradeSigna
             # Convergence means independent methods agree on direction.
             stronger = existing if existing.certainty >= sig.certainty else sig
             other = sig if stronger is existing else existing
-            stronger.certainty = min(1.0, max(existing.certainty, sig.certainty) + 0.10)
-            stronger.reason += f" | CONVERGENCE({other.strategy})"
-            stronger.converged_with.append(other.strategy)
+
+            # Preserve and deduplicate convergence history safely
+            existing_conv = getattr(existing, "converged_with", []) or []
+            sig_conv = getattr(sig, "converged_with", []) or []
+            all_conv = list(set(existing_conv + sig_conv + [other.strategy]))
+            stronger.converged_with = all_conv
+
+            # Bounded convergence certainty boost (+0.05 once, max 0.98)
+            stronger.certainty = min(0.98, max(existing.certainty, sig.certainty) + 0.05)
+            if f"CONVERGENCE({other.strategy})" not in stronger.reason:
+                stronger.reason += f" | CONVERGENCE({other.strategy})"
             merged[key] = stronger
             continue
 
@@ -274,7 +282,7 @@ def merge_signals(all_signals: List[TradeSignal], state=None) -> List[TradeSigna
         for outcome in ("YES", "NO"):
             group = [
                 signal for signal in final
-                if signal.outcome == outcome and signal.strategy not in _STRUCTURAL_STRATEGIES | {"ARB"}
+                if signal.outcome == outcome and signal.strategy not in _STRUCTURAL_STRATEGIES | {"ARB", "MAKER"}
             ]
             for i, sig_a in enumerate(group):
                 for sig_b in group[i + 1:]:
@@ -282,10 +290,12 @@ def merge_signals(all_signals: List[TradeSignal], state=None) -> List[TradeSigna
                     if pair in adjusted_pairs:
                         continue
                     if realized_correlation(sig_a.asset, sig_b.asset, state) > 0.85:
-                        sig_a.size_pct /= 2
-                        sig_b.size_pct /= 2
-                        sig_a.reason += f" | RISK_PARITY({sig_b.asset})"
-                        sig_b.reason += f" | RISK_PARITY({sig_a.asset})"
+                        if "RISK_PARITY" not in getattr(sig_a, "reason", ""):
+                            sig_a.size_pct = max(0.01, sig_a.size_pct * 0.70)
+                            sig_a.reason += f" | RISK_PARITY({sig_b.asset})"
+                        if "RISK_PARITY" not in getattr(sig_b, "reason", ""):
+                            sig_b.size_pct = max(0.01, sig_b.size_pct * 0.70)
+                            sig_b.reason += f" | RISK_PARITY({sig_a.asset})"
                         adjusted_pairs.add(pair)
 
     return final
