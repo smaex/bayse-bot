@@ -94,7 +94,19 @@ class RiskManager:
         return not self.paused
 
     def deployed(self) -> float:
-        return sum(p["amount_ngn"] for p in self.open_positions.values())
+        """Sum of capital in confirmed-filled positions only.
+
+        Resting MAKER limit orders (confirmed_filled=False) are tracked for
+        deduplication but excluded from the equity/drawdown calculation.
+        Counting them inflated equity while the order was live, then caused a
+        phantom equity drop when the order was cancelled — triggering a false
+        drawdown pause.
+        """
+        return sum(
+            p["amount_ngn"]
+            for p in self.open_positions.values()
+            if p.get("confirmed_filled", True)  # legacy positions default to True
+        )
 
     def can_trade(self, balance: float, amount: float, max_exposure: float = 0.30) -> bool:
         max_exposure = min(max_exposure, MAX_PORTFOLIO_EXPOSURE)
