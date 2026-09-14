@@ -326,26 +326,38 @@ async def _execute_logic(
     hard_cap = min(equity * allowed_pct, effective_max, free_cash)
 
     if hard_cap < effective_min:
-        min_equity = effective_min / allowed_pct if allowed_pct > 0 else float("inf")
-        _stall_skip(chat_id, sig, "risk_budget_below_platform_minimum",
-                    f"min ₦{effective_min:,.0f} > budget ₦{hard_cap:,.0f}; "
-                    f"needs ≈ ₦{min_equity:,.0f} equity at {allowed_pct:.1%} risk")
-        log.info(
-            f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — platform/user minimum "
-            f"₦{effective_min:,.0f} exceeds the {allowed_pct:.1%} risk budget "
-            f"₦{hard_cap:,.0f} (equity needed ≈ ₦{min_equity:,.0f})"
-        )
-        return
-
-    amount = min(equity * final_pct, hard_cap)
-    if amount < effective_min:
-        _stall_skip(chat_id, sig, "size_below_market_minimum",
-                    f"₦{amount:,.0f} < ₦{effective_min:,.0f}")
-        log.info(
-            f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — Kelly amount "
-            f"₦{amount:,.0f} is below minimum ₦{effective_min:,.0f}"
-        )
-        return
+        # If the account has sufficient free cash and bankroll for the exchange minimum order (e.g. ₦100),
+        # clamp to effective_min so smaller test balances (e.g. ₦1,000–₦4,999) can place ₦100 orders.
+        if free_cash >= effective_min and equity >= 500.0:
+            log.info(
+                f"[{chat_id}] CLAMP TO MINIMUM {sig.strategy} {sig.asset} — risk budget ₦{hard_cap:,.0f} "
+                f"bumped to exchange minimum ₦{effective_min:,.0f} (equity=₦{equity:,.0f})"
+            )
+            amount = effective_min
+        else:
+            min_equity = effective_min / allowed_pct if allowed_pct > 0 else float("inf")
+            _stall_skip(chat_id, sig, "risk_budget_below_platform_minimum",
+                        f"min ₦{effective_min:,.0f} > budget ₦{hard_cap:,.0f}; "
+                        f"needs ≈ ₦{min_equity:,.0f} equity at {allowed_pct:.1%} risk")
+            log.info(
+                f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — platform/user minimum "
+                f"₦{effective_min:,.0f} exceeds the {allowed_pct:.1%} risk budget "
+                f"₦{hard_cap:,.0f} (equity needed ≈ ₦{min_equity:,.0f})"
+            )
+            return
+    else:
+        amount = min(equity * final_pct, hard_cap)
+        if amount < effective_min:
+            if free_cash >= effective_min and equity >= 500.0:
+                amount = effective_min
+            else:
+                _stall_skip(chat_id, sig, "size_below_market_minimum",
+                            f"₦{amount:,.0f} < ₦{effective_min:,.0f}")
+                log.info(
+                    f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — Kelly amount "
+                    f"₦{amount:,.0f} is below minimum ₦{effective_min:,.0f}"
+                )
+                return
 
     if config.TEST_MODE:
         if equity < config.TEST_MIN_BANKROLL:
