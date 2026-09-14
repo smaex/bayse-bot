@@ -12,6 +12,8 @@ import json
 import logging
 import time
 from typing import Tuple
+import math
+from collections import deque
 import aiohttp
 import websockets
 
@@ -31,6 +33,40 @@ _BINANCE_WS_URLS = [
     "wss://stream.binance.com:9443",
     "wss://stream.binance.us:9443",
 ]
+
+# Microstructure and Lead-Lag Trackers
+_btc_ticks: deque = deque(maxlen=60)
+_ewma_vol: dict[str, float] = {"BTC": 0.025, "ETH": 0.035, "SOL": 0.045}
+_last_ewma_price: dict[str, tuple[float, float]] = {}
+_book_imbalances: dict[str, float] = {}
+
+
+def get_btc_velocity(seconds: float = 5.0) -> float:
+    """Return BTC % return over the last `seconds` (lead-lag predictor for ETH & SOL)."""
+    now = time.time()
+    if len(_btc_ticks) < 2:
+        return 0.0
+    latest_t, latest_p = _btc_ticks[-1]
+    if (now - latest_t) > 15.0 or latest_p <= 0:
+        return 0.0
+    target_t = now - seconds
+    for t, p in _btc_ticks:
+        if t >= target_t and p > 0:
+            return (latest_p - p) / p
+    oldest_t, oldest_p = _btc_ticks[0]
+    if oldest_p > 0 and (now - oldest_t) >= 1.0:
+        return (latest_p - oldest_p) / oldest_p
+    return 0.0
+
+
+def get_imbalance(asset: str) -> float:
+    """Return top-of-book depth imbalance: (bid_qty - ask_qty) / (bid_qty + ask_qty)."""
+    return _book_imbalances.get(asset, 0.0)
+
+
+def get_ewma_hourly_vol(asset: str, default: float = 0.025) -> float:
+    """Return instantaneous EWMA hourly volatility for dynamic risk gating."""
+    return _ewma_vol.get(asset, default)
 def get_direct_price(asset: str) -> Tuple[float, float]:
     """Return the independent oracle sample and its real timestamp.
 
@@ -102,11 +138,40 @@ async def binance_feed():
                     sym  = data.get("s", "").upper()
                     bid  = data.get("b")
                     ask  = data.get("a")
+                    bid_qty = data.get("B")
+                    ask_qty = data.get("A")
                     asset = _CRYPTO_SYMBOLS.get(sym)
                     if asset and bid and ask:
                         mid = (float(bid) + float(ask)) / 2
                         now = time.time()
                         direct_spot[asset] = {"price": mid, "time": now}
+
+                        # 1. Update Orderbook Imbalance
+                        try:
+                            b_q = float(bid_qty or 0.0)
+                            a_q = float(ask_qty or 0.0)
+                            if (b_q + a_q) > 0:
+                                _book_imbalances[asset] = (b_q - a_q) / (b_q + a_q)
+                        except (TypeError, ValueError):
+                            pass
+
+                        # 2. Update BTC tick history for Lead-Lag
+                        if asset == "BTC":
+                            _btc_ticks.append((now, mid))
+
+                        # 3. Update instantaneous EWMA volatility (RiskMetrics lambda=0.94)
+                        last_info = _last_ewma_price.get(asset)
+                        if last_info:
+                            last_t, last_p = last_info
+                            dt = now - last_t
+                            if 0.2 <= dt <= 30.0 and last_p > 0 and mid > 0:
+                                ret = math.log(mid / last_p)
+                                ret_hourly = ret * math.sqrt(3600.0 / dt)
+                                prev_vol = _ewma_vol.get(asset, 0.025)
+                                new_var = 0.94 * (prev_vol ** 2) + 0.06 * (ret_hourly ** 2)
+                                _ewma_vol[asset] = math.sqrt(max(0.0001, min(new_var, 0.25)))
+                        _last_ewma_price[asset] = (now, mid)
+
                         health.touch("direct_feed", asset=asset)
         except Exception as e:
             if "451" in str(e) and url_idx == 0:
