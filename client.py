@@ -58,19 +58,34 @@ class BayseClient:
                 sock_connect=API_CONNECT_TIMEOUT_SEC,
             )
             connector = aiohttp.TCPConnector(
-                limit=50,
-                ttl_dns_cache=300,
+                limit=100,
+                limit_per_host=30,
+                ttl_dns_cache=600,
+                keepalive_timeout=75,
                 enable_cleanup_closed=True,
+                force_close=False,
             )
             self._session = aiohttp.ClientSession(
                 headers={
                     "Content-Type": "application/json",
                     "User-Agent": "bayse-bot/production",
+                    "Connection": "keep-alive",
                 },
                 timeout=timeout,
                 connector=connector,
             )
         return self._session
+
+    async def prewarm(self):
+        """Pre-warm persistent TCP/TLS keep-alive connection for sub-10ms order dispatch."""
+        try:
+            session = await self._get_session()
+            headers = self._auth_headers("GET", "/ping")
+            async with session.get(f"{BASE_URL}/ping", headers=headers, timeout=aiohttp.ClientTimeout(total=3)) as r:
+                await r.read()
+            log.info("HTTP connection pre-warmed (keep-alive active)")
+        except Exception:
+            pass
 
     async def close(self):
         if self._session and not self._session.closed:
