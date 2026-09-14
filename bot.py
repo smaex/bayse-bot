@@ -376,9 +376,27 @@ async def _user_loop(chat_id: str):
                             # locked to the balance at the START of the day, not moving
                             # targets every time the user deposits or wins.
                             risk.peak_balance = equity
+                            risk._dd_breach_since = 0.0
                             _last_balance[chat_id] = equity
+                            # Auto-resume if the account was paused by drawdown.
+                            # A fresh deposit resets the baseline, so the drawdown
+                            # condition is no longer valid. The user shouldn't have
+                            # to manually /resume after every deposit.
+                            if settings.get("paused") and settings.get("paused_reason") == "drawdown":
+                                risk.paused = False
+                                settings["paused"] = False
+                                settings["paused_reason"] = ""
+                                await asyncio.to_thread(database.update_settings, chat_id, settings)
+                                log.info(f"[{chat_id}] Auto-resumed after deposit (drawdown pause cleared)")
                             if _tg_app:
-                                await telegram_bot.notify_deposit_detected(_tg_app, chat_id, delta, "NGN")
+                                resumed_note = "\n✅ *Trading auto-resumed* — drawdown pause cleared." if not settings.get("paused") else "\nSend /resume if trading was paused."
+                                await telegram_bot.send_message(
+                                    _tg_app, chat_id,
+                                    f"💸 *Deposit detected* +₦{delta:,.0f}\n"
+                                    f"New balance: ₦{equity:,.0f}\n"
+                                    f"Drawdown baseline reset.{resumed_note}",
+                                    parse_mode="Markdown",
+                                )
                         else:
                             log.info(f"[{chat_id}] WITHDRAWAL detected ₦{delta:,.0f} | new balance ₦{equity:,.0f}")
                             # Adjust peak_balance to prevent false drawdown pauses on withdrawals.
@@ -628,7 +646,7 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                             pos.get("outcome", ""), pos.get("amount_ngn", 0),
                         )
                     except Exception as ne:
-                        log.debug(f"notify_unfilled failed: {ne}")
+                        log.warning(f"notify_unfilled failed: {ne}")
                 continue
 
             # If still open, check if stale / needs requote / late in candle
@@ -661,10 +679,10 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                             pos.get("outcome", ""), pos.get("amount_ngn", 0),
                         )
                     except Exception as ne:
-                        log.debug(f"notify_unfilled failed: {ne}")
+                        log.warning(f"notify_unfilled (stale cancel) failed: {ne}")
 
         except Exception as e:
-            log.debug(f"[{chat_id}] Order management check error for {order_id}: {e}")
+            log.warning(f"[{chat_id}] Order management check error for {order_id}: {e}")
 
 
 async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dict):
