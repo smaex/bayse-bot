@@ -86,15 +86,15 @@ def classify_regime(ob_yes: dict, ob_no: dict) -> Tuple[str, dict]:
         metrics["reason"] = "Empty orderbooks (zero resting asks)"
         return "THIN_ONE_SIDED", metrics
 
-    if total_ask_depth < 200.0 or (best_yes_bid is None and best_no_bid is None):
-        metrics["reason"] = f"Thin liquidity: total ask depth ₦{total_ask_depth:.1f} < ₦200 or missing bids"
+    if total_ask_depth < 80.0 or (best_yes_bid is None and best_no_bid is None):
+        metrics["reason"] = f"Thin liquidity: total ask depth ₦{total_ask_depth:.1f} < ₦80 or missing bids"
         return "THIN_ONE_SIDED", metrics
 
     # Case 2: Dislocated wide spread (e.g. 0.05 bids vs 0.95 asks)
-    is_wide_yes = yes_spread is not None and yes_spread > 0.15
-    is_wide_no  = no_spread is not None and no_spread > 0.15
-    asks_dislocated = (best_yes_ask is not None and best_no_ask is not None and (best_yes_ask + best_no_ask) > 1.15)
-    bids_collapsed  = (best_yes_bid is not None and best_no_bid is not None and (best_yes_bid + best_no_bid) < 0.85)
+    is_wide_yes = yes_spread is not None and yes_spread > 0.25
+    is_wide_no  = no_spread is not None and no_spread > 0.25
+    asks_dislocated = (best_yes_ask is not None and best_no_ask is not None and (best_yes_ask + best_no_ask) > 1.20)
+    bids_collapsed  = (best_yes_bid is not None and best_no_bid is not None and (best_yes_bid + best_no_bid) < 0.80)
 
     if is_wide_yes or is_wide_no or asks_dislocated or bids_collapsed:
         sum_str = f"{best_yes_ask + best_no_ask:.2f}" if (best_yes_ask and best_no_ask) else "N/A"
