@@ -74,8 +74,13 @@ def inject(user_clients, user_risks, user_daily, active_markets, start_user_fn):
     _start_user_fn  = start_user_fn
 
 
+_bot_app = None
+
+
 def build_app() -> Application:
+    global _bot_app
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    _bot_app = app
     for cmd, fn in [
         ("start",         cmd_start),
         ("status",        cmd_status),
@@ -999,80 +1004,114 @@ _STRAT_ICONS = {
 }
 
 async def notify_win(app, cid, _mid, asset, tf, strat, pnl):
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_win dropped for {cid}: no Telegram app available")
+        return
+    try:
+        pnl_val = float(pnl or 0.0)
+    except (ValueError, TypeError):
+        pnl_val = 0.0
     icon, name = _STRAT_ICONS.get((strat or "").upper(), ("🔔", strat or "Trade"))
     _esc = lambda s: (s or "").replace("_", "\\_").replace("*", "\\*")
     msg = (
         f"🟢 *WIN* {icon} ({_esc(name)})\n"
         f"Market: *{_esc(asset)} {_esc(tf)}*\n"
-        f"Profit: *+₦{pnl:,.2f}*"
+        f"Profit: *+₦{pnl_val:,.2f}*"
     )
     try:
         await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
-    except Exception:
+    except Exception as e:
+        log.debug(f"notify_win markdown failed, falling back to plain text: {e}")
         try:
-            await app.bot.send_message(chat_id=cid,
-                text=f"🟢 WIN | {name} | {asset} {tf} | +₦{pnl:,.2f}")
-        except Exception as e:
-            log.error(f"notify_win failed: {e}")
+            await app.bot.send_message(chat_id=cid, text=f"🟢 WIN | {name} | {asset} {tf} | +₦{pnl_val:,.2f}")
+        except Exception as e2:
+            log.error(f"notify_win failed completely for {cid}: {e2}")
 
 async def notify_loss(app, cid, _mid, asset, tf, strat, pnl):
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_loss dropped for {cid}: no Telegram app available")
+        return
+    try:
+        pnl_val = float(pnl or 0.0)
+    except (ValueError, TypeError):
+        pnl_val = 0.0
     icon, name = _STRAT_ICONS.get((strat or "").upper(), ("🔔", strat or "Trade"))
     _esc = lambda s: (s or "").replace("_", "\\_").replace("*", "\\*")
     msg = (
         f"🔴 *LOSS* {icon} ({_esc(name)})\n"
         f"Market: *{_esc(asset)} {_esc(tf)}*\n"
-        f"PnL: *-₦{abs(pnl):,.2f}*"
+        f"PnL: *-₦{abs(pnl_val):,.2f}*"
     )
     try:
         await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
-    except Exception:
+    except Exception as e:
+        log.debug(f"notify_loss markdown failed, falling back to plain text: {e}")
         try:
-            await app.bot.send_message(chat_id=cid,
-                text=f"🔴 LOSS | {name} | {asset} {tf} | -₦{abs(pnl):,.2f}")
-        except Exception as e:
-            log.error(f"notify_loss failed: {e}")
+            await app.bot.send_message(chat_id=cid, text=f"🔴 LOSS | {name} | {asset} {tf} | -₦{abs(pnl_val):,.2f}")
+        except Exception as e2:
+            log.error(f"notify_loss failed completely for {cid}: {e2}")
 
 async def notify_fill(app, cid, strat, asset, tf, outcome, price, amount_ngn):
     """Notify user when a resting limit order is filled on the exchange."""
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_fill dropped for {cid}: no Telegram app available")
+        return
+    try:
+        price_val = float(price or 0.0)
+        amt_val = float(amount_ngn or 0.0)
+    except (ValueError, TypeError):
+        price_val = 0.0
+        amt_val = 0.0
     icon, name = _STRAT_ICONS.get((strat or "").upper(), ("📊", strat or "MAKER"))
     _esc = lambda s: (s or "").replace("_", "\\_").replace("*", "\\*")
     msg = (
         f"⚡ *Limit Order Filled* {icon}\n"
         f"Strategy: *{_esc(name)}*\n"
         f"Market: *{_esc(asset)} {_esc(tf)}* (*{_esc(outcome)}*)\n"
-        f"Fill Price: *{price:.3f}*\n"
-        f"Amount: *₦{amount_ngn:,.0f}*\n"
+        f"Fill Price: *{price_val:.3f}*\n"
+        f"Amount: *₦{amt_val:,.0f}*\n"
         f"_Matched by taker on CLOB. Position is now actively tracked._"
     )
     try:
         await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
-    except Exception:
+    except Exception as e:
+        log.debug(f"notify_fill markdown failed, falling back to plain text: {e}")
         try:
-            await app.bot.send_message(chat_id=cid,
-                text=f"⚡ FILLED | {name} | {asset} {tf} {outcome} | ₦{amount_ngn:,.0f} @ {price:.3f}")
-        except Exception as e:
-            log.error(f"notify_fill failed: {e}")
+            await app.bot.send_message(chat_id=cid, text=f"⚡ FILLED | {name} | {asset} {tf} {outcome} | ₦{amt_val:,.0f} @ {price_val:.3f}")
+        except Exception as e2:
+            log.error(f"notify_fill failed completely for {cid}: {e2}")
 
 
 async def notify_unfilled(app, cid, strat, asset, tf, outcome, amount_ngn):
     """Notify user when a FAK/limit order was cancelled with zero fill.
     This is NOT a loss — no money was deducted. The position was never opened."""
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_unfilled dropped for {cid}: no Telegram app available")
+        return
+    try:
+        amt_val = float(amount_ngn or 0.0)
+    except (ValueError, TypeError):
+        amt_val = 0.0
     icon, name = _STRAT_ICONS.get((strat or "").upper(), ("🔔", strat or "Trade"))
     _esc = lambda s: (s or "").replace("_", "\\_").replace("*", "\\*")
     msg = (
         f"⚪ *Unfilled Order — No Loss*\n"
         f"{icon} {_esc(name)} | {_esc(asset)} {_esc(tf)} {_esc(outcome)}\n"
-        f"₦{amount_ngn:,.0f} was *not* deducted — order cancelled before fill.\n"
+        f"₦{amt_val:,.0f} was *not* deducted — order cancelled before fill.\n"
         f"_The market moved before execution. Capital preserved._"
     )
     try:
         await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
-    except Exception:
+    except Exception as e:
+        log.debug(f"notify_unfilled markdown failed, falling back to plain text: {e}")
         try:
-            await app.bot.send_message(chat_id=cid,
-                text=f"⚪ UNFILLED | {name} | {asset} {tf} | ₦{amount_ngn:,.0f} returned, no loss")
-        except Exception as e:
-            log.error(f"notify_unfilled failed: {e}")
+            await app.bot.send_message(chat_id=cid, text=f"⚪ UNFILLED | {name} | {asset} {tf} {outcome} | ₦{amt_val:,.0f} returned, no loss")
+        except Exception as e2:
+            log.error(f"notify_unfilled failed completely for {cid}: {e2}")
 
 async def notify_drawdown(app, cid, balance, peak, dd):
     await send_message(app, cid,
