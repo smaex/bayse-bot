@@ -139,7 +139,7 @@ SNIPE_ALLOWED_TIMEFRAMES = _env_csv_set(
 )
 SNIPE_MIN_SECS_TO_CLOSE = 60
 SNIPE_MIN_CERTAINTY    = 0.27   # Maps to a conservative win probability of >= 62%.
-SNIPE_MAX_MARKET_PRICE = 0.65   # Avoid expensive, strongly asymmetric payoffs.
+SNIPE_MAX_MARKET_PRICE = 0.82   # Calibrated to allow high-conviction momentum breakout snipes (historical wins entered @ 0.68-0.78).
 SNIPE_MIN_ENTRY_PRICE  = 0.40   # Block low-probability underdog entries.
 SNIPE_MIN_DISTANCE_PCT = 0.0010 # Base minimum spot/threshold separation (calibrated by asset).
 SNIPE_MIN_RAW_MODEL_EDGE = 0.06 # Independent model must disagree materially with market.
