@@ -195,10 +195,11 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                     user_risks[chat_id].remove_position(
                                         trade["market_id"], order_id=trade.get("order_id", "")
                                     )
-                                if tg_app:
+                                app_to_use = tg_app or getattr(tgb, "_bot_app", None)
+                                if app_to_use:
                                     try:
                                         await tgb.notify_unfilled(
-                                            tg_app, chat_id,
+                                            app_to_use, chat_id,
                                             trade.get("strategy", "MAKER"),
                                             trade.get("asset", "?"),
                                             trade.get("timeframe", ""),
@@ -223,10 +224,11 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                             user_risks[chat_id].remove_position(
                                 trade["market_id"], order_id=trade.get("order_id", "")
                             )
-                        if tg_app:
+                        app_to_use = tg_app or getattr(tgb, "_bot_app", None)
+                        if app_to_use:
                             try:
                                 await tgb.notify_unfilled(
-                                    tg_app, chat_id,
+                                    app_to_use, chat_id,
                                     trade.get("strategy", "MAKER"),
                                     trade.get("asset", "?"),
                                     trade.get("timeframe", ""),
@@ -356,10 +358,11 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                         f"{trade['asset']} {trade['timeframe']} | pnl=₦{pnl:+,.2f}"
                     )
 
-                    if tg_app:
+                    app_to_use = tg_app or getattr(tgb, "_bot_app", None)
+                    if app_to_use:
                         try:
                             fn = tgb.notify_win if won else tgb.notify_loss
-                            await fn(tg_app, chat_id, trade["market_id"],
+                            await fn(app_to_use, chat_id, trade["market_id"],
                                      trade["asset"], trade["timeframe"],
                                      trade["strategy"], pnl)
                         except Exception as ne:
