@@ -46,10 +46,16 @@ _TAKER_STRATEGIES = {"SNIPE", "FRONTRUN", "CORRELATE", "ARB"}
 
 
 def _route_strategy_names(active_names, liquidity_regime: str) -> set[str]:
-    """Apply liquidity routing without ever enabling an unrequested strategy."""
+    """Apply liquidity routing without ever enabling an unrequested strategy.
+    SNIPE retains its own fee-adjusted EV ceiling and probability blend, so it
+    evaluates even in DISLOCATED_WIDE books where an asymmetric mispricing may exist.
+    """
     routed = set(active_names)
-    if liquidity_regime in {"DISLOCATED_WIDE", "THIN_ONE_SIDED"}:
+    if liquidity_regime == "THIN_ONE_SIDED":
         routed = {name for name in routed if name not in _TAKER_STRATEGIES}
+    elif liquidity_regime == "DISLOCATED_WIDE":
+        # Block aggressive latency takers, but keep SNIPE (which has strict EV gating)
+        routed = {name for name in routed if name not in (_TAKER_STRATEGIES - {"SNIPE"})}
     return routed
 
 
