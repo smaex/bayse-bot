@@ -638,10 +638,11 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                 if trade_id:
                     await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
                 log.info(f"[{chat_id}] Cleaned {status} maker order {order_id} on {market_id}")
-                if _tg_app:
+                app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                if app_to_use:
                     try:
                         await telegram_bot.notify_unfilled(
-                            _tg_app, chat_id, pos.get("strategy", "MAKER"),
+                            app_to_use, chat_id, pos.get("strategy", "MAKER"),
                             pos.get("asset", ""), pos.get("timeframe", ""),
                             pos.get("outcome", ""), pos.get("amount_ngn", 0),
                         )
@@ -671,10 +672,11 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                 trade_id = pos.get("trade_id")
                 if trade_id:
                     await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
-                if _tg_app:
+                app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                if app_to_use:
                     try:
                         await telegram_bot.notify_unfilled(
-                            _tg_app, chat_id, pos.get("strategy", "MAKER"),
+                            app_to_use, chat_id, pos.get("strategy", "MAKER"),
                             pos.get("asset", ""), pos.get("timeframe", ""),
                             pos.get("outcome", ""), pos.get("amount_ngn", 0),
                         )
