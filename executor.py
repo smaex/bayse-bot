@@ -567,6 +567,20 @@ async def _execute_logic(
         )
         return
 
+    # ── MAKER Concurrent Limit Guard ──────────────────────────────────────
+    # Limit resting/open MAKER trades to at most 1 concurrent position to avoid
+    # multi-asset exposure cascades when market trends against resting bids.
+    if is_maker:
+        active_makers = sum(
+            1 for p in risk.open_positions.values()
+            if p.get("strategy") == "MAKER"
+        )
+        if active_makers >= 1:
+            log.info(
+                f"[{chat_id}] SKIP MAKER {sig.asset} — max concurrent MAKER positions reached ({active_makers} >= 1)"
+            )
+            return
+
     # ── Correlated crypto exposure cap ─────────────────────────────────────
     if not is_oracle_arb and risk.has_correlated_open_position(sig.asset, sig.outcome, sig.timeframe, certainty=sig.certainty):
         log.info(
@@ -778,10 +792,11 @@ async def _execute_logic(
                 )
                 stall.note_order(chat_id, sig.strategy, placed=True, reason="clob_limit_resting")
                 stall.note_trade(chat_id, market_id=sig.market_id)
-                if _tg_app:
+                app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                if app_to_use:
                     try:
                         await telegram_bot.notify_trade(
-                            _tg_app, chat_id, sig, amount, engine="CLOB_LIMIT"
+                            app_to_use, chat_id, sig, amount, engine="CLOB_LIMIT"
                         )
                     except Exception as ne:
                         log.error(f"[{chat_id}] Limit order notification failed: {ne}")
@@ -936,10 +951,11 @@ async def _execute_logic(
 
     # ── Notify FIRST — trade has happened on Bayse ────────────────────────
     # Always notify before DB write. If DB fails, user still knows about the trade.
-    if _tg_app:
+    app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+    if app_to_use:
         try:
             await telegram_bot.notify_trade(
-                _tg_app, chat_id, sig, actual_ngn, engine=engine
+                app_to_use, chat_id, sig, actual_ngn, engine=engine
             )
         except Exception as ne:
             log.error(f"[{chat_id}] Notification failed: {ne}")
