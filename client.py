@@ -201,14 +201,20 @@ class BayseClient:
                 await asyncio.sleep(min(0.25 * (2 ** attempt), 2.0))
         raise RuntimeError(f"QUOTE {path} failed after retries: {last_error}")
 
-    async def _delete(self, path: str) -> dict:
+    async def _delete(self, path: str, body: dict = None) -> dict:
         session = await self._get_session()
+        body_dict = body if body is not None else {}
+        body_str  = json.dumps(body_dict, separators=(",", ":"))
         for attempt in range(API_READ_RETRIES):
             await self._write_rl.acquire()
-            headers = self._auth_headers("DELETE", path)
-            async with session.delete(f"{BASE_URL}{path}", headers=headers) as r:
+            headers = self._auth_headers("DELETE", path, body_str)
+            async with session.delete(f"{BASE_URL}{path}", data=body_str, headers=headers) as r:
                 if r.status == 429:
                     await asyncio.sleep(await self._retry_delay(r, attempt))
+                    continue
+                if 500 <= r.status < 600 and attempt + 1 < API_READ_RETRIES:
+                    await r.read()
+                    await asyncio.sleep(min(0.25 * (2 ** attempt), 2.0))
                     continue
                 r.raise_for_status()
                 if r.status == 204:
@@ -292,7 +298,15 @@ class BayseClient:
         )
 
     async def cancel_order(self, order_id: str) -> dict:
-        return await self._delete(f"/v1/pm/orders/{order_id}")
+        """Cancel an open limit order.
+
+        Uses the documented batch delete endpoint which reliably returns 200 with result status,
+        and falls back to single order delete with empty JSON body to satisfy HMAC signature.
+        """
+        try:
+            return await self._delete("/v1/pm/orders/batch", body={"orderIds": [order_id]})
+        except Exception:
+            return await self._delete(f"/v1/pm/orders/{order_id}", body={})
 
     async def list_orders(self, page: int = 1, limit: int = 50) -> dict:
         return await self._get("/v1/pm/orders", params={"page": page, "limit": limit})
