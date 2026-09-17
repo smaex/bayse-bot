@@ -146,7 +146,7 @@ SNIPE_MIN_RAW_MODEL_EDGE = 0.06 # Independent model must disagree materially wit
 SNIPE_MIN_BLENDED_EDGE = 0.025  # Required after shrinking toward market consensus.
 SNIPE_MODEL_WEIGHT = 0.35       # Market gets 65% weight until calibration improves.
 SNIPE_VOL_SAFETY_MULTIPLIER = 1.25
-MAKER_ORDER_TIMEOUT = 120       # Seconds before cancelling stale resting maker quote.
+MAKER_ORDER_TIMEOUT = 60        # Seconds before cancelling stale resting maker quote.
 TAKE_PROFIT_PRICE_TARGET = 0.82 # Absolute take-profit price target.
 
 # Complete-set arbitrage remains shadow-only. The edge must clear two taker
