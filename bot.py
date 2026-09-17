@@ -210,9 +210,10 @@ async def _roll_trading_day(chat_id: str, equity: float, settings: dict) -> None
     if not resumed:
         return
     stall.reject(chat_id, "cycle", "auto_resumed_new_trading_day", f"cleared '{resumed}'")
-    if _tg_app:
+    app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+    if app_to_use:
         await telegram_bot.send_message(
-            _tg_app, chat_id,
+            app_to_use, chat_id,
             "🌅 *New trading day — entries re-opened*\n\n"
             f"The previous session was stopped by the *{resumed.replace('_', ' ')}* safety limit.\n"
             "Risk limits, scope and monitoring are unchanged; this is only the daily stop expiring.",
@@ -388,10 +389,11 @@ async def _user_loop(chat_id: str):
                                 settings["paused_reason"] = ""
                                 await asyncio.to_thread(database.update_settings, chat_id, settings)
                                 log.info(f"[{chat_id}] Auto-resumed after deposit (drawdown pause cleared)")
-                            if _tg_app:
+                            app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                            if app_to_use:
                                 resumed_note = "\n✅ *Trading auto-resumed* — drawdown pause cleared." if not settings.get("paused") else "\nSend /resume if trading was paused."
                                 await telegram_bot.send_message(
-                                    _tg_app, chat_id,
+                                    app_to_use, chat_id,
                                     f"💸 *Deposit detected* +₦{delta:,.0f}\n"
                                     f"New balance: ₦{equity:,.0f}\n"
                                     f"Drawdown baseline reset.{resumed_note}",
@@ -403,9 +405,10 @@ async def _user_loop(chat_id: str):
                             # Again, do NOT touch start_balance — daily target stays fixed.
                             risk.peak_balance = max(0.0, risk.peak_balance + delta)
                             _last_balance[chat_id] = equity
-                            if _tg_app:
+                            app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                            if app_to_use:
                                 await telegram_bot.send_message(
-                                    _tg_app, chat_id,
+                                    app_to_use, chat_id,
                                     f"💸 *Withdrawal detected* — ₦{abs(delta):,.0f} removed\n"
                                     f"New balance: ₦{equity:,.2f}\n"
                                     f"_(Daily profit target unchanged — based on start-of-day balance)_",
@@ -510,9 +513,10 @@ async def _user_loop(chat_id: str):
             log.warning(
                 f"[{chat_id}] DAILY LOSS STOP ₦{profit:+,.0f} <= -₦{daily_loss_limit:,.0f}"
             )
-            if _tg_app:
+            app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+            if app_to_use:
                 await telegram_bot.send_message(
-                    _tg_app, chat_id,
+                    app_to_use, chat_id,
                     f"🛑 *Daily loss limit reached* — ₦{profit:+,.0f}. "
                     "New entries are paused; open positions remain monitored.",
                     parse_mode="Markdown",
@@ -526,9 +530,10 @@ async def _user_loop(chat_id: str):
             settings["paused_reason"] = "daily_target"
             await asyncio.to_thread(database.update_settings, chat_id, settings)
             log.info(f"[{chat_id}] DAILY TARGET HIT ₦{profit:+,.0f} — trading paused")
-            if _tg_app:
+            app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+            if app_to_use:
                 await telegram_bot.send_message(
-                    _tg_app, chat_id,
+                    app_to_use, chat_id,
                     f"🎯 *Daily target reached!* ₦{profit:+,.0f}\n/resume to override.",
                     parse_mode="Markdown",
                 )
@@ -541,8 +546,9 @@ async def _user_loop(chat_id: str):
             settings["paused_reason"] = "drawdown"
             await asyncio.to_thread(database.update_settings, chat_id, settings)
             log.warning(f"[{chat_id}] DRAWDOWN STOP {dd:.1%} — trading paused")
-            if _tg_app:
-                await telegram_bot.notify_drawdown(_tg_app, chat_id, equity, risk.peak_balance, dd)
+            app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+            if app_to_use:
+                await telegram_bot.notify_drawdown(app_to_use, chat_id, equity, risk.peak_balance, dd)
             continue
 
         # ── Systemic halt ──────────────────────────────────────────────────
@@ -551,9 +557,10 @@ async def _user_loop(chat_id: str):
             if not _systemic_alert.get(chat_id):
                 _systemic_alert[chat_id] = True
                 log.warning(f"[{chat_id}] SYSTEMIC HALT — {alert}")
-                if _tg_app:
+                app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                if app_to_use:
                     await telegram_bot.send_message(
-                        _tg_app, chat_id,
+                        app_to_use, chat_id,
                         f"🚨 *Systemic Risk Alert*\n{alert}\nTrading paused for {SYSTEMIC_RISK_HALT_MINS} min.",
                         parse_mode="Markdown",
                     )
@@ -621,10 +628,11 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                     f"[{chat_id}] MAKER LIMIT ORDER FILLED | {pos.get('asset')} {pos.get('outcome')} "
                     f"@ {fill_price:.3f} | {shares:.2f} shares (₦{confirmed_cost:,.0f})"
                 )
-                if _tg_app:
+                app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                if app_to_use:
                     try:
                         await telegram_bot.notify_fill(
-                            _tg_app, chat_id, pos.get("strategy", "MAKER"),
+                            app_to_use, chat_id, pos.get("strategy", "MAKER"),
                             pos.get("asset", ""), pos.get("timeframe", ""),
                             pos.get("outcome", ""), fill_price, confirmed_cost,
                         )
@@ -1139,7 +1147,8 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                     log.error(f"[{chat_id}] EXIT DB reconciliation failed: {db_err}")
 
             # Notify user — differentiate take-profit from stop-loss
-            if _tg_app:
+            app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+            if app_to_use:
                 emoji = "🟢" if pnl >= 0 else "🔴"
                 try:
                     if exit_reason == "TAKE_PROFIT":
@@ -1173,7 +1182,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                             f"Realized PnL: *-₦{abs(pnl):,.2f}* (capital protected)"
                         )
                     await telegram_bot.send_message(
-                        _tg_app, chat_id, tg_msg, parse_mode="Markdown",
+                        app_to_use, chat_id, tg_msg, parse_mode="Markdown",
                     )
                 except Exception:
                     pass
