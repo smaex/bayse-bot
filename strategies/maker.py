@@ -45,13 +45,13 @@ log = logging.getLogger("strat.maker")
 HALF_SPREAD       = 0.025
 
 # If Binance price moves more than this % since we placed orders, requote.
-REQUOTE_THRESHOLD = 0.0015   # 0.15%
+REQUOTE_THRESHOLD = 0.0010   # 0.10% (more responsive cancellation on adverse move)
 
 # Minimum secs to market close. Don't make-market in last 45s (AMM locking risk).
 MIN_SECS_TO_CLOSE = 45
 
-# Max secs to market close. Don't open new maker positions if >90% of market life is over.
-MAX_MAKER_WINDOW  = 840      # Quote for first 14 minutes of a 15-min market
+# Max secs to market close. Don't open new maker positions if >80% of market life is over.
+MAX_MAKER_WINDOW  = 720      # Quote for first 12 minutes of a 15-min market
 MARKET_LIFE_SEC   = 900      # Standard 15-min market
 
 # Bayse CLOB liquidityReward max spread (in cents / probability units).
@@ -185,13 +185,14 @@ class MakerStrategy(BaseStrategy):
 
         dist_pct = (spot - threshold) / threshold
 
-        # ── Quoting Window Guard (Minutes 2.5 to 13.5 of a 15-min candle) ─────────
+        # ── Quoting Window Guard (Minutes 2.5 to 12.0 of a 15-min candle) ─────────
         # - Don't quote in the first 2.5 minutes (secs > 750): wait for initial direction.
-        # - Don't open new maker limit bids in the final 90 seconds (secs < 90): settlement risk.
+        # - Don't open new maker limit bids in the final 3 minutes (secs < 180): settlement risk
+        #   and ensures plenty of time for order to fill and manage exit if thesis shifts.
         if secs_to_close > 750:
             note_reject(learned, "MAKER", "candle_warmup_window", f"secs={secs_to_close:.0f}")
             return None
-        if secs_to_close < 90:
+        if secs_to_close < 180:
             note_reject(learned, "MAKER", "late_candle_window", f"secs={secs_to_close:.0f}")
             return None
 
@@ -225,9 +226,10 @@ class MakerStrategy(BaseStrategy):
 
         # ── Asset-Specific Edge & Distance Calibration ────────────────────────
         # Calibrated for adaptive market making:
-        # - ETH: requires >= 0.20% buffer due to micro-volatility chop.
-        # - BTC & SOL: require >= 0.15% buffer ($115+ on BTC, $0.15+ on SOL).
-        min_dist_req = 0.0020 if asset == "ETH" else 0.0015
+        # Require strong separation buffer to avoid chop whipsawing positions.
+        # - ETH: requires >= 0.25% buffer due to micro-volatility chop.
+        # - BTC & SOL: require >= 0.20% buffer ($150+ on BTC, $0.25+ on SOL).
+        min_dist_req = 0.0025 if asset == "ETH" else 0.0020
         eth_edge_cushion = 0.020 if asset == "ETH" else 0.0
 
         if abs(dist_pct) < min_dist_req:
@@ -240,21 +242,21 @@ class MakerStrategy(BaseStrategy):
             return None
 
         # ── Strict Directional Alignment & Non-Opposing Momentum ───────────────
-        # NEVER trade against the spot side!
+        # NEVER trade against the spot side or enter when momentum actively opposes!
         # Requires true high-probability thesis (Fair Value >= 0.62, edge >= 0.020)
-        # AND momentum that is not actively opposing the trade:
-        # - For YES: momentum must not be falling (mom_5m >= -0.0005)
-        # - For NO: momentum must not be rising (mom_5m <= +0.0005)
+        # AND strictly supporting momentum:
+        # - For YES: momentum must be positive (mom_5m >= +0.0005)
+        # - For NO: momentum must be negative (mom_5m <= -0.0005)
         chosen_side = None
         min_maker_edge = 0.020 + eth_edge_cushion  # at least 2.0 cents of real edge
         if (dist_pct > 0 and edge_yes >= min_maker_edge
-                and fv_yes >= 0.62 and mom_5m >= -0.0005):
+                and fv_yes >= 0.62 and mom_5m >= 0.0005):
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
         elif (dist_pct < 0 and edge_no >= min_maker_edge
-                and fv_no >= 0.62 and mom_5m <= 0.0005):
+                and fv_no >= 0.62 and mom_5m <= -0.0005):
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price
@@ -271,16 +273,15 @@ class MakerStrategy(BaseStrategy):
 
         # Quote a competitive bid:
         # Instead of pinning to 0.510 when market_bid is 0.50, calculate a competitive bid:
-        # our_bid = min(target_fv - HALF_SPREAD, max(market_bid + 0.01, target_fv - 0.05, 0.540))
-        # This places bids between 0.540 and 0.650 where active takers actually trade!
+        # our_bid = min(target_fv - HALF_SPREAD, max(market_bid + 0.01, target_fv - 0.05, 0.520))
         chosen_edge = edge_yes if chosen_side == "YES" else edge_no
-        competitive_bid = max(market_bid + 0.01, target_fv - 0.05, 0.540)
+        competitive_bid = max(market_bid + 0.01, target_fv - 0.05, 0.520)
         our_bid = round(min(target_fv - HALF_SPREAD, competitive_bid), 3)
 
-        # Clamp into the executable band where takers actually trade. Entry
-        # price bounds limit poor payoff asymmetry; losing shares can still
-        # settle at zero.
-        our_bid = round(max(0.50, min(0.65, our_bid)), 3)
+        # Clamp into the executable band with asymmetric positive expected value.
+        # Max bid 0.580 guarantees payout is at least +72% on win (₦100 * (1/0.58 - 1) = +₦72.41),
+        # preventing bad risk/reward where ₦100 risk only yields ₦53 win.
+        our_bid = round(max(0.50, min(0.58, our_bid)), 3)
 
         # Data-driven certainty calibration: combines true statistical win probability and spread edge
         cert = min(0.95, max(target_fv, 0.50 + chosen_edge * 3.5))
