@@ -849,11 +849,13 @@ async def _execute_logic(
                     f"order={order_id} status={order_status} rtt={rtt_ms:.0f}ms | liquidity moved away"
                 )
                 try:
-                    await telegram_bot.notify_unfilled(
-                        _tg_app, chat_id, sig.strategy,
-                        sig.asset, sig.timeframe,
-                        sig.outcome, amount,
-                    )
+                    app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                    if app_to_use:
+                        await telegram_bot.notify_unfilled(
+                            app_to_use, chat_id, sig.strategy,
+                            sig.asset, sig.timeframe,
+                            sig.outcome, amount,
+                        )
                 except Exception as ne:
                     log.warning(f"notify_unfilled failed in executor: {ne}")
                 _trade_cooldown[_cooldown_key(chat_id, sig.market_id)] = time.time()
