@@ -791,22 +791,38 @@ async def _execute_logic(
                 if market and market.get("threshold") and feeds.spot.get(sig.asset):
                     spot_vs_thresh = (feeds.spot[sig.asset] - market["threshold"]) / market["threshold"]
 
-                try:
-                    trade_id = await asyncio.to_thread(
-                        database.record_trade,
-                        chat_id=chat_id,
-                        strategy=sig.strategy, asset=sig.asset, timeframe=sig.timeframe,
-                        outcome=sig.outcome, outcome_id=sig.outcome_id,
-                        market_id=sig.market_id, event_id=sig.event_id, order_id=order_id,
-                        entry_price=_safe_float(limit_price),
-                        amount_ngn=_safe_float(amount),
-                        certainty=_safe_float(sig.certainty),
-                        secs_to_close=_safe_float(market["secs_to_close"] if market else 0),
-                        spot_vs_threshold_pct=_safe_float(spot_vs_thresh),
-                        market_price_at_entry=_safe_float(limit_price),
-                        engine="CLOB_LIMIT",
-                        filled_quantity=0.0,
-                    )
+                trade_id = None
+                for db_attempt in range(3):
+                    try:
+                        trade_id = await asyncio.to_thread(
+                            database.record_trade,
+                            chat_id=chat_id,
+                            strategy=sig.strategy, asset=sig.asset, timeframe=sig.timeframe,
+                            outcome=sig.outcome, outcome_id=sig.outcome_id,
+                            market_id=sig.market_id, event_id=sig.event_id, order_id=order_id,
+                            entry_price=_safe_float(limit_price),
+                            amount_ngn=_safe_float(amount),
+                            certainty=_safe_float(sig.certainty),
+                            secs_to_close=_safe_float(market["secs_to_close"] if market else 0),
+                            spot_vs_threshold_pct=_safe_float(spot_vs_thresh),
+                            market_price_at_entry=_safe_float(limit_price),
+                            engine="CLOB_LIMIT",
+                            filled_quantity=0.0,
+                        )
+                        break
+                    except Exception as db_err:
+                        if db_attempt < 2:
+                            await asyncio.sleep(0.5 * (db_attempt + 1))
+                            continue
+                        log.error(f"[{chat_id}] MAKER DB record failed: {db_err}; cancelling untracked order")
+                        try:
+                            await client.cancel_order(order_id)
+                        except Exception as cancel_error:
+                            log.critical(
+                                f"[{chat_id}] UNTRACKED MAKER ORDER {order_id}; cancellation failed: {cancel_error}"
+                            )
+
+                if trade_id:
                     risk.add_position(sig.market_id, {
                         "market_id":   sig.market_id,
                         "trade_id":    trade_id,    "event_id":   sig.event_id,
@@ -820,14 +836,6 @@ async def _execute_logic(
                         "closing_date": market.get("closing_date") if market else "",
                         "placed_at":   time.time(),
                     })
-                except Exception as db_err:
-                    log.error(f"[{chat_id}] MAKER DB record failed: {db_err}; cancelling untracked order")
-                    try:
-                        await client.cancel_order(order_id)
-                    except Exception as cancel_error:
-                        log.critical(
-                            f"[{chat_id}] UNTRACKED MAKER ORDER {order_id}; cancellation failed: {cancel_error}"
-                        )
 
                 _trade_cooldown[_cooldown_key(chat_id, sig.market_id)] = time.time()
             else:
@@ -939,42 +947,51 @@ async def _execute_logic(
     # ── Record in DB ──────────────────────────────────────────────────────
     # Sanitise all floats before writing — prevents PostgreSQL REAL underflow
     # from subnormal GARCH/Kalman values (e.g. 9.4e-64 crashes psycopg2).
-    try:
-        trade_id = await asyncio.to_thread(
-            database.record_trade,
-            chat_id=chat_id,
-            strategy=sig.strategy, asset=sig.asset, timeframe=sig.timeframe,
-            outcome=sig.outcome, outcome_id=sig.outcome_id,
-            market_id=sig.market_id, event_id=sig.event_id, order_id=order_id,
-            entry_price=_safe_float(filled_price),
-            amount_ngn=_safe_float(actual_ngn),
-            certainty=_safe_float(sig.certainty),
-            secs_to_close=_safe_float(market["secs_to_close"] if market else 0),
-            spot_vs_threshold_pct=_safe_float(spot_vs_thresh),
-            momentum_at_entry=_safe_float(getattr(sig, "momentum_at_entry", 0.0)),
-            regime_at_entry=_safe_float(getattr(sig, "regime_at_entry", 0.0)),
-            edge_at_entry=_safe_float(getattr(sig, "edge_at_entry", 0.0)),
-            realized_vol_at_entry=_safe_float(getattr(sig, "realized_vol_at_entry", 0.0)),
-            market_price_at_entry=_safe_float(sig.market_price),
-            slippage_ngn=_safe_float(
-                ((filled_price / sig.market_price) - 1.0) * actual_ngn
-                if sig.market_price > 0 else 0
-            ),
-            engine=engine,
-            filled_quantity=_safe_float(shares_filled),
-        )
-    except Exception as db_err:
-        trade_id = None
-        log.critical(
-            f"[{chat_id}] DB record failed for {sig.asset} {sig.strategy}: {db_err}"
-            f" — order={order_id} executed; retaining an in-memory position for exit protection"
-        )
-        if _tg_app:
-            await telegram_bot.send_message(
-                _tg_app, chat_id,
-                f"🚨 Trade {order_id} executed but the database write failed. "
-                "The bot is tracking it in memory; check the Bayse portfolio before restarting.",
+    trade_id = None
+    for db_attempt in range(3):
+        try:
+            trade_id = await asyncio.to_thread(
+                database.record_trade,
+                chat_id=chat_id,
+                strategy=sig.strategy, asset=sig.asset, timeframe=sig.timeframe,
+                outcome=sig.outcome, outcome_id=sig.outcome_id,
+                market_id=sig.market_id, event_id=sig.event_id, order_id=order_id,
+                entry_price=_safe_float(filled_price),
+                amount_ngn=_safe_float(actual_ngn),
+                certainty=_safe_float(sig.certainty),
+                secs_to_close=_safe_float(market["secs_to_close"] if market else 0),
+                spot_vs_threshold_pct=_safe_float(spot_vs_thresh),
+                momentum_at_entry=_safe_float(getattr(sig, "momentum_at_entry", 0.0)),
+                regime_at_entry=_safe_float(getattr(sig, "regime_at_entry", 0.0)),
+                edge_at_entry=_safe_float(getattr(sig, "edge_at_entry", 0.0)),
+                realized_vol_at_entry=_safe_float(getattr(sig, "realized_vol_at_entry", 0.0)),
+                market_price_at_entry=_safe_float(sig.market_price),
+                slippage_ngn=_safe_float(
+                    ((filled_price / sig.market_price) - 1.0) * actual_ngn
+                    if sig.market_price > 0 else 0
+                ),
+                engine=engine,
+                filled_quantity=_safe_float(shares_filled),
             )
+            break
+        except Exception as db_err:
+            if db_attempt < 2:
+                await asyncio.sleep(0.5 * (db_attempt + 1))
+                continue
+            log.critical(
+                f"[{chat_id}] DB record failed for {sig.asset} {sig.strategy}: {db_err}"
+                f" — order={order_id} executed; retaining an in-memory position for exit protection"
+            )
+            app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+            if app_to_use:
+                try:
+                    await telegram_bot.send_message(
+                        app_to_use, chat_id,
+                        f"🚨 Trade {order_id} executed but the database write failed after retries. "
+                        "The bot is tracking it in memory; check the Bayse portfolio before restarting.",
+                    )
+                except Exception:
+                    pass
 
     position_key = (
         f"{sig.market_id}:{sig.outcome}:{order_id}"
