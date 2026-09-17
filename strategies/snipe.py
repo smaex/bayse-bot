@@ -130,7 +130,7 @@ class SnipeStrategy(BaseStrategy):
         rv = realized_vol_hourly(asset, state)
         rv = (rv * 0.5) + (ewma_v * vol_mult * 0.5)
         if secs < 300:
-            rv *= 1.0 + 0.5 * ((300.0 - secs) / 240.0)
+            rv *= 1.0 + 0.25 * ((300.0 - secs) / 240.0)
 
         raw_w_yes = gbm_win_probability(
             spot=live_spot,
@@ -223,9 +223,9 @@ class SnipeStrategy(BaseStrategy):
 
         # Asset-specific distance clearance with EWMA Volatility Adaptation
         base_dist_req = {
-            "BTC": 0.0012,
-            "ETH": 0.0018,
-            "SOL": 0.0015,
+            "BTC": 0.0010,
+            "ETH": 0.0012,
+            "SOL": 0.0010,
         }.get(asset.upper(), config.SNIPE_MIN_DISTANCE_PCT)
 
         # Dynamic EWMA regime adaptation:
