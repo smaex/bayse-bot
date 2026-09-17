@@ -708,21 +708,76 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                 try:
                     await client.cancel_order(order_id)
                 except Exception as ce:
-                    log.debug(f"cancel_order check: {ce}")
-                risk.remove_position(position_key)
-                trade_id = pos.get("trade_id")
-                if trade_id:
-                    await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
-                app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
-                if app_to_use:
-                    try:
-                        await telegram_bot.notify_unfilled(
-                            app_to_use, chat_id, pos.get("strategy", "MAKER"),
-                            pos.get("asset", ""), pos.get("timeframe", ""),
-                            pos.get("outcome", ""), pos.get("amount_ngn", 0),
+                    log.warning(f"[{chat_id}] cancel_order call error for {order_id}: {ce}")
+
+                # ALWAYS verify ground truth on exchange after cancel attempt
+                try:
+                    order_data = await client.get_order(order_id)
+                    status = str(order_data.get("status") or "").lower()
+                    shares = client.parse_filled_shares(order_data)
+
+                    if status in ("filled", "completed") or shares > 0:
+                        fill_price = float(
+                            order_data.get("avgFillPrice")
+                            or order_data.get("price")
+                            or pos.get("entry_price", 0.5)
                         )
-                    except Exception as ne:
-                        log.warning(f"notify_unfilled (stale cancel) failed: {ne}")
+                        fill_fee = float(order_data.get("fee") or 0.0)
+                        confirmed_cost = (
+                            shares * fill_price * config.CURRENCY_BASE_MULTIPLIER + fill_fee
+                        )
+                        pos["confirmed_filled"] = True
+                        pos["filled_quantity"] = shares
+                        pos["entry_price"] = fill_price
+                        pos["amount_ngn"] = confirmed_cost
+
+                        trade_id = pos.get("trade_id")
+                        if trade_id:
+                            await asyncio.to_thread(
+                                database.update_trade_fill,
+                                trade_id, confirmed_cost, shares, fill_price,
+                            )
+                        log.info(
+                            f"[{chat_id}] MAKER LIMIT ORDER FILLED during cancel check | "
+                            f"{pos.get('asset')} {pos.get('outcome')} @ {fill_price:.3f} | {shares:.2f} shares"
+                        )
+                        app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                        if app_to_use:
+                            try:
+                                await telegram_bot.notify_fill(
+                                    app_to_use, chat_id, pos.get("strategy", "MAKER"),
+                                    pos.get("asset", ""), pos.get("timeframe", ""),
+                                    pos.get("outcome", ""), fill_price, confirmed_cost,
+                                )
+                            except Exception as ne:
+                                log.debug(f"notify_fill failed: {ne}")
+                        continue
+
+                    if status in ("cancelled", "canceled", "expired", "rejected", "killed"):
+                        risk.remove_position(position_key)
+                        trade_id = pos.get("trade_id")
+                        if trade_id:
+                            await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
+                        log.info(f"[{chat_id}] Confirmed cancelled maker order {order_id} on {market_id}")
+                        app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                        if app_to_use:
+                            try:
+                                await telegram_bot.notify_unfilled(
+                                    app_to_use, chat_id, pos.get("strategy", "MAKER"),
+                                    pos.get("asset", ""), pos.get("timeframe", ""),
+                                    pos.get("outcome", ""), pos.get("amount_ngn", 0),
+                                )
+                            except Exception as ne:
+                                log.warning(f"notify_unfilled (stale cancel) failed: {ne}")
+                        continue
+
+                    # If still open on Bayse: DO NOT DROP! Retain in open_positions
+                    log.warning(
+                        f"[{chat_id}] Maker order {order_id} remains {status} on Bayse after cancel attempt. "
+                        "Retaining in open_positions to prevent ghost trade."
+                    )
+                except Exception as ve:
+                    log.warning(f"[{chat_id}] Verification of cancelled order {order_id} failed: {ve}")
 
         except Exception as e:
             log.warning(f"[{chat_id}] Order management check error for {order_id}: {e}")
