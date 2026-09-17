@@ -262,10 +262,11 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
                                     user_risks[chat_id].remove_position(
                                         trade["market_id"], order_id=trade.get("order_id", "")
                                     )
-                                if tg_app:
+                                app_to_use = tg_app or getattr(tgb, "_bot_app", None)
+                                if app_to_use:
                                     try:
                                         await tgb.notify_unfilled(
-                                            tg_app, chat_id,
+                                            app_to_use, chat_id,
                                             trade.get("strategy", "MAKER"),
                                             trade.get("asset", "?"),
                                             trade.get("timeframe", ""),
