@@ -94,19 +94,18 @@ class RiskManager:
         return not self.paused
 
     def deployed(self) -> float:
-        """Sum of capital in confirmed-filled positions only.
+        """Sum of capital in all open positions and resting maker orders.
 
-        Resting MAKER limit orders (confirmed_filled=False) are tracked for
-        deduplication but excluded from the equity/drawdown calculation.
-        Counting them inflated equity while the order was live, then caused a
-        phantom equity drop when the order was cancelled — triggering a false
-        drawdown pause.
+        Bayse reserves order funds from availableBalance immediately upon placing limit orders.
+        Including all open positions and resting orders in deployed capital ensures that equity
+        (free_cash + deployed) reflects true account net worth and prevents false drawdown
+        halts when maker orders are resting.
         """
         return sum(
-            p["amount_ngn"]
+            p.get("amount_ngn", 0.0)
             for p in self.open_positions.values()
-            if p.get("confirmed_filled", True)  # legacy positions default to True
         )
+
 
     def can_trade(self, balance: float, amount: float, max_exposure: float = 0.30) -> bool:
         max_exposure = min(max_exposure, MAX_PORTFOLIO_EXPOSURE)
