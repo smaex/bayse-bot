@@ -567,17 +567,17 @@ async def _execute_logic(
         )
         return
 
-    # ── MAKER Concurrent Limit Guard ──────────────────────────────────────
-    # Limit resting/open MAKER trades to at most 1 concurrent position to avoid
-    # multi-asset exposure cascades when market trends against resting bids.
+    # ── MAKER Individual Asset Guard ──────────────────────────────────────
+    # Limit resting/open MAKER trades to at most 1 per individual asset (e.g. 1 BTC, 1 ETH, 1 SOL),
+    # allowing independent evaluation and trading across all eligible assets without cross-blocking.
     if is_maker:
-        active_makers = sum(
+        asset_makers = sum(
             1 for p in risk.open_positions.values()
-            if p.get("strategy") == "MAKER"
+            if p.get("strategy") == "MAKER" and p.get("asset") == sig.asset
         )
-        if active_makers >= 1:
+        if asset_makers >= 1:
             log.info(
-                f"[{chat_id}] SKIP MAKER {sig.asset} — max concurrent MAKER positions reached ({active_makers} >= 1)"
+                f"[{chat_id}] SKIP MAKER {sig.asset} — active MAKER order already resting/held for {sig.asset}"
             )
             return
 
