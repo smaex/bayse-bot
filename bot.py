@@ -459,6 +459,39 @@ async def _user_loop(chat_id: str):
             dry_run=not config.LIVE_TRADING,
         )
 
+        # ── Drawdown auto-recovery guard ─────────────────────────────────────
+        # If the account was paused due to drawdown, but equity has recovered
+        # (e.g. resting maker orders cancelled, transient balance drop cleared,
+        # or deposit made), automatically clear the pause so the bot isn't
+        # permanently stuck dead.
+        if settings.get("paused") and settings.get("paused_reason") == "drawdown":
+            peak = risk.peak_balance
+            if peak > 0:
+                current_dd = (peak - equity) / peak
+                # If drawdown is now safe (< 50% of MAX_DRAWDOWN_STOP, i.e. < 5%)
+                if current_dd < config.MAX_DRAWDOWN_STOP * 0.5:
+                    log.info(
+                        f"[{chat_id}] DRAWDOWN RECOVERED: dd={current_dd:.1%} "
+                        f"(equity=₦{equity:,.0f}, peak=₦{peak:,.0f}) — auto-resuming trading"
+                    )
+                    settings["paused"] = False
+                    settings["paused_reason"] = ""
+                    risk.paused = False
+                    risk._dd_breach_since = 0.0
+                    await asyncio.to_thread(database.update_settings, chat_id, settings)
+                    app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                    if app_to_use:
+                        try:
+                            await telegram_bot.send_message(
+                                app_to_use, chat_id,
+                                f"✅ *Trading Auto-Resumed*\n"
+                                f"Equity recovered to ₦{equity:,.0f} (drawdown {current_dd:.1%}).\n"
+                                f"Drawdown pause cleared.",
+                                parse_mode="Markdown",
+                            )
+                        except Exception as ne:
+                            log.debug(f"Auto-resume notification failed: {ne}")
+
         # ── Paused check ───────────────────────────────────────────────────
         if settings.get("paused"):
             if iter_count % 6 == 0:   # log every 3 minutes when paused
