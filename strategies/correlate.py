@@ -20,7 +20,7 @@ log = logging.getLogger("strat.correlate")
 # Same fast-cycle restriction as SNIPE and FRONTRUN. CORRELATE's signal decays
 # within CORRELATION_WINDOW_SEC (180s) — evaluating it against a 1h/1d candle
 # whose threshold was set hours ago doesn't fit that decay window at all.
-ALLOWED_TFS = {"5min", "15min", "1h"}
+ALLOWED_TFS = {"5min", "15min"}
 
 
 class CorrelateStrategy(BaseStrategy):
@@ -65,23 +65,23 @@ class CorrelateStrategy(BaseStrategy):
 
         tgt_thresh = market.get("threshold")
         tgt_spot   = spot_price if spot_price is not None else feeds.spot.get(asset)
-        if tgt_thresh and tgt_spot and tgt_thresh > 0:
-            dist = (tgt_spot - tgt_thresh) / tgt_thresh
-            # Strict directional alignment: Target asset must NOT be on the opposite side of its own threshold!
-            if direction == "UP"   and dist < 0.0000: return None  # cannot buy UP if target asset is below its own strike
-            if direction == "DOWN" and dist > 0.0000: return None  # cannot buy DOWN if target asset is above its own strike
+        if tgt_thresh and tgt_spot:
+            if direction == "UP"   and tgt_spot < tgt_thresh: return None
+            if direction == "DOWN" and tgt_spot > tgt_thresh: return None
 
         outcome    = "YES" if direction == "UP" else "NO"
         outcome_id = market["yes_id"] if outcome == "YES" else market["no_id"]
         mkt_price  = market["yes_price"] if outcome == "YES" else market["no_price"]
 
-        # Market data-quality guard
+        # Market data-quality guard — same fix as SNIPE/FRONTRUN. The
+        # existing CORRELATE_MAX_MARKET_PRICE check only catches the high
+        # extreme; a broken/dead-liquidity market priced near zero would
+        # sail through that check and look like a false "great deal".
         price_sum = market.get("yes_price", 0) + market.get("no_price", 0)
         if not (0.90 <= price_sum <= 1.05):
             return None
 
-        # Price bounds: must be in 0.40 - 0.65 range
-        if mkt_price < 0.40 or mkt_price > config.CORRELATE_MAX_MARKET_PRICE:
+        if mkt_price > config.CORRELATE_MAX_MARKET_PRICE:
             return None
 
         regime = regime_score(asset, state)
