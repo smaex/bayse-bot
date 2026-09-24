@@ -162,12 +162,13 @@ class RiskManager:
                 return
         self.open_positions.pop(market_id, None)
 
-    def has_correlated_open_position(self, asset: str, outcome: str, timeframe: str = "15min", certainty: float = 0.0) -> bool:
+    def has_correlated_open_position(self, asset: str, outcome: str, timeframe: str = "15min", certainty: float = 0.0, strategy: str = "") -> bool:
         """
         Prevents stacking weak correlated bets on BTC, ETH, and SOL.
         Macro Consensus Exception: If certainty >= 0.65 (strong macro breakout where
         the model has high mathematical edge and conviction), all 3 assets are allowed
         to trade to capture the multi-asset winning sweep!
+        Only checks correlation against positions of the same strategy family (directional vs directional).
         """
         if certainty >= 0.65:
             return False  # High macro conviction — allow the multi-asset sweep!
@@ -175,14 +176,23 @@ class RiskManager:
         crypto_assets = {"BTC", "ETH", "SOL"}
         if asset not in crypto_assets:
             return False
+        
+        is_maker_strat = strategy.upper() in {"MAKER", "MIDMARKET_MAKER"}
+
         for pos in self.open_positions.values():
+            pos_strat = pos.get("strategy", "").upper()
+            pos_is_maker = pos_strat in {"MAKER", "MIDMARKET_MAKER"}
+            # Only correlate directional taker positions against directional taker positions
+            if strategy and (is_maker_strat != pos_is_maker):
+                continue
+
             if (pos.get("asset") in crypto_assets
                     and pos.get("outcome") == outcome
                     and pos.get("timeframe") == timeframe):
                 return True
         return False
 
-    def already_in(self, market_id: str, asset: str = "", is_hedge: bool = False) -> bool:
+    def already_in(self, market_id: str, asset: str = "", is_hedge: bool = False, strategy: str = "") -> bool:
         if is_hedge:
             # Matched-pair hedge explicitly acquires the opposite side to lock in redemption spread
             return False
@@ -190,16 +200,44 @@ class RiskManager:
             return True
         pos = self.open_positions.get(market_id)
         if pos is not None:
-            # Active position or pending limit order already exists for this exact market!
-            return True
-        # Asset-level deduplication: if we already hold ANY position on this asset
-        # (even on a different market_id / different side), block new entries.
+            # If an order/position exists on this exact market:
+            # Allow SNIPE and MAKER to coexist on the same market only if they are on the SAME outcome side.
+            # Never allow taking the direct opposing side on the same market unless it's a hedge.
+            if strategy and pos.get("strategy") and (strategy.upper() != pos.get("strategy", "").upper()):
+                # Different strategies (e.g. SNIPE vs MAKER)
+                incoming_strat = strategy.upper()
+                existing_strat = pos.get("strategy", "").upper()
+                is_maker_pair = (
+                    (incoming_strat in {"MAKER", "MIDMARKET_MAKER"} and existing_strat not in {"MAKER", "MIDMARKET_MAKER"}) or
+                    (existing_strat in {"MAKER", "MIDMARKET_MAKER"} and incoming_strat not in {"MAKER", "MIDMARKET_MAKER"})
+                )
+                if is_maker_pair:
+                    # Allow concurrent if on the same market when not conflicting, but block duplicate within same strategy
+                    pass
+                else:
+                    return True
+            else:
+                # Active position or pending limit order already exists for this exact market and strategy family!
+                return True
+
+        # Asset-level deduplication:
+        # Directional takers (SNIPE, FRONTRUN, CORRELATE) deduplicate against each other.
+        # Passive liquidity makers (MAKER) deduplicate against MAKER.
+        # MAKER and SNIPE do NOT block each other on the asset level.
         if asset:
+            incoming_is_maker = strategy.upper() in {"MAKER", "MIDMARKET_MAKER"}
             for existing_pos in self.open_positions.values():
                 if existing_pos.get("asset") == asset:
+                    existing_is_maker = existing_pos.get("strategy", "").upper() in {"MAKER", "MIDMARKET_MAKER"}
+                    if strategy and (incoming_is_maker != existing_is_maker):
+                        # Different execution nature: MAKER spread capture vs SNIPE directional take.
+                        # Do not block across the boundary!
+                        continue
+
                     log.info(
                         f"BLOCK duplicate asset entry: already holding {asset} "
-                        f"({existing_pos.get('outcome')} @ {existing_pos.get('entry_price', 0):.3f})"
+                        f"({existing_pos.get('outcome')} @ {existing_pos.get('entry_price', 0):.3f}, "
+                        f"strategy={existing_pos.get('strategy', 'UNKNOWN')})"
                     )
                     return True
         return False
