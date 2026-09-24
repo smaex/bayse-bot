@@ -1,54 +1,44 @@
-"""
-SNIPE — near-close certainty trading.
+"""Conservative near-close directional strategy.
 
-REBUILT for simplicity. Previous version had SIX separate, partially
-redundant adjustment layers stacked on top of the core probability:
-  1. A hard distance veto (CRYPTO_MIN_DISTANCE, time-scaled)
-  2. A momentum veto (separate condition, separate scale)
-  3. A velocity veto (ANOTHER separate condition, different scale)
-  4. An additive momentum "bonus" (mom_bonus = 0.12 * mom)
-  5. An additive edge "bonus" (edge_bonus, derived from win_prob - price —
-     which the EV gate downstream ALSO independently checks)
-  6. A regime multiplier (regime_fac) — applied AGAIN externally in
-     strategies/__init__.py via regime_controller, double-counting the
-     same volatility-regime signal twice.
-
-These interacted in ways that were hard to reason about and occasionally
-self-contradicting (one gate effectively vetoing what the probability math
-already correctly priced in). Verified by hand: the distance veto was
-ALWAYS looser than what the probability gate independently required, so
-it never did useful work — just extra surface area for bugs.
-
-NEW design: ONE diffusion model. Momentum is folded into the model as a
-proper drift term (the textbook-correct way to add momentum to a boundary-
-crossing probability — not a bolted-on bonus). Regime is handled exactly
-once, externally. The EV gate is the only "is this price attractive" check.
-Certainty IS the drift-adjusted win probability, full stop — no further
-multipliers inside this file.
+SNIPE compares a zero-drift diffusion estimate with Bayse's market price,
+then shrinks the model toward market consensus before risking capital. The
+shrinkage is deliberate: the production sample showed that raw directional
+confidence was not calibrated well enough to treat as truth.
 """
 import logging
+import math
 import time
-from typing import Optional
 
 import config
 import feeds
 from strategies.base import BaseStrategy, TradeSignal, global_state
-from strategies.utils import (
-    realized_vol_hourly, gbm_win_probability,
-    probability_to_certainty,
-)
 from strategies.manager import kelly_size, max_ev_price
-
+from strategies.utils import (
+    gbm_win_probability,
+    note_reject,
+    probability_to_certainty,
+    realized_vol_hourly,
+)
 log = logging.getLogger("strat.snipe")
 
-# SNIPE is hard-restricted to fast-cycle crypto markets only. 1h/1d candles
-# don't fit a "trade every 5-15 minutes" cadence, and FX assets only exist
-# on the 1h timeframe in config.SERIES — so this restriction also makes
-# SNIPE crypto-only (BTC/ETH/SOL) by construction.
-ALLOWED_TFS = {"5min", "15min"}
 
-# Suppress per-market rejection spam outside the entry window.
-_LOG_WITHIN_FACTOR = 2.0
+def blend_with_market(
+    model_probability: float, market_probability: float,
+    model_weight: float = config.SNIPE_MODEL_WEIGHT,
+) -> float:
+    """Geometrically blend odds so an uncalibrated model cannot dominate.
+
+    Combining log-odds is stable near 0/1 and makes the configured weight
+    explicit. Bayse consensus receives most of the weight until fresh SNIPE
+    fills demonstrate reliable out-of-sample calibration.
+    """
+    eps = 1e-6
+    q = min(1.0 - eps, max(eps, float(model_probability)))
+    p = min(1.0 - eps, max(eps, float(market_probability)))
+    weight = min(1.0, max(0.0, float(model_weight)))
+    log_odds = weight * math.log(q / (1.0 - q))
+    log_odds += (1.0 - weight) * math.log(p / (1.0 - p))
+    return 1.0 / (1.0 + math.exp(-log_odds))
 
 
 class SnipeStrategy(BaseStrategy):
@@ -56,7 +46,7 @@ class SnipeStrategy(BaseStrategy):
         super().__init__("SNIPE")
 
     async def evaluate(self, market: dict, learned: dict, state,
-                       spot_price: float = None) -> Optional[TradeSignal]:
+                       spot_price: float | None = None) -> TradeSignal | None:
         tf      = market["timeframe"]
         secs    = market.get("secs_to_close", 0)
         asset   = market["asset"]
@@ -64,17 +54,24 @@ class SnipeStrategy(BaseStrategy):
         learned = learned or {}
         mode    = learned.get("mode", "balanced")
 
-        # ── Hard scope restriction ─────────────────────────────────────────
-        if tf not in ALLOWED_TFS:
+        # ── Evidence-backed scope restriction ──────────────────────────────
+        if asset.upper() not in config.SNIPE_ALLOWED_ASSETS:
+            note_reject(learned, "SNIPE", "asset_not_in_allowed_scope", asset)
+            return None
+        if tf.upper() not in config.SNIPE_ALLOWED_TIMEFRAMES:
+            note_reject(learned, "SNIPE", "timeframe_not_in_allowed_scope", tf)
             return None
 
         # ── Entry window check ────────────────────────────────────────────
         window = config.SNIPE_ENTRY_WINDOWS.get(tf)
-        if window is None:
+        if window is None or secs > window:
+            note_reject(learned, "SNIPE", "outside_entry_window",
+                        f"secs={secs:.0f} window={window}")
             return None
-        if secs < 0 or secs > window:
-            return None
-        if secs < 30 and mode != "full_send":
+        # Never open inside the final minute. Settlement/oracle timing and
+        # order round-trip uncertainty dominate any apparent last-second edge.
+        if secs < config.SNIPE_MIN_SECS_TO_CLOSE:
+            note_reject(learned, "SNIPE", "too_close_to_settle", f"secs={secs:.0f}")
             return None
 
         # ── Price data ────────────────────────────────────────────────────
@@ -87,15 +84,18 @@ class SnipeStrategy(BaseStrategy):
                 live_spot = oracle_p
 
         if not threshold:
+            note_reject(learned, "SNIPE", "no_settlement_threshold")
             log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no threshold in market data")
             return None
         if not live_spot:
+            note_reject(learned, "SNIPE", "no_live_spot")
             log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no live spot price available")
             return None
 
         # ── Chaos guard ───────────────────────────────────────────────────
         flips = global_state.market_flips.get(mkt_id, 0)
         if secs < 210 and flips >= 5:
+            note_reject(learned, "SNIPE", "chaos_veto_flips", f"{flips} flips")
             log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — chaos veto ({flips} flips)")
             return None
 
@@ -110,6 +110,7 @@ class SnipeStrategy(BaseStrategy):
         # none of which could ever have filled.
         price_sum = market.get("yes_price", 0) + market.get("no_price", 0)
         if not (0.90 <= price_sum <= 1.05):
+            note_reject(learned, "SNIPE", "market_prices_unusable", f"sum={price_sum:.3f}")
             log.info(
                 f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — bad market data "
                 f"(yes={market.get('yes_price',0):.3f} no={market.get('no_price',0):.3f} "
@@ -117,98 +118,186 @@ class SnipeStrategy(BaseStrategy):
             )
             return None
 
-        # ── Liquidity-floor guard ──────────────────────────────────────────
-        # Confirmed TWICE in production with otherwise-valid price data
-        # (sum≈1.0): Bayse's AMM rejects MARKET orders at extreme prices
-        # with "Your order could not be filled at the moment, please try
-        # again later." Session 1: price=0.020. This session: price=0.050.
-        # Both looked like huge mathematical edges and both were genuinely
-        # unfillable. Matches ARB's existing 0.08 floor, added for the same
-        # observed reason — this isn't a guess, it's the second confirmed
-        # occurrence of the identical failure.
-        min_side = min(market.get("yes_price", 1), market.get("no_price", 1))
-        if min_side < 0.08:
-            log.info(
-                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — extreme price, "
-                f"likely unfillable (min_side={min_side:.3f} < 0.08)"
-            )
-            return None
+        # ── Asset-Calibrated Volatility & Safety with Instantaneous EWMA ──
+        vol_mult = {
+            "BTC": 1.15,
+            "ETH": 1.30,
+            "SOL": 1.20,
+        }.get(asset.upper(), config.SNIPE_VOL_SAFETY_MULTIPLIER)
 
-        # ── Core probability model (GBM d2) ─────────────────────────────
-        # Under Geometric Brownian Motion, P(S_T > K) = Φ(d2) where:
-        #   d2 = [ln(S/K) + (μ_eff − ½σ²)·T] / σ√T
-        # This is the standard quant formula for a binary digital call option.
-        # Key improvements over the previous linear heuristic:
-        #   1. Uses ln(S/K) instead of (S−K)/K — exact under log-normal dynamics.
-        #   2. Includes the Itô / Jensen correction −½σ²T — the old model
-        #      systematically overestimated win probability in high-vol regimes.
-        #   3. Drift (μ) is passed in proper hourly units via Kalman velocity,
-        #      dampened over min(secs, 180s) to prevent noise extrapolation.
-
-        # Hourly drift from Kalman filter velocity (price units/sec → hourly rate)
-        kalman = state.kalman_state.get(asset) if hasattr(state, "kalman_state") else None
-        if kalman:
-            k_price, k_velocity = kalman["x"]
-            hourly_drift = (k_velocity / k_price) * 3600.0 if k_price > 0 else 0.0
-        else:
-            hourly_drift = 0.0
-
-        # Realized volatility (GARCH-blended), with two protective adjustments:
-        #   1. Intraday scaling: US market hours see higher vol, so we widen
-        #      the uncertainty band to avoid over-confident entries.
-        #   2. Near-close cushion: oracle/settlement risk spikes in the final
-        #      300 seconds in ways the pure √T model can't capture.
+        import feeds_direct as _fd
+        ewma_v = _fd.get_ewma_hourly_vol(asset, default=0.025)
         rv = realized_vol_hourly(asset, state)
-        utc_hour = time.gmtime().tm_hour
-        rv *= 1.25 if (13 <= utc_hour <= 20) else 0.90
+        rv = (rv * 0.5) + (ewma_v * vol_mult * 0.5)
         if secs < 300:
-            rv *= (1.0 + 0.5 * ((300 - secs) / 210.0))
+            rv *= 1.0 + 0.25 * ((300.0 - secs) / 240.0)
 
-        w_yes = gbm_win_probability(
+        raw_w_yes = gbm_win_probability(
             spot=live_spot,
             threshold=threshold,
             secs=secs,
             hourly_vol=rv,
-            hourly_drift=hourly_drift,
-            horizon_cap=180.0,
+            hourly_drift=0.0,
+            horizon_cap=0.0,
         )
-        # w_yes is P(spot > threshold at close). Derive direction from this.
-        direction = "YES" if w_yes >= 0.50 else "NO"
-        w_est     = w_yes if direction == "YES" else 1.0 - w_yes
-        composite = probability_to_certainty(w_est)
+        raw_w_no = 1.0 - raw_w_yes
 
-        # Retain distance_pct for logging only
+        yes_price = market.get("yes_price", 0.50)
+        no_price  = market.get("no_price", 0.50)
+
+        raw_edge_yes = raw_w_yes - yes_price
+        raw_edge_no = raw_w_no - no_price
         distance_pct = (live_spot - threshold) / threshold
 
-        if composite < config.SNIPE_MIN_CERTAINTY:
+        # ── 5-Minute Momentum Check ───────────────────────────────────────
+        mom_5m = 0.0
+        try:
+            hist = getattr(state, "price_history", {}).get(asset, []) if state else []
+            if not hist:
+                hist = global_state.price_history.get(asset, [])
+            if hist and len(hist) >= 5:
+                now_t = time.time()
+                old_prices = [p for t, p in hist if 240 <= (now_t - t) <= 360]
+                if old_prices and live_spot:
+                    mom_5m = (live_spot - old_prices[-1]) / old_prices[-1]
+        except Exception:
+            mom_5m = 0.0
+
+        # Direction must agree with spot's side of the settlement threshold;
+        # never buy the apparent underdog against the current oracle position.
+        # Momentum must not be actively opposing the thesis.
+        if (
+            distance_pct > 0
+            and raw_w_yes >= 0.55
+            and raw_edge_yes >= config.SNIPE_MIN_RAW_MODEL_EDGE
+            and mom_5m >= -0.0008
+        ):
+            direction = "YES"
+            raw_probability = raw_w_yes
+            market_price = yes_price
+        elif (
+            distance_pct < 0
+            and raw_w_no >= 0.55
+            and raw_edge_no >= config.SNIPE_MIN_RAW_MODEL_EDGE
+            and mom_5m <= 0.0008
+        ):
+            direction = "NO"
+            raw_probability = raw_w_no
+            market_price = no_price
+        else:
+            note_reject(learned, "SNIPE", "no_raw_edge_or_trend_alignment",
+                        f"yes={raw_w_yes:.1%}/{yes_price:.3f} no={raw_w_no:.1%}/{no_price:.3f}")
             log.info(
-                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — composite too low "
-                f"({composite:.2f} < {config.SNIPE_MIN_CERTAINTY} | dist={distance_pct:+.3%} drift_h={hourly_drift:+.4f} "
-                f"secs={secs:.0f} w={w_est:.1%})"
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no raw edge/trend alignment "
+                f"(raw_yes={raw_w_yes:.1%} vs {yes_price:.3f}, "
+                f"raw_no={raw_w_no:.1%} vs {no_price:.3f}, "
+                f"dist={distance_pct:+.3%}, mom_5m={mom_5m:+.4f})"
             )
             return None
 
-        # ── EV gate ───────────────────────────────────────────────────────
-        # The ONLY "is this price attractive" check — replaces the old
-        # edge_bonus, which was double-counting the exact same comparison
-        # (win_prob vs market_price) that this gate already makes definitive.
-        market_price = market["yes_price"] if direction == "YES" else market["no_price"]
-        fee_rate = market.get("fee_rate", 0.02)
-        margin   = {
-            "safe": 0.15, "balanced": 0.06, "aggressive": 0.04,
-            "full_send": 0.02, "custom": 0.05,
-        }.get(mode, 0.06)
-        ev_ceil = max_ev_price(w_est, market_price, fee_rate, min_margin=margin)
+        # ── BTC Lead-Lag Veto & Momentum Boost for ETH & SOL ───────────────
+        if asset.upper() in {"ETH", "SOL"}:
+            btc_velocity = _fd.get_btc_velocity(seconds=5.0)
+            if direction == "YES" and btc_velocity < -0.0015:
+                note_reject(learned, "SNIPE", "lead_lag_btc_opposing_drop", f"btc_vel={btc_velocity:+.3%}")
+                log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — vetoed: BTC lead-lag dumping ({btc_velocity:+.3%})")
+                return None
+            elif direction == "NO" and btc_velocity > 0.0015:
+                note_reject(learned, "SNIPE", "lead_lag_btc_opposing_pump", f"btc_vel={btc_velocity:+.3%}")
+                log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — vetoed: BTC lead-lag pumping ({btc_velocity:+.3%})")
+                return None
+            elif (direction == "YES" and btc_velocity > 0.0010) or (direction == "NO" and btc_velocity < -0.0010):
+                raw_probability = min(0.96, raw_probability + 0.02)
+                log.info(f"SNIPE {asset} {tf} — BTC lead-lag breakout (+{abs(btc_velocity):.2%}) confirmed")
 
+        # ── Microstructure Orderbook Depth Imbalance ──────────────────────
+        imbalance = _fd.get_imbalance(asset)
+        if direction == "YES" and imbalance > 0.20:
+            raw_probability = min(0.96, raw_probability + 0.02 * min(imbalance, 0.8))
+        elif direction == "NO" and imbalance < -0.20:
+            raw_probability = min(0.96, raw_probability + 0.02 * min(abs(imbalance), 0.8))
+        elif direction == "YES" and imbalance < -0.45:
+            raw_probability = max(0.51, raw_probability - 0.03)
+        elif direction == "NO" and imbalance > 0.45:
+            raw_probability = max(0.51, raw_probability - 0.03)
+
+        # Asset-specific distance clearance with EWMA Volatility Adaptation
+        base_dist_req = {
+            "BTC": 0.0010,
+            "ETH": 0.0012,
+            "SOL": 0.0010,
+        }.get(asset.upper(), config.SNIPE_MIN_DISTANCE_PCT)
+
+        # Dynamic EWMA regime adaptation:
+        # Calm session (ewma_v < 0.020) -> tighten distance requirement by up to 25% (capture more trades)
+        # High vol spike (ewma_v > 0.040) -> widen distance requirement by up to 30% (protect capital)
+        vol_factor = max(0.75, min(1.30, ewma_v / 0.025))
+        min_dist_req = base_dist_req * vol_factor
+
+        if abs(distance_pct) < min_dist_req:
+            note_reject(learned, "SNIPE", "distance_below_calibration",
+                        f"{abs(distance_pct):.4%} < {min_dist_req:.4%}")
+            log.info(
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — insufficient distance "
+                f"({abs(distance_pct):.4%} < {min_dist_req:.4%}, vol_factor={vol_factor:.2f})"
+            )
+            return None
+        if not (
+            config.SNIPE_MIN_ENTRY_PRICE
+            <= market_price
+            <= config.SNIPE_MAX_MARKET_PRICE
+        ):
+            note_reject(learned, "SNIPE", "entry_price_out_of_band", f"{market_price:.3f}")
+            log.info(
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — entry outside "
+                f"[{config.SNIPE_MIN_ENTRY_PRICE:.2f}, "
+                f"{config.SNIPE_MAX_MARKET_PRICE:.2f}] ({market_price:.3f})"
+            )
+            return None
+
+        # Shrink the independent model toward Bayse consensus. This prevents a
+        # noisy diffusion estimate from manufacturing a large executable edge.
+        w_est = blend_with_market(raw_probability, market_price)
+        degraded_oracle_penalty = max(
+            0.0, float(learned.get("oracle_penalty", 0.0) or 0.0)
+        )
+        required_edge = config.SNIPE_MIN_BLENDED_EDGE + degraded_oracle_penalty
+        blended_edge = w_est - market_price
+        if blended_edge < required_edge:
+            note_reject(learned, "SNIPE", "shrunk_edge_below_requirement",
+                        f"{blended_edge:.1%} < {required_edge:.1%}")
+            log.info(
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — shrunk edge "
+                f"{blended_edge:.1%} < {required_edge:.1%}"
+            )
+            return None
+
+        composite = probability_to_certainty(w_est)
+        learned_min = learned.get(
+            "snipe_min_certainty", config.SNIPE_MIN_CERTAINTY
+        )
+        effective_floor = max(config.SNIPE_MIN_CERTAINTY, float(learned_min))
+        if composite < effective_floor:
+            note_reject(learned, "SNIPE", "certainty_below_floor",
+                        f"{composite:.3f} < {effective_floor:.3f}")
+            return None
+
+        # The strategy gate uses the same fee-adjusted economics as sizing.
+        fee_rate = float(market.get("fee_rate", 0.02) or 0.0)
+        margin = {
+            "safe": 0.05,
+            "balanced": 0.03,
+            "aggressive": 0.03,
+            "full_send": 0.03,
+            "custom": 0.03,
+        }.get(mode, 0.03)
+        ev_ceil = min(
+            config.SNIPE_MAX_MARKET_PRICE,
+            max_ev_price(w_est, market_price, fee_rate, min_margin=margin),
+        )
         if market_price >= ev_ceil:
-            log.info(
-                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — EV gate: "
-                f"price={market_price:.3f} >= ceil={ev_ceil:.3f} (w={w_est:.1%})"
-            )
-            return None
-        if market_price > config.SNIPE_MAX_MARKET_PRICE:
-            log.info(f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — price ceiling "
-                     f"({market_price:.3f} > {config.SNIPE_MAX_MARKET_PRICE})")
+            note_reject(learned, "SNIPE", "price_at_or_above_ev_ceiling",
+                        f"price={market_price:.3f} ceiling={ev_ceil:.3f}")
             return None
 
         # ── Size ──────────────────────────────────────────────────────────
@@ -217,8 +306,9 @@ class SnipeStrategy(BaseStrategy):
                           strategy_name="SNIPE")
 
         log.info(
-            f"SNIPE ✅ {asset} {tf} | dist={distance_pct:+.3%} drift_hourly={hourly_drift:+.4f} "
-            f"secs={secs:.0f} w={w_est:.1%} composite={composite:.2f} price={market_price:.3f}"
+            f"SNIPE ✅ {asset} {tf} | dist={distance_pct:+.3%} "
+            f"secs={secs:.0f} raw={raw_probability:.1%} blended={w_est:.1%} "
+            f"edge={blended_edge:.1%} price={market_price:.3f}"
         )
 
         return TradeSignal(
@@ -234,11 +324,12 @@ class SnipeStrategy(BaseStrategy):
             market_price=market_price,
             size_pct=size,
             reason=(
-                f"dist={distance_pct:+.3%} drift_h={hourly_drift:+.4f} "
-                f"w={w_est:.1%} composite={composite:.2f} secs={secs:.0f}"
+                f"dist={distance_pct:+.3%} raw={raw_probability:.1%} "
+                f"blended={w_est:.1%} edge={blended_edge:.1%} "
+                f"secs={secs:.0f}"
             ),
             title=market.get("title", ""),
-            momentum_at_entry=hourly_drift,
+            momentum_at_entry=mom_5m,
             regime_at_entry=0.0,
             edge_at_entry=w_est - market_price,
             realized_vol_at_entry=rv,

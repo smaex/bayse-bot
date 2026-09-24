@@ -20,21 +20,35 @@ import psycopg2.extras
 import psycopg2.pool
 from cryptography.fernet import Fernet
 
+import config
+
 log = logging.getLogger(__name__)
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
+
 DEFAULT_SETTINGS: dict = {
-    "assets":           ["BTC", "ETH", "SOL"],
-    "timeframes":       ["5min", "15min", "1h"],
-    "strategies":       ["SNIPE", "ARB", "FRONTRUN", "CORRELATE"],
-    "risk_pct":         2.0,
+    # New accounts start paused on the default multi-strategy scope. Existing
+    # users keep their saved choices because saved settings override these
+    # defaults (non-custom modes additionally union in current defaults at
+    # evaluation time so they pick up newly enabled scope automatically).
+    "assets":           list(config.DEFAULT_ASSETS),
+    "timeframes":       list(config.DEFAULT_TIMEFRAMES),
+    "strategies":       list(config.DEFAULT_STRATEGIES),
+    "risk_pct":         1.0,
     "mintrade":         100,
     "maxtrade":         5_000,
-    "maxexposure":      20.0,
-    "daily_multiplier": 10,
+    "maxexposure":      15.0,
+    "daily_multiplier": 3,
     "daily_target_ngn": 0,
-    "paused":           False,
+    "daily_loss_limit_pct": 5.0,
+    "paused":           True,
     "learned":          {},
     "mode":             "balanced",
 }
@@ -62,9 +76,10 @@ def _dec(text: str) -> str:
 
 _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
-# Simple in-memory caches
-_USER_CACHE: dict[str, dict] = {}
-_ACTIVE_USERS_CACHE: list[dict] | None = None
+# Simple in-memory caches with 15-second TTL
+_USER_CACHE: dict[str, tuple[float, dict]] = {}  # chat_id -> (timestamp, data)
+_ACTIVE_USERS_CACHE: tuple[float, list[dict]] | None = None
+_CACHE_TTL = 15.0  # seconds
 
 
 def _init_pool():
@@ -153,11 +168,15 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS bot_lock (
                     lock_id    TEXT PRIMARY KEY,
                     process_id INTEGER NOT NULL,
+                    owner_id   TEXT,
                     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Safe online migrations for databases created by older releases.
+            cur.execute("ALTER TABLE bot_lock ADD COLUMN IF NOT EXISTS owner_id TEXT")
             cur.execute(
-                "INSERT INTO bot_lock (lock_id, process_id) VALUES ('MASTER', 0) ON CONFLICT DO NOTHING"
+                "INSERT INTO bot_lock (lock_id, process_id, owner_id) "
+                "VALUES ('MASTER', 0, NULL) ON CONFLICT DO NOTHING"
             )
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
@@ -183,12 +202,14 @@ def init_db():
                     market_price_at_entry REAL,
                     slippage_ngn          REAL,
                     engine                TEXT,
+                    filled_quantity       REAL,
                     won                   INTEGER,
                     pnl_ngn               REAL,
                     created_at            TIMESTAMPTZ DEFAULT NOW(),
                     resolved_at           TIMESTAMPTZ
                 )
             """)
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS filled_quantity REAL")
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_trades_user
                 ON trades(chat_id, created_at DESC)
@@ -210,7 +231,15 @@ def init_db():
     log.info("Database ready (Supabase / PostgreSQL)")
 
 
-# ── Singleton lock ────────────────────────────────────────────────────────────
+# ── Singleton lease ───────────────────────────────────────────────────────────
+# A PID is not globally unique across containers/hosts, so every process gets a
+# random owner token.  A process may take the lease only if it is free, already
+# owns it, or the prior heartbeat is stale.  The previous implementation used
+# an unconditional UPSERT (and startup first deleted the row), so every process
+# always "acquired" the singleton lock.
+_LOCK_OWNER_ID = os.getenv("BOT_INSTANCE_ID") or f"{os.getpid()}-{uuid.uuid4().hex}"
+_LOCK_LEASE_SEC = max(20, int(os.getenv("LOCK_LEASE_SEC", "45")))
+
 
 def force_acquire_singleton_lock() -> bool:
     pid = os.getpid()
@@ -218,42 +247,60 @@ def force_acquire_singleton_lock() -> bool:
         with _cx() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO bot_lock (lock_id, process_id, updated_at)
-                    VALUES ('MASTER', %s, NOW())
-                    ON CONFLICT (lock_id) DO UPDATE
-                        SET process_id = %s, updated_at = NOW()
-                """, (pid, pid))
-        return True
+                    UPDATE bot_lock
+                       SET process_id = %s, owner_id = %s, updated_at = NOW()
+                     WHERE lock_id = 'MASTER'
+                       AND (
+                            owner_id IS NULL
+                            OR owner_id = %s
+                            OR updated_at < NOW() - (%s * INTERVAL '1 second')
+                       )
+                    RETURNING owner_id
+                """, (pid, _LOCK_OWNER_ID, _LOCK_OWNER_ID, _LOCK_LEASE_SEC))
+                row = cur.fetchone()
+                if row:
+                    return True
+
+                cur.execute(
+                    "SELECT owner_id, process_id, updated_at FROM bot_lock WHERE lock_id = 'MASTER'"
+                )
+                holder = cur.fetchone()
+                log.warning("Singleton lease is held by another live instance: %s", holder)
+                return False
     except Exception as e:
-        log.error(f"Error acquiring lock: {e}")
+        log.error(f"Error acquiring singleton lease: {e}")
         return False
 
 
 def heartbeat_singleton_lock() -> bool:
-    pid = os.getpid()
     try:
         with _cx() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE bot_lock SET updated_at = NOW()
-                    WHERE lock_id = 'MASTER' AND process_id = %s
-                    RETURNING process_id
-                """, (pid,))
-                row = cur.fetchone()
-                return bool(row)
+                    UPDATE bot_lock SET updated_at = NOW(), process_id = %s
+                    WHERE lock_id = 'MASTER' AND owner_id = %s
+                    RETURNING owner_id
+                """, (os.getpid(), _LOCK_OWNER_ID))
+                return bool(cur.fetchone())
     except Exception as e:
-        log.error(f"Heartbeat error: {e}")
-        return True  # don't self-terminate on transient DB error
+        # Fail closed. If this process cannot prove lease ownership, it must
+        # stop before the lease expires and another instance can acquire it.
+        log.error(f"Singleton heartbeat error: {e}")
+        return False
 
 
 def release_singleton_lock() -> bool:
     try:
         with _cx() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM bot_lock WHERE lock_id = 'MASTER'")
-            conn.commit()
-            return True
-    except Exception:
+                cur.execute("""
+                    UPDATE bot_lock
+                       SET process_id = 0, owner_id = NULL, updated_at = NOW()
+                     WHERE lock_id = 'MASTER' AND owner_id = %s
+                """, (_LOCK_OWNER_ID,))
+                return cur.rowcount == 1
+    except Exception as e:
+        log.warning(f"Could not release singleton lease: {e}")
         return False
 
 
@@ -277,26 +324,32 @@ def add_user(chat_id: str, public_key: str, secret_key: str) -> dict:
     return get_user(chat_id)
 
 
-def get_user(chat_id: str) -> dict | None:
-    if chat_id in _USER_CACHE:
-        return copy.deepcopy(_USER_CACHE[chat_id])
+def get_user(chat_id: str, force_fresh: bool = False) -> dict | None:
+    now = time.time()
+    if not force_fresh and chat_id in _USER_CACHE:
+        ts, data = _USER_CACHE[chat_id]
+        if (now - ts) < _CACHE_TTL:
+            return copy.deepcopy(data)
     row = _fetch_one("SELECT * FROM users WHERE chat_id = %s", (chat_id,))
     if row:
         h = _hydrate(row)
-        _USER_CACHE[chat_id] = copy.deepcopy(h)
+        _USER_CACHE[chat_id] = (now, copy.deepcopy(h))
         return h
     return None
 
 
-def get_all_active() -> list[dict]:
+def get_all_active(force_fresh: bool = False) -> list[dict]:
     global _ACTIVE_USERS_CACHE
-    if _ACTIVE_USERS_CACHE is not None:
-        return copy.deepcopy(_ACTIVE_USERS_CACHE)
+    now = time.time()
+    if not force_fresh and _ACTIVE_USERS_CACHE is not None:
+        ts, data = _ACTIVE_USERS_CACHE
+        if (now - ts) < _CACHE_TTL:
+            return copy.deepcopy(data)
     rows = _fetch_all("SELECT * FROM users WHERE is_active = 1")
     result = [_hydrate(r) for r in rows if str(r.get("chat_id", "")) != "0"]
     for u in result:
-        _USER_CACHE[u["chat_id"]] = copy.deepcopy(u)
-    _ACTIVE_USERS_CACHE = copy.deepcopy(result)
+        _USER_CACHE[u["chat_id"]] = (now, copy.deepcopy(u))
+    _ACTIVE_USERS_CACHE = (now, copy.deepcopy(result))
     return result
 
 
@@ -306,12 +359,17 @@ def update_settings(chat_id: str, settings: dict):
         "UPDATE users SET settings = %s WHERE chat_id = %s",
         (json.dumps(settings), chat_id),
     )
+    now = time.time()
     if chat_id in _USER_CACHE:
-        _USER_CACHE[chat_id]["settings"] = copy.deepcopy(settings)
+        ts, u = _USER_CACHE[chat_id]
+        u["settings"] = copy.deepcopy(settings)
+        _USER_CACHE[chat_id] = (now, u)
     if _ACTIVE_USERS_CACHE:
-        for u in _ACTIVE_USERS_CACHE:
+        ts, users_list = _ACTIVE_USERS_CACHE
+        for u in users_list:
             if u["chat_id"] == chat_id:
                 u["settings"] = copy.deepcopy(settings)
+        _ACTIVE_USERS_CACHE = (now, users_list)
 
 
 def invalidate_user_cache(chat_id: str = None):
@@ -336,12 +394,14 @@ def _hydrate(row: dict) -> dict:
     row["chat_id"] = str(row.get("chat_id", ""))
     try:
         row["public_key"] = _dec(pub) if pub else ""
-    except Exception:
-        row["public_key"] = pub or ""
-    try:
         row["secret_key"] = _dec(sec) if sec else ""
-    except Exception:
-        row["secret_key"] = sec or ""
+    except Exception as exc:
+        # Never reinterpret undecryptable ciphertext (or legacy plaintext) as
+        # usable credentials. That hides key-rotation mistakes and can send
+        # malformed secrets to the exchange.
+        log.error("Could not decrypt API credentials for user %s: %s", row["chat_id"], exc)
+        row["public_key"] = ""
+        row["secret_key"] = ""
     saved = json.loads(row.get("settings") or "{}")
     row["settings"] = {**DEFAULT_SETTINGS, **saved}
     return row
@@ -357,9 +417,9 @@ def record_trade(chat_id: str, **kw) -> str:
             market_id, event_id, order_id, entry_price, amount_ngn, certainty,
             secs_to_close, spot_vs_threshold_pct, momentum_at_entry,
             regime_at_entry, edge_at_entry, realized_vol_at_entry,
-            market_price_at_entry, slippage_ngn, engine
+            market_price_at_entry, slippage_ngn, engine, filled_quantity
         ) VALUES (
-            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+            %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
         )
     """, (
         trade_id, chat_id,
@@ -371,15 +431,50 @@ def record_trade(chat_id: str, **kw) -> str:
         kw.get("momentum_at_entry", 0.0), kw.get("regime_at_entry", 0.0),
         kw.get("edge_at_entry", 0.0), kw.get("realized_vol_at_entry", 0.0),
         kw.get("market_price_at_entry"), kw.get("slippage_ngn"),
-        kw.get("engine"),
+        kw.get("engine"), kw.get("filled_quantity"),
     ))
     return trade_id
 
 
-def resolve_trade(trade_id: str, won: bool, pnl_ngn: float):
+def resolve_trade(trade_id: str, won: bool | None, pnl_ngn: float):
+    won_val = 1 if won is True else (0 if won is False else None)
     _execute(
-        "UPDATE trades SET won = %s, pnl_ngn = %s, resolved_at = NOW() WHERE trade_id = %s",
-        (1 if won else 0, pnl_ngn, trade_id),
+        """UPDATE trades
+              SET won = %s,
+                  pnl_ngn = COALESCE(pnl_ngn, 0) + %s,
+                  resolved_at = NOW()
+            WHERE trade_id = %s AND resolved_at IS NULL""",
+        (won_val, pnl_ngn, trade_id),
+    )
+
+
+def update_trade_fill(
+    trade_id: str, amount_ngn: float, filled_quantity: float,
+    entry_price: float,
+) -> None:
+    """Replace a resting order's requested values with its confirmed fill."""
+    _execute(
+        """UPDATE trades
+              SET amount_ngn = %s,
+                  filled_quantity = %s,
+                  entry_price = %s
+            WHERE trade_id = %s AND resolved_at IS NULL""",
+        (amount_ngn, filled_quantity, entry_price, trade_id),
+    )
+
+
+def update_trade_remaining(
+    trade_id: str, amount_ngn: float, filled_quantity: float,
+    realized_pnl: float = 0.0,
+) -> None:
+    """Persist the cost basis left after a partial liquidation."""
+    _execute(
+        """UPDATE trades
+              SET amount_ngn = %s,
+                  filled_quantity = %s,
+                  pnl_ngn = COALESCE(pnl_ngn, 0) + %s
+            WHERE trade_id = %s AND resolved_at IS NULL""",
+        (amount_ngn, filled_quantity, realized_pnl, trade_id),
     )
 
 
@@ -387,14 +482,36 @@ def get_unresolved(chat_id: str, older_than_minutes: int = 6) -> list[dict]:
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)).isoformat()
     return _fetch_all("""
         SELECT * FROM trades
-        WHERE chat_id = %s AND won IS NULL
+        WHERE chat_id = %s AND resolved_at IS NULL
           AND created_at < %s::TIMESTAMPTZ
     """, (chat_id, cutoff))
 
 
+def reset_bad_resolutions(chat_id: str) -> int:
+    """Reset trades that were incorrectly resolved with won=NULL, pnl=0.
+    These were stamped as resolved but never got a real win/loss value —
+    likely due to phantom detection firing on already-resolved markets.
+    Resetting allows resolution_monitor to re-process them correctly.
+    Returns the number of trades reset."""
+    result = _execute(
+        """UPDATE trades
+           SET resolved_at = NULL, pnl_ngn = 0
+           WHERE chat_id = %s
+             AND resolved_at IS NOT NULL
+             AND won IS NULL""",
+        (chat_id,),
+    )
+    # _execute doesn't return rowcount directly; re-query to confirm
+    count = _fetch_all(
+        "SELECT COUNT(*) AS n FROM trades WHERE chat_id = %s AND resolved_at IS NULL AND won IS NULL",
+        (chat_id,),
+    )
+    return count[0]["n"] if count else 0
+
+
 def get_all_unresolved(chat_id: str) -> list[dict]:
     return _fetch_all("""
-        SELECT * FROM trades WHERE chat_id = %s AND won IS NULL
+        SELECT * FROM trades WHERE chat_id = %s AND resolved_at IS NULL
         ORDER BY created_at DESC
     """, (chat_id,))
 
@@ -418,6 +535,15 @@ def recent_stats(chat_id: str, days: int = 30, after_dt=None) -> list[dict]:
                COUNT(*)       AS total,
                SUM(won)       AS wins,
                SUM(pnl_ngn)   AS total_pnl,
+               SUM(amount_ngn) AS total_deployed,
+               SUM(CASE
+                       WHEN filled_quantity > 0
+                           THEN filled_quantity * 100.0
+                       WHEN entry_price > 0
+                           THEN amount_ngn / entry_price
+                       ELSE 0
+                   END) AS potential_payout,
+               AVG(entry_price) AS avg_entry_price,
                AVG(certainty) AS avg_certainty
         FROM trades
         WHERE chat_id = %s AND won IS NOT NULL
@@ -454,7 +580,16 @@ def get_combo_stats(chat_id: str, days: int = 14, after_dt=None) -> list[dict]:
     cutoff_str = cutoff.isoformat()
     rows = _fetch_all("""
         SELECT strategy, asset, timeframe,
-               COUNT(*) AS total, SUM(won) AS wins, SUM(pnl_ngn) AS total_pnl
+               COUNT(*) AS total, SUM(won) AS wins, SUM(pnl_ngn) AS total_pnl,
+               SUM(amount_ngn) AS total_deployed,
+               SUM(CASE
+                       WHEN filled_quantity > 0
+                           THEN filled_quantity * 100.0
+                       WHEN entry_price > 0
+                           THEN amount_ngn / entry_price
+                       ELSE 0
+                   END) AS potential_payout,
+               AVG(entry_price) AS avg_entry_price
         FROM trades
         WHERE chat_id = %s AND won IS NOT NULL
           AND created_at > %s::TIMESTAMPTZ
@@ -566,18 +701,17 @@ def get_alpha_trend(chat_id: str, strategy: str, asset: str, days: int = 7) -> f
         return 1.0
 
 
-def get_daily_resolved_pnl(chat_id: str, date_str: str) -> float:
-    """
-    Query today's resolved PnL directly from the database of resolved trades for a UTC date string.
-    Returns 0.0 if no resolved trades or if sum is null.
-    """
+def get_daily_resolved_pnl(
+    chat_id: str, date_str: str, trading_timezone: str = "Africa/Lagos",
+) -> float:
+    """Return PnL for a calendar day in the configured trading timezone."""
     try:
         row = _fetch_one("""
             SELECT SUM(pnl_ngn) AS pnl
             FROM trades
             WHERE chat_id = %s AND won IS NOT NULL
-              AND resolved_at::DATE = %s::DATE
-        """, (chat_id, date_str))
+              AND (resolved_at AT TIME ZONE %s)::DATE = %s::DATE
+        """, (chat_id, trading_timezone, date_str))
         return float(row["pnl"] or 0.0) if row else 0.0
     except Exception as e:
         log.error(f"get_daily_resolved_pnl error: {e}")

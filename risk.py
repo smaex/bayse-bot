@@ -4,7 +4,7 @@ Risk manager: position sizing, drawdown control, exposure limits.
 
 import logging
 import time
-from config import MAX_DRAWDOWN_STOP, MAX_PORTFOLIO_EXPOSURE
+from config import MAX_DRAWDOWN_STOP, MAX_PORTFOLIO_EXPOSURE, TRADING_TIMEZONE
 
 log = logging.getLogger(__name__)
 
@@ -45,11 +45,19 @@ class RiskManager:
 
     def reset_daily_if_needed(self):
         import datetime
-        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        from zoneinfo import ZoneInfo
+        today = datetime.datetime.now(ZoneInfo(TRADING_TIMEZONE)).strftime("%Y-%m-%d")
         if self.last_reset_date != today:
             log.info(f"Daily risk reset: profit was ₦{self.daily_realized_pnl:,.0f}")
             self.daily_realized_pnl = 0.0
             self.last_reset_date = today
+            # If the risk manager paused from yesterday's drawdown, reset the baseline for the new day
+            # so the bot never stays permanently silent across trading days
+            if self.paused:
+                log.info("Daily risk reset: clearing drawdown pause for new trading day")
+                self.paused = False
+                self.peak_balance = self.current_free_cash
+                self._dd_breach_since = 0.0
 
     def update_balance(self, balance: float):
         self.update_peak(balance)
@@ -86,9 +94,21 @@ class RiskManager:
         return not self.paused
 
     def deployed(self) -> float:
-        return sum(p["amount_ngn"] for p in self.open_positions.values())
+        """Sum of capital in all open positions and resting maker orders.
+
+        Bayse reserves order funds from availableBalance immediately upon placing limit orders.
+        Including all open positions and resting orders in deployed capital ensures that equity
+        (free_cash + deployed) reflects true account net worth and prevents false drawdown
+        halts when maker orders are resting.
+        """
+        return sum(
+            p.get("amount_ngn", 0.0)
+            for p in self.open_positions.values()
+        )
+
 
     def can_trade(self, balance: float, amount: float, max_exposure: float = 0.30) -> bool:
+        max_exposure = min(max_exposure, MAX_PORTFOLIO_EXPOSURE)
         if (self.deployed() + amount) > balance * max_exposure:
             log.debug(
                 f"Exposure cap: deployed=₦{self.deployed():,.0f} + "
@@ -111,14 +131,16 @@ class RiskManager:
     def add_pnl(self, pnl: float):
         self.daily_realized_pnl += pnl
         if pnl < 0:
-            self.probation_trades_left = 2
-            log.warning(f"Risk Manager: Entering PROBATION for next 2 trades after loss of ₦{abs(pnl):,.0f}")
+            self.probation_trades_left = 1
+            log.warning(f"Risk Manager: Entering PROBATION for next 1 trade after loss of ₦{abs(pnl):,.0f}")
         elif pnl > 0 and self.probation_trades_left > 0:
             self.probation_trades_left -= 1
             if self.probation_trades_left == 0:
                 log.info("Risk Manager: Probation cleared! Returning to full position sizes.")
 
     def add_position(self, market_id: str, pos: dict):
+        pos.setdefault("placed_at", time.time())  # always stamp entry time
+        pos.setdefault("market_id", market_id)
         self.open_positions[market_id] = pos
         log.info(
             f"Position opened [{pos['strategy']}] "
@@ -126,11 +148,61 @@ class RiskManager:
             f"₦{pos['amount_ngn']:,.0f}"
         )
 
-    def remove_position(self, market_id: str):
+    def remove_position(self, market_id: str, *, order_id: str = "", outcome_id: str = ""):
+        """Remove one tracked position without deleting sibling hedge legs."""
+        if order_id or outcome_id:
+            for key, pos in list(self.open_positions.items()):
+                if pos.get("market_id", key) != market_id:
+                    continue
+                if order_id and pos.get("order_id") != order_id:
+                    continue
+                if outcome_id and pos.get("outcome_id") != outcome_id:
+                    continue
+                self.open_positions.pop(key, None)
+                return
         self.open_positions.pop(market_id, None)
 
-    def already_in(self, market_id: str) -> bool:
-        return market_id in self.open_positions or market_id in self.pending_markets
+    def has_correlated_open_position(self, asset: str, outcome: str, timeframe: str = "15min", certainty: float = 0.0) -> bool:
+        """
+        Prevents stacking weak correlated bets on BTC, ETH, and SOL.
+        Macro Consensus Exception: If certainty >= 0.65 (strong macro breakout where
+        the model has high mathematical edge and conviction), all 3 assets are allowed
+        to trade to capture the multi-asset winning sweep!
+        """
+        if certainty >= 0.65:
+            return False  # High macro conviction — allow the multi-asset sweep!
+
+        crypto_assets = {"BTC", "ETH", "SOL"}
+        if asset not in crypto_assets:
+            return False
+        for pos in self.open_positions.values():
+            if (pos.get("asset") in crypto_assets
+                    and pos.get("outcome") == outcome
+                    and pos.get("timeframe") == timeframe):
+                return True
+        return False
+
+    def already_in(self, market_id: str, asset: str = "", is_hedge: bool = False) -> bool:
+        if is_hedge:
+            # Matched-pair hedge explicitly acquires the opposite side to lock in redemption spread
+            return False
+        if market_id in self.pending_markets:
+            return True
+        pos = self.open_positions.get(market_id)
+        if pos is not None:
+            # Active position or pending limit order already exists for this exact market!
+            return True
+        # Asset-level deduplication: if we already hold ANY position on this asset
+        # (even on a different market_id / different side), block new entries.
+        if asset:
+            for existing_pos in self.open_positions.values():
+                if existing_pos.get("asset") == asset:
+                    log.info(
+                        f"BLOCK duplicate asset entry: already holding {asset} "
+                        f"({existing_pos.get('outcome')} @ {existing_pos.get('entry_price', 0):.3f})"
+                    )
+                    return True
+        return False
 
     def lock_market(self, market_id: str):
         self.pending_markets.add(market_id)

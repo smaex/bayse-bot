@@ -275,3 +275,20 @@ def realized_correlation(asset1: str, asset2: str, state) -> float:
     if d1 <= 1e-9 or d2 <= 1e-9:
         return 0.0
     return num / math.sqrt(d1 * d2)
+
+
+def note_reject(learned: dict | None, stage: str, code: str, detail: str = "") -> None:
+    """Count a rejected candidate under the gate that rejected it.
+
+    Telemetry for the trading-drought watchdog: a strategy declining to trade is
+    usually correct behaviour, and the counter is what proves it. It is attributed
+    to the user whose evaluation is running, and any failure here is swallowed so
+    a counting bug can never become a trading bug.
+    """
+    try:
+        import stall
+
+        chat_id = (learned or {}).get("chat_id")
+        stall.reject(chat_id, stage, code, detail)
+    except Exception:
+        pass

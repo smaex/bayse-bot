@@ -12,12 +12,15 @@ import json
 import logging
 import time
 import websockets
+
+import health
 from config import WS_MARKETS_URL, WS_REALTIME_URL
 
 log = logging.getLogger(__name__)
 
-# Live spot prices
+# Live Bayse-relay spot prices and their actual receive times.
 spot: dict[str, float] = {}
+spot_updated_at: dict[str, float] = {}
 
 # Bayse market YES/NO prices — {market_id: {"yes": float, "no": float}}
 market_prices: dict[str, dict] = {}
@@ -60,7 +63,13 @@ async def realtime_feed(on_price=None):
     backoff = 1
     while True:
         try:
-            async with websockets.connect(WS_REALTIME_URL, ping_interval=20) as ws:
+            async with websockets.connect(
+                WS_REALTIME_URL,
+                ping_interval=20,
+                ping_timeout=20,
+                open_timeout=10,
+                close_timeout=5,
+            ) as ws:
                 log.info(f"Bayse realtime feed connected ({len(_SUBSCRIBE_SYMBOLS)} symbols)")
                 backoff = 1
                 await ws.send(json.dumps({
@@ -77,7 +86,10 @@ async def realtime_feed(on_price=None):
                         price  = data.get("price")
                         asset  = _REALTIME_SYMBOLS.get(symbol)
                         if asset and price is not None:
+                            now = time.time()
                             spot[asset] = float(price)
+                            spot_updated_at[asset] = now
+                            health.touch("relay_feed", asset=asset)
                             log.debug(f"Spot {asset}: {float(price):,.4f}")
                             if on_price:
                                 on_price(asset, float(price))
@@ -101,7 +113,13 @@ async def bayse_feed(event_ids: list[str], on_update=None):
     backoff = 1
     while True:
         try:
-            async with websockets.connect(WS_MARKETS_URL, ping_interval=20) as ws:
+            async with websockets.connect(
+                WS_MARKETS_URL,
+                ping_interval=20,
+                ping_timeout=20,
+                open_timeout=10,
+                close_timeout=5,
+            ) as ws:
                 log.info(f"Bayse markets feed connected ({len(event_ids)} events)")
                 backoff = 1
                 for eid in event_ids:
@@ -170,7 +188,8 @@ def _handle_market(msg: dict, on_update=None):
                 global_state.market_last_fav[mid] = fav
 
         prev_yes[mid] = market_prices.get(mid, {}).get("yes", yes_val)
-        market_prices[mid] = {"yes": yes_val, "no": no_val}
+        market_prices[mid] = {"yes": yes_val, "no": no_val, "updated_at": time.time()}
+        health.touch("market_feed", market_id=mid)
 
         if on_update:
             on_update(mid, market_prices[mid])
