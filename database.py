@@ -523,6 +523,22 @@ def recent_trades(chat_id: str, limit: int = 10) -> list[dict]:
     """, (chat_id, limit))
 
 
+def last_filled_trade_at(chat_id: str):
+    """Timestamp of the most recent exchange-confirmed fill, or None.
+
+    The trading-drought clock must measure time since the last *execution*.
+    Using the newest trade row instead counted a resting MAKER quote that was
+    later cancelled unfilled, so an account that never got a fill reported a
+    recent trade and the stall watchdog stayed quiet.
+    """
+    row = _fetch_one("""
+        SELECT created_at FROM trades
+        WHERE chat_id = %s AND COALESCE(filled_quantity, 0) > 0
+        ORDER BY created_at DESC LIMIT 1
+    """, (chat_id,))
+    return row.get("created_at") if row else None
+
+
 def recent_stats(chat_id: str, days: int = 30, after_dt=None) -> list[dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     if after_dt:

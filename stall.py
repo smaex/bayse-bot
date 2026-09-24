@@ -34,6 +34,11 @@ log = logging.getLogger("stall")
 _MAX_CODES = 48
 _MAX_RECENT = 12
 
+# Mirrors executor.TRADE_COOLDOWN_SEC for the wording of the COOLDOWN_BLOCKED
+# verdict. Referenced rather than imported: stall.py is deliberately free of
+# imports from the trading path so it can never fail a trade.
+TRADE_COOLDOWN_SEC_REFERENCE = 60
+
 _lock = threading.RLock()
 
 # Scanner/oracle state is process-wide, not per user.
@@ -59,6 +64,7 @@ def _blank() -> dict[str, Any]:
         "order_attempts": 0,
         "last_order_placed": 0.0,
         "orders_placed": 0,
+        "orders_resting": 0,
         "last_trade": 0.0,
         "trades": 0,
         "markets_total": 0,
@@ -195,6 +201,11 @@ def note_order(chat_id: str | None, strategy: str, *, placed: bool, reason: str 
             if placed:
                 state["last_order_placed"] = now
                 state["orders_placed"] += 1
+                # A placed MAKER order is a resting quote: the exchange has NOT
+                # executed anything. Counting it separately keeps /why able to
+                # distinguish "we are quoting" from "we are getting filled".
+                if reason and reason != "filled" and "resting" in reason:
+                    state["orders_resting"] += 1
                 _remember(state, f"ORDER PLACED {label}")
             else:
                 _bump(state["rejects"], f"exec:{reason or 'rejected'}", label)
@@ -248,7 +259,10 @@ def trade_gap_minutes(chat_id: str | None, now: float | None = None) -> float:
         state = _bucket(chat_id)
         if state is None:
             return 0.0
-        last = float(state.get("last_trade", 0.0)) or float(state.get("last_order_placed", 0.0))
+        # Deliberately NOT falling back to last_order_placed: a resting MAKER
+        # quote is placed every minute and may never execute, and counting it
+        # here is what kept the drought watchdog quiet through a fill-less day.
+        last = float(state.get("last_trade", 0.0))
         reference = last or max(float(state.get("first_seen", 0.0)), float(_global.get("started_at", 0.0)))
     if not reference:
         return 0.0
@@ -303,7 +317,7 @@ def verdict(chat_id: str | None, *, now: float | None = None,
         state = _bucket(chat_id)
         snapshot = dict(state) if state else _blank()
     last_eval = float(snapshot.get("last_evaluation", 0.0))
-    last_trade = float(snapshot.get("last_trade", 0.0)) or float(snapshot.get("last_order_placed", 0.0))
+    last_trade = float(snapshot.get("last_trade", 0.0))
     trade_gap_min = (now - last_trade) / 60.0 if last_trade else None
     skips = snapshot.get("skips", {})
     rejects = snapshot.get("rejects", {})
@@ -447,12 +461,46 @@ def verdict(chat_id: str | None, *, now: float | None = None,
             "market minimum, fee-adjusted EV, or the risk budget not covering the platform minimum.",
             "critical",
         )
+    # Bounded safety valves deserve their own verdict: both were silent INFO
+    # logs before, which is how "MAKER resting quotes froze every entry" read
+    # as a healthy account with no edge.
+    reject_counts = {code: int(entry.get("count", 0)) for code, entry in rejects.items()}
+    if reject_counts.get("exec:exposure_cap", 0) > 0:
+        return out(
+            "EXPOSURE_CAPPED",
+            "Entries are being refused by the portfolio exposure ceiling.",
+            f"exec:exposure_cap ×{reject_counts['exec:exposure_cap']} "
+            f"(filled positions count toward the cap; resting orders no longer do).",
+            "Wait for open positions to resolve, or raise MAX_PORTFOLIO_EXPOSURE deliberately. "
+            "At ₦1,600 equity and a 15% ceiling the account can only hold ₦240 of filled exposure.",
+            "warn",
+        )
+    if reject_counts.get("exec:market_cooldown", 0) > 0:
+        return out(
+            "COOLDOWN_BLOCKED",
+            "A per-strategy cooldown on the same market is refusing entries.",
+            f"exec:market_cooldown ×{reject_counts['exec:market_cooldown']} "
+            f"({TRADE_COOLDOWN_SEC_REFERENCE}s window per strategy).",
+            "Normal after any placement or rejection on that market; if the counter dominates, "
+            "check whether one strategy is churning the market with re-quotes.",
+            "info",
+        )
     if float(snapshot.get("last_order_placed", 0.0)) and int(snapshot.get("trades", 0)) <= 0:
+        resting = int(snapshot.get("orders_resting", 0))
+        gap_text = (
+            f" No confirmed fill for {trade_gap_min:.0f} min."
+            if trade_gap_min is not None else " No confirmed fill yet in this process."
+        )
         return out(
             "NO_CONFIRMED_FILL",
             "Orders are submitted but no exchange-confirmed fill has been recorded.",
-            "Maker quotes may be resting unfilled, or fills are not being reconciled from the order object.",
-            "Check /trades and the fill reconciliation log; unfilled maker orders are cancelled by design.",
+            f"{int(snapshot.get('orders_placed', 0))} order(s) placed; "
+            f"{int(snapshot.get('trades', 0))} confirmed fill(s)"
+            + (f"; {resting} still resting unfilled." if resting else ".")
+            + gap_text,
+            "Passive quotes often expire unfilled by design. Check /trades for real fills and "
+            "wait for the unfilled-order notices; if every quote expires, the quoting price or "
+            "MAKER_ORDER_TIMEOUT is the thing to look at — not a risk gate.",
             "warn",
         )
     return out(
@@ -484,6 +532,7 @@ def report(chat_id: str | None, **context: Any) -> dict[str, Any]:
         "signals": int(snapshot.get("signals", 0)),
         "order_attempts": int(snapshot.get("order_attempts", 0)),
         "orders_placed": int(snapshot.get("orders_placed", 0)),
+        "orders_resting": int(snapshot.get("orders_resting", 0)),
         "trades": int(snapshot.get("trades", 0)),
         "age_evaluation_sec": round(now - float(snapshot.get("last_evaluation", 0.0)), 1)
         if snapshot.get("last_evaluation") else None,
@@ -523,7 +572,12 @@ def format_report(chat_id: str | None, **context: Any) -> str:
         f"Code: `{verdict_data['code']}`",
     ]
     if verdict_data.get("trade_gap_min") is not None:
-        lines.append(f"Last confirmed trade: {verdict_data['trade_gap_min']:.0f} min ago")
+        lines.append(f"Last confirmed fill: {verdict_data['trade_gap_min']:.0f} min ago")
+    elif int(data.get("orders_placed", 0)):
+        lines.append(
+            "Last confirmed fill: none yet — every order so far is resting or "
+            "expired unfilled"
+        )
     if verdict_data.get("detail"):
         lines += ["", verdict_data["detail"]]
     if verdict_data.get("action"):
@@ -533,7 +587,8 @@ def format_report(chat_id: str | None, **context: Any) -> str:
         f"Markets: {data['markets_total']} open, {data['markets_in_scope']} in scope, "
         f"{data['markets_evaluated']} evaluated per cycle",
         f"Process totals: {data['evaluations']} evaluations | {data['signals']} signals | "
-        f"{data['orders_placed']} orders placed",
+        f"{data['orders_placed']} orders placed | {data['trades']} confirmed fills"
+        + (f" | {data['orders_resting']} still resting unfilled" if data.get('orders_resting') else ""),
     ]
     if data["top_rejects"]:
         lines += ["", "🚪 Gates that stopped candidates:"]

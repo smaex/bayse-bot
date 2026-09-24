@@ -9,6 +9,21 @@ from config import MAX_DRAWDOWN_STOP, MAX_PORTFOLIO_EXPOSURE, TRADING_TIMEZONE
 log = logging.getLogger(__name__)
 
 
+def position_is_filled(pos: dict) -> bool:
+    """True only when the exchange has confirmed shares for this position.
+
+    A resting LIMIT order that has not been matched yet is deliberately NOT a
+    fill: the bot asked for it, the exchange has not executed it. Exposure and
+    the drought clock must use the same definition of "we are in this trade".
+    """
+    if pos.get("confirmed_filled"):
+        return True
+    try:
+        return float(pos.get("filled_quantity") or 0.0) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
 class RiskManager:
     def __init__(self):
         self.peak_balance: float = 0.0
@@ -100,19 +115,43 @@ class RiskManager:
         Including all open positions and resting orders in deployed capital ensures that equity
         (free_cash + deployed) reflects true account net worth and prevents false drawdown
         halts when maker orders are resting.
+
+        This is the *balance-sheet* view. It is NOT the number the entry-exposure
+        cap uses — see ``deployed_filled`` for why.
         """
         return sum(
             p.get("amount_ngn", 0.0)
             for p in self.open_positions.values()
         )
 
+    def deployed_filled(self) -> float:
+        """Capital in positions the exchange has actually executed.
+
+        The README's rule is that exposure is created only from exchange-
+        confirmed filled quantity. A resting, unmatched MAKER quote has no
+        directional risk (and its cash is already excluded from free_cash), so
+        charging it against MAX_PORTFOLIO_EXPOSURE let a single unfilled quote
+        exhaust the whole budget for every other strategy on the account —
+        observed in production as "MAKER resting orders freeze SNIPE", logged
+        at INFO with no gate counter and no notification.
+        """
+        return sum(
+            p.get("amount_ngn", 0.0)
+            for p in self.open_positions.values()
+            if position_is_filled(p)
+        )
+
+    def deployed_resting(self) -> float:
+        """Capital committed to orders that are still waiting to be matched."""
+        return max(0.0, self.deployed() - self.deployed_filled())
 
     def can_trade(self, balance: float, amount: float, max_exposure: float = 0.30) -> bool:
         max_exposure = min(max_exposure, MAX_PORTFOLIO_EXPOSURE)
-        if (self.deployed() + amount) > balance * max_exposure:
-            log.debug(
-                f"Exposure cap: deployed=₦{self.deployed():,.0f} + "
-                f"₦{amount:,.0f} > {max_exposure:.0%} of ₦{balance:,.0f}"
+        if (self.deployed_filled() + amount) > balance * max_exposure:
+            log.info(
+                f"Exposure cap: filled=₦{self.deployed_filled():,.0f} + "
+                f"₦{amount:,.0f} > {max_exposure:.0%} of ₦{balance:,.0f} "
+                f"(resting orders ₦{self.deployed_resting():,.0f} excluded)"
             )
             return False
         return True

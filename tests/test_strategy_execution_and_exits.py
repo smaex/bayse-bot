@@ -187,7 +187,15 @@ def test_take_profit_triggers_on_price_target(monkeypatch):
 
 
 def test_unfilled_maker_order_management(monkeypatch):
-    """Unfilled maker orders that get filled on exchange are marked filled; stale orders are cancelled."""
+    """Stale maker orders are cancelled; if the exchange still reports them open
+    the position is RETAINED (never dropped while it may still fill) and the user
+    is told once that it is still resting.
+
+    This previously asserted that the position was removed from the risk book.
+    It was: silently, with the order possibly still live on the exchange — the
+    exact behaviour that let three unfilled MAKER entries resolve with no
+    Telegram message and no cancelled order.
+    """
     risk = RiskManager()
     risk.add_position(
         "market-resting",
@@ -224,9 +232,11 @@ def test_unfilled_maker_order_management(monkeypatch):
     client = MockClient(order_response={"status": "open", "filledSize": 0})
     asyncio.run(bot._manage_unfilled_maker_orders("chat-1", client, risk, {}))
 
-    # Stale order was cancelled and removed from risk
+    # The stale order was cancelled, but the exchange still reports it OPEN, so
+    # the position stays tracked until the exchange confirms otherwise.
     assert "maker-order-1" in client.cancelled_orders
-    assert "market-resting" not in risk.open_positions
+    assert "market-resting" in risk.open_positions
+    assert risk.open_positions["market-resting"]["unfilled_alerted"] is True
 
 
 def test_oracle_arb_evaluates_near_close():
