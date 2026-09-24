@@ -222,7 +222,7 @@ async def execute_trade(chat_id: str, sig, client, risk, settings: dict,
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — systemic halt active")
         return
     is_hedge = "PAIR_HEDGE" in getattr(sig, "reason", "")
-    if risk.already_in(sig.market_id, asset=sig.asset, is_hedge=is_hedge):
+    if risk.already_in(sig.market_id, asset=sig.asset, is_hedge=is_hedge, strategy=sig.strategy):
         _stall_skip(chat_id, sig, "already_in_or_pending")
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — already in/pending on {sig.market_id}")
         return
@@ -582,7 +582,7 @@ async def _execute_logic(
             return
 
     # ── Correlated crypto exposure cap ─────────────────────────────────────
-    if not is_oracle_arb and risk.has_correlated_open_position(sig.asset, sig.outcome, sig.timeframe, certainty=sig.certainty):
+    if not is_oracle_arb and risk.has_correlated_open_position(sig.asset, sig.outcome, sig.timeframe, certainty=sig.certainty, strategy=sig.strategy):
         log.info(
             f"[{chat_id}] SKIP {sig.strategy} {sig.asset} {sig.outcome} — "
             f"correlated crypto position already open in same direction on {sig.timeframe} (certainty={sig.certainty:.2f} < 0.65)"
