@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bayse Bot | Command Center</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0a0c10;
+            --card-bg: rgba(255, 255, 255, 0.03);
+            --accent: #00ffcc;
+            --accent-glow: rgba(0, 255, 204, 0.3);
+            --text: #e0e6ed;
+            --text-dim: #94a3b8;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --error: #ef4444;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Outfit', sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 2rem;
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(0, 255, 204, 0.05) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(0, 255, 204, 0.05) 0%, transparent 40%);
+        }
+
+        .container { max-width: 1200px; margin: 0 auto; }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 3rem;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            padding-bottom: 1rem;
+        }
+
+        h1 { font-weight: 600; letter-spacing: -1px; display: flex; align-items: center; gap: 10px; }
+        .dot { width: 10px; height: 10px; background: var(--accent); border-radius: 50%; box-shadow: 0 0 10px var(--accent-glow); animation: pulse 2s infinite; }
+
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 3rem;
+        }
+
+        .card {
+            background: var(--card-bg);
+            border: 1px solid rgba(255,255,255,0.05);
+            padding: 1.5rem;
+            border-radius: 1.5rem;
+            backdrop-filter: blur(10px);
+            transition: transform 0.3s ease, border-color 0.3s ease;
+        }
+        .card:hover { transform: translateY(-5px); border-color: var(--accent-glow); }
+
+        .card-label { font-size: 0.85rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 0.5rem; }
+        .card-value { font-size: 1.75rem; font-weight: 600; }
+        .card-sub { font-size: 0.85rem; margin-top: 0.5rem; }
+
+        table { width: 100%; border-collapse: collapse; margin-top: 2rem; }
+        th { text-align: left; padding: 1rem; color: var(--text-dim); font-size: 0.85rem; text-transform: uppercase; border-bottom: 1px solid rgba(255,255,255,0.1); }
+        td { padding: 1rem; border-bottom: 1px solid rgba(255,255,255,0.03); }
+
+        .user-row:hover { background: rgba(255,255,255,0.02); }
+
+        .badge {
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .badge-success { background: rgba(16, 185, 129, 0.1); color: var(--success); }
+        .badge-warning { background: rgba(245, 158, 11, 0.1); color: var(--warning); }
+        .badge-error { background: rgba(239, 68, 68, 0.1); color: var(--error); }
+
+        .oracle-tag { font-family: monospace; font-size: 0.8rem; background: rgba(0,0,0,0.3); padding: 2px 6px; border-radius: 4px; }
+
+        .refresh-btn {
+            background: var(--accent);
+            color: #000;
+            border: none;
+            padding: 0.5rem 1.25rem;
+            border-radius: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.3s ease;
+        }
+        .refresh-btn:hover { background: #fff; }
+
+        .loading-overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: var(--bg);
+            display: flex; justify-content: center; align-items: center;
+            z-index: 1000; transition: opacity 0.5s ease;
+        }
+        .loading-overlay.hidden { opacity: 0; pointer-events: none; }
+    </style>
+</head>
+<body>
+    <div id="loading" class="loading-overlay">
+        <div class="dot" style="width: 30px; height: 30px;"></div>
+    </div>
+
+    <div class="container">
+        <header>
+            <h1><span class="dot"></span> BAYSE CORE :: <span id="sys-status">STABLE</span></h1>
+            <div style="display: flex; gap: 1rem; align-items: center;">
+                <span id="last-update" style="font-size: 0.8rem; color: var(--text-dim);">Last update: --:--</span>
+                <button class="refresh-btn" onclick="fetchData()">FORCE REFRESH</button>
+            </div>
+        </header>
+
+        <div class="stats-grid">
+            <div class="card">
+                <div class="card-label">Network Health</div>
+                <div id="net-health" class="card-value">100%</div>
+                <div class="card-sub"><span class="badge badge-success">Binance.US BookTicker Active</span></div>
+            </div>
+            <div class="card">
+                <div class="card-label">Active Fleets</div>
+                <div id="user-count" class="card-value">0</div>
+                <div class="card-sub" id="active-positions">0 Open Positions</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Total System PnL</div>
+                <div id="total-pnl" class="card-value">₦0.00</div>
+                <div class="card-sub" id="pnl-trend">--</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Oracle Latency</div>
+                <div id="oracle-lag" class="card-value">0.0s</div>
+                <div class="card-sub"><span id="oracle-status" class="badge badge-success">Nominal</span></div>
+            </div>
+        </div>
+
+        <div class="card" style="padding: 0; overflow-x: auto;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>User ID</th>
+                        <th>Status</th>
+                        <th>Balance (NGN)</th>
+                        <th>PnL Today</th>
+                        <th>Mode</th>
+                        <th>Exposure</th>
+                        <th>Positions</th>
+                    </tr>
+                </thead>
+                <tbody id="user-table">
+                    <!-- Data injected here -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        async function fetchData() {
+            try {
+                const password = new URLSearchParams(window.location.search).get('pass') || '';
+                const response = await fetch(`/api/stats?pass=${password}`);
+                
+                if (response.status === 401) {
+                    alert("Unauthorized. Append ?pass=YOUR_PASSWORD to the URL.");
+                    return;
+                }
+                
+                const data = await response.json();
+                updateUI(data);
+                document.getElementById('loading').classList.add('hidden');
+            } catch (error) {
+                console.error("Fetch failed:", error);
+            }
+        }
+
+        function updateUI(data) {
+            document.getElementById('user-count').textContent = data.users.length;
+            document.getElementById('last-update').textContent = `Last update: ${new Date().toLocaleTimeString()}`;
+            
+            let totalPnL = 0;
+            let totalOpen = 0;
+            let maxLag = 0;
+
+            const table = document.getElementById('user-table');
+            table.innerHTML = '';
+
+            data.users.forEach(u => {
+                totalPnL += u.pnl_today;
+                totalOpen += u.open_count;
+                
+                const row = document.createElement('tr');
+                row.className = 'user-row';
+                
+                const statusBadge = u.paused 
+                    ? '<span class="badge badge-warning">PAUSED</span>' 
+                    : '<span class="badge badge-success">TRADING</span>';
+
+                row.innerHTML = `
+                    <td>${u.id}</td>
+                    <td>${statusBadge}</td>
+                    <td style="font-family: monospace;">₦${u.balance.toLocaleString()}</td>
+                    <td style="font-family: monospace; color: ${u.pnl_today >= 0 ? 'var(--success)' : 'var(--error)'}">
+                        ${u.pnl_today >= 0 ? '+' : ''}₦${u.pnl_today.toLocaleString()}
+                    </td>
+                    <td><span class="badge" style="background: rgba(255,255,255,0.1)">${u.mode.toUpperCase()}</span></td>
+                    <td>${u.exposure.toFixed(1)}%</td>
+                    <td>${u.open_count}</td>
+                `;
+                table.appendChild(row);
+            });
+
+            document.getElementById('total-pnl').textContent = `₦${totalPnL.toLocaleString()}`;
+            document.getElementById('total-pnl').style.color = totalPnL >= 0 ? 'var(--success)' : 'var(--error)';
+            document.getElementById('active-positions').textContent = `${totalOpen} Open Positions Across Fleet`;
+
+            // Oracle info
+            if (data.oracles) {
+                const lags = Object.values(data.oracles).map(o => o.lag || 0);
+                maxLag = Math.max(...lags, 0);
+                document.getElementById('oracle-lag').textContent = `${maxLag.toFixed(1)}s`;
+                
+                const statusEl = document.getElementById('oracle-status');
+                if (maxLag > 10) {
+                    statusEl.textContent = 'DEGRADED';
+                    statusEl.className = 'badge badge-warning';
+                } else if (maxLag > 45) {
+                    statusEl.textContent = 'STALLED';
+                    statusEl.className = 'badge badge-error';
+                } else {
+                    statusEl.textContent = 'NOMINAL';
+                    statusEl.className = 'badge badge-success';
+                }
+            }
+        }
+
+        // Initial fetch
+        fetchData();
+        // Auto-refresh every 15 seconds
+        setInterval(fetchData, 15000);
+    </script>
+</body>
+</html>
