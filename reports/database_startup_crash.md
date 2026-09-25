@@ -172,38 +172,59 @@ was reading `main()` as text and matched a function name inside a *comment*.
 It is now stripped of whole-line comments and asserts on call sites, so prose
 cannot satisfy or defeat an ordering check.
 
-## 4. The probe could not tell a dead bot from the wrong URL *(added after operator follow-up)*
+## 4. The watchdog was pointed at the wrong address — resolved with hard evidence
 
-### What the operator supplied
+Two earlier guesses in this section were wrong and are corrected here: that
+`APP_URL` pointed at Coolify's dashboard on `:3000`, and then that the
+application's Ports Exposes was mismatched. The operator opening
+`http://lxipev6rdu9rbvr5d0uxj8cz.69.164.244.180.sslip.io/live` and getting
+`status: live` disproved both — routing and the port mapping are fine.
 
-* Container status: **Running**, with **2 restarts**.
-* The application's public address:
-  `http://lxipev6rdu9rbvr5d0uxj8cz.69.164.244.180.sslip.io`
-* Earlier, the port in play: **3000**.
+What actually settled it was a **job annotation**, readable from
+`api.github.com` even though the run logs are hosted on a domain this sandbox
+cannot reach:
 
-That address is a **Coolify-generated application domain** (sslip.io, `<uuid>.<ip>`),
-not a bare host:port. It resolves to `69.164.244.180` and carries no port, so it
-is served by Coolify's reverse proxy on 80, which forwards to whatever the
-application's **Ports Exposes** is set to.
+```
+$ gh api repos/smaex/bayse-bot/check-runs/107967141285/annotations
+[warning] /live did not answer on https://bayse-bot.***.sslip.io
+```
 
-**Correction to what was claimed a step earlier.** This report previously said
-`APP_URL` probably pointed at Coolify's dashboard on `:3000`. Given the actual
-domain, that was wrong: the URL is the application's own domain. `3000` is much
-more likely the application's **Ports Exposes** value — which would be the
-actual fault, because the bot binds **8080**:
+Run `36102281530`, 2026-09-25T06:18:31Z. So `APP_URL` was
+`https://bayse-bot.<host>.sslip.io` — **a different subdomain from the one that
+actually serves the bot** (`lxipev6rdu9rbvr5d0uxj8cz.<host>.sslip.io`), and
+`https` where the working address is `http`. The `***` is GitHub redaction of a
+substring matching a repository secret, consistent with the host IP appearing in
+one.
 
-| Where | Value |
-|---|---|
-| `bot.py` | `server.start_server(port=int(os.getenv("PORT", "8080")))` |
-| `Dockerfile` | `EXPOSE 8080`; healthcheck probes `${PORT:-8080}/live` |
-| Coolify Ports Exposes | **3000** (per the operator) |
+The failure step also changed partway through, which dates the mistake:
 
-If those disagree, the proxy forwards to a port nothing is listening on and
-answers `502 Bad Gateway` for every path — including `/live`.
+| Run (UTC) | Failed step | What that implies |
+|---|---|---|
+| 2026-09-24 20:06 | `Verify the service is running (SSH)` | `APP_URL` **empty** — that step is gated `vars.APP_URL == ''` |
+| 2026-09-24 23:11 | `Verify the service is running (SSH)` | same |
+| 2026-09-25 01:27 | `Verify the service is running (SSH)` | same |
+| 2026-09-25 06:18 | `HTTP probe (APP_URL)` | `APP_URL` **set** — and set to the wrong domain |
+
+So for months the watchdog SSHed to a host that no longer exists, and between
+01:27 and 06:18 on 2026-09-25 `APP_URL` was set to a domain the bot does not
+serve. In neither case was the bot down. **The bot was never the thing that was
+broken in those alerts.**
+
+### The fix
+
+Set the `APP_URL` repository variable to the address that actually works:
+
+```
+http://lxipev6rdu9rbvr5d0uxj8cz.69.164.244.180.sslip.io
+```
+
+Use `http` unless a certificate is configured for that domain — `http` is what
+was verified to return `status: live`.
 
 ### The defect in the probe
 
-Whatever the cause, the old probe could not report it usefully:
+Independent of the wrong address, the old probe could not have explained any of
+this:
 
 ```bash
 live=$(curl -fsS --max-time 10 "$base/live" 2>/dev/null || echo "")
@@ -211,11 +232,13 @@ if [ -z "$live" ]; then … exit 1
 ```
 
 `-f` makes curl fail on any 4xx/5xx and discards the body, so a `502` from the
-proxy, a `404` from the wrong service, and a genuinely dead bot all produced the
-same message. The probe now verifies the answer came from *this* bot (the health
-server identifies itself as `{"status": "live", …}`) and names the failure mode:
-nothing answered, proxy cannot reach the container, wrong service, or
-alive-but-not-ready.
+proxy, a `404` from an unrouted domain, and a genuinely dead bot all produced
+the same one-line message. The probe now verifies the answer came from *this*
+bot (the health server identifies itself as `{"status": "live", …}`) and names
+the failure mode: nothing answered, proxy cannot reach the container, wrong
+service, or alive-but-not-ready. Had it been in place, the 06:18 run would have
+said "404 — something serves this host but has no /live route, it is not the
+bot" instead of "the bot is down".
 
 Two bugs in the first version of that rewrite were caught by its own tests
 before it shipped, and are pinned there:
@@ -226,19 +249,6 @@ before it shipped, and are pinned there:
 * `curl -o` does not truncate the output file on failure, so a failed probe
   reported the *previous* probe's response body as its own.
 
-### What the operator has to do
-
-Set the application's **Ports Exposes to 8080** (Coolify → the bayse-bot
-application → Configuration), or set a `PORT` environment variable equal to
-whatever is exposed — `bot.py` honours it. Then redeploy.
-
-To confirm the diagnosis before changing anything, open the domain in a browser
-and look at `/live`:
-
-* `{"status": "live", …}` → routing is fine; the problem was elsewhere.
-* `502`/`503`/`504` → port mismatch, as described above.
-* `404` → the domain is not the bot's.
-
 The container showing **Running with 2 restarts** is consistent with cause #1 —
 the crash-on-unreachable-database loop — but it is not proof: the deploy that
 rolled back left the *previous* image running, so the running container may
@@ -246,22 +256,18 @@ predate both fixes.
 
 ## Not verified from here
 
-Stated plainly, because these are the open questions:
-
-* **The application's public URL could not be probed from here, for a reason
-  that has nothing to do with the bot.** This sandbox has no plain-HTTP egress:
-  `http://example.com` and `http://neverssl.com` both fail with the same
-  `curl: (52) Empty reply from server` that the bot's domain returned, while
-  allowlisted hosts such as `api.github.com` return 200. So the "empty reply"
-  observed against
-  `http://lxipev6rdu9rbvr5d0uxj8cz.69.164.244.180.sslip.io/live` is this
-  sandbox's network policy and is **not** evidence about the deployment. The
-  port-mismatch reading above is an inference from the domain's shape plus the
-  reported `3000`, not an observation. The operator's browser settles it in one
-  request.
-* **The value of the `APP_URL` repository variable and the Ports Exposes
-  setting.** Neither is readable with the available credentials
+* **Nothing on the deployment host was probed directly.** This sandbox has no
+  plain-HTTP egress: `http://example.com` and `http://neverssl.com` both fail
+  with the same `curl: (52) Empty reply from server` that the bot's domain
+  returned, while allowlisted hosts such as `api.github.com` return 200. So the
+  "empty reply" seen against the bot's `/live` was this sandbox's network
+  policy, not evidence about the deployment. The operator's browser — which
+  returned `status: live` — is the observation that matters.
+* **The exact un-redacted value of `APP_URL`.** The annotation shows
+  `https://bayse-bot.***.sslip.io`; the `***` is GitHub masking a substring that
+  matches a repository secret, and the variable itself is not readable
   (`gh api …/actions/variables` → `403 Resource not accessible by integration`).
+  The *subdomain* differing from the working one is visible and is the finding.
 * **Whether the running container predates these fixes.** A rolled-back deploy
   leaves the *previous* image running, so "Running" does not prove the new code
   is live. Confirm by checking the image/commit Coolify reports for the running
@@ -269,3 +275,17 @@ Stated plainly, because these are the open questions:
 * **No Docker build was run.** Docker is not installed in this sandbox, so the
   image was never rebuilt or smoke-tested. The Dockerfile was not modified by
   this change.
+
+### Retracted along the way
+
+Recorded so the wrong turns are not repeated:
+
+1. "The watchdog failure is unexplained." — Resolved: wrong `APP_URL`.
+2. "`APP_URL` probably points at Coolify's dashboard on `:3000`." — Wrong; the
+   operator's URL is the application's own domain.
+3. "Ports Exposes is probably 3000 and mismatches the bot's 8080." — Wrong;
+   `/live` returning `status: live` proves the proxy reaches the container.
+
+The lesson is that two of the three were reached by reasoning from config files
+in the repo instead of reading the one piece of runtime evidence — the job
+annotation — that was reachable all along.
