@@ -234,3 +234,57 @@ Operator checks, in order:
    `sudo systemctl restart bayse-bot`; then `/why` in Telegram. Note that positions
    opened since the outage have already resolved on-exchange (15-minute binaries);
    nothing accumulates, but exit management was absent while the bot was down.
+
+## Addendum — 2026-09-25: production runs in Coolify, and the deploy path now says so
+
+The third pass above concluded that the host behind `VPS_HOST` is not the bot's
+server. That was correct, and it had a second consequence nobody had written
+down: **it was never the bot's server.** Production runs in Coolify as a Docker
+container. `.github/workflows/deploy.yml` SSHes to a systemd unit at
+`/opt/bayse-bot`; that is a different deployment model. The pipeline was not
+"broken" — it was pointed at a machine that never hosted this bot, which is why
+all ~200 retained runs failed and why the fixes in PR #4/#5 never shipped.
+
+Current state:
+
+* **Deploy:** Coolify's GitHub App on the application delivers the push event
+  and redeploys on merge to `main`. `.github/workflows/deploy.yml` is retained
+  but is explicitly marked as not the production path.
+* **Manual redeploy / verification:** `.github/workflows/coolify-deploy.yml`
+  (workflow_dispatch) triggers Coolify's documented deploy webhook
+  (`GET /api/v1/deploy?uuid=…&force=…` with a Bearer token) and polls `/ready`
+  afterwards when the `APP_URL` repository variable is set. It needs
+  `COOLIFY_URL`, `COOLIFY_TOKEN` (deploy permission) and `COOLIFY_APP_UUID`.
+* **Liveness:** set the `APP_URL` repository variable to the bot's public URL.
+  The watchdog then probes `/live` and `/ready` over HTTP, and the SSH probe is
+  skipped — a container has no systemd unit to restart, so that probe could
+  only ever alert falsely (it did, every 15 minutes).
+* **Health:** enable Coolify's own health check on `/ready` for the application
+  (start period ~90s; startup waits on Postgres, Telegram and the price feeds).
+  That, plus a container restart policy of `unless-stopped`, is the mechanism
+  that brings a wedged trading engine back.
+
+### Environment variables only exist in Coolify
+
+`.env` is not deployed — `dockerignore` excludes it. Anything not set in the
+Coolify application is missing at runtime, and the defaults are the safe ones:
+
+* `LIVE_TRADING` — defaults to `false`. **The single most common cause of a
+  silent bot.** With it unset the bot evaluates, logs signals, and sends no
+  order, forever.
+* `MAX_PORTFOLIO_EXPOSURE` — defaults to `0.15`. A user setting of
+  `/set maxexposure 30` is silently clamped to 15%, so a ₦1,600 account can
+  hold only ₦240 of filled exposure (two ₦100 orders).
+* `MAX_TRADE_RISK` and `MAX_PORTFOLIO_EXPOSURE` are **fractions**: `0.02` and
+  `0.30`. Writing `5` or `30` raises at startup inside `config.validate()`,
+  which runs before the health server binds — Docker then restart-loops the
+  container.
+
+### Reading "quiet" correctly
+
+`/why` now reports `N orders placed | M confirmed fills | R still resting
+unfilled`. A MAKER quote that rests and expires is *not* a trade: it is an
+order that produced no position, capital came back, and the user is notified
+(`⏳` still resting, `⚪` unfilled, `🚫` rejected, `❓` unconfirmed). When
+`NO_CONFIRMED_FILL` is the verdict, the thing to inspect is the quoting price
+and `MAKER_ORDER_TIMEOUT`, not a risk gate.

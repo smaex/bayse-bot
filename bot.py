@@ -261,16 +261,30 @@ async def start_user(chat_id: str):
             if not mid:
                 continue
             key = mid if mid not in risk.open_positions else f"{mid}:{t.get('outcome')}:{t.get('order_id')}"
+            holdings = float(t.get("filled_quantity") or 0.0)
+            restored_at = time.time()
+            created = t.get("created_at")
+            if created is not None:
+                if getattr(created, "tzinfo", None) is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                restored_at = created.timestamp()
             risk.add_position(key, {
                 "market_id": mid,
                 "trade_id": t["trade_id"], "event_id": t["event_id"],
                 "order_id": t.get("order_id"),
                 "outcome": t["outcome"], "outcome_id": t["outcome_id"],
                 "entry_price": t["entry_price"], "amount_ngn": t["amount_ngn"],
-                "filled_quantity": float(t.get("filled_quantity") or 0.0),
+                "filled_quantity": holdings,
                 "strategy": t["strategy"], "asset": t["asset"],
                 "timeframe": t["timeframe"],
-                "confirmed_filled": float(t.get("filled_quantity") or 0.0) > 0,
+                "confirmed_filled": holdings > 0,
+                # `placed_at` drives every staleness/requote decision. Without
+                # it, a restored position was stamped "now" on each restart, so
+                # a dormant unfilled MAKER order kept a market locked forever:
+                # /manage saw a fresh order, never cancelled it, and the risk
+                # book held the market permanently. Age it from the ledger row.
+                "placed_at": restored_at,
+                "restored": True,
             })
 
     if chat_id not in _user_tasks or _user_tasks[chat_id].done():
@@ -608,12 +622,49 @@ async def _user_loop(chat_id: str):
         await _evaluate_single_user(user, penalty=0.0)
 
 
+async def _resolve_unfilled_position(chat_id: str, risk, pos: dict, position_key: str,
+                                     reason: str, *, notify: bool = True) -> None:
+    """Close out an order that never filled: free the capital, settle the trade
+    row at 0.0 PnL, and tell the user.
+
+    An unfilled order is not a loss, but it must never be silent. Maker quotes
+    resolving without a single Telegram message is the exact failure this path
+    exists to prevent: the capital came back, the position left the risk book,
+    and the operator had no way to know either happened.
+    """
+    trade_id = pos.get("trade_id")
+    if trade_id:
+        try:
+            await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
+        except Exception as db_err:
+            log.error(f"[{chat_id}] Could not settle unfilled trade {trade_id} ({reason}): {db_err}")
+    risk.remove_position(position_key)
+    log.info(
+        f"[{chat_id}] UNFILLED {pos.get('strategy', 'MAKER')} {pos.get('asset', '?')} "
+        f"order={pos.get('order_id')} — {reason}; capital freed, trade settled at ₦0"
+    )
+    if not notify:
+        return
+    app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+    if app_to_use:
+        try:
+            await telegram_bot.notify_unfilled(
+                app_to_use, chat_id, pos.get("strategy", "MAKER"),
+                pos.get("asset", "?"), pos.get("timeframe", ""),
+                pos.get("outcome", ""), pos.get("amount_ngn", 0),
+            )
+        except Exception as ne:
+            log.warning(f"[{chat_id}] notify_unfilled ({reason}) failed: {ne}")
+
+
 async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: dict):
     """
     Actively monitors resting maker limit orders on the CLOB:
     - If filled: updates DB, records position as confirmed filled, notifies user via notify_fill.
     - If cancelled/expired: removes from tracker, resolves DB trade as won=None (0.0 PnL), notifies user.
     - If stale (>120s or oracle moved > 0.15% or secs < 180): cancels order, frees capital, resolves trade as 0.0 PnL, notifies user via notify_unfilled.
+    - If the cancel cannot be confirmed: tells the user the order is still resting
+      instead of silently keeping it, and never drops it from the risk book.
     """
     if not risk.open_positions:
         return
@@ -657,10 +708,13 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                         database.update_trade_fill,
                         trade_id, confirmed_cost, shares, fill_price,
                     )
+                pos["unfilled_alerted"] = False
                 log.info(
                     f"[{chat_id}] MAKER LIMIT ORDER FILLED | {pos.get('asset')} {pos.get('outcome')} "
                     f"@ {fill_price:.3f} | {shares:.2f} shares (₦{confirmed_cost:,.0f})"
                 )
+                # Exchange-confirmed: only now does the drought clock move.
+                stall.note_trade(chat_id, market_id=market_id)
                 app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
                 if app_to_use:
                     try:
@@ -674,21 +728,9 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                 continue
 
             if status in ("cancelled", "expired", "rejected", "killed"):
-                risk.remove_position(position_key)
-                trade_id = pos.get("trade_id")
-                if trade_id:
-                    await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
-                log.info(f"[{chat_id}] Cleaned {status} maker order {order_id} on {market_id}")
-                app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
-                if app_to_use:
-                    try:
-                        await telegram_bot.notify_unfilled(
-                            app_to_use, chat_id, pos.get("strategy", "MAKER"),
-                            pos.get("asset", ""), pos.get("timeframe", ""),
-                            pos.get("outcome", ""), pos.get("amount_ngn", 0),
-                        )
-                    except Exception as ne:
-                        log.warning(f"notify_unfilled failed: {ne}")
+                await _resolve_unfilled_position(
+                    chat_id, risk, pos, position_key, f"exchange status={status}"
+                )
                 continue
 
             # If still open, check if stale / needs requote / late in candle
@@ -737,10 +779,12 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                                 database.update_trade_fill,
                                 trade_id, confirmed_cost, shares, fill_price,
                             )
+                        pos["unfilled_alerted"] = False
                         log.info(
                             f"[{chat_id}] MAKER LIMIT ORDER FILLED during cancel check | "
                             f"{pos.get('asset')} {pos.get('outcome')} @ {fill_price:.3f} | {shares:.2f} shares"
                         )
+                        stall.note_trade(chat_id, market_id=market_id)
                         app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
                         if app_to_use:
                             try:
@@ -754,21 +798,10 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                         continue
 
                     if status in ("cancelled", "canceled", "expired", "rejected", "killed"):
-                        risk.remove_position(position_key)
-                        trade_id = pos.get("trade_id")
-                        if trade_id:
-                            await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
-                        log.info(f"[{chat_id}] Confirmed cancelled maker order {order_id} on {market_id}")
-                        app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
-                        if app_to_use:
-                            try:
-                                await telegram_bot.notify_unfilled(
-                                    app_to_use, chat_id, pos.get("strategy", "MAKER"),
-                                    pos.get("asset", ""), pos.get("timeframe", ""),
-                                    pos.get("outcome", ""), pos.get("amount_ngn", 0),
-                                )
-                            except Exception as ne:
-                                log.warning(f"notify_unfilled (stale cancel) failed: {ne}")
+                        await _resolve_unfilled_position(
+                            chat_id, risk, pos, position_key,
+                            f"cancelled unfilled (status={status})",
+                        )
                         continue
 
                     # If still open on Bayse: DO NOT DROP! Retain in open_positions
@@ -776,6 +809,23 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                         f"[{chat_id}] Maker order {order_id} remains {status} on Bayse after cancel attempt. "
                         "Retaining in open_positions to prevent ghost trade."
                     )
+                    # Retaining is correct — but it was also silent, so an order
+                    # that never filled produced no message at all. Notify once
+                    # per order with the fact that matters: it is still resting.
+                    if not pos.get("unfilled_alerted"):
+                        pos["unfilled_alerted"] = True
+                        app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                        if app_to_use:
+                            try:
+                                await telegram_bot.notify_order_resting(
+                                    app_to_use, chat_id, pos.get("strategy", "MAKER"),
+                                    pos.get("asset", ""), pos.get("timeframe", ""),
+                                    pos.get("outcome", ""), pos.get("amount_ngn", 0),
+                                    price=float(pos.get("entry_price") or 0.0),
+                                    reason=f"cancel not confirmed (exchange status: {status or 'open'})",
+                                )
+                            except Exception as ne:
+                                log.warning(f"notify_order_resting failed: {ne}")
                 except Exception as ve:
                     log.warning(f"[{chat_id}] Verification of cancelled order {order_id} failed: {ve}")
 
@@ -836,7 +886,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                         f"[{chat_id}] Cleaning stale resolved position on {market_id} "
                         f"(age={age_secs:.0f}s, asset={asset}, strategy={pos.get('strategy')})"
                     )
-                    stale_positions.append(position_key)
+                    stale_positions.append((position_key, pos))
                 continue
 
         # Don't try to exit in the final 45 seconds — settlement/oracle resolution
@@ -1328,9 +1378,37 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             else:
                 log.error(f"[{chat_id}] EXIT order failed for {market_id}: {e}", exc_info=True)
 
-    # Clean up stale/expired positions that rotated out of active_markets
-    for stale_mid in stale_positions:
-        risk.remove_position(stale_mid)
+    # ── Stale positions that rotated out of active_markets ───────────────
+    # These used to be dropped from the risk book with no cancellation, no DB
+    # settlement and no notification: the trade row stayed unresolved forever,
+    # the order could still be live on the exchange, and the user was told
+    # nothing. Cancel what is still cancellable, settle the row at ₦0, and say so.
+    for stale_key, stale_pos in stale_positions:
+        order_id = stale_pos.get("order_id")
+        filled = float(stale_pos.get("filled_quantity") or 0.0)
+        confirmed = bool(stale_pos.get("confirmed_filled")) or filled > 0
+        if order_id and not confirmed:
+            try:
+                await client.cancel_order(order_id)
+                log.info(f"[{chat_id}] Cancelled stale unfilled order {order_id} on "
+                         f"{stale_pos.get('market_id')}")
+            except Exception as ce:
+                log.warning(
+                    f"[{chat_id}] Stale order {order_id} could not be cancelled ({ce}); "
+                    "it may still be resting on the exchange"
+                )
+            await _resolve_unfilled_position(
+                chat_id, risk, stale_pos, stale_key,
+                "market rotated out and the order never filled",
+            )
+        else:
+            # Either a confirmed fill (real position — settlement owns it) or
+            # nothing to cancel. Record why it left the risk book.
+            log.info(
+                f"[{chat_id}] Dropping stale tracked position {stale_pos.get('market_id')} "
+                f"(filled={filled:.2f}, confirmed={confirmed})"
+            )
+            risk.remove_position(stale_key)
 
 
 async def _evaluate_single_user(user: dict, trigger_asset: str = None, penalty: float = 0.0):
@@ -1802,13 +1880,28 @@ async def _seed_stall_clocks(users: list[dict]) -> None:
             )
             rows = await asyncio.to_thread(database.recent_trades, chat_id, 1)
             created = rows[0].get("created_at") if rows else None
+            try:
+                filled_at = await asyncio.to_thread(database.last_filled_trade_at, chat_id)
+            except Exception:
+                filled_at = None
+            # Prefer the last CONFIRMED fill. Falling back to the newest trade
+            # row would let a resting quote that was later cancelled unfilled
+            # reset the drought clock, hiding exactly the drought this seeds.
+            if filled_at is not None:
+                created = filled_at
+            elif rows:
+                log.info(
+                    f"[{chat_id}] No confirmed fill in the ledger — drought clock "
+                    "starts from process start, not from the last unfilled quote"
+                )
+                continue
             if created is not None:
                 if created.tzinfo is None:
                     created = created.replace(tzinfo=timezone.utc)
                 stall.seed_last_trade(chat_id, created.timestamp())
                 log.info(
                     f"[{chat_id}] Stall clock seeded from ledger "
-                    f"(last order {(time.time() - created.timestamp()) / 3600:.1f}h ago)"
+                    f"(last confirmed fill {(time.time() - created.timestamp()) / 3600:.1f}h ago)"
                 )
         except Exception as seed_err:
             log.debug(f"[{chat_id}] Stall clock seeding skipped: {seed_err}")

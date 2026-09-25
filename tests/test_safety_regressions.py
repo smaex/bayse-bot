@@ -2,6 +2,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 
 import config
 import health
@@ -127,8 +128,22 @@ def test_readiness_requires_declared_startup_and_recent_core_progress():
 
     health.touch("bot")
     health.touch("singleton_lock")
+    # Readiness also requires a live scanner heartbeat: a process whose market
+    # discovery loop has died is not "ready", however healthy the event loop is.
+    health.touch("scanner")
     health.set_ready(True)
     ready, reasons, _ = health.readiness()
     assert ready is True
     assert reasons == []
+
+    # A scanner that has stopped reporting makes the process un-ready.
+    health.touch("scanner")
+    snapshot = health.snapshot()
+    with health._lock:
+        health._components["scanner"]["last_ok"] = time.time() - 600
+    ready, reasons, _ = health.readiness()
+    assert ready is False
+    assert any("scanner" in reason for reason in reasons)
+
+    health.touch("scanner")
     health.set_ready(False)

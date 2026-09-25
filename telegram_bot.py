@@ -1113,6 +1113,118 @@ async def notify_unfilled(app, cid, strat, asset, tf, outcome, amount_ngn):
         except Exception as e2:
             log.error(f"notify_unfilled failed completely for {cid}: {e2}")
 
+async def notify_order_resting(app, cid, strat, asset, tf, outcome, amount_ngn,
+                               price: float = 0.0, reason: str = ""):
+    """A passive order is still resting unfilled.
+
+    Sent when a cancel could not be confirmed (the order may still be live and
+    matchable), so the user is not left believing the position was closed.
+    """
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_order_resting dropped for {cid}: no Telegram app available")
+        return
+    try:
+        amt_val = float(amount_ngn or 0.0)
+        price_val = float(price or 0.0)
+    except (ValueError, TypeError):
+        amt_val = 0.0
+        price_val = 0.0
+    icon, name = _STRAT_ICONS.get((strat or "").upper(), ("📊", strat or "MAKER"))
+    _esc = lambda s: (s or "").replace("_", "\\_").replace("*", "\\*")
+    detail = f"\nWhy: {_esc(reason)}" if reason else ""
+    msg = (
+        f"⏳ *Order Resting — Not Filled*\n"
+        f"{icon} {_esc(name)} | {_esc(asset)} {_esc(tf)} {_esc(outcome)}\n"
+        f"Limit: *{price_val:.3f}* | ₦{amt_val:,.0f}\n"
+        f"_Still open on the exchange and cannot be cancelled for certain — it may "
+        f"still fill, or expire unfilled. You will be told which.{detail}_"
+    )
+    try:
+        await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+    except Exception as e:
+        log.debug(f"notify_order_resting markdown failed, falling back to plain text: {e}")
+        try:
+            await app.bot.send_message(
+                chat_id=cid,
+                text=f"⏳ RESTING (unfilled) | {name} | {asset} {tf} {outcome} | "
+                     f"₦{amt_val:,.0f} @ {price_val:.3f}",
+            )
+        except Exception as e2:
+            log.error(f"notify_order_resting failed completely for {cid}: {e2}")
+
+
+async def notify_order_unconfirmed(app, cid, strat, asset, tf, outcome, amount_ngn,
+                                   order_id: str = ""):
+    """Bayse accepted an order but returned no fill confirmation.
+
+    Fail-closed and deliberately loud: the wallet may or may not have been
+    debited, so the user is asked to check the exchange portfolio.
+    """
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_order_unconfirmed dropped for {cid}: no Telegram app available")
+        return
+    try:
+        amt_val = float(amount_ngn or 0.0)
+    except (ValueError, TypeError):
+        amt_val = 0.0
+    icon, name = _STRAT_ICONS.get((strat or "").upper(), ("🔔", strat or "Trade"))
+    _esc = lambda s: (s or "").replace("_", "\\_").replace("*", "\\*")
+    msg = (
+        f"❓ *Order Unconfirmed — Please Verify*\n"
+        f"{icon} {_esc(name)} | {_esc(asset)} {_esc(tf)} {_esc(outcome)} | ₦{amt_val:,.0f}\n"
+        f"Order `{_esc(str(order_id))}` was accepted but no fill was confirmed.\n"
+        f"_No position was recorded and this market is paused for new entries. "
+        f"Check your Bayse portfolio before assuming the money is untouched._"
+    )
+    try:
+        await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+    except Exception as e:
+        log.debug(f"notify_order_unconfirmed markdown failed, falling back to plain text: {e}")
+        try:
+            await app.bot.send_message(
+                chat_id=cid,
+                text=f"❓ UNCONFIRMED ORDER {order_id} | {name} | {asset} {tf} {outcome} | "
+                     f"₦{amt_val:,.0f} — check the exchange portfolio",
+            )
+        except Exception as e2:
+            log.error(f"notify_order_unconfirmed failed completely for {cid}: {e2}")
+
+
+async def notify_order_rejected(app, cid, strat, asset, tf, outcome, amount_ngn,
+                                reason: str = ""):
+    """The exchange refused the order. Nothing was filled; say so explicitly."""
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_order_rejected dropped for {cid}: no Telegram app available")
+        return
+    try:
+        amt_val = float(amount_ngn or 0.0)
+    except (ValueError, TypeError):
+        amt_val = 0.0
+    icon, name = _STRAT_ICONS.get((strat or "").upper(), ("🔔", strat or "Trade"))
+    _esc = lambda s: (s or "").replace("_", "\\_").replace("*", "\\*")
+    msg = (
+        f"🚫 *Order Rejected by Exchange*\n"
+        f"{icon} {_esc(name)} | {_esc(asset)} {_esc(tf)} {_esc(outcome)} | ₦{amt_val:,.0f}\n"
+        f"_{_esc((reason or 'no reason returned')[:300])}_\n"
+        f"_No fill occurred. Nothing was deducted for this order._"
+    )
+    try:
+        await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+    except Exception as e:
+        log.debug(f"notify_order_rejected markdown failed, falling back to plain text: {e}")
+        try:
+            await app.bot.send_message(
+                chat_id=cid,
+                text=f"🚫 REJECTED | {name} | {asset} {tf} {outcome} | ₦{amt_val:,.0f} — "
+                     f"{(reason or '')[:200]}",
+            )
+        except Exception as e2:
+            log.error(f"notify_order_rejected failed completely for {cid}: {e2}")
+
+
 async def notify_drawdown(app, cid, balance, peak, dd):
     await send_message(app, cid,
         f"⚠️ *Drawdown — Trading Paused*\n\n"
