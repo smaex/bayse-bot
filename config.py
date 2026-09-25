@@ -125,8 +125,8 @@ CURRENCY_BASE_MULTIPLIER = 100.0 if CURRENCY == "NGN" else 1.0
 
 # ── Sniping ───────────────────────────────────────────────────────────────────
 SNIPE_ENTRY_WINDOWS = {
-    "5min":  240,    # evaluate in final 4 minutes of 5min market
-    "15min": 660,    # evaluate in final 11 minutes of 15min market (gives trend 4 mins to form)
+    "5min":  270,    # evaluate in final 4.5 minutes of 5min market
+    "15min": 810,    # evaluate in final 13.5 minutes of 15min market (opens after initial 90s formation)
     "1h":    1800,   # evaluate in final 30 minutes of 1h market
     "6h":    7200,
     "1d":    21600,
@@ -139,14 +139,10 @@ SNIPE_ALLOWED_TIMEFRAMES = _env_csv_set(
 )
 SNIPE_MIN_SECS_TO_CLOSE = 60
 SNIPE_MIN_CERTAINTY    = 0.27   # Maps to a conservative win probability of >= 62%.
-SNIPE_MAX_MARKET_PRICE = 0.65   # Reverted from 0.82. The production audit found entries
-                                # >= 0.80 were the -₦314 bucket: at 0.85 you need a 93%+
-                                # win rate just to break even after fees, and a 57% win
-                                # rate there loses money. 0.65 keeps SNIPE inside the
-                                # band where a fee-adjusted edge can actually exist.
-SNIPE_MIN_ENTRY_PRICE  = 0.40   # Block low-probability underdog entries.
+SNIPE_MAX_MARKET_PRICE = 0.70   # Broadened from 0.65 to capture liquid high-EV entries while avoiding extreme skew.
+SNIPE_MIN_ENTRY_PRICE  = 0.35   # Allow attractive underdog mispricings while blocking extreme lotteries.
 SNIPE_MIN_DISTANCE_PCT = 0.0010 # Base minimum spot/threshold separation (calibrated by asset).
-SNIPE_MIN_RAW_MODEL_EDGE = 0.06 # Independent model must disagree materially with market.
+SNIPE_MIN_RAW_MODEL_EDGE = 0.035 # Independent model must exceed market price by at least 3.5% (comfortably clearing fees).
 SNIPE_MIN_BLENDED_EDGE = 0.025  # Required after shrinking toward market consensus.
 SNIPE_MODEL_WEIGHT = 0.35       # Market gets 65% weight until calibration improves.
 SNIPE_VOL_SAFETY_MULTIPLIER = 1.25

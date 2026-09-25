@@ -962,6 +962,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         if (
             (secs < TAKE_PROFIT_MIN_SECS_REMAINING and gain_pct >= TAKE_PROFIT_GAIN_PCT)
             or (current_price >= target_tp_price and gain_pct >= 0.20)
+            or (gain_pct >= 0.40)
         ):
             positions_to_exit.append({
                 "market_id": market_id,
