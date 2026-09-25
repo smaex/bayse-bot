@@ -255,9 +255,10 @@ class RiskManager:
                 # exact market and strategy family.
                 return True
             # A passive MAKER quote and a directional taker may share a market
-            # only on the SAME outcome. Opposite sides of one binary cost more
-            # than the 1.00 they can ever pay out together, so one leg is a
-            # guaranteed loss. An unknown side is treated as a conflict.
+            # only on the SAME outcome. On opposite outcomes exactly one leg can
+            # pay out, so the two strategies would be betting against each
+            # other, and the pair loses outright whenever the two entry prices
+            # sum to more than 1.00. An unknown side is treated as a conflict.
             existing_outcome = str(pos.get("outcome") or "").upper()
             if not outcome or existing_outcome != str(outcome).upper():
                 log.info(

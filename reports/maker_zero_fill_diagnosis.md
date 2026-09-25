@@ -84,7 +84,7 @@ MAKER only quotes when its model says fv ≥ 0.62, and it bids at most fv − 0.
 ## Latent position-safety bugs found on the way (fixed)
 
 1. **A MAKER quote could erase a filled SNIPE position.** `risk.already_in` allows a MAKER quote and a SNIPE position on the same market. The MAKER path then called `risk.add_position(sig.market_id, …)`, and positions are keyed by market id, so the filled SNIPE entry was overwritten. It dropped out of exit management and would be deleted when the quote expired. MAKER now uses the same collision-free `market:outcome:order` key as the taker fill path.
-2. **Opposite sides of one market were allowed.** The comment in `already_in` says MAKER and SNIPE may share a market "only if they are on the SAME outcome side", but the side was never checked. Opposite sides of one binary cost more than the 1.00 they can pay out together. The side is now checked, and an unknown side is treated as a conflict. `already_in` also now sees compound-keyed entries. The dual-leg MIDMARKET_MAKER `market_YES`/`market_NO` keys keep their existing behaviour.
+2. **Opposite sides of one market were allowed.** The comment in `already_in` says MAKER and SNIPE may share a market "only if they are on the SAME outcome side", but the side was never checked. On opposite sides of one binary exactly one leg can pay out, so the two strategies would be betting against each other, and the pair loses outright whenever the two entry prices sum to more than 1.00. The side is now checked, and an unknown side is treated as a conflict. `already_in` also now sees compound-keyed entries. The dual-leg MIDMARKET_MAKER `market_YES`/`market_NO` keys keep their existing behaviour.
 
 ## Deliberately not changed
 
