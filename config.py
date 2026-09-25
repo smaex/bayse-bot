@@ -139,7 +139,13 @@ SNIPE_ALLOWED_TIMEFRAMES = _env_csv_set(
 )
 SNIPE_MIN_SECS_TO_CLOSE = 60
 SNIPE_MIN_CERTAINTY    = 0.27   # Maps to a conservative win probability of >= 62%.
-SNIPE_MAX_MARKET_PRICE = 0.70   # Broadened from 0.65 to capture liquid high-EV entries while avoiding extreme skew.
+SNIPE_MAX_MARKET_PRICE = 0.65   # Restored 2026-09-25 by operator decision: PR #14 raised it to
+                                # 0.70 without new evidence, and SNIPE entered no trades at the
+                                # higher cap. Origin: the production audit found entries >= 0.80
+                                # were the -₦314 bucket: at 0.85 you need a 93%+ win rate just to
+                                # break even after fees, and a 57% win rate there loses money.
+                                # 0.65 keeps SNIPE inside the band where a fee-adjusted edge can
+                                # actually exist. Pinned by test_snipe_hardening.py.
 SNIPE_MIN_ENTRY_PRICE  = 0.35   # Allow attractive underdog mispricings while blocking extreme lotteries.
 SNIPE_MIN_DISTANCE_PCT = 0.0010 # Base minimum spot/threshold separation (calibrated by asset).
 SNIPE_MIN_RAW_MODEL_EDGE = 0.035 # Independent model must exceed market price by at least 3.5% (comfortably clearing fees).

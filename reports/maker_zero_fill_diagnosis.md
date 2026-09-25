@@ -2,7 +2,7 @@
 
 Date: 2026-09-25
 Scope: MAKER quoting and execution, the trading-stall report and `/why`, and Telegram trade notifications.
-Constraint honoured throughout: no risk gate was loosened and no ceiling was raised. The MAKER 0.58 ceiling is unchanged; it is now explicit (`MAKER_MAX_BID`) and enforced against the live book.
+Constraint honoured throughout: no risk gate was loosened and no ceiling was raised. The MAKER 0.58 ceiling is unchanged; it is now explicit (`MAKER_MAX_BID`) and enforced against the live book. The only config value changed is the SNIPE max price, which the operator chose to restore from 0.70 to 0.65 (see below).
 
 ## What the operator saw
 
@@ -86,13 +86,16 @@ MAKER only quotes when its model says fv ≥ 0.62, and it bids at most fv − 0.
 1. **A MAKER quote could erase a filled SNIPE position.** `risk.already_in` allows a MAKER quote and a SNIPE position on the same market. The MAKER path then called `risk.add_position(sig.market_id, …)`, and positions are keyed by market id, so the filled SNIPE entry was overwritten. It dropped out of exit management and would be deleted when the quote expired. MAKER now uses the same collision-free `market:outcome:order` key as the taker fill path.
 2. **Opposite sides of one market were allowed.** The comment in `already_in` says MAKER and SNIPE may share a market "only if they are on the SAME outcome side", but the side was never checked. On opposite sides of one binary exactly one leg can pay out, so the two strategies would be betting against each other, and the pair loses outright whenever the two entry prices sum to more than 1.00. The side is now checked, and an unknown side is treated as a conflict. `already_in` also now sees compound-keyed entries. The dual-leg MIDMARKET_MAKER `market_YES`/`market_NO` keys keep their existing behaviour.
 
+## SNIPE max price restored to 0.65 (operator decision)
+
+* `tests/test_snipe_hardening.py::test_snipe_scope_defaults_match_production_evidence` asserts `SNIPE_MAX_MARKET_PRICE == 0.65`, a value guarded since 2026-09-10. It came from the production audit: entries ≥ 0.80 were the −₦314 bucket, and at 0.85 a 93%+ win rate is needed just to break even after fees.
+* PR #14 raised the config to 0.70 ("to capture liquid high-EV entries") without new out-of-sample evidence, and left this test failing on `main`.
+* The operator reports that SNIPE entered no trades at the 0.70 cap, so there is no evidence for it. On 2026-09-25 the operator chose to restore 0.65 and keep the test as it is. The config is back at 0.65, the audit rationale is restored next to it, and the suite is green again.
+* PR #14 also lowered `SNIPE_MIN_ENTRY_PRICE` (0.40 → 0.35) and `SNIPE_MIN_RAW_MODEL_EDGE` (0.06 → 0.035). Those are not changed here.
+
 ## Deliberately not changed
 
-* The 0.58 MAKER ceiling, the `fv ≥ 0.62` / 2-cent edge entry rule, and every SNIPE gate.
-* **Pre-existing red test (needs an operator decision):**
-  * `tests/test_snipe_hardening.py::test_snipe_scope_defaults_match_production_evidence` asserts `SNIPE_MAX_MARKET_PRICE == 0.65`. That value has been guarded since 2026-09-10.
-  * PR #14 raised the config to 0.70 ("to capture liquid high-EV entries") without new out-of-sample evidence and left this test failing on `main`. The same PR also loosened SNIPE entry windows and price bands.
-  * Either revert the config to 0.65, or update the test after reviewing SNIPE fills recorded since that deploy. This work does neither.
+* The 0.58 MAKER ceiling, the `fv ≥ 0.62` / 2-cent edge entry rule, and every other SNIPE gate.
 
 ## Verification
 
@@ -106,4 +109,4 @@ MAKER only quotes when its model says fv ≥ 0.62, and it bids at most fv − 0.
   * a legacy-Markdown checker implementing Telegram's rules, which confirms the old notification is invalid and the new report, watchdog alert, trade and rejection notices are valid;
   * the plain-text retry, the `MAKER_QUOTE_UNCOMPETITIVE` verdict, the recency window, and the certainty cap.
 * Mutation check: against the pre-fix code, 14 of the 23 book-quoting tests and 16 of the 19 report tests fail. The rest are "unchanged behaviour" controls.
-* Full suite: `181 passed, 1 failed`. The failure is the pre-existing SNIPE config test above, which fails identically on `main`.
+* Full suite: `182 passed`. Before the SNIPE restore it was `181 passed, 1 failed`; the failure was the SNIPE config test above, which fails identically on `main`.
