@@ -32,6 +32,7 @@ import math
 import time
 from typing import Optional
 
+import config
 import feeds_direct
 import feeds
 from strategies.base import TradeSignal, BaseStrategy
@@ -290,7 +291,13 @@ class MakerStrategy(BaseStrategy):
         # Clamp into the executable band with asymmetric positive expected value.
         # Max bid 0.580 guarantees payout is at least +72% on win (₦100 * (1/0.58 - 1) = +₦72.41),
         # preventing bad risk/reward where ₦100 risk only yields ₦53 win.
-        our_bid = round(max(0.50, min(0.58, our_bid)), 3)
+        #
+        # NOTE: ``market_bid`` above is Bayse's outcome *probability* price (a
+        # mid, not the best bid), so this is the most MAKER is willing to pay,
+        # not a price that is known to be competitive. The executor re-prices it
+        # against the live order book before anything is sent (see
+        # executor._maker_quote_against_book).
+        our_bid = round(max(config.MAKER_MIN_BID, min(config.MAKER_MAX_BID, our_bid)), 3)
 
         # Data-driven certainty calibration: combines true statistical win probability and spread edge
         cert = min(0.95, max(target_fv, 0.50 + chosen_edge * 3.5))

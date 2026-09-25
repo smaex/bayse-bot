@@ -27,6 +27,9 @@ from strategies.liquidity_regime import classify_regime
 
 log = logging.getLogger("strategies")
 
+# Upper bound on post-multiplier certainty (see evaluate_all).
+MAX_REPORTED_CERTAINTY = 0.99
+
 _strategies = {
     "SNIPE":           SnipeStrategy(),
     "ARB":             ArbStrategy(),
@@ -193,7 +196,13 @@ async def evaluate_all(
             # probability above, it also reflects the current market regime.
             final_mult = max(0.80, final_mult)
             if final_mult != 1.0:
-                sig.certainty = min(1.0, max(0.0, sig.certainty * final_mult))
+                # Capped below 100%: no directional binary is a certainty. The
+                # MAKER ceiling (0.95) times the TREND regime boost (1.2) used
+                # to clamp to exactly 1.0 and render "Cert: 100%" on quotes
+                # that then never filled. Every sizing/admission threshold
+                # (0.55/0.65/0.70/0.90/0.95) is below this cap, so no decision
+                # changes — only the claim.
+                sig.certainty = min(MAX_REPORTED_CERTAINTY, max(0.0, sig.certainty * final_mult))
                 sig.reason   += f" | MULT(x{final_mult:.2f})"
 
             # Mode floor — minimum certainty to actually execute a trade.
