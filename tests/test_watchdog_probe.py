@@ -79,19 +79,29 @@ def _free_port() -> int:
     return port
 
 
-class _NotTheBot(http.server.BaseHTTPRequestHandler):
-    """Stands in for Coolify's dashboard: answers, but 404s on /live."""
+def _responder(status: int, body: bytes):
+    """Build a handler that answers every GET with `status`/`body`.
 
-    def do_GET(self):  # noqa: N802 - stdlib naming
-        body = b"<!DOCTYPE html><html><title>Coolify</title></html>"
-        self.send_response(404)
-        self.send_header("Content-Type", "text/html")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    Stands in for whatever is actually behind APP_URL: Coolify's dashboard (404)
+    or Coolify's proxy unable to reach the container (502).
+    """
 
-    def log_message(self, *args):
-        pass
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 - stdlib naming
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    return _Handler
+
+
+_NotTheBot = _responder(404, b"<!DOCTYPE html><html><title>Coolify</title></html>")
+_ProxyNoBackend = _responder(502, b"502 Bad Gateway")
 
 
 class _HealthyBot(http.server.BaseHTTPRequestHandler):
@@ -124,6 +134,16 @@ def _serve(handler):
 @pytest.fixture()
 def wrong_server():
     port, server = _serve(_NotTheBot)
+    try:
+        yield port
+    finally:
+        server.shutdown()
+
+
+@pytest.fixture()
+def proxy_server():
+    """Coolify's proxy when 'Ports Exposes' does not match the bot's port."""
+    port, server = _serve(_ProxyNoBackend)
     try:
         yield port
     finally:
@@ -213,6 +233,22 @@ def test_probe_names_a_wrong_server_instead_of_crying_outage(wrong_server):
     assert "3000" in result.stdout, (
         "the error should name the port 3000 trap, since that is how this "
         "deployment gets misconfigured"
+    )
+
+
+def test_probe_names_a_proxy_that_cannot_reach_the_container(proxy_server):
+    """A 502 means the domain is right and the port mapping is wrong.
+
+    Different fix from a 404, so it must not share a message: the remedy is
+    Ports Exposes = 8080, not "point APP_URL somewhere else".
+    """
+    result = _run_probe(f"http://127.0.0.1:{proxy_server}")
+    assert result.returncode == 1
+    assert "NOT pointing at the bot" in result.stdout, result.stdout
+    assert "port mismatch" in result.stdout, result.stdout
+    assert "8080" in result.stdout, result.stdout
+    assert "404" not in result.stdout.split("port mismatch")[0], (
+        "a 502 must not be diagnosed as the 404/wrong-service case"
     )
 
 

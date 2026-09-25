@@ -174,31 +174,48 @@ cannot satisfy or defeat an ordering check.
 
 ## 4. The probe could not tell a dead bot from the wrong URL *(added after operator follow-up)*
 
-The operator confirmed the container is **Running** (2 restarts) and reported the
-port as **3000**. That points at the real reason `/live` never answered from the
-outside — and it is not that the bot was down.
+### What the operator supplied
 
-`setup_coolify_fixed.sh` publishes **Coolify's own dashboard** with
-`-p 3000:8080` and `APP_URL="http://69.164.244.180:3000"`. Port 3000 on that
-host is the admin UI, not the bot. The bot binds **8080** (`bot.py`:
-`server.start_server(port=int(os.getenv("PORT", "8080")))`; `Dockerfile`:
-`EXPOSE 8080`, and the healthcheck probes `${PORT:-8080}/live`).
+* Container status: **Running**, with **2 restarts**.
+* The application's public address:
+  `http://lxipev6rdu9rbvr5d0uxj8cz.69.164.244.180.sslip.io`
+* Earlier, the port in play: **3000**.
 
-The old probe could not notice the difference:
+That address is a **Coolify-generated application domain** (sslip.io, `<uuid>.<ip>`),
+not a bare host:port. It resolves to `69.164.244.180` and carries no port, so it
+is served by Coolify's reverse proxy on 80, which forwards to whatever the
+application's **Ports Exposes** is set to.
+
+**Correction to what was claimed a step earlier.** This report previously said
+`APP_URL` probably pointed at Coolify's dashboard on `:3000`. Given the actual
+domain, that was wrong: the URL is the application's own domain. `3000` is much
+more likely the application's **Ports Exposes** value — which would be the
+actual fault, because the bot binds **8080**:
+
+| Where | Value |
+|---|---|
+| `bot.py` | `server.start_server(port=int(os.getenv("PORT", "8080")))` |
+| `Dockerfile` | `EXPOSE 8080`; healthcheck probes `${PORT:-8080}/live` |
+| Coolify Ports Exposes | **3000** (per the operator) |
+
+If those disagree, the proxy forwards to a port nothing is listening on and
+answers `502 Bad Gateway` for every path — including `/live`.
+
+### The defect in the probe
+
+Whatever the cause, the old probe could not report it usefully:
 
 ```bash
 live=$(curl -fsS --max-time 10 "$base/live" 2>/dev/null || echo "")
 if [ -z "$live" ]; then … exit 1
 ```
 
-`-f` makes curl fail on any 4xx and discards the body, so a 404 from Coolify's
-dashboard is indistinguishable from the bot being down. If the `APP_URL`
-repository *variable* was set to that same `:3000` address, the watchdog spent
-every 15 minutes probing the admin UI and reporting an outage while the bot ran.
-
-The probe now checks that the answer came from *this* bot (the health server
-identifies itself as `{"status": "live", …}`) and names the failure mode:
-nothing answered, wrong server, or alive-but-not-ready.
+`-f` makes curl fail on any 4xx/5xx and discards the body, so a `502` from the
+proxy, a `404` from the wrong service, and a genuinely dead bot all produced the
+same message. The probe now verifies the answer came from *this* bot (the health
+server identifies itself as `{"status": "live", …}`) and names the failure mode:
+nothing answered, proxy cannot reach the container, wrong service, or
+alive-but-not-ready.
 
 Two bugs in the first version of that rewrite were caught by its own tests
 before it shipped, and are pinned there:
@@ -209,12 +226,18 @@ before it shipped, and are pinned there:
 * `curl -o` does not truncate the output file on failure, so a failed probe
   reported the *previous* probe's response body as its own.
 
-### What the operator still has to do
+### What the operator has to do
 
-Point `APP_URL` at the bot, not at Coolify. Either give the application a domain
-in Coolify (Configuration → Domains) and use that, or publish the container's
-8080 on a host port that is **not 3000** and use `http://<host>:<that port>`.
-Until then the watchdog has nothing valid to probe.
+Set the application's **Ports Exposes to 8080** (Coolify → the bayse-bot
+application → Configuration), or set a `PORT` environment variable equal to
+whatever is exposed — `bot.py` honours it. Then redeploy.
+
+To confirm the diagnosis before changing anything, open the domain in a browser
+and look at `/live`:
+
+* `{"status": "live", …}` → routing is fine; the problem was elsewhere.
+* `502`/`503`/`504` → port mismatch, as described above.
+* `404` → the domain is not the bot's.
 
 The container showing **Running with 2 restarts** is consistent with cause #1 —
 the crash-on-unreachable-database loop — but it is not proof: the deploy that
@@ -225,14 +248,20 @@ predate both fixes.
 
 Stated plainly, because these are the open questions:
 
-* **The value of the `APP_URL` repository variable.** This sandbox cannot read it
-  (`gh api …/actions/variables` → `403 Resource not accessible by integration`)
-  and cannot reach the deployment host (`curl` fails at the TCP layer; Coolify's
-  `:3000` resets the connection). The operator reported the container is
-  **Running** with **2 restarts** and gave the port as **3000**, which makes
-  cause #4 the leading explanation — but the variable's actual value was never
-  read, so this is a well-supported inference, not a confirmed fact. After the
-  next watchdog run the step log will say which of the three cases it hit.
+* **The application's public URL could not be probed from here, for a reason
+  that has nothing to do with the bot.** This sandbox has no plain-HTTP egress:
+  `http://example.com` and `http://neverssl.com` both fail with the same
+  `curl: (52) Empty reply from server` that the bot's domain returned, while
+  allowlisted hosts such as `api.github.com` return 200. So the "empty reply"
+  observed against
+  `http://lxipev6rdu9rbvr5d0uxj8cz.69.164.244.180.sslip.io/live` is this
+  sandbox's network policy and is **not** evidence about the deployment. The
+  port-mismatch reading above is an inference from the domain's shape plus the
+  reported `3000`, not an observation. The operator's browser settles it in one
+  request.
+* **The value of the `APP_URL` repository variable and the Ports Exposes
+  setting.** Neither is readable with the available credentials
+  (`gh api …/actions/variables` → `403 Resource not accessible by integration`).
 * **Whether the running container predates these fixes.** A rolled-back deploy
   leaves the *previous* image running, so "Running" does not prove the new code
   is live. Confirm by checking the image/commit Coolify reports for the running

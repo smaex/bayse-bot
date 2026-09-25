@@ -98,8 +98,20 @@ jobs:
 
           if ! is_bot "$live_body"; then
             echo "::error::APP_URL is NOT pointing at the bot. $base/live returned HTTP $live_code from something else: ${live_body:0:160}"
-            echo "::error::Coolify's own dashboard runs on port 3000 (setup_coolify_fixed.sh publishes it as -p 3000:8080), so APP_URL=http://<host>:3000 probes the admin UI, not the bot. Point APP_URL at the bot's own domain, or at a host port mapped to the container's 8080 — the port the bot binds (Dockerfile EXPOSE 8080)."
-            echo "::error::The bot was never actually probed by this run. This is a monitoring misconfiguration, not necessarily an outage."
+            # The status code says which misconfiguration it is, and they have
+            # different fixes — do not collapse them into one message.
+            case "$live_code" in
+              502|503|504)
+                echo "::error::A reverse proxy answered but cannot reach the bot container. This is almost always a port mismatch: Coolify's 'Ports Exposes' must be the port the bot binds — 8080 (bot.py reads PORT, default 8080; Dockerfile EXPOSE 8080). If it is set to another value, the proxy forwards to a port nothing listens on. Fix: Configuration → Ports Exposes = 8080, or set the PORT env var to the exposed port."
+                ;;
+              404)
+                echo "::error::Something is serving this host but has no /live route, so it is not the bot. Coolify's own dashboard runs on port 3000 (setup_coolify_fixed.sh publishes it as -p 3000:8080) — if APP_URL points there, you are probing the admin UI. Use the application's own domain instead."
+                ;;
+              *)
+                echo "::error::Unexpected response from $base. Confirm this is the bayse-bot application's domain and that its Ports Exposes is 8080."
+                ;;
+            esac
+            echo "::error::The bot was never actually probed by this run. This is a routing/misconfiguration problem, not necessarily an outage."
             exit 1
           fi
 
