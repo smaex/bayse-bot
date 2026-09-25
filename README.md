@@ -94,12 +94,21 @@ Additional safeguards include bounded HTTP/WebSocket waits, conservative retries
 
 ## Health and dashboard
 
-- `GET /live` (or legacy `/ping`): event loop is reachable.
+- `GET /live` (or legacy `/ping`): event loop is reachable. Answers 200 even while this instance is a standby waiting for the singleton lease.
 - `GET /ready`: startup finished and core ownership/main-loop heartbeats are fresh.
 - `GET /dashboard`: static dashboard.
 - `GET /api/stats`: requires `Authorization: Bearer <DASHBOARD_PASSWORD>`.
 
+Both probes also report the instance `role` — `starting`, `standby`, `active`, or
+`stopping` — so during a deploy you can tell which of the two running containers
+is the one trading.
+
 Point the deployment platform's liveness probe at `/live` and readiness probe at `/ready`. A process can be alive while Telegram or trading tasks are dead, so these signals are intentionally separate. `/api/stats` additionally carries a per-account stall report and the current `live_trading` flag.
+
+**Never point a container healthcheck at `/ready`.** A rolling update runs two
+containers at once: the new one is correctly *not ready* until the old one hands
+over the lease, and a readiness-based restart policy turns that into a
+crash-loop. See `reports/coolify_rolling_update_lease.md`.
 
 ### When the bot goes quiet
 
@@ -110,6 +119,26 @@ these gates and is reported as such — it is not an invitation to lower a gate.
 `reports/trading_stall_runbook.md` is the full procedure.
 
 ### Deploys
+
+Production runs as a Docker container under Coolify. Two rules keep a rolling
+update from deadlocking; both come from a deploy that rolled back on 2026-09-25
+(`reports/coolify_rolling_update_lease.md`):
+
+- the image must ship a client the platform's *injected* probe can run — Coolify
+  health-checks Dockerfile deployments with `wget`, which `python:3.11-slim` does
+  not have, so `wget` and `curl` are both installed;
+- the health port is bound **before** the singleton lease is contested, and a
+  container that finds the lease held by a live instance **stands by** — alive,
+  `/live` 200, `/ready` 503 — instead of exiting after a deadline. Coolify stops
+  the old container only once the new one is healthy, so exiting on "lease held"
+  left both containers waiting on each other and the new one crash-looping.
+
+`SIGTERM` unwinds in a fixed order: trading loops stop, Telegram polling stops,
+the lease is released, clients close. That makes the handover about a second; if
+the process is SIGKILLed instead, the standby takes over when the lease expires
+(`LOCK_LEASE_SEC`). `LOCK_ACQUIRE_TIMEOUT_SEC` (default 900, `0` = forever) caps
+how long a container will stand by, so two live deployments sharing one database
+surface as a loud error and a restart rather than a healthy-looking spare.
 
 Watchdog configuration (GitHub → Settings → Secrets and variables → Actions):
 `VPS_HOST`/`VPS_USER`/`VPS_SSH_KEY`/`VPS_PORT` secrets for a systemd host, and/or an

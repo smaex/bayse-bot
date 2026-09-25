@@ -93,6 +93,11 @@ EnvironmentFile=$BOT_DIR/.env
 ExecStart=$BOT_DIR/.venv/bin/python bot.py
 Restart=always
 RestartSec=10
+# The bot releases its singleton lease when it receives SIGTERM, so a restart
+# hands over in about a second instead of waiting for the lease to expire.
+# Give that unwind room before systemd escalates to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=bayse-bot
