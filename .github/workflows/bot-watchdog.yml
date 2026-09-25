@@ -66,6 +66,7 @@ jobs:
       # the recovery mechanism. Set the APP_URL repository variable
       # (Settings → Secrets and variables → Actions → Variables) to enable it.
       - name: Verify the service is running (SSH)
+        id: ssh_recover
         if: ${{ env.VPS_HOST != '' && vars.APP_URL == '' }}
         timeout-minutes: 10
         env:
@@ -128,6 +129,13 @@ jobs:
             exit "$rc"
           fi
 
+      # The previous message asserted "a restart did not recover it" and told
+      # the operator to run `systemctl status bayse-bot` on the VPS. For this
+      # deployment both halves were false: the SSH recovery step is skipped
+      # whenever APP_URL is set (there is no systemd unit in a container), so no
+      # restart was ever attempted, and the VPS is not where production runs.
+      # An alert that sends you to the wrong machine wastes the minutes that
+      # matter during a real outage, so it now states which path actually ran.
       - name: Alert on failure
         if: ${{ failure() && env.NOTIFY_CHAT != '' }}
         uses: appleboy/telegram-action@master
@@ -136,9 +144,14 @@ jobs:
           token:   ${{ secrets.TELEGRAM_TOKEN }}
           message: |
             🚨 *Bayse bot watchdog*
-            `/ready` did not answer and a restart did not recover it.
-            Run: `sudo systemctl status bayse-bot` and
-            `sudo journalctl -u bayse-bot -n 200` on the VPS.
+            `/live` did not answer on `${{ vars.APP_URL }}`.
+
+            ${{ steps.ssh_recover.outcome == 'skipped' && 'No restart was attempted: production runs as a Coolify container, so there is no systemd unit here. Open Coolify → the bayse-bot application → Logs and Deployments, and check that the container is running and that its healthcheck on `/live` is passing.' || 'A restart was attempted on the VPS and did not recover it. Run: `sudo systemctl status bayse-bot` and `sudo journalctl -u bayse-bot -n 200`.' }}
+
+            If the container keeps restarting, the log will say why — a
+            database it cannot reach, or a Telegram token it cannot
+            authenticate, both log a clear reason before exiting.
+
             Positions stay open on the exchange — if you cannot restore the bot,
             check the Bayse portfolio and close/hedge manually if needed.
             (Trading itself reports *why* it is quiet via /why; this alert is

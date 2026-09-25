@@ -145,18 +145,30 @@ def test_docker_healthcheck_probes_liveness_not_readiness():
     assert "/ready" not in command
 
 
+def _code_only(source: str) -> str:
+    """Drop whole-line comments.
+
+    Ordering assertions read ``main()`` as text, so a prose comment that happens
+    to name a function would otherwise satisfy or defeat them. Assert on the
+    call sites instead.
+    """
+    return "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
 def test_health_port_is_bound_before_the_lease_is_contested():
     """Ordering is the whole fix: no socket, no healthcheck pass, no handover."""
-    source = inspect.getsource(bot.main)
-    bind = source.index("server.start_server")
-    contest = source.index("_acquire_singleton_lease")
+    source = _code_only(inspect.getsource(bot.main))
+    bind = source.index("server.start_server(")
+    contest = source.index("await _acquire_singleton_lease(")
     assert bind < contest, (
         "main() must start the health server before waiting for the singleton "
         "lease, or a rolling update can never complete"
     )
     # Same argument for the database: a slow or unreachable Supabase must not
     # keep /live dark while the platform is deciding whether we are healthy.
-    assert source.index("server.start_server") < source.index("init_db")
+    assert bind < source.index("_init_database_with_retry(")
 
 
 # ── Standing by ───────────────────────────────────────────────────────────────

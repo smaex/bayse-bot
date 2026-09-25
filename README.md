@@ -140,18 +140,36 @@ the process is SIGKILLed instead, the standby takes over when the lease expires
 how long a container will stand by, so two live deployments sharing one database
 surface as a loud error and a restart rather than a healthy-looking spare.
 
+Database startup is retried, not fatal. `init_db` opens the pool and runs
+migrations, and on an unreachable Postgres it raises — which used to kill the
+process in under a second, before `/live` answered a single probe, so a
+Supabase pause or a connection blip failed the platform health check and rolled
+the deploy back. Binding the health port early does not help if the process then
+exits: a closed port is closed no matter when it was opened. Startup now retries
+inside `DB_INIT_TIMEOUT_SEC` (default 120, `0` = forever) while `/live` keeps
+answering 200 and `/ready` reports 503, and exits non-zero only if the database
+never returns. See `reports/database_startup_crash.md`.
+
 Watchdog configuration (GitHub → Settings → Secrets and variables → Actions):
 `VPS_HOST`/`VPS_USER`/`VPS_SSH_KEY`/`VPS_PORT` secrets for a systemd host, and/or an
 `APP_URL` **variable** for a platform that exposes `/live` publicly. Missing
 configuration degrades to a warning rather than a failing run.
 
-`Deploy to VPS` runs the suite and an import/config sanity check first, then executes
-`scripts/zero_downtime_deploy.sh` on the host. That script's invariant is that it never
-exits with the service stopped: it verifies `/live` and `/ready` and, on any failure, rolls
-the checkout back to the previously running commit and restarts before reporting the
-failure. `Bot watchdog` re-checks `/ready` every 15 minutes, restarts an unresponsive unit,
-and alerts only when something was actually wrong. Neither workflow places, cancels, or
-modifies orders.
+`Deploy to VPS` is **manual-only** (`workflow_dispatch`). It SSHes to a systemd
+host, which is not how this bot runs — production is a Coolify container — and
+the host behind `VPS_HOST` no longer accepts sessions. It used to fire on every
+push to `main`, fail at the SSH step, and send "❌ Bayse Bot deploy FAILED" to
+Telegram for merges Coolify had already shipped. Keep it for a host you actually
+operate; run it by hand. When it does run, it executes the suite and an
+import/config sanity check first, then `scripts/zero_downtime_deploy.sh`, whose
+invariant is that it never exits with the service stopped: it verifies `/live`
+and `/ready` and, on any failure, rolls the checkout back to the previously
+running commit and restarts before reporting the failure.
+
+`Bot watchdog` probes `/live` every 15 minutes — over `APP_URL` for a container,
+over SSH for a systemd host — and alerts only when something was actually wrong,
+saying which path ran rather than assuming a restart happened. Neither workflow
+places, cancels, or modifies orders.
 
 ## Architecture
 
