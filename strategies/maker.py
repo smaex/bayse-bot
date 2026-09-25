@@ -228,8 +228,17 @@ class MakerStrategy(BaseStrategy):
         # Calibrated for adaptive market making:
         # Require strong separation buffer to avoid chop whipsawing positions.
         # - ETH: requires >= 0.25% buffer due to micro-volatility chop.
-        # - BTC & SOL: require >= 0.20% buffer ($150+ on BTC, $0.25+ on SOL).
-        min_dist_req = 0.0025 if asset == "ETH" else 0.0020
+        # - SOL: requires >= 0.20% buffer ($0.25+ on SOL).
+        # - BTC: requires >= 0.08% buffer ($65+ on BTC) calibrated for lower BTC baseline variance.
+        if asset == "ETH":
+            min_dist_req = 0.0025
+            min_mom_req = 0.0005
+        elif asset == "BTC":
+            min_dist_req = 0.0008
+            min_mom_req = 0.0002
+        else:
+            min_dist_req = 0.0020
+            min_mom_req = 0.0005
         eth_edge_cushion = 0.020 if asset == "ETH" else 0.0
 
         if abs(dist_pct) < min_dist_req:
@@ -250,13 +259,13 @@ class MakerStrategy(BaseStrategy):
         chosen_side = None
         min_maker_edge = 0.020 + eth_edge_cushion  # at least 2.0 cents of real edge
         if (dist_pct > 0 and edge_yes >= min_maker_edge
-                and fv_yes >= 0.62 and mom_5m >= 0.0005):
+                and fv_yes >= 0.62 and mom_5m >= min_mom_req):
             chosen_side = "YES"
             target_fv   = fv_yes
             market_bid  = yes_bid_price
             outcome_id  = market.get("yes_id", "")
         elif (dist_pct < 0 and edge_no >= min_maker_edge
-                and fv_no >= 0.62 and mom_5m <= -0.0005):
+                and fv_no >= 0.62 and mom_5m <= -min_mom_req):
             chosen_side = "NO"
             target_fv   = fv_no
             market_bid  = no_bid_price
