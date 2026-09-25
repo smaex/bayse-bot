@@ -29,8 +29,21 @@ def test_agreement_boosts_only_same_direction():
 
     assert len(merged) == 1
     assert merged[0].outcome == "YES"
-    assert merged[0].certainty == pytest.approx(0.80)
+    # Bounded convergence boost: +0.05 once, on top of the stronger certainty.
+    assert merged[0].certainty == pytest.approx(0.75)
     assert "CONVERGENCE" in merged[0].reason
+
+
+def test_convergence_boost_is_bounded_and_applied_once():
+    """A third agreeing strategy must not compound the boost past the cap."""
+    merged = merge_signals([
+        _signal("SNIPE", "YES", 0.94, 0.90, 0.55),
+        _signal("FRONTRUN", "YES", 0.93, 0.89, 0.55),
+        _signal("CORRELATE", "YES", 0.95, 0.91, 0.55),
+    ])
+
+    assert len(merged) == 1
+    assert merged[0].certainty <= 0.98
 
 
 def test_opposite_signals_do_not_get_false_convergence_boost():

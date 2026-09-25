@@ -57,8 +57,16 @@ jobs:
 
       # Native ssh (same reasoning as deploy.yml): no action black box between
       # the probe and the host, and a failure here is visible in annotations.
+      #
+      # SKIPPED whenever APP_URL is configured. Production runs as a Coolify
+      # container, so there is no systemd unit to restart and this probe can
+      # only ever fail — which it did every 15 minutes, alerting on a bot that
+      # was running fine. The HTTP probe above is the authoritative liveness
+      # check for a container deployment, and Coolify's own restart policy is
+      # the recovery mechanism. Set the APP_URL repository variable
+      # (Settings → Secrets and variables → Actions → Variables) to enable it.
       - name: Verify the service is running (SSH)
-        if: ${{ env.VPS_HOST != '' }}
+        if: ${{ env.VPS_HOST != '' && vars.APP_URL == '' }}
         timeout-minutes: 10
         env:
           VPS_USER: ${{ secrets.VPS_USER }}

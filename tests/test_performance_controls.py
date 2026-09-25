@@ -69,10 +69,14 @@ def test_historical_performance_never_inflates_fresh_model_probability():
 
 
 def test_liquidity_router_never_auto_enables_quarantined_midmarket_maker():
-    routed = _route_strategy_names({"SNIPE", "MAKER"}, "DISLOCATED_WIDE")
+    # The router may only ever REMOVE strategies. SNIPE stays because it carries
+    # its own fee-adjusted EV ceiling; the latency takers are suppressed.
+    routed = _route_strategy_names({"SNIPE", "FRONTRUN", "MAKER"}, "DISLOCATED_WIDE")
 
-    assert routed == {"MAKER"}
+    assert routed == {"SNIPE", "MAKER"}
     assert "MIDMARKET_MAKER" not in routed
+    # Thin one-sided books suppress every taker, SNIPE included.
+    assert _route_strategy_names({"SNIPE", "FRONTRUN"}, "THIN_ONE_SIDED") == set()
 
 
 def test_new_accounts_default_to_multi_strategy_scope_and_stay_paused():

@@ -47,34 +47,45 @@ def _eval_market(**overrides):
 
 
 def test_confident_binary_market_does_not_suppress_takers(monkeypatch):
-    """YES=0.82/NO=0.18 (sum=1.00) is valid — SNIPE must still be evaluated."""
-    taker_calls: list = []
+    """YES=0.82/NO=0.18 (sum=1.00) is valid — takers must still be evaluated.
+
+    In a genuinely dislocated book (sum=1.30) the orchestrator suppresses
+    aggressive latency takers, but SNIPE is deliberately exempt: it carries its
+    own fee-adjusted EV ceiling and price band, so a wide book is exactly where
+    it is allowed to look for a mispricing.
+    """
+    snipe_calls: list = []
+    frontrun_calls: list = []
     maker_calls: list = []
     monkeypatch.setattr(
         strategies,
         "_strategies",
         {
-            "SNIPE": _RecordingStrategy(taker_calls),
+            "SNIPE": _RecordingStrategy(snipe_calls),
+            "FRONTRUN": _RecordingStrategy(frontrun_calls),
             "MAKER": _RecordingStrategy(maker_calls),
         },
     )
-    learned = {"strategies": ["SNIPE", "MAKER"], "mode": "balanced"}
+    learned = {"strategies": ["SNIPE", "FRONTRUN", "MAKER"], "mode": "balanced"}
 
     asyncio.run(strategies.evaluate_all(
         _eval_market(yes_price=0.82, no_price=0.18),
         dict(learned), MarketState(), spot_price=60_500.0,
     ))
-    assert taker_calls == [0.82]
+    assert snipe_calls == [0.82]
+    assert frontrun_calls == [0.82]
     assert maker_calls == [0.82]
 
-    # True sum dislocation (sum=1.30) still suppresses takers, not makers.
-    taker_calls.clear()
+    # True sum dislocation (sum=1.30) still suppresses the latency taker.
+    snipe_calls.clear()
+    frontrun_calls.clear()
     maker_calls.clear()
     asyncio.run(strategies.evaluate_all(
         _eval_market(yes_price=0.70, no_price=0.60),
         dict(learned), MarketState(), spot_price=60_500.0,
     ))
-    assert taker_calls == []
+    assert frontrun_calls == []
+    assert snipe_calls == [0.70]
     assert maker_calls == [0.70]
 
 

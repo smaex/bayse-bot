@@ -1,5 +1,20 @@
 name: Deploy to VPS
 
+# ─────────────────────────────────────────────────────────────────────────────
+# !!! THIS WORKFLOW DOES NOT DEPLOY THE PRODUCTION BOT !!!
+#
+# Production runs in Coolify as a Docker container (see the Coolify application
+# for bayse-bot). This workflow SSHes to a systemd unit at /opt/bayse-bot, which
+# is not how any container deployment runs. Every run of it in the retained
+# history (~200 back to 2026-06-26) failed, and the 2026-09-24 diagnosis found
+# the address behind VPS_HOST completes an SSH handshake and then drops the
+# session before authentication — i.e. it is no longer that machine.
+#
+# It is kept only because retiring it is an operator decision, not a code one.
+# Deployments happen through Coolify's GitHub App, or through
+# .github/workflows/coolify-deploy.yml for a manual redeploy.
+# ─────────────────────────────────────────────────────────────────────────────
+#
 # A deploy must never be able to leave the bot down. Two guards enforce that:
 #   1. `verify` runs the regression suite and a config/import sanity check, so
 #      code that cannot start never reaches the server at all.

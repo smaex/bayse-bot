@@ -113,9 +113,36 @@ def test_exit_uses_desired_ngn_proceeds_and_confirmed_fill(monkeypatch):
     sell = client.sell_calls[0]
     assert sell["side"] == "SELL"
     assert sell["amount"] == 497.5  # 99.5% of exchange currentValue, not 10 shares
-    assert sell["max_slippage"] == 0.20
+    # A CLOB exit is a LIMIT FAK order, and Bayse has no maxSlippage field for
+    # LIMIT — the limit price IS the bound. The stop-loss tolerance (20% here)
+    # must therefore be visible in the price the exit is willing to accept.
+    assert sell["order_type"] == "LIMIT"
+    assert sell["price"] == 0.4      # 0.5 × (1 − 0.20)
+    assert "max_slippage" not in sell
     assert risk.open_positions == {}
     assert risk.daily_realized_pnl == -105.0
+
+
+def test_amm_exit_sends_an_explicit_slippage_bound(monkeypatch):
+    """On an AMM the exit is a MARKET order, so the 20% bound must be sent."""
+    _install_market(monkeypatch)
+    risk = _risk_with_position()
+    # Force the AMM branch: a non-crypto asset whose market does not declare CLOB.
+    for pos in risk.open_positions.values():
+        pos["asset"] = "EURUSD"
+    monkeypatch.setattr(
+        bot, "active_markets",
+        [{**bot.active_markets[0], "asset": "EURUSD", "engine": "AMM"}],
+    )
+    client = FakeExitClient()
+
+    asyncio.run(bot._evaluate_and_exit_positions("chat", client, risk, {}))
+
+    assert len(client.sell_calls) == 1
+    sell = client.sell_calls[0]
+    assert sell["order_type"] == "MARKET"
+    assert sell["max_slippage"] == 0.20
+    assert sell["amount"] == 497.5
 
 
 def test_partial_exit_keeps_unsold_shares_under_risk(monkeypatch):

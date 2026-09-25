@@ -24,9 +24,13 @@ name: Deploy to Coolify
 #                     the deploy. Without it the workflow cannot prove the bot
 #                     recovered, and says so instead of assuming.
 
+# Trigger: manual only. This deployment uses Coolify's GitHub App, which
+# delivers the push event to Coolify directly — Coolify redeploys on merge with
+# no CI involvement, and a push trigger here would just queue a duplicate build.
+# Keep this workflow for the cases the app cannot cover: redeploying a specific
+# commit, forcing a cache-free rebuild, or adding Coolify deploy + /ready
+# verification to CI later by setting the three secrets above.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       force_rebuild:
