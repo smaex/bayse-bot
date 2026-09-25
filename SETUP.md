@@ -7,7 +7,7 @@ The current deployment and safety instructions live in [README.md](README.md). T
 3. Set `TELEGRAM_TOKEN`, `DATABASE_URL`, `ENCRYPTION_KEY`, and `DASHBOARD_PASSWORD`.
 4. Keep `LIVE_TRADING=false` and `ALLOW_EXPERIMENTAL_STRATEGIES=false`.
 5. Run `pytest -q`; all checks must pass.
-6. Start `python bot.py` and confirm `/live` returns 200 and `/ready` becomes 200.
+6. Start `python bot.py` and confirm `/live` returns 200 and `/ready` becomes 200. During a rolling update the new container reports `"role": "standby"` on `/live` (200) while `/ready` stays 503 until the old one hands over the lease — that is the deploy working, not stalling.
 7. Use Telegram `/start`, verify feeds with `/debug`, and inspect market discovery.
 8. Connect only a low-balance test account first. New users start paused.
 9. Enable live trading only after dry-run validation, then use `/resume` for the intended account.

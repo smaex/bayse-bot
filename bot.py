@@ -5,6 +5,7 @@ Multi-user trading bot — one server, all users via Telegram.
 import asyncio
 import logging
 import os
+import signal
 import sys
 import time
 from datetime import datetime, timezone
@@ -2054,6 +2055,200 @@ async def _dashboard_loop():
         await asyncio.sleep(30)
 
 
+# ── Graceful shutdown ─────────────────────────────────────────────────────────
+# Docker — and therefore Coolify — stops a container with SIGTERM and escalates
+# to SIGKILL after a grace period. Python's default SIGTERM action kills the
+# process without running `finally` blocks, so the singleton lease stayed held
+# until it expired (LOCK_LEASE_SEC of dead air) on every deploy and restart.
+# Turning the signal into an event lets main() unwind in a known order: stop the
+# trading loops, stop Telegram polling, hand the lease over, close the clients.
+_shutdown_event = asyncio.Event()
+
+
+def _request_shutdown(signum=None) -> None:
+    """Signal-handler body: wind down instead of dying in place."""
+    if _shutdown_event.is_set():
+        # A second signal means the first shutdown is slower than whatever sent
+        # it is willing to wait. Leave now rather than be SIGKILLed mid-cleanup.
+        log.warning("Repeated shutdown request (%s) — exiting immediately.", signum)
+        os._exit(1)
+    try:
+        name = signal.Signals(signum).name if signum is not None else "shutdown request"
+    except ValueError:
+        name = str(signum)
+    log.info("Received %s — stopping tasks and releasing the singleton lease.", name)
+    # /ready must go 503 *before* the lease is handed over, never after.
+    health.set_ready(False)
+    server.instance_state["role"] = "stopping"
+    _shutdown_event.set()
+
+
+def _install_signal_handlers(loop) -> None:
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown, sig)
+        except (NotImplementedError, RuntimeError, ValueError) as exc:
+            # Non-main thread or a platform without loop signal support. The
+            # lease still expires on its own; the handover is just slower.
+            log.warning("Cannot install a %s handler (%s).", sig, exc)
+
+
+def _release_lease_if_owned() -> None:
+    """Give the lease back so a standby instance can take over immediately."""
+    global _owns_singleton
+    if not _owns_singleton:
+        return
+    _owns_singleton = False
+    if not hasattr(database, "release_singleton_lock"):
+        return
+    try:
+        released = database.release_singleton_lock()
+    except Exception as exc:
+        log.warning("Could not release the singleton lease: %s", exc)
+        return
+    log.info(
+        "Singleton lease released — a standby instance can take over now."
+        if released
+        else "Singleton lease was already gone (another owner)."
+    )
+
+
+async def _graceful_stop() -> None:
+    """Unwind in the order that makes a handover cheap instead of conflicting.
+
+    Trading loops stop first, then Telegram polling, then the lease is released.
+    Releasing before polling stops would let the standby instance start its own
+    poller against the same bot token and eat `409 Conflict` from Telegram.
+
+    Every step is time-bounded and the bounds add up to less than Docker's
+    default 10s stop grace period *up to the release*, because the release is
+    the only step the next deployment is waiting on: if SIGKILL lands first, the
+    handover degrades to "wait for the lease to expire" instead of "immediate".
+    """
+    pending = [task for task in _background_tasks if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        done, not_done = await asyncio.wait(pending, timeout=3)
+        _background_tasks.difference_update(done)
+        if not_done:
+            log.warning(
+                "%d background task(s) ignored cancellation: %s",
+                len(not_done), [t.get_name() for t in not_done],
+            )
+
+    app = _tg_app
+    if app is not None:
+        try:
+            updater = getattr(app, "updater", None)
+            if updater is not None and updater.running:
+                await asyncio.wait_for(updater.stop(), timeout=4)
+        except Exception as exc:
+            log.warning("Telegram polling did not stop cleanly: %s", exc)
+
+    _release_lease_if_owned()
+
+    if app is not None:
+        for label, step in (("stop", app.stop), ("shutdown", app.shutdown)):
+            try:
+                await asyncio.wait_for(step(), timeout=3)
+            except Exception as exc:
+                log.warning("Telegram app %s did not complete: %s", label, exc)
+
+
+# ── Singleton lease standby ───────────────────────────────────────────────────
+# A rolling update starts the NEW container before stopping the OLD one, and the
+# old one keeps renewing its lease until it is told to stop. "Lease held by
+# another live instance" is therefore the normal state of a fresh container for
+# the first seconds of every deploy — not an error.
+#
+# The previous code waited 12 × 5s and exited. That made deploys unrecoverable:
+# Coolify stops the old container only after the new one passes its health
+# check, and the new one only passed after owning the lease, which only freed
+# once the old container was stopped. Both sides waited on each other and the
+# new container crash-looped until the deploy was rolled back (2026-09-25).
+# Standing by instead — alive, answering /live, never /ready — lets the platform
+# finish the swap and the lease hand over in seconds.
+LOCK_RETRY_SEC = max(1.0, float(os.getenv("LOCK_ACQUIRE_RETRY_SEC", "5")))
+# 0 means "stand by forever": a live lease holder is a real bot somewhere, and
+# trading twice is worse than waiting. The default cap exists so a wedged
+# two-deployments-at-once setup still surfaces as a restart instead of silence.
+LOCK_STANDBY_LIMIT_SEC = max(0.0, float(os.getenv("LOCK_ACQUIRE_TIMEOUT_SEC", "900")))
+_STANDBY_ESCALATE_SEC = 300.0
+
+
+async def _acquire_singleton_lease(
+    acquire,
+    *,
+    retry_sec: float = LOCK_RETRY_SEC,
+    standby_limit_sec: float = LOCK_STANDBY_LIMIT_SEC,
+    sleep=asyncio.sleep,
+    clock=time.monotonic,
+) -> bool:
+    """Wait until this process owns the singleton lease.
+
+    True  — the lease is ours.
+    False — a shutdown was requested while standing by, or the standby limit was
+            reached. The caller distinguishes the two via ``_shutdown_event``.
+
+    ``acquire`` runs in a worker thread because it is a blocking database call,
+    and must never be called from the event loop directly: while it blocks, the
+    health server cannot answer and the platform thinks the container is dead.
+    """
+    started = clock()
+    attempt = 0
+    escalated = False
+    server.instance_state["role"] = "standby"
+    while True:
+        attempt += 1
+        if await asyncio.to_thread(acquire):
+            server.instance_state["role"] = "active"
+            health.touch("singleton_lock")
+            if attempt > 1:
+                log.info(
+                    "Singleton lease acquired after %.0fs in standby (%d attempts).",
+                    clock() - started, attempt,
+                )
+            return True
+
+        if _shutdown_event.is_set():
+            log.warning("Shutdown requested while standing by for the lease.")
+            return False
+
+        waited = clock() - started
+        # Recorded as a failure so /ready explains *why* this container is not
+        # serving, instead of just reporting "not ready".
+        health.fail(
+            "singleton_lock",
+            f"lease held by another instance for {waited:.0f}s",
+            state="standby",
+        )
+        # One line a minute rather than one per retry: a long standby should be
+        # visible without burying the logs around it.
+        if attempt == 1 or attempt % 12 == 0:
+            log.warning(
+                "Singleton lease held by another instance — standing by "
+                "(attempt %d, %.0fs elapsed, retrying in %.0fs)",
+                attempt, waited, retry_sec,
+            )
+        if not escalated and waited >= _STANDBY_ESCALATE_SEC:
+            escalated = True
+            log.error(
+                "Still in standby after %.0fs. If no deploy is in progress, two "
+                "live deployments share this database and this one will never "
+                "trade — stop one of them.",
+                waited,
+            )
+        if standby_limit_sec > 0 and waited >= standby_limit_sec:
+            log.critical(
+                "No singleton lease after %.0fs in standby. Exiting so the "
+                "platform restarts this container and retries.",
+                waited,
+            )
+            return False
+        await sleep(retry_sec)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
@@ -2063,29 +2258,14 @@ async def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN not set")
 
-    if hasattr(database, "init_db"):
-        database.init_db()
-    elif hasattr(database, "_init_pool"):
-        database._init_pool()
+    _install_signal_handlers(asyncio.get_running_loop())
 
-    if hasattr(database, "force_acquire_singleton_lock"):
-        acquired = False
-        for attempt in range(12):  # 12 × 5s = 60s max wait
-            if database.force_acquire_singleton_lock():
-                acquired = True
-                break
-            log.warning(
-                f"Singleton lease held by another instance — waiting for expiry "
-                f"(attempt {attempt + 1}/12, retrying in 5s)"
-            )
-            await asyncio.sleep(5)
-        if not acquired:
-            log.critical("Could not acquire singleton lock after 60s. Exiting.")
-            return
-        _owns_singleton = True
-        log.info("Singleton lease acquired.")
-        health.touch("singleton_lock")
-
+    # Bind the health port before anything that can block. Coolify probes the
+    # new container while the old one still owns the lease and only stops the
+    # old one once the new one is healthy; a container that starts its HTTP
+    # server after winning the lease can never pass that probe, so the deploy
+    # rolls back and both containers restart forever. The same argument covers
+    # database startup: a slow or unreachable Supabase must not keep /live dark.
     server_task = asyncio.create_task(
         server.start_server(port=int(os.getenv("PORT", "8080"))),
         name="http-server",
@@ -2093,6 +2273,26 @@ async def main():
     _background_tasks.add(server_task)
     server_task.add_done_callback(_background_tasks.discard)
     _start_supervised("self_ping", _self_ping_loop)
+
+    if hasattr(database, "init_db"):
+        await asyncio.to_thread(database.init_db)
+    elif hasattr(database, "_init_pool"):
+        await asyncio.to_thread(database._init_pool)
+
+    if hasattr(database, "force_acquire_singleton_lock"):
+        owned = await _acquire_singleton_lease(database.force_acquire_singleton_lock)
+        if not owned:
+            if _shutdown_event.is_set():
+                log.info("Stood down without the singleton lease.")
+                return
+            # Non-zero so the platform (and the deploy log) shows a failure
+            # instead of a clean stop that quietly restarts.
+            raise SystemExit(1)
+        _owns_singleton = True
+        log.info("Singleton lease acquired.")
+        health.touch("singleton_lock")
+    else:
+        server.instance_state["role"] = "active"
 
     async def _lock_heartbeat():
         while True:
@@ -2221,10 +2421,21 @@ async def main():
     log.info(f"Spot prices: {feeds.spot}")
 
     health.touch("bot")
-    health.set_ready(True)
-    log.info("Bot startup complete; readiness enabled")
-    while True:
-        await asyncio.sleep(5)
+    if _shutdown_event.is_set():
+        log.warning("Shutdown arrived during startup — skipping readiness.")
+    else:
+        health.set_ready(True)
+        log.info("Bot startup complete; readiness enabled")
+    while not _shutdown_event.is_set():
+        try:
+            # One wait serving two purposes: the 5s supervision tick and an
+            # immediate response to SIGTERM. Sleeping blindly for 5s after a
+            # stop request burns the platform's grace period doing nothing.
+            await asyncio.wait_for(_shutdown_event.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+        if _shutdown_event.is_set():
+            break
         _refresh_timers()
         health.touch("bot")
         if server_task.done():
@@ -2233,11 +2444,17 @@ async def main():
         if not _tg_app.updater.running:
             raise RuntimeError("Telegram polling stopped unexpectedly")
 
+    log.info("Shutdown requested — handing over to the next instance.")
+    await _graceful_stop()
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     finally:
         health.set_ready(False)
-        if _owns_singleton and hasattr(database, "release_singleton_lock"):
-            database.release_singleton_lock()
+        # Backstop. _graceful_stop() already released the lease on an orderly
+        # shutdown; this covers the paths that raise instead — a dead HTTP
+        # server, polling that stopped, an unrecoverable startup error — so the
+        # lease is never left held by a process that is gone.
+        _release_lease_if_owned()

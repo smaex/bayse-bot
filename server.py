@@ -27,6 +27,13 @@ stats_cache = {
     "last_update": 0,
 }
 
+# Which role this process currently plays.  A rolling update runs two
+# containers at once: the new one answers `/live` while it stands by for the
+# singleton lease, so an operator (or a deploy log) must be able to tell the
+# trading instance from the spare.  One of:
+#   starting → standby → active → stopping
+instance_state = {"role": "starting"}
+
 
 def _security_headers(response: web.StreamResponse) -> web.StreamResponse:
     response.headers.update(
@@ -41,7 +48,12 @@ def _security_headers(response: web.StreamResponse) -> web.StreamResponse:
 
 
 async def handle_live(_request: web.Request) -> web.Response:
-    return _security_headers(web.json_response({"status": "live"}))
+    # Always 200 while the event loop can answer, including while this instance
+    # stands by for the singleton lease during a rolling update.  Restarting a
+    # healthy standby never helps it win the lease; it only delays the handover.
+    return _security_headers(
+        web.json_response({"status": "live", "role": instance_state["role"]})
+    )
 
 
 async def handle_ready(_request: web.Request) -> web.Response:
@@ -57,6 +69,7 @@ async def handle_ready(_request: web.Request) -> web.Response:
         web.json_response(
             {
                 "status": "ready" if ready else "starting",
+                "role": instance_state["role"],
                 "uptime_sec": snapshot.get("uptime_sec"),
                 "components": component_ages,
                 "issues": len(reasons),
