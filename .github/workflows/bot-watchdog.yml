@@ -40,20 +40,95 @@ jobs:
         run: |
           echo "::warning::Watchdog is not configured: set the VPS_HOST/VPS_USER/VPS_SSH_KEY secrets or the APP_URL repo variable. No liveness check ran."
 
+      # `curl -fsS` only ever asked "did something answer?". That is not a
+      # liveness check, it is a TCP check with extra steps: a 404 from the wrong
+      # server looks identical to the bot being down, because `-f` fails the
+      # command on any 4xx and the body is discarded either way. This deployment
+      # has a live example of the confusion — Coolify's own dashboard runs on
+      # :3000 (setup_coolify_fixed.sh publishes it `-p 3000:8080`), so an
+      # APP_URL of http://<host>:3000 probes the admin UI, gets a 404 on /live,
+      # and reports an outage every 15 minutes while the bot trades normally.
+      #
+      # The health server identifies itself (`{"status": "live", ...}`), so the
+      # probe now verifies the answer came from the bot and names the failure
+      # mode: unreachable, wrong server, or genuinely unhealthy.
       - name: HTTP probe (APP_URL)
         id: http
         if: ${{ vars.APP_URL != '' }}
         run: |
           base="${{ vars.APP_URL }}"
           base="${base%/}"
-          live=$(curl -fsS --max-time 10 "$base/live" 2>/dev/null || echo "")
-          ready=$(curl -fsS --max-time 10 "$base/ready" 2>/dev/null || echo "")
-          echo "ready=$ready" >> "$GITHUB_OUTPUT"
-          if [ -z "$live" ]; then
-            echo "::warning::/live did not answer on $base"
+          tmp="$RUNNER_TEMP/probe_body"
+
+          # Sets CODE and BODY. No -f: we want the status code even on a 4xx,
+          # because "404 from the wrong server" is the diagnostic that matters.
+          #
+          # Two traps, both found by tests/test_watchdog_probe.py:
+          #   * curl already writes "000" for %{http_code} when it cannot
+          #     connect, so `|| echo 000` produced "000000" and the equality
+          #     check below never matched — an unreachable host was reported as
+          #     "wrong server".
+          #   * curl does not truncate -o on failure, so without the rm the
+          #     body would be whatever the previous probe left behind.
+          probe() {
+            rm -f "$tmp"
+            CODE=$(curl -sS --max-time 10 -o "$tmp" -w '%{http_code}' "$base$1" 2>/dev/null) || true
+            [ -n "$CODE" ] || CODE=000
+            BODY=$(head -c 400 "$tmp" 2>/dev/null || true)
+          }
+
+          # The health server's own signature, tolerant of JSON spacing.
+          is_bot() {
+            printf '%s' "$1" | grep -qE '"status"[[:space:]]*:[[:space:]]*"(live|ready|starting)"'
+          }
+
+          probe /live
+          live_code="$CODE"; live_body="$BODY"
+          probe /ready
+          ready_code="$CODE"; ready_body="$BODY"
+          echo "ready=$ready_body" >> "$GITHUB_OUTPUT"
+
+          echo "GET $base/live  -> HTTP $live_code  body: ${live_body:-<empty>}"
+          echo "GET $base/ready -> HTTP $ready_code body: ${ready_body:-<empty>}"
+
+          if [ "$live_code" = "000" ]; then
+            echo "::error::Nothing answered on $base/live at all (DNS failure, connection refused, or timeout). Either the bot is down or APP_URL does not point at a reachable address."
             exit 1
           fi
-          echo "✅ /live answered; /ready: ${ready:-<no response>}"
+
+          if ! is_bot "$live_body"; then
+            echo "::error::APP_URL is NOT pointing at the bot. $base/live returned HTTP $live_code from something else: ${live_body:0:160}"
+            # The status code says which misconfiguration it is, and they have
+            # different fixes — do not collapse them into one message.
+            case "$live_code" in
+              502|503|504)
+                echo "::error::A reverse proxy answered but cannot reach the bot container. This is almost always a port mismatch: Coolify's 'Ports Exposes' must be the port the bot binds — 8080 (bot.py reads PORT, default 8080; Dockerfile EXPOSE 8080). If it is set to another value, the proxy forwards to a port nothing listens on. Fix: Configuration → Ports Exposes = 8080, or set the PORT env var to the exposed port."
+                ;;
+              404)
+                echo "::error::Something is serving this host but has no /live route, so it is not the bot. Coolify's own dashboard runs on port 3000 (setup_coolify_fixed.sh publishes it as -p 3000:8080) — if APP_URL points there, you are probing the admin UI. Use the application's own domain instead."
+                ;;
+              *)
+                echo "::error::Unexpected response from $base. Confirm this is the bayse-bot application's domain and that its Ports Exposes is 8080."
+                ;;
+            esac
+            echo "::error::The bot was never actually probed by this run. This is a routing/misconfiguration problem, not necessarily an outage."
+            exit 1
+          fi
+
+          if [ "$live_code" != "200" ]; then
+            echo "::warning::The bot answered /live with HTTP $live_code (expected 200)."
+          fi
+
+          if [ "$ready_code" = "200" ] && is_bot "$ready_body"; then
+            echo "✅ healthy: $ready_body"
+            exit 0
+          fi
+
+          # /live 200 from the bot but /ready not 200: alive and not trading.
+          # That is the real outage signal, and it is different from the two
+          # misconfigurations above.
+          echo "::error::The bot is alive (/live $live_code) but not ready (/ready $ready_code). It is running and not trading — check its logs for the reason; /ready reports which component is stale."
+          exit 1
 
       # Native ssh (same reasoning as deploy.yml): no action black box between
       # the probe and the host, and a failure here is visible in annotations.
@@ -66,6 +141,7 @@ jobs:
       # the recovery mechanism. Set the APP_URL repository variable
       # (Settings → Secrets and variables → Actions → Variables) to enable it.
       - name: Verify the service is running (SSH)
+        id: ssh_recover
         if: ${{ env.VPS_HOST != '' && vars.APP_URL == '' }}
         timeout-minutes: 10
         env:
@@ -128,6 +204,13 @@ jobs:
             exit "$rc"
           fi
 
+      # The previous message asserted "a restart did not recover it" and told
+      # the operator to run `systemctl status bayse-bot` on the VPS. For this
+      # deployment both halves were false: the SSH recovery step is skipped
+      # whenever APP_URL is set (there is no systemd unit in a container), so no
+      # restart was ever attempted, and the VPS is not where production runs.
+      # An alert that sends you to the wrong machine wastes the minutes that
+      # matter during a real outage, so it now states which path actually ran.
       - name: Alert on failure
         if: ${{ failure() && env.NOTIFY_CHAT != '' }}
         uses: appleboy/telegram-action@master
@@ -136,9 +219,14 @@ jobs:
           token:   ${{ secrets.TELEGRAM_TOKEN }}
           message: |
             🚨 *Bayse bot watchdog*
-            `/ready` did not answer and a restart did not recover it.
-            Run: `sudo systemctl status bayse-bot` and
-            `sudo journalctl -u bayse-bot -n 200` on the VPS.
+            `/live` did not answer on `${{ vars.APP_URL }}`.
+
+            ${{ steps.ssh_recover.outcome == 'skipped' && 'No restart was attempted: production runs as a Coolify container, so there is no systemd unit here. Open Coolify → the bayse-bot application → Logs and Deployments, and check that the container is running and that its healthcheck on `/live` is passing.' || 'A restart was attempted on the VPS and did not recover it. Run: `sudo systemctl status bayse-bot` and `sudo journalctl -u bayse-bot -n 200`.' }}
+
+            If the container keeps restarting, the log will say why — a
+            database it cannot reach, or a Telegram token it cannot
+            authenticate, both log a clear reason before exiting.
+
             Positions stay open on the exchange — if you cannot restore the bot,
             check the Bayse portfolio and close/hedge manually if needed.
             (Trading itself reports *why* it is quiet via /why; this alert is

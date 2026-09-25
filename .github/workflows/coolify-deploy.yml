@@ -61,12 +61,15 @@ jobs:
           python -m pip install --upgrade pip --quiet
           pip install --quiet -r requirements.txt pytest pytest-asyncio
 
-      # Advisory on purpose. The suite has a small number of long-standing
-      # failures that encode *superseded* policy decisions; hard-blocking here
-      # is how this repo ended up with a green-looking merge and a deploy that
-      # silently never shipped. Failing tests are surfaced loudly in the run
-      # summary and in the Telegram notice, and the deploy still goes out —
-      # gating belongs on the pull request, not on the post-merge push.
+      # Advisory on purpose, and the reason is historical: this repo ended up
+      # with a green-looking merge and a deploy that silently never shipped.
+      # The suite is currently green (134 passed, 2026-09-25) — the "small
+      # number of long-standing failures" that used to justify skipping the
+      # gate no longer exist. The step stays advisory anyway because gating
+      # belongs on the pull request, not on the post-merge push; a red suite
+      # here is surfaced loudly in the run summary and the Telegram notice, and
+      # the deploy still goes out. If this step ever reports RED, that is new
+      # information, not known noise.
       - name: Regression suite (advisory)
         id: tests
         continue-on-error: true

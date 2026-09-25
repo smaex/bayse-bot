@@ -2156,6 +2156,80 @@ async def _graceful_stop() -> None:
                 log.warning("Telegram app %s did not complete: %s", label, exc)
 
 
+# ── Database startup ──────────────────────────────────────────────────────────
+# `init_db` opens the connection pool and runs migrations, and it is the first
+# blocking thing `main()` does after binding the health port. On an unreachable
+# Postgres it raises `psycopg2.OperationalError`, and that exception used to
+# propagate out of `main()`: the process died in under a second, `/live` never
+# answered a single probe, and the platform rolled the release back. A Supabase
+# pause, a pool-exhaustion blip or a DNS hiccup during a deploy therefore looked
+# exactly like a broken image (2026-09-25).
+#
+# Binding the port early is only half the fix — a container that exits keeps the
+# port closed no matter when it was opened. Waiting a bounded time instead of
+# dying on the first error is what makes a transient outage survivable, while
+# still failing loudly and non-zero when the database never comes back.
+DB_INIT_RETRY_SEC = max(1.0, float(os.getenv("DB_INIT_RETRY_SEC", "5")))
+# 0 means "retry forever". The default covers the platform's probe grace window
+# (Coolify: 5 attempts, and the Dockerfile HEALTHCHECK has start-period=90s), so
+# a database that is briefly unreachable is outlasted rather than fatal.
+DB_INIT_TIMEOUT_SEC = max(0.0, float(os.getenv("DB_INIT_TIMEOUT_SEC", "120")))
+
+
+async def _init_database_with_retry(
+    init_fn,
+    *,
+    retry_sec: float = DB_INIT_RETRY_SEC,
+    timeout_sec: float = DB_INIT_TIMEOUT_SEC,
+    sleep=asyncio.sleep,
+    clock=time.monotonic,
+) -> bool:
+    """Run ``init_fn`` until it succeeds, a shutdown arrives, or the cap hits.
+
+    True  — the database is up and migrated.
+    False — gave up at the timeout, or a shutdown was requested while waiting.
+            The caller distinguishes the two via ``_shutdown_event``.
+
+    ``init_fn`` is a blocking psycopg2 call, so it runs in a worker thread: on
+    the event loop it would freeze the health server, which is the exact symptom
+    a platform reads as a dead container.
+    """
+    started = clock()
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            await asyncio.to_thread(init_fn)
+        except Exception as exc:
+            # Recorded so /ready explains *why* this container is not serving.
+            health.fail("database", exc, state="starting", attempts=attempt)
+            waited = clock() - started
+            log.error(
+                "Database startup failed (attempt %d, %.0fs elapsed): %s",
+                attempt, waited, exc,
+            )
+            if _shutdown_event.is_set():
+                log.info("Shutdown requested while waiting for the database.")
+                return False
+            if timeout_sec > 0 and waited >= timeout_sec:
+                log.critical(
+                    "Database unreachable for %.0fs. Exiting non-zero so the "
+                    "platform reports a failed start rather than restarting "
+                    "silently. Check DATABASE_URL and that Postgres/Supabase "
+                    "accepts connections from this host.",
+                    waited,
+                )
+                return False
+            await sleep(retry_sec)
+            continue
+        health.touch("database", attempts=attempt)
+        if attempt > 1:
+            log.info(
+                "Database up after %d attempt(s) (%.0fs).", attempt, clock() - started,
+            )
+        return True
+
+
 # ── Singleton lease standby ───────────────────────────────────────────────────
 # A rolling update starts the NEW container before stopping the OLD one, and the
 # old one keeps renewing its lease until it is told to stop. "Lease held by
@@ -2264,8 +2338,13 @@ async def main():
     # new container while the old one still owns the lease and only stops the
     # old one once the new one is healthy; a container that starts its HTTP
     # server after winning the lease can never pass that probe, so the deploy
-    # rolls back and both containers restart forever. The same argument covers
-    # database startup: a slow or unreachable Supabase must not keep /live dark.
+    # rolls back and both containers restart forever.
+    #
+    # Binding early is necessary but not sufficient: /live stays dark just as
+    # surely if the process *exits*. Everything below that can fail for an
+    # external reason (the database, the singleton lease) therefore retries
+    # inside a bounded window instead of propagating out of main() — see the
+    # database retry and the lease standby defined above.
     server_task = asyncio.create_task(
         server.start_server(port=int(os.getenv("PORT", "8080"))),
         name="http-server",
@@ -2274,10 +2353,15 @@ async def main():
     server_task.add_done_callback(_background_tasks.discard)
     _start_supervised("self_ping", _self_ping_loop)
 
-    if hasattr(database, "init_db"):
-        await asyncio.to_thread(database.init_db)
-    elif hasattr(database, "_init_pool"):
-        await asyncio.to_thread(database._init_pool)
+    init_db_fn = getattr(database, "init_db", None) or getattr(database, "_init_pool", None)
+    if init_db_fn is not None:
+        if not await _init_database_with_retry(init_db_fn):
+            if _shutdown_event.is_set():
+                log.info("Stood down before the database came up.")
+                return
+            # Non-zero so the platform (and the deploy log) shows a failure
+            # instead of a clean stop that quietly restarts.
+            raise SystemExit(1)
 
     if hasattr(database, "force_acquire_singleton_lock"):
         owned = await _acquire_singleton_lease(database.force_acquire_singleton_lock)

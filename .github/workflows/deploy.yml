@@ -22,9 +22,21 @@ name: Deploy to VPS
 #      /live and /ready and — on any failure — rolls the checkout back to the
 #      previously running commit and restarts before reporting anything.
 
+# Trigger: manual only.
+#
+# This used to fire on every push to main, and because the host behind VPS_HOST
+# no longer accepts sessions, every single run failed and the "Notify Telegram
+# on failure" step sent "❌ Bayse Bot deploy FAILED" — on merges that Coolify had
+# already deployed successfully. That false alarm, repeated on every merge, is
+# indistinguishable from a real failed deploy and is why the bot looked broken
+# while it was running (verified 2026-09-25: the last 12 runs of this workflow
+# all failed at the SSH step with "Check deploy configuration" green).
+#
+# Production deploys through Coolify's GitHub App, or through
+# coolify-deploy.yml. This workflow stays available on demand for anyone who
+# brings the VPS back: run it from the Actions tab, and it will tell you
+# honestly whether the host is reachable.
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch: {}
 
 concurrency:
@@ -208,8 +220,13 @@ jobs:
             By: ${{ github.actor }}
             `/ready` verified after start.
 
+      # Gated on the SSH step having actually run. A failure in the
+      # configuration check means nothing was attempted and nothing was
+      # deployed, so a "deploy FAILED" notice would be a lie — the run is red
+      # in the Actions UI with an explicit ::error:: annotation, which is the
+      # right place for "you forgot to set the secrets".
       - name: Notify Telegram on failure
-        if: failure()
+        if: failure() && steps.ssh_deploy.outcome == 'failure'
         uses: appleboy/telegram-action@master
         with:
           to:    ${{ secrets.TELEGRAM_NOTIFY_CHAT_ID }}
