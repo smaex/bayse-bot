@@ -39,6 +39,30 @@ _MAX_RECENT = 12
 # imports from the trading path so it can never fail a trade.
 TRADE_COOLDOWN_SEC_REFERENCE = 60
 
+# Counters are process-lifetime, but a safety valve that fired once hours ago
+# is not why the account is quiet *now*. Valve verdicts (exposure cap,
+# cooldown, MAKER book position) only consider hits inside this window.
+RECENT_WINDOW_SEC = 900
+
+# Reject codes that say "this market/strategy is excluded by configuration",
+# recorded on every pass before any candidate is weighed. Counted alongside real
+# gates they dominate the report by construction: in production the top two
+# "gates that stopped candidates" were scope:blocked_by_policy and
+# SNIPE:asset_not_in_allowed_scope while the actual problem was that MAKER's
+# quotes never filled. They are reported on their own line instead.
+# scope:no_enabled_strategies is deliberately NOT here: it stops everything.
+_STRUCTURAL_CODES = frozenset({"scope:blocked_by_policy", "scope:suspended_by_learner"})
+_STRUCTURAL_SUFFIXES = (":engine_not_clob", "_not_in_allowed_scope")
+
+# Executor outcomes produced by MAKER's live-book check (executor.py).
+_MAKER_BOOK_CODES = frozenset({"exec:maker_quote_behind_book", "exec:maker_would_cross_book"})
+
+
+def is_structural(code: str) -> bool:
+    """True for configuration/scope exclusions rather than candidate gates."""
+    code = str(code or "")
+    return code in _STRUCTURAL_CODES or code.endswith(_STRUCTURAL_SUFFIXES)
+
 _lock = threading.RLock()
 
 # Scanner/oracle state is process-wide, not per user.
@@ -249,10 +273,11 @@ def seed_last_trade(chat_id: str | None, epoch: float) -> None:
 
 
 def trade_gap_minutes(chat_id: str | None, now: float | None = None) -> float:
-    """Minutes since the last placed order for this account.
+    """Minutes since the last exchange-confirmed fill for this account.
 
-    Falls back to process start when nothing has been placed yet, so a restart
-    does not reset an ongoing drought to zero.
+    Placed-but-unfilled orders do not count (see below). Falls back to process
+    start when nothing has filled yet, so a restart does not reset an ongoing
+    drought to zero.
     """
     now = now if now is not None else time.time()
     with _lock:
@@ -294,11 +319,19 @@ def _remember(state: dict[str, Any], line: str) -> None:
 
 # ── Diagnosis ────────────────────────────────────────────────────────────────
 
-def _top(counters: dict[str, Any], limit: int = 4) -> list[tuple[str, int, float, str]]:
-    rows = [
-        (code, int(entry.get("count", 0)), float(entry.get("last", 0.0)), str(entry.get("detail", "")))
-        for code, entry in counters.items()
-    ]
+def _top(counters: dict[str, Any], limit: int = 4, *, structural: bool | None = False,
+         since: float | None = None) -> list[tuple[str, int, float, str]]:
+    """Most frequent codes. By default candidate gates only (``structural=False``);
+    ``structural=True`` selects configuration exclusions, ``None`` selects all.
+    ``since`` keeps only codes hit at or after that epoch."""
+    rows = []
+    for code, entry in counters.items():
+        if structural is not None and is_structural(code) != structural:
+            continue
+        last = float(entry.get("last", 0.0))
+        if since is not None and last < since:
+            continue
+        rows.append((code, int(entry.get("count", 0)), last, str(entry.get("detail", ""))))
     rows.sort(key=lambda row: (-row[1], -row[2]))
     return rows[:limit]
 
@@ -307,8 +340,12 @@ def verdict(chat_id: str | None, *, now: float | None = None,
              equity: float = 0.0, min_viable: float = 0.0,
              feed_age_sec: float | None = None,
              stale_feed_skip: int = 0,
-             eval_max_age_sec: float = 180.0) -> dict[str, Any]:
+             eval_max_age_sec: float = 180.0,
+             resting_now: int | None = None) -> dict[str, Any]:
     """Classify why the account is not trading, most-actionable first.
+
+    ``resting_now`` is the live count of unfilled resting orders from the risk
+    book, when the caller has it; the lifetime placement counter is not that.
 
     Returns ``{"code", "headline", "detail", "action", "severity"}``.
     """
@@ -438,20 +475,56 @@ def verdict(chat_id: str | None, *, now: float | None = None,
             "Check the Binance/relay feeds and network egress; /debug shows per-asset age.",
             "critical",
         )
+    reject_counts = {code: int(entry.get("count", 0)) for code, entry in rejects.items()}
+    recent_since = now - RECENT_WINDOW_SEC
+    last_placed = float(snapshot.get("last_order_placed", 0.0))
+    placed_recently = last_placed >= recent_since
+    # Executor outcomes that explain a missing order, most frequent first. The
+    # per-market cooldown is left out: every placement *and* every skip stamps
+    # it, so it is always a consequence of something else, never a root cause.
+    exec_causes = [
+        row for row in _top(rejects, _MAX_CODES, structural=None)
+        if row[0].startswith("exec:") and row[0] != "exec:market_cooldown"
+    ]
+    recent_exec_causes = [row for row in exec_causes if row[2] >= recent_since]
+
+    def _hit_recently(code: str) -> bool:
+        entry = rejects.get(code) or {}
+        return int(entry.get("count", 0)) > 0 and float(entry.get("last", 0.0)) >= recent_since
+
     if int(snapshot.get("markets_evaluated", 0)) > 0 and int(snapshot.get("signals", 0)) <= 0:
-        top = _top(rejects)
+        top = _top(rejects) or _top(rejects, structural=True)
         detail = "; ".join(f"{code}×{count}" for code, count, _, _ in top) or "no gate counters recorded"
         return out(
             "NO_EDGE",
-            f"{int(snapshot['markets_evaluated'])} market(s) evaluated per cycle; no candidate cleared its gates.",
+            f"{int(snapshot['markets_evaluated'])} market(s) evaluated in the last pass; "
+            "no candidate cleared its gates.",
             f"Dominant rejections: {detail}",
             "Absence of qualifying edge is the correct outcome on a quiet tape. Lowering a gate "
             "to manufacture activity is not a fix.",
             "info",
         )
+    # MAKER found a signal but its maximum price cannot reach the live book, so
+    # it declined to rest a quote that could not fill. Checked before the
+    # generic execution verdict: this is a pricing-policy boundary, not a fault.
+    if recent_exec_causes and recent_exec_causes[0][0] in _MAKER_BOOK_CODES and not placed_recently:
+        code, count, _, detail = recent_exec_causes[0]
+        return out(
+            "MAKER_QUOTE_UNCOMPETITIVE",
+            "MAKER has signals, but its price ceiling sits below the live order book, "
+            "so no quote could fill.",
+            f"{code} ×{count} — latest: {detail}. A post-only bid under the best bid only "
+            "fills if every bid above it is exhausted first; previously such quotes were "
+            "placed anyway and expired unfilled after MAKER_ORDER_TIMEOUT, every time.",
+            "This is the MAKER risk/reward ceiling doing its job, not a fault. MAKER_MAX_BID "
+            "(default 0.58: a fill pays at least +72% on a win) caps what MAKER pays. Raise it "
+            "only deliberately, with fill evidence, or accept that MAKER sits out markets that "
+            "trade above it.",
+            "warn",
+        )
     if int(snapshot.get("signals", 0)) > 0 and int(snapshot.get("order_attempts", 0)) > 0 and int(
             snapshot.get("orders_placed", 0)) <= 0:
-        top = _top(rejects)
+        top = exec_causes[:4] or _top(rejects)
         detail = "; ".join(f"{code}×{count}" for code, count, _, _ in top) or "no executor rejections recorded"
         return out(
             "EXECUTION_BLOCKED",
@@ -463,9 +536,9 @@ def verdict(chat_id: str | None, *, now: float | None = None,
         )
     # Bounded safety valves deserve their own verdict: both were silent INFO
     # logs before, which is how "MAKER resting quotes froze every entry" read
-    # as a healthy account with no edge.
-    reject_counts = {code: int(entry.get("count", 0)) for code, entry in rejects.items()}
-    if reject_counts.get("exec:exposure_cap", 0) > 0:
+    # as a healthy account with no edge. Only a *recent* hit explains a
+    # current drought — one refusal hours ago must not name the cause forever.
+    if _hit_recently("exec:exposure_cap"):
         return out(
             "EXPOSURE_CAPPED",
             "Entries are being refused by the portfolio exposure ceiling.",
@@ -475,7 +548,39 @@ def verdict(chat_id: str | None, *, now: float | None = None,
             "At ₦1,600 equity and a 15% ceiling the account can only hold ₦240 of filled exposure.",
             "warn",
         )
-    if reject_counts.get("exec:market_cooldown", 0) > 0:
+    # Orders were placed and none filled. This outranks the cooldown: a
+    # cooldown hit is the expected echo of every placement, and checking it
+    # first let a single cooldown skip mask "zero fills" for the whole process.
+    if last_placed and int(snapshot.get("trades", 0)) <= 0:
+        placed = int(snapshot.get("orders_placed", 0))
+        passive = int(snapshot.get("orders_resting", 0))
+        if resting_now is not None:
+            resting_text = f"; {int(resting_now)} resting on the book now"
+        else:
+            resting_text = ""
+        gap_text = (
+            f" No confirmed fill for {trade_gap_min:.0f} min."
+            if trade_gap_min is not None else " No confirmed fill yet in this process."
+        )
+        book_text = ""
+        maker_book = [row for row in recent_exec_causes if row[0] in _MAKER_BOOK_CODES]
+        if maker_book:
+            code, count, _, detail = maker_book[0]
+            book_text = f" Recent MAKER quotes skipped as unfillable: {code} ×{count} ({detail})."
+        return out(
+            "NO_CONFIRMED_FILL",
+            "Orders are submitted but no exchange-confirmed fill has been recorded.",
+            f"{placed} order(s) placed"
+            + (f" ({passive} as passive resting quotes)" if passive else "")
+            + f"; {int(snapshot.get('trades', 0))} confirmed fill(s){resting_text}."
+            + gap_text + book_text,
+            "Passive quotes often expire unfilled by design. Check /trades for real fills and "
+            "the unfilled-order notices; if every quote expires, the quoting price relative to "
+            "the live book (MAKER_MAX_BID) or MAKER_ORDER_TIMEOUT is the thing to look at — "
+            "not a risk gate.",
+            "warn",
+        )
+    if _hit_recently("exec:market_cooldown") and not placed_recently and not recent_exec_causes:
         return out(
             "COOLDOWN_BLOCKED",
             "A per-strategy cooldown on the same market is refusing entries.",
@@ -485,24 +590,6 @@ def verdict(chat_id: str | None, *, now: float | None = None,
             "check whether one strategy is churning the market with re-quotes.",
             "info",
         )
-    if float(snapshot.get("last_order_placed", 0.0)) and int(snapshot.get("trades", 0)) <= 0:
-        resting = int(snapshot.get("orders_resting", 0))
-        gap_text = (
-            f" No confirmed fill for {trade_gap_min:.0f} min."
-            if trade_gap_min is not None else " No confirmed fill yet in this process."
-        )
-        return out(
-            "NO_CONFIRMED_FILL",
-            "Orders are submitted but no exchange-confirmed fill has been recorded.",
-            f"{int(snapshot.get('orders_placed', 0))} order(s) placed; "
-            f"{int(snapshot.get('trades', 0))} confirmed fill(s)"
-            + (f"; {resting} still resting unfilled." if resting else ".")
-            + gap_text,
-            "Passive quotes often expire unfilled by design. Check /trades for real fills and "
-            "wait for the unfilled-order notices; if every quote expires, the quoting price or "
-            "MAKER_ORDER_TIMEOUT is the thing to look at — not a risk gate.",
-            "warn",
-        )
     return out(
         "HEALTHY",
         "The trading pipeline is evaluating and has placed orders.",
@@ -511,7 +598,6 @@ def verdict(chat_id: str | None, *, now: float | None = None,
         "",
         "info",
     )
-
 
 def report(chat_id: str | None, **context: Any) -> dict[str, Any]:
     """Full structured diagnosis for one account (safe for logs and /api/stats)."""
@@ -532,7 +618,12 @@ def report(chat_id: str | None, **context: Any) -> dict[str, Any]:
         "signals": int(snapshot.get("signals", 0)),
         "order_attempts": int(snapshot.get("order_attempts", 0)),
         "orders_placed": int(snapshot.get("orders_placed", 0)),
+        # Lifetime count of orders placed as passive resting quotes. NOT the
+        # number resting now — that is ``resting_now`` (from the risk book).
         "orders_resting": int(snapshot.get("orders_resting", 0)),
+        "resting_now": (
+            int(context["resting_now"]) if context.get("resting_now") is not None else None
+        ),
         "trades": int(snapshot.get("trades", 0)),
         "age_evaluation_sec": round(now - float(snapshot.get("last_evaluation", 0.0)), 1)
         if snapshot.get("last_evaluation") else None,
@@ -548,6 +639,11 @@ def report(chat_id: str | None, **context: Any) -> dict[str, Any]:
             {"code": code, "count": count, "age_sec": round(now - last, 1), "detail": detail}
             for code, count, last, detail in _top(snapshot["rejects"], 6)
         ],
+        # Configuration/scope exclusions (see is_structural), kept apart from gates.
+        "structural_rejects": [
+            {"code": code, "count": count, "age_sec": round(now - last, 1), "detail": detail}
+            for code, count, last, detail in _top(snapshot["rejects"], 4, structural=True)
+        ],
         "recent": list(snapshot["recent"])[-6:],
         "scan": {
             "age_sec": round(now - float(_global.get("last_scan_ok", 0.0)), 1)
@@ -559,16 +655,33 @@ def report(chat_id: str | None, **context: Any) -> dict[str, Any]:
     }
 
 
-def format_report(chat_id: str | None, **context: Any) -> str:
-    """Telegram-shaped rendering of :func:`report`."""
+def md_escape(text: Any) -> str:
+    """Escape Telegram legacy-Markdown control characters in free text."""
+    out = str(text)
+    for ch in ("_", "*", "`", "["):
+        out = out.replace(ch, "\\" + ch)
+    return out
+
+
+def format_report(chat_id: str | None, *, markdown: bool = False, **context: Any) -> str:
+    """Telegram-shaped rendering of :func:`report`.
+
+    ``markdown=True`` escapes every free-text line for Telegram's legacy
+    Markdown parse mode. The report quotes raw gate codes full of underscores
+    (``exec:market_cooldown``, ``MAKER_ORDER_TIMEOUT``); unescaped, Telegram
+    rendered them as italics ("blockedbypolicy", "MAKERORDERTIMEOUT") or, with
+    an odd count, rejected the whole alert.
+    """
     data = report(chat_id, **context)
+    esc = md_escape if markdown else str
     verdict_data = data["verdict"]
     icon = {"critical": "🔴", "warn": "🟠", "config": "⚙️", "info": "🟢"}.get(
         verdict_data.get("severity", "info"), "🟢"
     )
     lines = [
-        f"{icon} {verdict_data['headline']}",
+        f"{icon} {esc(verdict_data['headline'])}",
         "",
+        # Inside a code span underscores are literal; codes are [A-Z_] only.
         f"Code: `{verdict_data['code']}`",
     ]
     if verdict_data.get("trade_gap_min") is not None:
@@ -579,30 +692,44 @@ def format_report(chat_id: str | None, **context: Any) -> str:
             "expired unfilled"
         )
     if verdict_data.get("detail"):
-        lines += ["", verdict_data["detail"]]
+        lines += ["", esc(verdict_data["detail"])]
     if verdict_data.get("action"):
-        lines += ["", f"→ {verdict_data['action']}"]
+        lines += ["", "→ " + esc(verdict_data["action"])]
+    totals = (
+        f"Process totals: {data['evaluations']} evaluations | {data['signals']} signals | "
+        f"{data['orders_placed']} orders placed"
+    )
+    if data.get("orders_resting"):
+        totals += f" ({data['orders_resting']} as passive quotes)"
+    totals += f" | {data['trades']} confirmed fills"
+    if data.get("resting_now") is not None:
+        totals += f" | {data['resting_now']} resting now"
     lines += [
         "",
+        # A feed-triggered pass evaluates one asset, so this is "last pass",
+        # not a per-cycle rate.
         f"Markets: {data['markets_total']} open, {data['markets_in_scope']} in scope, "
-        f"{data['markets_evaluated']} evaluated per cycle",
-        f"Process totals: {data['evaluations']} evaluations | {data['signals']} signals | "
-        f"{data['orders_placed']} orders placed | {data['trades']} confirmed fills"
-        + (f" | {data['orders_resting']} still resting unfilled" if data.get('orders_resting') else ""),
+        f"{data['markets_evaluated']} evaluated in the last pass",
+        esc(totals),
     ]
     if data["top_rejects"]:
         lines += ["", "🚪 Gates that stopped candidates:"]
         for row in data["top_rejects"]:
-            lines.append(f"  {row['code']}: {row['count']}× (last {row['age_sec']:.0f}s ago)")
+            lines.append(esc(f"  {row['code']}: {row['count']}× (last {row['age_sec']:.0f}s ago)"))
+    if data.get("structural_rejects"):
+        parts = []
+        for row in data["structural_rejects"]:
+            detail = str(row.get("detail") or "")[:40]
+            parts.append(f"{row['code']}" + (f" [{detail}]" if detail else "") + f" ×{row['count']}")
+        lines += ["", esc("⚙️ Excluded by configuration (every pass, not a gate): " + "; ".join(parts))]
     if data["skip_counts"]:
         skips = sorted(data["skip_counts"].items(), key=lambda kv: -kv[1])[:5]
-        lines += ["", "⏭ Skips: " + ", ".join(f"{k}={v}" for k, v in skips)]
+        lines += ["", esc("⏭ Skips: " + ", ".join(f"{k}={v}" for k, v in skips))]
     if data["recent"]:
         lines += ["", "🕒 Recent:"]
         for row in data["recent"][-4:]:
-            lines.append(f"  {time.strftime('%H:%M:%S', time.localtime(row['t']))} {row['text']}")
+            lines.append(esc(f"  {time.strftime('%H:%M:%S', time.localtime(row['t']))} {row['text']}"))
     return "\n".join(lines)
-
 
 def note_alert(chat_id: str | None, code: str, *, now: float | None = None) -> bool:
     """True when an alert for this (code, account) should be sent now.

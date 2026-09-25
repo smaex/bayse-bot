@@ -117,7 +117,11 @@ that work.
    `sudo systemctl status bayse-bot` and `journalctl -u bayse-bot -n 200` on the VPS.
 2. **Ask the bot why.** `/why`. Expected codes: `NO_EVALUATION`, `NO_MARKETS`,
    `FEEDS_STALE`, `DRY_RUN`, `PAUSED_MANUAL`, `PAUSED_SESSION`, `LOW_BALANCE`,
-   `SCOPE_EMPTY`, `NO_EDGE`, `EXECUTION_BLOCKED`, `NO_CONFIRMED_FILL`, `HEALTHY`.
+   `SCOPE_EMPTY`, `NO_EDGE`, `MAKER_QUOTE_UNCOMPETITIVE`, `EXECUTION_BLOCKED`,
+   `EXPOSURE_CAPPED`, `NO_CONFIRMED_FILL`, `COOLDOWN_BLOCKED`, `HEALTHY`.
+   (`MAKER_QUOTE_UNCOMPETITIVE`: MAKER has signals but `MAKER_MAX_BID` is below the
+   live book, so it declines to rest quotes that cannot fill — a policy boundary,
+   see `reports/maker_zero_fill_diagnosis.md`.)
 3. **Check the flag, not the vibe.** `LIVE_TRADING=true` in `/opt/bayse-bot/.env`.
    `DRY_RUN` is not a bug — it is the documented safe default, and `render.yaml` ships
    with it `false`.
@@ -275,6 +279,11 @@ Coolify application is missing at runtime, and the defaults are the safe ones:
 * `MAX_PORTFOLIO_EXPOSURE` — defaults to `0.15`. A user setting of
   `/set maxexposure 30` is silently clamped to 15%, so a ₦1,600 account can
   hold only ₦240 of filled exposure (two ₦100 orders).
+* `MAKER_MAX_BID` — defaults to `0.58`, the most a MAKER quote will pay (a
+  fill pays at least +72% on a win). MAKER prices against the live book and
+  skips — `exec:maker_quote_behind_book` — when the book bids above this, so if
+  the chosen side trades at 0.65+ MAKER will not trade. Raising it is a
+  risk/reward decision; must be within `0.50`–`0.75` or startup fails.
 * `MAX_TRADE_RISK` and `MAX_PORTFOLIO_EXPOSURE` are **fractions**: `0.02` and
   `0.30`. Writing `5` or `30` raises at startup inside `config.validate()`,
   which runs before the health server binds — Docker then restart-loops the
@@ -282,9 +291,13 @@ Coolify application is missing at runtime, and the defaults are the safe ones:
 
 ### Reading "quiet" correctly
 
-`/why` now reports `N orders placed | M confirmed fills | R still resting
-unfilled`. A MAKER quote that rests and expires is *not* a trade: it is an
-order that produced no position, capital came back, and the user is notified
-(`⏳` still resting, `⚪` unfilled, `🚫` rejected, `❓` unconfirmed). When
-`NO_CONFIRMED_FILL` is the verdict, the thing to inspect is the quoting price
-and `MAKER_ORDER_TIMEOUT`, not a risk gate.
+`/why` now reports `N orders placed (P as passive quotes) | M confirmed fills |
+R resting now` — `R` is read from the live risk book; the earlier "still resting
+unfilled" figure was a lifetime placement count and overstated it. A MAKER quote
+that rests and expires is *not* a trade: it is an order that produced no
+position, capital came back, and the user is notified (`⏳` still resting, `⚪`
+unfilled, `🚫` rejected, `❓` unconfirmed). When `NO_CONFIRMED_FILL` is the
+verdict, the thing to inspect is the quoting price relative to the live book
+and `MAKER_ORDER_TIMEOUT`, not a risk gate. Configuration exclusions
+(`scope:blocked_by_policy`, `*:engine_not_clob`, `*_not_in_allowed_scope`) are
+listed on their own "Excluded by configuration" line, not as gates.

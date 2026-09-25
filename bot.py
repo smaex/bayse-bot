@@ -28,7 +28,7 @@ import config
 import stall
 import feeds_direct
 import health
-from risk import RiskManager
+from risk import RiskManager, position_is_filled
 from client import BayseClient
 from config import (TELEGRAM_TOKEN, CURRENCY, SCAN_INTERVAL_SECONDS,
                     SYSTEMIC_RISK_HALT_MINS, EXIT_EV_THRESHOLD, MIN_EXIT_TIME_REMAINING,
@@ -1928,7 +1928,26 @@ def _stall_context(chat_id: str, user: dict | None = None) -> dict:
         "min_viable": _MIN_VIABLE_BALANCE,
         "feed_age_sec": _worst_feed_age_sec(time.time()),
         "eval_max_age_sec": config.STALL_EVAL_MAX_AGE_SEC,
+        "resting_now": _resting_order_count(risk),
     }
+
+
+def _resting_order_count(risk) -> int | None:
+    """Unfilled orders currently resting on the exchange, from the risk book.
+
+    The stall counter of passive placements only ever grows; reporting it as
+    "still resting" told the user five quotes were live when they had all
+    expired. The risk book is the source of truth for what is open now.
+    """
+    if risk is None:
+        return None
+    try:
+        return sum(
+            1 for pos in risk.open_positions.values()
+            if pos.get("order_id") and not position_is_filled(pos)
+        )
+    except Exception:
+        return None
 
 
 async def _check_trading_stalls() -> None:
@@ -1967,12 +1986,18 @@ async def _check_trading_stalls() -> None:
             if severe:
                 health.fail("trading_stall", f"{chat_id}: {verdict['code']}", gap_min=round(gap))
             if _tg_app:
-                text = stall.format_report(chat_id, **{k: v for k, v in context.items()
-                                                       if k in ("equity", "min_viable", "feed_age_sec",
-                                                               "eval_max_age_sec")})
+                text = stall.format_report(
+                    chat_id, markdown=True,
+                    **{k: v for k, v in context.items()
+                       if k in ("equity", "min_viable", "feed_age_sec",
+                                "eval_max_age_sec", "resting_now")},
+                )
+                # The gap is measured from the last exchange-confirmed FILL.
+                # "without an order" contradicted the report whenever MAKER had
+                # just placed quotes that never filled.
                 await telegram_bot.send_message(
                     _tg_app, chat_id,
-                    f"🩺 *Trading stall — {gap:.0f} min without an order*\n\n{text[:3500]}",
+                    f"🩺 *Trading stall — {gap:.0f} min without a confirmed fill*\n\n{text[:3500]}",
                     parse_mode="Markdown",
                 )
         except Exception as stall_err:
@@ -1982,7 +2007,7 @@ async def _check_trading_stalls() -> None:
 
 async def _stall_watchdog():
     log.info(
-        "Trading-drought watchdog started (alert after %.0f min without an order)",
+        "Trading-drought watchdog started (alert after %.0f min without a confirmed fill)",
         config.TRADE_STALL_ALERT_MIN,
     )
     while True:

@@ -150,6 +150,79 @@ def _clob_buy_effective_price(price: float, fee_rate: float) -> float:
     return price / max(1.0 - _effective_fee(fee_rate, price), 1e-9)
 
 
+def _level_prices(levels) -> list[float]:
+    """Valid (0, 1) prices from a Bayse book side, tolerating malformed levels."""
+    prices = []
+    for level in levels or []:
+        try:
+            raw = level.get("price") if isinstance(level, dict) else level[0]
+            price = float(raw)
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            continue
+        if 0.0 < price < 1.0:
+            prices.append(price)
+    return prices
+
+
+def _maker_quote_against_book(
+    book: dict,
+    max_price: float,
+    *,
+    min_price: float | None = None,
+    tick: float | None = None,
+    max_ticks_behind: int | None = None,
+) -> tuple[float | None, str, str]:
+    """Price a post-only MAKER BUY against the live order book.
+
+    ``max_price`` is the strategy's number: the most MAKER will pay (fair value
+    minus its half-spread, clamped to ``MAKER_MAX_BID``). It is derived from
+    Bayse's outcome *probability* price, which is not the best bid, so sent
+    as-is it lands in one of two dead zones:
+
+    * at/through the best ask — a post-only order is rejected by the exchange;
+    * several ticks under the best bid — every seller hits the bids above it
+      first, so it rests until MAKER_ORDER_TIMEOUT cancels it and the next
+      signal re-places the same dead quote (the zero-fill churn observed in
+      production: five 0.58 quotes, zero fills, ~19 hours without a fill).
+
+    Returns ``(price, "", detail)`` for a quote worth resting, or
+    ``(None, code, detail)`` with a stable skip code. Never raises the price
+    above ``max_price``: the risk/reward ceiling is not a liquidity setting.
+    """
+    min_price = config.MAKER_MIN_BID if min_price is None else float(min_price)
+    tick = config.MAKER_TICK if tick is None else float(tick)
+    if max_ticks_behind is None:
+        max_ticks_behind = config.MAKER_MAX_TICKS_BEHIND_BEST_BID
+
+    bids = _level_prices(book.get("bids"))
+    asks = _level_prices(book.get("asks"))
+    best_bid = max(bids) if bids else None
+    best_ask = min(asks) if asks else None
+    book_text = (
+        (f"best bid {best_bid:.3f}" if best_bid is not None else "no bids")
+        + (f" / best ask {best_ask:.3f}" if best_ask is not None else " / no asks")
+    )
+
+    price = round(float(max_price), 3)
+    if best_ask is not None and price >= best_ask - 1e-9:
+        # Post-only would cross. Rest one tick inside the ask instead: that is
+        # a *lower* price than intended, and the top of the book.
+        stepped = round(best_ask - tick, 3)
+        if stepped < min_price - 1e-9:
+            return None, "maker_would_cross_book", (
+                f"{book_text}: no passive price >= {min_price:.2f} exists below the ask"
+            )
+        price = stepped
+    if best_bid is not None:
+        ticks_behind = round((best_bid - price) / tick, 6)
+        if ticks_behind > max_ticks_behind:
+            return None, "maker_quote_behind_book", (
+                f"max bid {max_price:.3f} is {ticks_behind:.0f} tick(s) under the "
+                f"{book_text}; a post-only bid there cannot fill before timeout"
+            )
+    return price, "", f"{book_text} -> bid {price:.3f}"
+
+
 def _book_is_stale(
     book: dict, *, max_age: float | None = None, now: float | None = None
 ) -> bool:
@@ -228,7 +301,8 @@ async def execute_trade(chat_id: str, sig, client, risk, settings: dict,
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — systemic halt active")
         return
     is_hedge = "PAIR_HEDGE" in getattr(sig, "reason", "")
-    if risk.already_in(sig.market_id, asset=sig.asset, is_hedge=is_hedge, strategy=sig.strategy):
+    if risk.already_in(sig.market_id, asset=sig.asset, is_hedge=is_hedge,
+                       strategy=sig.strategy, outcome=getattr(sig, "outcome", "")):
         _stall_skip(chat_id, sig, "already_in_or_pending")
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — already in/pending on {sig.market_id}")
         return
@@ -642,8 +716,45 @@ async def _execute_logic(
             log.info(f"[{chat_id}] SKIP MAKER {sig.asset} — passive orders require CLOB")
             return
         time_in_force = "GTC"
-        limit_price   = sig.market_price
         post_only     = True  # never accidentally cross and pay taker fees
+        # ── Book-aware passive price ──────────────────────────────────────
+        # The strategy's bid is the most MAKER will pay, not a competitive
+        # price (see _maker_quote_against_book). Check it against the live
+        # book so MAKER only rests quotes that can fill, and a quote that
+        # cannot is reported as such instead of churning every 60s.
+        cooldown_key = _cooldown_key(chat_id, sig.market_id, sig.strategy)
+        book_error = ""
+        try:
+            ob = await asyncio.wait_for(
+                client.get_orderbook(sig.outcome_id, depth=5), timeout=1.5
+            )
+        except Exception as obe:
+            ob, book_error = {}, str(obe)[:120]
+        if not isinstance(ob, dict) or not ob or _book_is_stale(ob):
+            # Same rule as every other entry: no fresh market state, no order.
+            code = "maker_book_stale" if isinstance(ob, dict) and ob else "maker_book_unavailable"
+            _stall_skip(chat_id, sig, code, book_error or "order book could not be verified")
+            log.info(
+                f"[{chat_id}] SKIP MAKER {sig.asset} {sig.outcome} — {code.replace('_', ' ')}"
+                + (f": {book_error}" if book_error else "")
+            )
+            _trade_cooldown[cooldown_key] = time.time()
+            return
+        limit_price, book_skip, book_detail = _maker_quote_against_book(ob, sig.market_price)
+        if limit_price is None:
+            _stall_skip(chat_id, sig, book_skip, book_detail)
+            log.info(f"[{chat_id}] SKIP MAKER {sig.asset} {sig.outcome} — {book_detail}")
+            # One book check per market per cooldown window, not per signal.
+            _trade_cooldown[cooldown_key] = time.time()
+            return
+        if abs(limit_price - sig.market_price) > 1e-9:
+            log.info(
+                f"[{chat_id}] MAKER re-priced {sig.asset} {sig.outcome} "
+                f"{sig.market_price:.3f} -> {limit_price:.3f} ({book_detail})"
+            )
+            # Downstream (notification, DB row, requote tracking) must show the
+            # price actually sent, which is never above the strategy's bid.
+            sig.market_price = limit_price
     elif engine == "CLOB":
         # ── CLOB Taker Execution: Price to match real Order Book Asks ────────
         # On a CLOB, buying into a book requires crossing the spread to the lowest ask.
@@ -871,7 +982,17 @@ async def _execute_logic(
                             )
 
                 if trade_id:
-                    risk.add_position(sig.market_id, {
+                    # risk.already_in lets a MAKER quote coexist with a SNIPE
+                    # position on the same market (same side only). Keying by
+                    # the bare market id here silently overwrote that filled
+                    # SNIPE position, dropping it from exit management. Use the
+                    # same collision-free key as the taker fill path.
+                    maker_key = (
+                        f"{sig.market_id}:{sig.outcome}:{order_id}"
+                        if sig.market_id in risk.open_positions
+                        else sig.market_id
+                    )
+                    risk.add_position(maker_key, {
                         "market_id":   sig.market_id,
                         "trade_id":    trade_id,    "event_id":   sig.event_id,
                         "order_id":    order_id,

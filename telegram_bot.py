@@ -572,20 +572,30 @@ async def cmd_why(update: Update, _ctx):
             equity = float(risk.current_free_cash or 0.0) + risk.deployed()
         except Exception:
             equity = 0.0
+    resting_now = None
     try:
         import bot as _bot
         feed_age = _bot._worst_feed_age_sec(time.time())
         min_viable = float(getattr(_bot, "_MIN_VIABLE_BALANCE", 0.0))
+        resting_now = _bot._resting_order_count(risk)
     except Exception:
         pass
     text = stall.format_report(
         cid,
+        markdown=True,
         equity=equity,
         min_viable=min_viable,
         feed_age_sec=feed_age,
         eval_max_age_sec=float(config.STALL_EVAL_MAX_AGE_SEC),
+        resting_now=resting_now,
     )
-    await update.message.reply_text(text[:3900], parse_mode="Markdown")
+    try:
+        await update.message.reply_text(text[:3900], parse_mode="Markdown")
+    except Exception as exc:
+        # Never leave /why unanswered because of a formatting slip.
+        if not _is_markdown_parse_error(exc):
+            raise
+        await update.message.reply_text(_markdown_to_plain(text)[:3900])
 
 
 @_guard
@@ -940,10 +950,47 @@ async def _clear_daily(cid: str):
 
 # ── Notifications ─────────────────────────────────────────────────────────────
 
+def _code_span(text: str) -> str:
+    """Render free text (gate codes, exchange reasons) as a Markdown code span.
+
+    Legacy Markdown forbids nested entities, so an escaped ``\\_`` inside an
+    ``_italic_`` entity is a parse error: every MAKER notification carried
+    ``spread_capture`` in its reason and was therefore always downgraded to the
+    one-line fallback. Inside a code span underscores are literal.
+    """
+    return "`" + str(text or "").replace("`", "'") + "`"
+
+
+def _markdown_to_plain(text: str) -> str:
+    """Best-effort plain rendering of a legacy-Markdown message."""
+    for escaped in ("\\_", "\\*", "\\`", "\\["):
+        text = text.replace(escaped, escaped[1])
+    return text.replace("*", "").replace("`", "")
+
+
+def _is_markdown_parse_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "parse" in message and "entit" in message
+
+
 async def send_message(app: Application, chat_id: str, text: str, **kwargs):
     try:
         await app.bot.send_message(chat_id=chat_id, text=text, **kwargs)
     except Exception as e:
+        if kwargs.get("parse_mode") and _is_markdown_parse_error(e):
+            # A formatting slip must never drop an alert. The trading-stall
+            # report quotes raw gate codes; one unbalanced underscore made
+            # Telegram reject the whole message and it was only logged.
+            plain_kwargs = {k: v for k, v in kwargs.items() if k != "parse_mode"}
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id, text=_markdown_to_plain(text), **plain_kwargs
+                )
+                log.warning(f"send_message → {chat_id}: Markdown rejected ({e}); sent as plain text")
+                return
+            except Exception as e2:
+                log.warning(f"send_message → {chat_id}: plain-text retry failed: {e2}")
+                return
         log.warning(f"send_message → {chat_id}: {e}")
 
 
@@ -966,17 +1013,24 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
     icon_strat, title_strat = strat_meta.get(strat, ("🔔", f"*{strat} Trade*"))
     
     dir_icon = "🎯" if sig.outcome.upper() in ("DUAL_LIMIT", "ARB") else ("⬆️" if sig.outcome.upper() in ("YES", "UP") else "⬇️")
-    safe_reason = (getattr(sig, "reason", "") or "").replace("_", "\\_").replace("*", "\\*")
+    reason = (getattr(sig, "reason", "") or "")[:300]
     market_price = getattr(sig, "market_price", 0.0)
     win_prob = getattr(sig, "win_prob", sig.certainty)
+    # A resting LIMIT is an order, not a fill — say so, so a quote that later
+    # expires unfilled does not read as a trade that happened.
+    status_line = (
+        "Status: resting post-only bid — *not filled yet*\n"
+        if engine == "CLOB_LIMIT" else ""
+    )
 
     msg = (
         f"{icon_strat} {title_strat}\n"
         f"Asset: *{sig.asset} {sig.timeframe}*\n"
         f"Direction: {dir_icon} *{sig.outcome}*\n"
         f"Size: *₦{amount:,.0f}* @ price *{market_price:.3f}*\n"
+        f"{status_line}"
         f"Certainty: *{sig.certainty:.0%}* (Prob: {win_prob:.1%})\n"
-        f"_{safe_reason}_"
+        + (_code_span(reason) if reason else "")
     )
     try:
         await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
@@ -986,6 +1040,7 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
             plain = (
                 f"{icon_strat} [{strat}] {sig.asset} {sig.timeframe} {dir_icon} {sig.outcome} "
                 f"₦{amount:,.0f} @ {market_price:.3f} (Cert: {sig.certainty:.0%})"
+                + (" — resting bid, not filled yet" if engine == "CLOB_LIMIT" else "")
             )
             await app.bot.send_message(chat_id=cid, text=plain)
         except Exception as e:
@@ -1208,7 +1263,7 @@ async def notify_order_rejected(app, cid, strat, asset, tf, outcome, amount_ngn,
     msg = (
         f"🚫 *Order Rejected by Exchange*\n"
         f"{icon} {_esc(name)} | {_esc(asset)} {_esc(tf)} {_esc(outcome)} | ₦{amt_val:,.0f}\n"
-        f"_{_esc((reason or 'no reason returned')[:300])}_\n"
+        f"{_code_span((reason or 'no reason returned')[:300])}\n"
         f"_No fill occurred. Nothing was deducted for this order._"
     )
     try:

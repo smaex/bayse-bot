@@ -231,32 +231,39 @@ class RiskManager:
                 return True
         return False
 
-    def already_in(self, market_id: str, asset: str = "", is_hedge: bool = False, strategy: str = "") -> bool:
+    def already_in(self, market_id: str, asset: str = "", is_hedge: bool = False,
+                   strategy: str = "", outcome: str = "") -> bool:
         if is_hedge:
             # Matched-pair hedge explicitly acquires the opposite side to lock in redemption spread
             return False
         if market_id in self.pending_markets:
             return True
-        pos = self.open_positions.get(market_id)
-        if pos is not None:
-            # If an order/position exists on this exact market:
-            # Allow SNIPE and MAKER to coexist on the same market only if they are on the SAME outcome side.
-            # Never allow taking the direct opposing side on the same market unless it's a hedge.
-            if strategy and pos.get("strategy") and (strategy.upper() != pos.get("strategy", "").upper()):
-                # Different strategies (e.g. SNIPE vs MAKER)
-                incoming_strat = strategy.upper()
-                existing_strat = pos.get("strategy", "").upper()
-                is_maker_pair = (
-                    (incoming_strat in {"MAKER", "MIDMARKET_MAKER"} and existing_strat not in {"MAKER", "MIDMARKET_MAKER"}) or
-                    (existing_strat in {"MAKER", "MIDMARKET_MAKER"} and incoming_strat not in {"MAKER", "MIDMARKET_MAKER"})
+        makers = {"MAKER", "MIDMARKET_MAKER"}
+        incoming_strat = (strategy or "").upper()
+        # A market can hold more than one tracked entry: the executor keys a
+        # second position as "<market_id>:<outcome>:<order_id>". Looking up the
+        # bare key alone made those entries invisible to this check.
+        for key, pos in self.open_positions.items():
+            if key != market_id and not str(key).startswith(f"{market_id}:"):
+                continue
+            existing_strat = str(pos.get("strategy") or "").upper()
+            is_maker_pair = bool(incoming_strat and existing_strat) and (
+                (incoming_strat in makers) != (existing_strat in makers)
+            )
+            if not is_maker_pair:
+                # Active position or pending limit order already exists for this
+                # exact market and strategy family.
+                return True
+            # A passive MAKER quote and a directional taker may share a market
+            # only on the SAME outcome. Opposite sides of one binary cost more
+            # than the 1.00 they can ever pay out together, so one leg is a
+            # guaranteed loss. An unknown side is treated as a conflict.
+            existing_outcome = str(pos.get("outcome") or "").upper()
+            if not outcome or existing_outcome != str(outcome).upper():
+                log.info(
+                    f"BLOCK opposite-side entry on {market_id}: {incoming_strat} "
+                    f"{outcome or '?'} vs open {existing_strat} {existing_outcome or '?'}"
                 )
-                if is_maker_pair:
-                    # Allow concurrent if on the same market when not conflicting, but block duplicate within same strategy
-                    pass
-                else:
-                    return True
-            else:
-                # Active position or pending limit order already exists for this exact market and strategy family!
                 return True
 
         # Asset-level deduplication:
