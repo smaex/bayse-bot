@@ -172,23 +172,71 @@ was reading `main()` as text and matched a function name inside a *comment*.
 It is now stripped of whole-line comments and asserts on call sites, so prose
 cannot satisfy or defeat an ordering check.
 
+## 4. The probe could not tell a dead bot from the wrong URL *(added after operator follow-up)*
+
+The operator confirmed the container is **Running** (2 restarts) and reported the
+port as **3000**. That points at the real reason `/live` never answered from the
+outside — and it is not that the bot was down.
+
+`setup_coolify_fixed.sh` publishes **Coolify's own dashboard** with
+`-p 3000:8080` and `APP_URL="http://69.164.244.180:3000"`. Port 3000 on that
+host is the admin UI, not the bot. The bot binds **8080** (`bot.py`:
+`server.start_server(port=int(os.getenv("PORT", "8080")))`; `Dockerfile`:
+`EXPOSE 8080`, and the healthcheck probes `${PORT:-8080}/live`).
+
+The old probe could not notice the difference:
+
+```bash
+live=$(curl -fsS --max-time 10 "$base/live" 2>/dev/null || echo "")
+if [ -z "$live" ]; then … exit 1
+```
+
+`-f` makes curl fail on any 4xx and discards the body, so a 404 from Coolify's
+dashboard is indistinguishable from the bot being down. If the `APP_URL`
+repository *variable* was set to that same `:3000` address, the watchdog spent
+every 15 minutes probing the admin UI and reporting an outage while the bot ran.
+
+The probe now checks that the answer came from *this* bot (the health server
+identifies itself as `{"status": "live", …}`) and names the failure mode:
+nothing answered, wrong server, or alive-but-not-ready.
+
+Two bugs in the first version of that rewrite were caught by its own tests
+before it shipped, and are pinned there:
+
+* `curl -w '%{http_code}'` already prints `000` when it cannot connect, so
+  `… || echo 000` produced `000000` and the `= "000"` test never matched —
+  an unreachable host was reported as "wrong server";
+* `curl -o` does not truncate the output file on failure, so a failed probe
+  reported the *previous* probe's response body as its own.
+
+### What the operator still has to do
+
+Point `APP_URL` at the bot, not at Coolify. Either give the application a domain
+in Coolify (Configuration → Domains) and use that, or publish the container's
+8080 on a host port that is **not 3000** and use `http://<host>:<that port>`.
+Until then the watchdog has nothing valid to probe.
+
+The container showing **Running with 2 restarts** is consistent with cause #1 —
+the crash-on-unreachable-database loop — but it is not proof: the deploy that
+rolled back left the *previous* image running, so the running container may
+predate both fixes.
+
 ## Not verified from here
 
-Stated plainly, because it is the one open question:
+Stated plainly, because these are the open questions:
 
-* **Whether production is currently up.** This sandbox cannot reach the
-  deployment host (`curl` to it fails at the TCP layer, and Coolify's port 3000
-  resets), and repository Actions variables are not readable with the available
-  credentials (`gh api …/actions/variables` → `403 Resource not accessible by
-  integration`). So the `APP_URL` the watchdog probes could not be read or
-  probed.
-* Consequently **the watchdog's `/live` failure is unexplained**. It is either a
-  genuine outage, or `APP_URL`/the Coolify port mapping not pointing at the
-  container's 8080. Only Coolify can tell them apart: open the application and
-  check whether the container is running and whether its port is mapped. If it
-  is mapped and the container is up, cause #1 above is the likely culprit and is
-  now fixed; if it is not mapped, no external probe will ever pass regardless of
-  how healthy the bot is.
+* **The value of the `APP_URL` repository variable.** This sandbox cannot read it
+  (`gh api …/actions/variables` → `403 Resource not accessible by integration`)
+  and cannot reach the deployment host (`curl` fails at the TCP layer; Coolify's
+  `:3000` resets the connection). The operator reported the container is
+  **Running** with **2 restarts** and gave the port as **3000**, which makes
+  cause #4 the leading explanation — but the variable's actual value was never
+  read, so this is a well-supported inference, not a confirmed fact. After the
+  next watchdog run the step log will say which of the three cases it hit.
+* **Whether the running container predates these fixes.** A rolled-back deploy
+  leaves the *previous* image running, so "Running" does not prove the new code
+  is live. Confirm by checking the image/commit Coolify reports for the running
+  container.
 * **No Docker build was run.** Docker is not installed in this sandbox, so the
-  Dockerfile change-free state was not rebuilt or smoke-tested. The Dockerfile
-  was not modified by this change.
+  image was never rebuilt or smoke-tested. The Dockerfile was not modified by
+  this change.
