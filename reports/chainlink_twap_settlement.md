@@ -87,6 +87,49 @@ already computes `diff_pct`; log its distribution for a day and set the
 thresholds from the data. The 2026-09-26 stall alert's `stale_feed` /
 `degraded` counters will show it if this starts firing.
 
+## 3b. MAKER is affected too, but less — and for different reasons
+
+`MakerStrategy._fair_value` was still calling `gbm_win_probability`, so it
+priced the close print while its quote is paid on the average. It now prices
+the TWAP with the same 180 s drift cap (and `window_sec = 0` reproduces the old
+value to 1e-12, pinned by a test). The correction is **smaller than SNIPE's**,
+because MAKER quotes 180-750 s out, where the averaged minute is a small share
+of what remains:
+
+| secs | dist | fv, close print | fv, TWAP | shift |
+|---|---|---|---|---|
+| 700 | +0.08% | 0.5386 | 0.5398 | +0.1 pt |
+| 400 | +0.20% | 0.6293 | 0.6361 | +0.7 pt |
+| 200 | +0.08% | 0.5739 | 0.5827 | +0.9 pt |
+| 200 | +0.20% | 0.6804 | 0.7000 | +2.0 pts |
+
+With MAKER's usual 3%/h Kalman drift the shifts are +0.8 to +2.1 points. So the
+model fix alone will not change MAKER's signal count much — but near the 0.65
+certainty floor a 1-2 point shift does flip individual candidates, and the
+direction is always the same: an above-strike spot was underpriced.
+
+The bigger MAKER consequences are not in the model:
+
+* **Adverse selection changes shape, and partly in our favour.** A momentary
+  Binance spike that reverts inside the minute is averaged out of settlement,
+  so a resting bid is less exposed to a last-second print than it was. A
+  *sustained* move is fully reflected. The vol-spike cancel-all protection is
+  therefore over-conservative at the margin — left alone, because "less
+  protective" is not a change to make without fill data.
+* **`REQUOTE_THRESHOLD = 0.0010` is now over-reactive.** It requotes when
+  *Binance* moves 0.10%, but a 0.10% wiggle moves the settled average much less
+  than it used to. Every requote cancels a resting order, and liquidity rewards
+  accrue per sampling interval an order is live — the `sampleCount` field in
+  `GET /v1/pm/liquidity-rewards`. Churning on a threshold tuned for spot
+  settlement can cost reward income that the requote was meant to protect. The
+  endpoint added in `model_and_api_audit.md` measures exactly that; raising the
+  threshold before reading `sampleCount` would be a guess.
+* **The mid we quote against is smoothed.** `edge = fv − mid` now compares a
+  Binance-derived fair value against a lagging average, so the edge looks
+  larger during any move — precisely when the quote is most likely to be
+  lifted. This is the argument for widening `HALF_SPREAD` or shortening
+  `MAKER_ORDER_TIMEOUT`, and it is a tuning decision, not a defect.
+
 ## 4. Execution and strategy windows
 
 * `SNIPE_MIN_SECS_TO_CLOSE = 60` is exactly the averaging window, so **every
@@ -120,13 +163,14 @@ turns an unverified notice into a measured one.
 
 ## 6. Verification
 
-`pytest -q` → **266 passed** (252 before). 14 new tests in
+`pytest -q` → **269 passed** (252 before this notice). 17 tests in
 `tests/test_twap_settlement.py`: the closed form against simulation (5 cases,
 tolerance 1.5 pts, observed worst 0.3), the terminal-spot model shown
 materially wrong at the entry deadline, `window_sec = 0` reproducing
 `gbm_win_probability` to 1e-12, the effective-horizon arithmetic, both
-partial-window branches, the integral helper, and SNIPE's pipeline end to end
-with `SETTLEMENT_TWAP_SEC` at 60 and at 0.
+partial-window branches, the integral helper, SNIPE's pipeline end to end with
+`SETTLEMENT_TWAP_SEC` at 60 and at 0, and MAKER's `_fair_value` including the
+180 s drift cap.
 
 **Unverified:** everything about the live Chainlink feed — its basis against
 Binance, its update cadence, the exact averaging window, and which series the

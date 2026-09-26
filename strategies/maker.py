@@ -36,7 +36,13 @@ import config
 import feeds_direct
 import feeds
 from strategies.base import TradeSignal, BaseStrategy
-from strategies.utils import gbm_win_probability, note_reject, realized_vol_hourly
+from strategies.utils import (
+    gbm_win_probability,
+    note_reject,
+    realized_twap_integral,
+    realized_vol_hourly,
+    twap_win_probability,
+)
 
 log = logging.getLogger("strat.maker")
 
@@ -137,15 +143,38 @@ class MakerStrategy(BaseStrategy):
         else:
             hourly_drift = 0.0
 
-        # Exact GBM win probability
-        fv = gbm_win_probability(
-            spot=spot,
-            threshold=threshold,
-            secs=secs_to_close,
-            hourly_vol=rv,
-            hourly_drift=hourly_drift,
-            horizon_cap=180.0,
-        )
+        # Fair value of the *settled* quantity. Bayse resolves these markets on
+        # a Chainlink 60-second TWAP, not the close print, so the average — not
+        # the terminal spot — is what a resting quote is paid on. Pricing the
+        # close print overstates how much the final minute can still move
+        # against us, which matters more for a maker than for a taker: the
+        # quote has to survive until close. The Kalman drift cap is unchanged.
+        twap_sec = float(getattr(config, "SETTLEMENT_TWAP_SEC", 0.0) or 0.0)
+        if twap_sec > 0:
+            integral, elapsed = (
+                realized_twap_integral(asset, state, twap_sec - secs_to_close)
+                if secs_to_close < twap_sec else (0.0, 0.0)
+            )
+            fv = twap_win_probability(
+                spot=spot,
+                threshold=threshold,
+                secs=secs_to_close,
+                hourly_vol=rv,
+                window_sec=twap_sec,
+                realized_integral=integral,
+                realized_secs=elapsed,
+                hourly_drift=hourly_drift,
+                horizon_cap=180.0,
+            )
+        else:
+            fv = gbm_win_probability(
+                spot=spot,
+                threshold=threshold,
+                secs=secs_to_close,
+                hourly_vol=rv,
+                hourly_drift=hourly_drift,
+                horizon_cap=180.0,
+            )
 
         return max(0.03, min(0.97, fv))
 

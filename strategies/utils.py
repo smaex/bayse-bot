@@ -300,19 +300,26 @@ def twap_win_probability(spot: float, threshold: float, secs: float,
                          hourly_vol: float, window_sec: float = 60.0,
                          realized_integral: float = 0.0,
                          realized_secs: float = 0.0,
-                         hourly_drift: float = 0.0) -> float:
+                         hourly_drift: float = 0.0,
+                         horizon_cap: float = 0.0) -> float:
     """``P(settlement TWAP >= threshold)`` — the quantity Bayse actually settles.
 
     Drop-in replacement for :func:`gbm_win_probability` on TWAP-settled
-    markets. When part of the averaging window has already elapsed, its
-    contribution (``realized_integral`` over ``realized_secs``) is fixed, so
-    the requirement shifts to the average still needed over the *remaining*
-    window — which makes an entry inside the final minute far more informative
-    than a terminal-spot model can express.
+    markets, including its ``horizon_cap`` drift dampening: with a cap the
+    Kalman velocity is extrapolated over ``min(drift_horizon, cap)`` rather than
+    the whole horizon, so a noisy instantaneous reading cannot dominate. With
+    ``window_sec = 0`` the two are identical, drift cap included.
+
+    When part of the averaging window has already elapsed, its contribution
+    (``realized_integral`` over ``realized_secs``) is fixed, so the requirement
+    shifts to the average still needed over the *remaining* window — which
+    makes an entry inside the final minute far more informative than a
+    terminal-spot model can express.
     """
     if spot <= 0 or threshold <= 0 or secs <= 0:
         return gbm_win_probability(spot, threshold, secs, hourly_vol,
-                                   hourly_drift=hourly_drift)
+                                   hourly_drift=hourly_drift,
+                                   horizon_cap=horizon_cap)
     if hourly_vol <= 0:
         hourly_vol = config.ASSET_HOURLY_VOL.get("BTC", 0.018)
 
@@ -331,7 +338,11 @@ def twap_win_probability(spot: float, threshold: float, secs: float,
     t_drift = max(drift_secs, 0.0) / 3600.0
     t_var = var_secs / 3600.0
     jensen_corr = -0.5 * (hourly_vol ** 2)
-    numerator = math.log(spot / target) + (hourly_drift + jensen_corr) * t_drift
+    f_drift = 1.0
+    if horizon_cap > 0 and drift_secs > 0:
+        f_drift = min(drift_secs, horizon_cap) / drift_secs
+    numerator = (math.log(spot / target)
+                 + (hourly_drift * f_drift + jensen_corr) * t_drift)
     denominator = hourly_vol * math.sqrt(t_var)
     if denominator <= 0:
         return 1.0 if spot > target else 0.0

@@ -195,3 +195,45 @@ def test_snipe_prices_the_twap_and_not_the_close_print(monkeypatch):
 def test_the_settlement_window_is_configurable(monkeypatch):
     monkeypatch.setattr(config, "SETTLEMENT_TWAP_SEC", 0.0)
     assert config.SETTLEMENT_TWAP_SEC == 0.0
+
+
+# ── MAKER is paid on the same settled quantity ────────────────────────────────
+
+def test_the_drift_cap_survives_a_zero_window():
+    """MAKER caps its Kalman extrapolation at 180s; window 0 must match gbm."""
+    for secs in (700.0, 400.0, 200.0):
+        assert twap_win_probability(1.0, 0.998, secs, 0.018, window_sec=0.0,
+                                    hourly_drift=0.03, horizon_cap=180.0) \
+            == pytest.approx(gbm_win_probability(1.0, 0.998, secs, 0.018,
+                                                 hourly_drift=0.03,
+                                                 horizon_cap=180.0), abs=1e-12)
+
+
+def _maker_fv(monkeypatch, secs: float, drift: bool = False) -> float:
+    from strategies.maker import MakerStrategy
+    kalman = {"BTC": {"x": [100_000.0, 100_000.0 * 0.03 / 3600.0]}} if drift else {}
+    state = SimpleNamespace(price_history={}, kalman_state=kalman, garch_state={})
+    market = {"asset": "BTC", "threshold": 100_000.0, "secs_to_close": secs}
+    return MakerStrategy()._fair_value("BTC", market, state=state,
+                                       spot=100_000.0 * 1.002)
+
+
+def test_maker_prices_the_settlement_twap_too(monkeypatch):
+    monkeypatch.setattr(config, "SETTLEMENT_TWAP_SEC", 0.0)
+    at_close_print = _maker_fv(monkeypatch, 200.0)
+    monkeypatch.setattr(config, "SETTLEMENT_TWAP_SEC", 60.0)
+    at_twap = _maker_fv(monkeypatch, 200.0)
+    assert at_twap > at_close_print + 0.01
+
+
+def test_the_correction_grows_as_the_window_approaches(monkeypatch):
+    """The averaged minute is a bigger share of what is left, so it matters more."""
+    monkeypatch.setattr(config, "SETTLEMENT_TWAP_SEC", 60.0)
+    gaps = []
+    for secs in (700.0, 200.0):
+        twap = _maker_fv(monkeypatch, secs)
+        monkeypatch.setattr(config, "SETTLEMENT_TWAP_SEC", 0.0)
+        spot = _maker_fv(monkeypatch, secs)
+        monkeypatch.setattr(config, "SETTLEMENT_TWAP_SEC", 60.0)
+        gaps.append(twap - spot)
+    assert gaps[1] > gaps[0] > 0

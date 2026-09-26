@@ -93,7 +93,11 @@ def _state(momentum=0.0004):
 def _evaluate(monkeypatch, market, fair_value, *, spot_price=SPOT, state=None,
               direct_price=None):
     """Run the real strategy with fair value pinned and the feeds under control."""
+    # Both entry points: MAKER prices the settlement TWAP by default and only
+    # falls back to the close print when SETTLEMENT_TWAP_SEC = 0. These tests
+    # are about the gates, so pin whichever one _fair_value calls.
     monkeypatch.setattr(maker_module, "gbm_win_probability", lambda **kwargs: fair_value)
+    monkeypatch.setattr(maker_module, "twap_win_probability", lambda **kwargs: fair_value)
     if direct_price is not None:
         monkeypatch.setattr(maker_module.feeds_direct, "get_direct_price",
                             lambda asset: direct_price)
