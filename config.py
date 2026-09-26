@@ -97,6 +97,19 @@ ASSET_ORACLE = {
     "EURUSD": "TWELVEDATA", "GBPUSD": "TWELVEDATA", "XAUUSD": "TWELVEDATA",
 }
 
+# Settlement reference for the crypto series. Operator notice 2026-09-26: these
+# markets resolve on a Chainlink 60-second time-weighted average price, not the
+# Binance spot print at close. Two consequences the code has to respect:
+#   1. The random variable is the average over the final minute, so the last
+#      60s of diffusion is partly averaged away — see
+#      strategies.utils.twap_win_probability. Set 0 to model the close print.
+#   2. ASSET_ORACLE above is now the *independent* feed we cross-check with, not
+#      the settlement source. Binance spot and the Chainlink TWAP differ by
+#      both aggregation basis and the averaging lag, so the minimum-distance
+#      calibrations are measured against a proxy, not against the settling
+#      series.
+SETTLEMENT_TWAP_SEC = _env_float("SETTLEMENT_TWAP_SEC", 60.0)
+
 # ── Strategies ────────────────────────────────────────────────────────────────
 ACTIVE_STRATEGIES = [
     "SNIPE", "MAKER", "ORACLE_ARB", "FRONTRUN", "CORRELATE",

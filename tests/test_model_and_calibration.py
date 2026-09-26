@@ -151,7 +151,12 @@ def _market(yes: float, market_id: str, secs: float = 400.0):
 
 
 def _evaluate(monkeypatch, market, model_probability):
+    # Both entry points: SNIPE prices the settlement TWAP by default and only
+    # falls back to the close print when SETTLEMENT_TWAP_SEC = 0. These tests
+    # are about the gates, so pin whichever one the pipeline calls.
     monkeypatch.setattr(snipe_module, "gbm_win_probability",
+                        lambda **kwargs: model_probability)
+    monkeypatch.setattr(snipe_module, "twap_win_probability",
                         lambda **kwargs: model_probability)
     learned = {"chat_id": "u-band", "mode": "balanced"}
     signal = asyncio.run(SnipeStrategy().evaluate(

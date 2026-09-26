@@ -244,6 +244,100 @@ def gbm_win_probability(
     return _norm_cdf(d2)
 
 
+def twap_effective_horizons(secs: float, window_sec: float = 60.0) -> tuple[float, float]:
+    """``(drift_seconds, variance_seconds)`` for a contract settled on a TWAP.
+
+    Bayse settles its crypto series against a **Chainlink 60-second
+    time-weighted average price**, not the spot print at close (operator
+    notice, 2026-09-26; the public docs still say only "resolved based on the
+    real-world result"). The average is a different random variable from the
+    terminal spot, and pricing the terminal spot misprices it.
+
+    For the arithmetic average ``A`` of a GBM over the window ``[T-w, T]``,
+    matching log-normal moments gives, with ``a = secs - w`` the time until the
+    window opens::
+
+        E[ln A]   = ln S_t + (mu - sigma^2/2) * (a + w/2)
+        Var[ln A] = sigma^2 * (a + w/3)
+
+    so the drift acts over ``secs - w/2`` while the variance acts over
+    ``secs - 2w/3``: the final minute of diffusion is averaged away. Inside the
+    window (``secs < w``) the elapsed part of the average is already known and
+    only the remaining ``secs`` is random, itself averaged — drift over
+    ``secs/2``, variance over ``secs/3``.
+
+    ``window_sec = 0`` restores the terminal-spot model exactly.
+    """
+    if window_sec <= 0 or secs <= 0:
+        return secs, secs
+    if secs >= window_sec:
+        return secs - window_sec / 2.0, secs - window_sec * (2.0 / 3.0)
+    return secs / 2.0, secs / 3.0
+
+
+def realized_twap_integral(asset: str, state, window_sec: float = 60.0):
+    """``(integral of price dt, elapsed seconds)`` over the averaging window so far.
+
+    Only meaningful when evaluating inside the final ``window_sec`` before
+    close; returns ``(0.0, 0.0)`` when there is no usable history. Trapezoid
+    integration over the tick history, which already carries timestamps.
+    """
+    hist = getattr(state, "price_history", None)
+    series = hist.get(asset) if hist else None
+    if not series or len(series) < 2:
+        return 0.0, 0.0
+    newest_t = series[-1][0]
+    pts = [(t, p) for t, p in series if newest_t - t <= window_sec and p > 0]
+    if len(pts) < 2:
+        return 0.0, 0.0
+    total = 0.0
+    for (t0, p0), (t1, p1) in zip(pts, pts[1:]):
+        total += 0.5 * (p0 + p1) * (t1 - t0)
+    return total, pts[-1][0] - pts[0][0]
+
+
+def twap_win_probability(spot: float, threshold: float, secs: float,
+                         hourly_vol: float, window_sec: float = 60.0,
+                         realized_integral: float = 0.0,
+                         realized_secs: float = 0.0,
+                         hourly_drift: float = 0.0) -> float:
+    """``P(settlement TWAP >= threshold)`` — the quantity Bayse actually settles.
+
+    Drop-in replacement for :func:`gbm_win_probability` on TWAP-settled
+    markets. When part of the averaging window has already elapsed, its
+    contribution (``realized_integral`` over ``realized_secs``) is fixed, so
+    the requirement shifts to the average still needed over the *remaining*
+    window — which makes an entry inside the final minute far more informative
+    than a terminal-spot model can express.
+    """
+    if spot <= 0 or threshold <= 0 or secs <= 0:
+        return gbm_win_probability(spot, threshold, secs, hourly_vol,
+                                   hourly_drift=hourly_drift)
+    if hourly_vol <= 0:
+        hourly_vol = config.ASSET_HOURLY_VOL.get("BTC", 0.018)
+
+    target = threshold
+    if window_sec > 0 and 0 < realized_secs < window_sec:
+        remaining = window_sec - realized_secs
+        target = (threshold * window_sec - realized_integral) / remaining
+        if target <= 0:
+            return 0.999          # the elapsed average already settles it
+        drift_secs, var_secs = remaining / 2.0, remaining / 3.0
+    else:
+        drift_secs, var_secs = twap_effective_horizons(secs, window_sec)
+
+    if var_secs <= 0:
+        return 1.0 if spot > target else 0.0
+    t_drift = max(drift_secs, 0.0) / 3600.0
+    t_var = var_secs / 3600.0
+    jensen_corr = -0.5 * (hourly_vol ** 2)
+    numerator = math.log(spot / target) + (hourly_drift + jensen_corr) * t_drift
+    denominator = hourly_vol * math.sqrt(t_var)
+    if denominator <= 0:
+        return 1.0 if spot > target else 0.0
+    return _norm_cdf(numerator / denominator)
+
+
 def win_probability(dist_pct: float, secs: float, asset: str,
                     sigma_override: float = None) -> float:
     """

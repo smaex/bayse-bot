@@ -78,7 +78,12 @@ def _state(history=None):
 
 def _evaluate(monkeypatch, market, model_probability, history=None):
     """Run the real strategy with the diffusion model pinned to a probability."""
+    # Both entry points: SNIPE prices the settlement TWAP by default and only
+    # falls back to the close print when SETTLEMENT_TWAP_SEC = 0. These tests
+    # are about the gates, so pin whichever one the pipeline calls.
     monkeypatch.setattr(snipe_module, "gbm_win_probability",
+                        lambda **kwargs: model_probability)
+    monkeypatch.setattr(snipe_module, "twap_win_probability",
                         lambda **kwargs: model_probability)
     monkeypatch.setattr(snipe_module.global_state, "price_history", {})
     monkeypatch.setattr(snipe_module.global_state, "market_flips", {})

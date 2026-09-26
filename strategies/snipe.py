@@ -17,7 +17,9 @@ from strategies.utils import (
     gbm_win_probability,
     note_reject,
     probability_to_certainty,
+    realized_twap_integral,
     realized_vol_hourly,
+    twap_win_probability,
 )
 log = logging.getLogger("strat.snipe")
 
@@ -220,14 +222,38 @@ class SnipeStrategy(BaseStrategy):
         if secs < 300:
             rv *= 1.0 + 0.25 * ((300.0 - secs) / 240.0)
 
-        raw_w_yes = gbm_win_probability(
-            spot=live_spot,
-            threshold=threshold,
-            secs=secs,
-            hourly_vol=rv,
-            hourly_drift=0.0,
-            horizon_cap=0.0,
-        )
+        # Bayse settles these crypto markets on a Chainlink 60-second TWAP, not
+        # the spot print at close, so the random variable is the average over
+        # the final window and not the terminal spot. Pricing the terminal spot
+        # overstates how much the last minute can still move the outcome —
+        # SNIPE_MIN_SECS_TO_CLOSE is exactly 60s, so every entry here has the
+        # whole window in front of it. SETTLEMENT_TWAP_SEC = 0 restores the
+        # terminal-spot model.
+        twap_sec = float(getattr(config, "SETTLEMENT_TWAP_SEC", 0.0) or 0.0)
+        if twap_sec > 0:
+            integral, elapsed = (
+                realized_twap_integral(asset, state, twap_sec - secs)
+                if secs < twap_sec else (0.0, 0.0)
+            )
+            raw_w_yes = twap_win_probability(
+                spot=live_spot,
+                threshold=threshold,
+                secs=secs,
+                hourly_vol=rv,
+                window_sec=twap_sec,
+                realized_integral=integral,
+                realized_secs=elapsed,
+                hourly_drift=0.0,
+            )
+        else:
+            raw_w_yes = gbm_win_probability(
+                spot=live_spot,
+                threshold=threshold,
+                secs=secs,
+                hourly_vol=rv,
+                hourly_drift=0.0,
+                horizon_cap=0.0,
+            )
         raw_w_no = 1.0 - raw_w_yes
 
         yes_price = market.get("yes_price", 0.50)
