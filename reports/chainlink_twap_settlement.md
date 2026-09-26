@@ -150,6 +150,29 @@ The bigger MAKER consequences are not in the model:
   reliability curve in `analysis.reliability_table()` says otherwise — but it is
   the first thing to revisit once there are resolved trades.
 
+## 4b. Fixed: the relay could enter the model's price history
+
+`bot._on_spot_price` is the **relay** callback (`feeds.start_feeds(on_price=…)`),
+and it recorded `check_lag(...)["price"]` into
+`strategy.update_price_history`. `check_lag` returns
+`best = p if lag_sec < 2.0 else relay_price` — it is answering "which price is
+fresher right now", so past a 2-second-old oracle sample it hands back the
+**relay**. That history feeds the measured volatility, the 5-minute momentum,
+the Kalman velocity and the GARCH variance, so the substitution biased all four
+*low*, which makes the model overconfident rather than cautious.
+
+Invisible while the relay was Binance-derived. Not invisible now: the relay is
+a 60-second average, so the fallback was injecting a smoothed series. The
+history now uses the oracle until it is stale by `FEED_STALE_SEC` (30s) — the
+standard the rest of the bot already applies — and falls back to the relay only
+past that, because history must not stop when the oracle dies. The
+`status == "stale"` branch is unchanged: it has always recorded the relay,
+deliberately, since blocking evaluations once caused 4-hour blackouts.
+
+Covered by `tests/test_oracle_history_source.py` (5 tests). With the previous
+`bot.py` restored, the two behavioural ones fail and the three controls pass, so
+they pin the fix rather than restating it.
+
 ## 5. How to confirm the rule from the market itself
 
 `eventCloseValue` is documented as "Closing price at resolution. Present on
@@ -163,7 +186,7 @@ turns an unverified notice into a measured one.
 
 ## 6. Verification
 
-`pytest -q` → **269 passed** (252 before this notice). 17 tests in
+`pytest -q` → **274 passed** (252 before this notice). 17 tests in
 `tests/test_twap_settlement.py`: the closed form against simulation (5 cases,
 tolerance 1.5 pts, observed worst 0.3), the terminal-spot model shown
 materially wrong at the entry deadline, `window_sec = 0` reproducing

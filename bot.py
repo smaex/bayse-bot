@@ -1709,8 +1709,24 @@ def _on_spot_price(asset: str, price: float):
         asyncio.create_task(_evaluate_all_users_for_asset(asset, penalty=0.0))
         return
     penalty = 0.0010 if lag["status"] == "degraded" else 0.0
-    strategy.update_price_history(asset, lag["price"])
-    recorder.record_spot_tick(asset, lag["price"])
+    # This history feeds the measured volatility, the 5-minute momentum, the
+    # Kalman drift and the GARCH variance — so it must be the independent
+    # oracle series. check_lag hands back the *relay* price once its oracle
+    # sample is 2s old, because it is answering "which price is fresher right
+    # now". That was harmless while the relay was Binance-derived; since
+    # 2026-09-26 the relay is a Chainlink 60-second TWAP, so the substitution
+    # injects a smoothed series that understates all four estimators. A
+    # 5-second-old Binance print is still a Binance print: use the oracle until
+    # it is stale by the same standard the rest of the bot applies, and fall
+    # back to the relay only past that.
+    direct_price, direct_time = feeds_direct.get_direct_price(asset)
+    history_price = (
+        direct_price
+        if direct_price and (time.time() - direct_time) <= config.FEED_STALE_SEC
+        else lag["price"]
+    )
+    strategy.update_price_history(asset, history_price)
+    recorder.record_spot_tick(asset, history_price)
     asyncio.create_task(_evaluate_all_users_for_asset(asset, penalty))
 
 
