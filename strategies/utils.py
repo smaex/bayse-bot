@@ -6,9 +6,70 @@ from datetime import datetime, timezone
 log = logging.getLogger("strategies.utils")
 
 
-def realized_vol_hourly(asset: str, state) -> float:
-    """Blended hourly vol: max(GARCH estimate, config baseline)."""
+def measured_vol_hourly(asset: str, state, window_sec: float = 300.0,
+                        min_ticks: int = 20):
+    """Hourly volatility measured from the tick history's own timestamps.
+
+    Returns ``None`` when there is not enough history to measure.
+
+    Why this exists: the GARCH branch of :func:`realized_vol_hourly` scales
+    per-tick variance by a fixed 720, which is an assumption of one tick every
+    five seconds. The oracle feed is a Binance ``bookTicker`` stream — many
+    ticks a second, with evaluations debounced at 250ms — so that factor
+    understates the annualised vol by ``sqrt(ticks_per_hour / 720)``, and
+    because the GARCH value is then compared with ``max()`` against
+    ``ASSET_HOURLY_VOL``, in a calm tape the hard-coded constant won outright.
+    Every probability the model produced was therefore priced off a 1.8%/h BTC
+    vol regardless of what the tape was actually doing.
+
+    Dividing by the *measured* mean tick interval makes the result correct at
+    whatever cadence the feed happens to run. Bid-ask bounce inflates a
+    tick-level estimate, so this is conservative rather than optimistic.
+    """
+    hist = getattr(state, "price_history", None)
+    series = hist.get(asset) if hist else None
+    if not series or len(series) < min_ticks:
+        return None
+    newest_t = series[-1][0]
+    pts = [(t, p) for t, p in series if newest_t - t <= window_sec and p > 0]
+    if len(pts) < min_ticks:
+        return None
+    span = pts[-1][0] - pts[0][0]
+    if span < 20.0:
+        return None
+    squares = []
+    for (_, p0), (_, p1) in zip(pts, pts[1:]):
+        if p0 > 0 and p1 > 0:
+            r = math.log(p1 / p0)
+            squares.append(r * r)
+    if not squares:
+        return None
+    mean_dt = span / len(squares)
+    if mean_dt <= 0:
+        return None
+    var_per_sec = (sum(squares) / len(squares)) / mean_dt
+    if not math.isfinite(var_per_sec) or var_per_sec <= 0:
+        return None
+    vol = math.sqrt(var_per_sec * 3600.0)
     base = config.ASSET_HOURLY_VOL.get(asset, 0.022)
+    # Guard rails for degenerate data only (a stalled or duplicated feed can
+    # produce a near-zero or absurd reading). Not a tuning knob: the point of
+    # the measurement is to move away from the constant.
+    return min(max(vol, base * 0.10), base * 10.0)
+
+
+def realized_vol_hourly(asset: str, state) -> float:
+    """Hourly vol for the diffusion model.
+
+    Prefers a measurement taken from the live tick history; falls back to the
+    GARCH estimate and finally to the configured baseline. Set
+    ``USE_MEASURED_VOL=false`` to restore the old constant/GARCH behaviour.
+    """
+    base = config.ASSET_HOURLY_VOL.get(asset, 0.022)
+    if getattr(config, "USE_MEASURED_VOL", True):
+        measured = measured_vol_hourly(asset, state)
+        if measured is not None:
+            return measured
     if not hasattr(state, "garch_state"):
         return base
     g = state.garch_state.get(asset)

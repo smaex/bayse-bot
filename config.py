@@ -258,6 +258,14 @@ ASSET_HOURLY_VOL = {
     "XAUUSD": 0.0015,
 }
 
+# These are priors, not measurements: BTC at 1.8%/h is roughly 4x a typical
+# calm-market hourly vol, and every probability the diffusion model produces
+# scales with it. realized_vol_hourly() now prefers a vol measured from the
+# live tick history (see strategies.utils.measured_vol_hourly) and falls back
+# to these values when there is not enough history. Set false to restore the
+# constant/GARCH-only behaviour.
+USE_MEASURED_VOL = _env_bool("USE_MEASURED_VOL", True)
+
 # ── Kelly sizing ──────────────────────────────────────────────────────────────
 # Min: 3% — smallest useful bet on Bayse (100₦ min, 3% of ₦30k = ₦900)
 # Max: 50% — only hit on ORACLE_ARB near-certainty signals (95%+ confidence)

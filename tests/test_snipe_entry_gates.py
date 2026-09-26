@@ -142,13 +142,20 @@ def test_the_certainty_floor_needs_a_nineteen_point_disagreement(monkeypatch):
     assert signal.win_prob == pytest.approx(blend_with_market(0.74, 0.55), abs=1e-9)
 
 
-def test_nothing_can_enter_at_the_top_of_the_price_band(monkeypatch):
-    """``ev_ceil`` is clamped to SNIPE_MAX_MARKET_PRICE and compared with ``>=``,
-    so a market priced exactly at the band's upper edge is always refused."""
+def test_the_top_of_the_price_band_is_reachable(monkeypatch):
+    """It used to be unreachable, and this test asserted that it was.
+
+    ``ev_ceil`` was ``min(SNIPE_MAX_MARKET_PRICE, max_ev_price(...))`` and the
+    gate is ``market_price >= ev_ceil``, so a market priced exactly at the
+    band's upper edge was refused at *any* model probability — verified with a
+    raw 0.9995. The band gate owns the price limit; the ceiling is now purely
+    fee+margin economics, so 0.65 behaves like the rest of the band.
+    """
     ceiling = config.SNIPE_MAX_MARKET_PRICE
     signal, rejects = _evaluate(monkeypatch, _market(yes=ceiling), 0.99)
-    assert signal is None
-    assert "SNIPE:price_at_or_above_ev_ceiling" in _codes(rejects)
+    assert "SNIPE:price_at_or_above_ev_ceiling" not in _codes(rejects)
+    assert signal is not None, rejects
+    assert signal.market_price == pytest.approx(ceiling)
 
 
 # ── The lumped counter is now specific ────────────────────────────────────────

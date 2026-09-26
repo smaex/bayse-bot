@@ -381,10 +381,15 @@ class SnipeStrategy(BaseStrategy):
             "full_send": 0.03,
             "custom": 0.03,
         }.get(mode, 0.03)
-        ev_ceil = min(
-            config.SNIPE_MAX_MARKET_PRICE,
-            max_ev_price(w_est, market_price, fee_rate, min_margin=margin),
-        )
+        # The EV ceiling is economics; the entry band above is price policy.
+        # They used to be combined with min(SNIPE_MAX_MARKET_PRICE, ...), which
+        # made the band cap double as a ceiling: at market_price == 0.65 the
+        # comparison `market_price >= ev_ceil` was true for *any* model
+        # probability, so the top of the advertised band could never be entered
+        # no matter how strong the model was (verified: raw 0.9995 still
+        # refused). The band gate at SNIPE_MIN_ENTRY_PRICE..MAX already owns
+        # the price limit, so the ceiling here is purely fee+margin economics.
+        ev_ceil = max_ev_price(w_est, market_price, fee_rate, min_margin=margin)
         if market_price >= ev_ceil:
             note_reject(learned, "SNIPE", "price_at_or_above_ev_ceiling",
                         f"price={market_price:.3f} ceiling={ev_ceil:.3f}")
