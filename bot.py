@@ -1625,6 +1625,9 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
         stall.note_evaluation(
             chat_id,
             markets_total=len(active_markets),
+            # The scanner holds markets whose status is not "open" as well, so
+            # len(active_markets) is a discovery count, not an open count.
+            open_markets=len(active_markets) - skipped_status,
             in_scope=in_scope,
             evaluated=evaluated,
             signals=len(all_signals),
@@ -1969,25 +1972,34 @@ async def _check_trading_stalls() -> None:
             continue
         try:
             context = _stall_context(chat_id, user)
-            data = stall.report(chat_id, **context)
+            # One instant for the whole alert. The header, the report body and
+            # the NO_CONFIRMED_FILL detail all print "minutes since the last
+            # confirmed fill"; they disagreed inside a single message (observed:
+            # "stall — 1573 min" over "Last confirmed fill: 1572 min ago"). The
+            # rounding itself is fixed in stall.format_gap_minutes — every
+            # renderer goes through it — and reading one clock here keeps a
+            # sub-second drift from straddling a minute boundary as well.
+            now = time.time()
+            data = stall.report(chat_id, now=now, **context)
             verdict = data["verdict"]
-            gap = stall.trade_gap_minutes(chat_id)
+            gap = stall.trade_gap_minutes(chat_id, now=now)
             severe = verdict.get("severity") == "critical"
             if gap < limit and not severe:
                 health.touch("trading_stall", chat_id=chat_id, verdict=verdict["code"],
                              gap_min=round(gap, 1))
                 continue
-            if not stall.note_alert(chat_id, verdict["code"]):
+            if not stall.note_alert(chat_id, verdict["code"], now=now):
                 continue
+            gap_text = stall.format_gap_minutes(gap)
             log.warning(
-                f"[{chat_id}] TRADING STALL after {gap:.0f} min — {verdict['code']}: "
+                f"[{chat_id}] TRADING STALL after {gap_text} min — {verdict['code']}: "
                 f"{verdict['headline']} | {verdict['detail']} | action: {verdict['action']}"
             )
             if severe:
                 health.fail("trading_stall", f"{chat_id}: {verdict['code']}", gap_min=round(gap))
             if _tg_app:
                 text = stall.format_report(
-                    chat_id, markdown=True,
+                    chat_id, markdown=True, now=now,
                     **{k: v for k, v in context.items()
                        if k in ("equity", "min_viable", "feed_age_sec",
                                 "eval_max_age_sec", "resting_now")},
@@ -1997,7 +2009,8 @@ async def _check_trading_stalls() -> None:
                 # just placed quotes that never filled.
                 await telegram_bot.send_message(
                     _tg_app, chat_id,
-                    f"🩺 *Trading stall — {gap:.0f} min without a confirmed fill*\n\n{text[:3500]}",
+                    f"🩺 *Trading stall — {gap_text} min without a confirmed fill*\n\n"
+                    f"{text[:3500]}",
                     parse_mode="Markdown",
                 )
         except Exception as stall_err:

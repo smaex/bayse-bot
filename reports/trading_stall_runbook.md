@@ -118,7 +118,16 @@ that work.
 2. **Ask the bot why.** `/why`. Expected codes: `NO_EVALUATION`, `NO_MARKETS`,
    `FEEDS_STALE`, `DRY_RUN`, `PAUSED_MANUAL`, `PAUSED_SESSION`, `LOW_BALANCE`,
    `SCOPE_EMPTY`, `NO_EDGE`, `MAKER_QUOTE_UNCOMPETITIVE`, `EXECUTION_BLOCKED`,
-   `EXPOSURE_CAPPED`, `NO_CONFIRMED_FILL`, `COOLDOWN_BLOCKED`, `HEALTHY`.
+   `SIGNALS_NOT_EXECUTED`, `EXPOSURE_CAPPED`, `NO_CONFIRMED_FILL`,
+   `COOLDOWN_BLOCKED`, `HEALTHY`.
+   (`SCOPE_EMPTY` only fires once the scope has been empty for
+   `stall.SCOPE_EMPTY_CONFIRM_SEC` (15 min) straight: around every series
+   boundary the in-scope markets are briefly undiscoverable because the round
+   closed and the next has not opened, which is the exchange's calendar and not
+   a settings fault. `SIGNALS_NOT_EXECUTED` means signals were produced but the
+   executor recorded no outcome for any of them. `HEALTHY` is only reachable
+   once an order has been placed *and* a fill confirmed — see
+   `reports/stall_report_false_verdicts.md`.)
    (`MAKER_QUOTE_UNCOMPETITIVE`: MAKER's risk-capped bid is too far below the
    live book to compete for a fill — a policy boundary, see
    `reports/maker_zero_fill_diagnosis.md`. `/why` includes the signal's model FV
