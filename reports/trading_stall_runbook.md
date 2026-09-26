@@ -119,9 +119,13 @@ that work.
    `FEEDS_STALE`, `DRY_RUN`, `PAUSED_MANUAL`, `PAUSED_SESSION`, `LOW_BALANCE`,
    `SCOPE_EMPTY`, `NO_EDGE`, `MAKER_QUOTE_UNCOMPETITIVE`, `EXECUTION_BLOCKED`,
    `EXPOSURE_CAPPED`, `NO_CONFIRMED_FILL`, `COOLDOWN_BLOCKED`, `HEALTHY`.
-   (`MAKER_QUOTE_UNCOMPETITIVE`: MAKER has signals but `MAKER_MAX_BID` is below the
-   live book, so it declines to rest quotes that cannot fill — a policy boundary,
-   see `reports/maker_zero_fill_diagnosis.md`.)
+   (`MAKER_QUOTE_UNCOMPETITIVE`: MAKER's risk-capped bid is too far below the
+   live book to compete for a fill — a policy boundary, see
+   `reports/maker_zero_fill_diagnosis.md`. `/why` includes the signal's model FV
+   and hypothetical gross ROI at the best bid; that FV is an estimate, not a
+   measured win rate. `/makershadow` compares read-only cap levels against
+   signal-time books; it does not establish fills or profitability. Do not raise
+   `MAKER_MAX_BID` merely to chase the book.)
 3. **Check the flag, not the vibe.** `LIVE_TRADING=true` in `/opt/bayse-bot/.env`.
    `DRY_RUN` is not a bug — it is the documented safe default, and `render.yaml` ships
    with it `false`.

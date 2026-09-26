@@ -168,6 +168,7 @@ def _maker_quote_against_book(
     book: dict,
     max_price: float,
     *,
+    fair_value: float | None = None,
     min_price: float | None = None,
     tick: float | None = None,
     max_ticks_behind: int | None = None,
@@ -184,6 +185,10 @@ def _maker_quote_against_book(
       first, so it rests until MAKER_ORDER_TIMEOUT cancels it and the next
       signal re-places the same dead quote (the zero-fill churn observed in
       production: five 0.58 quotes, zero fills, ~19 hours without a fill).
+
+    ``fair_value`` is optional diagnostic context only. When supplied, a skip
+    reports model-implied gross returns at the current best bid and ask. It
+    never changes admission or pricing.
 
     Returns ``(price, "", detail)`` for a quote worth resting, or
     ``(None, code, detail)`` with a stable skip code. Never raises the price
@@ -202,6 +207,22 @@ def _maker_quote_against_book(
         (f"best bid {best_bid:.3f}" if best_bid is not None else "no bids")
         + (f" / best ask {best_ask:.3f}" if best_ask is not None else " / no asks")
     )
+    model_at_book = ""
+    try:
+        fv = float(fair_value)
+    except (TypeError, ValueError):
+        fv = math.nan
+    if math.isfinite(fv) and 0.0 < fv < 1.0:
+        modeled_prices = []
+        if best_bid is not None:
+            modeled_prices.append(f"at best bid {fv / best_bid - 1.0:+.1%}")
+        if best_ask is not None:
+            modeled_prices.append(f"at best ask {fv / best_ask - 1.0:+.1%}")
+        if modeled_prices:
+            model_at_book = (
+                f"; model FV {fv:.3f} -> gross ROI " + " and ".join(modeled_prices)
+                + " if filled (model estimate only; before fees/adverse selection)"
+            )
 
     price = round(float(max_price), 3)
     if best_ask is not None and price >= best_ask - 1e-9:
@@ -211,6 +232,7 @@ def _maker_quote_against_book(
         if stepped < min_price - 1e-9:
             return None, "maker_would_cross_book", (
                 f"{book_text}: no passive price >= {min_price:.2f} exists below the ask"
+                f"{model_at_book}"
             )
         price = stepped
     if best_bid is not None:
@@ -218,7 +240,7 @@ def _maker_quote_against_book(
         if ticks_behind > max_ticks_behind:
             return None, "maker_quote_behind_book", (
                 f"max bid {max_price:.3f} is {ticks_behind:.0f} tick(s) under the "
-                f"{book_text}; a post-only bid there cannot fill before timeout"
+                f"{book_text}{model_at_book}; a post-only bid there cannot fill before timeout"
             )
     return price, "", f"{book_text} -> bid {price:.3f}"
 
@@ -740,8 +762,18 @@ async def _execute_logic(
             )
             _trade_cooldown[cooldown_key] = time.time()
             return
-        limit_price, book_skip, book_detail = _maker_quote_against_book(ob, sig.market_price)
+        limit_price, book_skip, book_detail = _maker_quote_against_book(
+            ob, sig.market_price, fair_value=sig.win_prob
+        )
         if limit_price is None:
+            if book_skip in {"maker_quote_behind_book", "maker_would_cross_book"}:
+                try:
+                    import maker_shadow
+                    # The quote was declined already; collect read-only price
+                    # feasibility data without adding work to the order path.
+                    await asyncio.to_thread(maker_shadow.record_candidate, sig, ob)
+                except Exception as shadow_error:
+                    log.debug("MAKER shadow audit failed: %s", shadow_error)
             _stall_skip(chat_id, sig, book_skip, book_detail)
             log.info(f"[{chat_id}] SKIP MAKER {sig.asset} {sig.outcome} — {book_detail}")
             # One book check per market per cooldown window, not per signal.

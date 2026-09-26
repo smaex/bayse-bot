@@ -511,15 +511,15 @@ def verdict(chat_id: str | None, *, now: float | None = None,
         code, count, _, detail = recent_exec_causes[0]
         return out(
             "MAKER_QUOTE_UNCOMPETITIVE",
-            "MAKER has signals, but its price ceiling sits below the live order book, "
-            "so no quote could fill.",
-            f"{code} ×{count} — latest: {detail}. A post-only bid under the best bid only "
-            "fills if every bid above it is exhausted first; previously such quotes were "
-            "placed anyway and expired unfilled after MAKER_ORDER_TIMEOUT, every time.",
-            "This is the MAKER risk/reward ceiling doing its job, not a fault. MAKER_MAX_BID "
-            "(default 0.58: a fill pays at least +72% on a win) caps what MAKER pays. Raise it "
-            "only deliberately, with fill evidence, or accept that MAKER sits out markets that "
-            "trade above it.",
+            "MAKER has signals, but its risk-capped bid is too far below the live book to "
+            "compete for a fill.",
+            f"{code} ×{count} — latest: {detail}. A post-only bid below the best bid fills "
+            "only if higher bids are removed or consumed first.",
+            "Do not raise MAKER_MAX_BID just to force activity. Prob is a model estimate, not "
+            "a confirmed win rate. A fill at the live best bid is positive EV only if the "
+            "calibrated win probability clears that price by a margin after execution costs "
+            "and adverse selection. Keep the cap until out-of-sample fill results support "
+            "changing it.",
             "warn",
         )
     if int(snapshot.get("signals", 0)) > 0 and int(snapshot.get("order_attempts", 0)) > 0 and int(
@@ -574,10 +574,11 @@ def verdict(chat_id: str | None, *, now: float | None = None,
             + (f" ({passive} as passive resting quotes)" if passive else "")
             + f"; {int(snapshot.get('trades', 0))} confirmed fill(s){resting_text}."
             + gap_text + book_text,
-            "Passive quotes often expire unfilled by design. Check /trades for real fills and "
-            "the unfilled-order notices; if every quote expires, the quoting price relative to "
-            "the live book (MAKER_MAX_BID) or MAKER_ORDER_TIMEOUT is the thing to look at — "
-            "not a risk gate.",
+            "Passive quotes often expire unfilled by design. Check /trades and the unfilled-order "
+            "notices. A longer MAKER_ORDER_TIMEOUT will not make a buried quote competitive; "
+            "do not raise MAKER_MAX_BID unless out-of-sample results show the model probability "
+            "clears actual fill prices. Prob is a model estimate, not an observed win rate "
+            "or a guarantee.",
             "warn",
         )
     if _hit_recently("exec:market_cooldown") and not placed_recently and not recent_exec_causes:

@@ -25,6 +25,7 @@ import pytest
 
 import config
 import executor
+import maker_shadow
 import stall
 from risk import RiskManager
 from strategies.base import TradeSignal
@@ -46,11 +47,27 @@ def _book(bids=(), asks=(), **extra):
 def test_quote_buried_under_the_book_is_skipped_not_rested():
     """The production case: 0.58 ceiling, market bidding 0.66."""
     price, code, detail = executor._maker_quote_against_book(
-        _book(bids=[0.66, 0.65], asks=[0.69, 0.70]), 0.58
+        _book(bids=[0.66, 0.65], asks=[0.69, 0.70]), 0.58, fair_value=0.789
     )
     assert price is None
     assert code == "maker_quote_behind_book"
     assert "8 tick(s)" in detail and "0.660" in detail
+    assert "model FV 0.789" in detail
+    assert "gross ROI at best bid +19.5%" in detail
+    assert "at best ask +14.3%" in detail
+
+
+def test_book_skip_shows_when_chasing_the_bid_is_negative_ev_under_the_model():
+    """A high signal probability is not positive EV at an even higher book price."""
+    price, code, detail = executor._maker_quote_against_book(
+        _book(bids=[0.92], asks=[0.94]), 0.58, fair_value=0.789
+    )
+
+    assert price is None and code == "maker_quote_behind_book"
+    assert "model FV 0.789" in detail
+    assert "gross ROI at best bid -14.2%" in detail
+    assert "at best ask -16.1%" in detail
+    assert "model estimate only" in detail
 
 
 def test_quote_that_would_cross_steps_inside_the_ask():
@@ -170,7 +187,15 @@ def maker_env(monkeypatch):
 
     monkeypatch.setattr(executor.telegram_bot, "notify_trade", _notify)
     monkeypatch.setattr(executor, "_tg_app", object())
-    return {"chat": chat, "recorded": recorded, "notified": notified}
+    shadowed = []
+    monkeypatch.setattr(
+        maker_shadow, "record_candidate",
+        lambda sig, book: shadowed.append((sig, book)) or True,
+    )
+    return {
+        "chat": chat, "recorded": recorded, "notified": notified,
+        "shadowed": shadowed,
+    }
 
 
 def _run(env, sig, client, risk=None):
@@ -185,14 +210,19 @@ def _run(env, sig, client, risk=None):
 
 def test_executor_does_not_rest_a_buried_quote(maker_env):
     client = _MakerClient(_book(bids=[0.66], asks=[0.69]))
-    risk = _run(maker_env, _maker_signal(), client)
+    sig = _maker_signal()
+    risk = _run(maker_env, sig, client)
 
     assert client.place_calls == [], "a 0.58 bid under a 0.66 best bid can never fill"
+    assert maker_env["shadowed"] == [(sig, client.book)]
     assert risk.open_positions == {}
     assert maker_env["notified"] == [], "no '📊 MAKER … @ 0.580' message for a quote never sent"
     rejects = stall._users[maker_env["chat"]]["rejects"]
     assert "exec:maker_quote_behind_book" in rejects
     assert "0.660" in rejects["exec:maker_quote_behind_book"]["detail"]
+    assert "model FV 0.750" in rejects["exec:maker_quote_behind_book"]["detail"]
+    assert "gross ROI at best bid +13.6%" in rejects["exec:maker_quote_behind_book"]["detail"]
+    assert "at best ask +8.7%" in rejects["exec:maker_quote_behind_book"]["detail"]
     # One book check per market per cooldown window, not per 5-second signal.
     key = executor._cooldown_key(maker_env["chat"], "m", "MAKER")
     assert key in executor._trade_cooldown
