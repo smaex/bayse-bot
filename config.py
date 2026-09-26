@@ -149,7 +149,17 @@ SNIPE_MAX_MARKET_PRICE = 0.65   # Restored 2026-09-25 by operator decision: PR #
 SNIPE_MIN_ENTRY_PRICE  = 0.35   # Allow attractive underdog mispricings while blocking extreme lotteries.
 SNIPE_MIN_DISTANCE_PCT = 0.0010 # Base minimum spot/threshold separation (calibrated by asset).
 SNIPE_MIN_RAW_MODEL_EDGE = 0.035 # Independent model must exceed market price by at least 3.5% (comfortably clearing fees).
-SNIPE_MIN_BLENDED_EDGE = 0.025  # Required after shrinking toward market consensus.
+                                # NOT the binding threshold: the blend below gives the market 65%
+                                # of the log-odds and SNIPE_MIN_BLENDED_EDGE then re-imposes a gap
+                                # from that same market price, so the raw edge actually required is
+                                # ~0.069-0.072 across the whole entry band. Lowering this value
+                                # alone changes nothing. See
+                                # snipe.effective_raw_edge_floor() and
+                                # reports/snipe_no_entry_diagnosis.md.
+SNIPE_MIN_BLENDED_EDGE = 0.025  # Required after shrinking toward market consensus. This is the gate
+                                # that actually decides: measured against the market price *after*
+                                # a 0.35-weight shrinkage toward it, so it costs ~2x the raw edge
+                                # the line above appears to ask for.
 SNIPE_MODEL_WEIGHT = 0.35       # Market gets 65% weight until calibration improves.
 SNIPE_VOL_SAFETY_MULTIPLIER = 1.25
 MAKER_ORDER_TIMEOUT = 60        # Seconds before cancelling stale resting maker quote.
