@@ -105,6 +105,7 @@ def build_app() -> Application:
         ("rekey",         cmd_rekey),
         ("wallet",        cmd_wallet),
         ("shadow",        cmd_shadow),
+        ("makershadow",   cmd_makershadow),
         ("arbshadow",     cmd_arbshadow),
         ("help",          cmd_help),
     ]:
@@ -703,6 +704,14 @@ async def cmd_shadow(update: Update, _ctx):
 
 
 @_guard
+async def cmd_makershadow(update: Update, _ctx):
+    import maker_shadow
+    await update.message.reply_text(
+        maker_shadow.get_summary_report(), parse_mode="Markdown"
+    )
+
+
+@_guard
 async def cmd_arbshadow(update: Update, _ctx):
     import complete_set_shadow
     await update.message.reply_text(
@@ -727,6 +736,7 @@ async def cmd_help(update: Update, _ctx):
         "/pause — stop trading\n"
         "/resume — resume trading\n"
         "/shadow — view mid-market shadow tracker report\n"
+        "/makershadow — view read-only MAKER quote-ladder observations\n"
         "/arbshadow — view read-only complete-set arbitrage observations\n"
         "/debug — diagnose why trades aren't firing\n"
         "/why — the single reason nothing has traded, with evidence\n"
@@ -1016,11 +1026,18 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
     reason = (getattr(sig, "reason", "") or "")[:300]
     market_price = getattr(sig, "market_price", 0.0)
     win_prob = getattr(sig, "win_prob", sig.certainty)
+    maker_limit = strat == "MAKER" and engine == "CLOB_LIMIT"
     # A resting LIMIT is an order, not a fill — say so, so a quote that later
     # expires unfilled does not read as a trade that happened.
     status_line = (
         "Status: resting post-only bid — *not filled yet*\n"
         if engine == "CLOB_LIMIT" else ""
+    )
+    probability_line = (
+        f"Signal score (heuristic): *{sig.certainty:.0%}*\n"
+        f"Model win estimate: *{win_prob:.1%}* (not an observed win rate)\n"
+        if maker_limit else
+        f"Certainty: *{sig.certainty:.0%}* (Prob: {win_prob:.1%})\n"
     )
 
     msg = (
@@ -1029,7 +1046,7 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
         f"Direction: {dir_icon} *{sig.outcome}*\n"
         f"Size: *₦{amount:,.0f}* @ price *{market_price:.3f}*\n"
         f"{status_line}"
-        f"Certainty: *{sig.certainty:.0%}* (Prob: {win_prob:.1%})\n"
+        f"{probability_line}"
         + (_code_span(reason) if reason else "")
     )
     try:
@@ -1037,9 +1054,14 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
     except Exception:
         # Fallback — plain text if markdown parsing fails
         try:
+            fallback_probability = (
+                f"signal score {sig.certainty:.0%} (heuristic); "
+                f"model win estimate {win_prob:.1%} (not an observed win rate)"
+                if maker_limit else f"Cert: {sig.certainty:.0%}"
+            )
             plain = (
                 f"{icon_strat} [{strat}] {sig.asset} {sig.timeframe} {dir_icon} {sig.outcome} "
-                f"₦{amount:,.0f} @ {market_price:.3f} (Cert: {sig.certainty:.0%})"
+                f"₦{amount:,.0f} @ {market_price:.3f} ({fallback_probability})"
                 + (" — resting bid, not filled yet" if engine == "CLOB_LIMIT" else "")
             )
             await app.bot.send_message(chat_id=cid, text=plain)

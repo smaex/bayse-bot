@@ -118,6 +118,11 @@ def test_production_report_names_the_real_problem():
     assert "5 order(s) placed" in verdict["detail"]
     assert "0 resting on the book now" in verdict["detail"]
     assert "still resting" not in verdict["detail"]
+    assert (
+        "A longer MAKER_ORDER_TIMEOUT will not make a buried quote competitive"
+        in verdict["action"]
+    )
+    assert "not an observed win rate" in verdict["action"]
     assert verdict["trade_gap_min"] == pytest.approx(1124, abs=1)
 
     gate_codes = [row["code"] for row in data["top_rejects"]]
@@ -319,6 +324,8 @@ def test_maker_notification_is_valid_markdown_and_says_it_is_not_a_fill():
     assert legacy_markdown_error(text) is None, text
     assert "`MAKER YES fv=0.740 spread_capture bid=0.580 | MULT(x1.20)`" in text
     assert "not filled yet" in text
+    assert "Signal score (heuristic): *95%*" in text
+    assert "Model win estimate: *74.0%* (not an observed win rate)" in text
 
 
 def test_exchange_rejection_notice_is_valid_markdown():
