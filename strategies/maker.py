@@ -36,7 +36,13 @@ import config
 import feeds_direct
 import feeds
 from strategies.base import TradeSignal, BaseStrategy
-from strategies.utils import gbm_win_probability, note_reject, realized_vol_hourly
+from strategies.utils import (
+    gbm_win_probability,
+    note_reject,
+    realized_twap_integral,
+    realized_vol_hourly,
+    twap_win_probability,
+)
 
 log = logging.getLogger("strat.maker")
 
@@ -52,6 +58,10 @@ REQUOTE_THRESHOLD = 0.0010   # 0.10% (more responsive cancellation on adverse mo
 MIN_SECS_TO_CLOSE = 45
 
 # Max secs to market close. Don't open new maker positions if >80% of market life is over.
+# NOT WIRED: the quoting window is the literal 750/180 pair in evaluate()
+# (minutes 2.5-12 of a 15-minute candle). Same for BOOK_DEPTH, REQUOTE_INTERVAL
+# and MAX_REWARDED_SPREAD_CENTS below — they read like tuning knobs and change
+# nothing, which is how SNIPE_MIN_RAW_MODEL_EDGE already misled once.
 MAX_MAKER_WINDOW  = 720      # Quote for first 12 minutes of a 15-min market
 MARKET_LIFE_SEC   = 900      # Standard 15-min market
 
@@ -60,7 +70,19 @@ MARKET_LIFE_SEC   = 900      # Standard 15-min market
 MAX_REWARDED_SPREAD_CENTS = 5   # From API: "maxSpreadCents": 5
 
 # Volatility threshold — if realized vol is very high, widen spread or skip.
+# NOT EFFECTIVE as written: _realized_vol() returns the mean *per-tick*
+# absolute return over the last 120s, so at roughly one tick a second this
+# fires only if price moves 0.3% every second (~18% a minute). It has never
+# appeared in a production gate counter. Left alone deliberately — making it
+# fire would suppress quoting, which is a risk decision, not a cleanup.
 HIGH_VOL_THRESHOLD = 0.003  # 0.3% per minute = very volatile
+
+# The certainty floor (cert = max(fv, 0.50 + 3.5*edge) >= 0.65) is the gate
+# that actually decides MAKER entries. Solving it for the edge term gives the
+# alternative to fv >= 0.65; the fv >= 0.62 direction gate is never binding.
+CERT_FLOOR        = 0.65
+CERT_EDGE_WEIGHT  = 3.5
+MIN_EDGE_FOR_CERT_FLOOR = (CERT_FLOOR - 0.50) / CERT_EDGE_WEIGHT   # 0.0429
 
 # Order book depth to check for existing liquidity.
 BOOK_DEPTH        = 10
@@ -84,16 +106,24 @@ class MakerStrategy(BaseStrategy):
         super().__init__("MAKER")
         self.open_orders: dict[str, dict] = {}   # market_id → order info
 
-    def _fair_value(self, asset: str, market: dict, state=None) -> Optional[float]:
+    def _fair_value(self, asset: str, market: dict, state=None,
+                    spot: float | None = None) -> Optional[float]:
         """
         Fair Value of YES = P(spot at close >= threshold).
 
         Uses rigorous GBM model with Itô correction and asset-specific Kalman velocity drift.
+
+        ``spot`` is the price the caller already resolved. It used to re-read
+        the feeds here with its own 10s staleness rule, so one decision could
+        compare a ``dist_pct`` from one price against a fair value computed
+        from another — and both against Bayse's own relay price when the
+        independent oracle was 10-30s old.
         """
-        spot, t = feeds_direct.get_direct_price(asset)
-        if not spot or (time.time() - t) > 10:
-            # Fall back to Bayse relay price
-            spot = feeds.spot.get(asset, 0.0)
+        if not spot:
+            spot, t = feeds_direct.get_direct_price(asset)
+            if not spot or (time.time() - t) > 10:
+                # Fall back to Bayse relay price
+                spot = feeds.spot.get(asset, 0.0)
         if not spot:
             return None
 
@@ -113,15 +143,38 @@ class MakerStrategy(BaseStrategy):
         else:
             hourly_drift = 0.0
 
-        # Exact GBM win probability
-        fv = gbm_win_probability(
-            spot=spot,
-            threshold=threshold,
-            secs=secs_to_close,
-            hourly_vol=rv,
-            hourly_drift=hourly_drift,
-            horizon_cap=180.0,
-        )
+        # Fair value of the *settled* quantity. Bayse resolves these markets on
+        # a Chainlink 60-second TWAP, not the close print, so the average — not
+        # the terminal spot — is what a resting quote is paid on. Pricing the
+        # close print overstates how much the final minute can still move
+        # against us, which matters more for a maker than for a taker: the
+        # quote has to survive until close. The Kalman drift cap is unchanged.
+        twap_sec = float(getattr(config, "SETTLEMENT_TWAP_SEC", 0.0) or 0.0)
+        if twap_sec > 0:
+            integral, elapsed = (
+                realized_twap_integral(asset, state, twap_sec - secs_to_close)
+                if secs_to_close < twap_sec else (0.0, 0.0)
+            )
+            fv = twap_win_probability(
+                spot=spot,
+                threshold=threshold,
+                secs=secs_to_close,
+                hourly_vol=rv,
+                window_sec=twap_sec,
+                realized_integral=integral,
+                realized_secs=elapsed,
+                hourly_drift=hourly_drift,
+                horizon_cap=180.0,
+            )
+        else:
+            fv = gbm_win_probability(
+                spot=spot,
+                threshold=threshold,
+                secs=secs_to_close,
+                hourly_vol=rv,
+                hourly_drift=hourly_drift,
+                horizon_cap=180.0,
+            )
 
         return max(0.03, min(0.97, fv))
 
@@ -176,9 +229,20 @@ class MakerStrategy(BaseStrategy):
             return None
 
         # ── Price data ────────────────────────────────────────────────────────
-        spot, t = feeds_direct.get_direct_price(asset)
-        if not spot or (time.time() - t) > 10:
-            spot = feeds.spot.get(asset, 0.0)
+        # The evaluation loop already picked the oracle for this pass — direct
+        # Binance price while fresh, relay as a documented fallback, or it
+        # skipped the market as stale — and hands it to every strategy. Use it.
+        # The local re-read this replaces kept a private 10s staleness rule and
+        # fell back to the Bayse relay, so for an oracle aged 10-30s
+        # (FEED_STALE_SEC) MAKER computed "fair value" from the same source as
+        # the market price it compares against, while SNIPE used the
+        # independent oracle. feeds_direct.get_direct_price documents exactly
+        # this: "Never substitute the Bayse relay here."
+        spot = spot_price
+        if not spot:
+            spot, t = feeds_direct.get_direct_price(asset)
+            if not spot or (time.time() - t) > 10:
+                spot = feeds.spot.get(asset, 0.0)
         threshold = market.get("threshold", 0.0)
         if not spot or not threshold:
             note_reject(learned, "MAKER", "missing_spot_or_threshold")
@@ -198,7 +262,7 @@ class MakerStrategy(BaseStrategy):
             return None
 
         # Calculate Drift-Aware Fair Value
-        fv_yes = self._fair_value(asset, market, state=state)
+        fv_yes = self._fair_value(asset, market, state=state, spot=spot)
         if fv_yes is None:
             note_reject(learned, "MAKER", "fair_value_unavailable")
             return None
@@ -255,6 +319,11 @@ class MakerStrategy(BaseStrategy):
         # NEVER trade against the spot side or enter when momentum actively opposes!
         # Requires true high-probability thesis (Fair Value >= 0.62, edge >= 0.020)
         # AND strictly supporting momentum:
+        # NOTE: fv >= 0.62 here is not the operative threshold. The certainty
+        # floor further down needs max(fv, 0.50 + 3.5*edge) >= 0.65, so entries
+        # happen on fv >= 0.65 or on a 4.29c edge; an fv of 0.62-0.65 with a
+        # thin edge is refused there instead. Same trap as SNIPE's raw-edge
+        # floor — the number in the comment is not the number that binds.
         # - For YES: momentum must be positive (mom_5m >= +0.0005)
         # - For NO: momentum must be negative (mom_5m <= -0.0005)
         chosen_side = None
@@ -272,10 +341,35 @@ class MakerStrategy(BaseStrategy):
             market_bid  = no_bid_price
             outcome_id  = market.get("no_id", "")
         else:
-            note_reject(learned, "MAKER", "no_trend_or_edge_alignment",
-                        f"edge_yes={edge_yes:+.3f} edge_no={edge_no:+.3f}")
+            # Same defect as SNIPE's lumped gate: four independent conditions,
+            # one counter, so the report could not say which one bound.
+            if dist_pct > 0:
+                side, fv, edge, bid = "YES", fv_yes, edge_yes, yes_bid_price
+                momentum_ok = mom_5m >= min_mom_req
+            elif dist_pct < 0:
+                side, fv, edge, bid = "NO", fv_no, edge_no, no_bid_price
+                momentum_ok = mom_5m <= -min_mom_req
+            else:
+                side, fv, edge, bid, momentum_ok = "NEITHER", fv_yes, edge_yes, yes_bid_price, True
+            detail = (
+                f"{side} fv={fv:.3f} (needs >=0.620) edge={edge:+.3f} "
+                f"(needs >={min_maker_edge:+.3f}) mkt={bid:.3f} "
+                f"dist={dist_pct:+.3%} mom_5m={mom_5m:+.4f} (needs "
+                f"{'>=' if side == 'YES' else '<='}{min_mom_req:+.4f})"
+            )
+            if side == "NEITHER":
+                code = "spot_on_threshold"
+            elif fv < 0.62:
+                code = "fair_value_below_floor"
+            elif edge < min_maker_edge:
+                code = "edge_below_floor"
+            elif not momentum_ok:
+                code = "momentum_not_supporting"
+            else:
+                code = "side_mismatch"
+            note_reject(learned, "MAKER", code, detail)
             log.info(
-                f"MAKER SKIP {asset} — trend/edge guard "
+                f"MAKER SKIP {asset} — {code} "
                 f"(fv_yes={fv_yes:.3f}, fv_no={fv_no:.3f}, edge_yes={edge_yes:+.3f}, "
                 f"edge_no={edge_no:+.3f}, dist={dist_pct:+.3%}, mom_5m={mom_5m:+.4f})"
             )
@@ -300,9 +394,18 @@ class MakerStrategy(BaseStrategy):
         our_bid = round(max(config.MAKER_MIN_BID, min(config.MAKER_MAX_BID, our_bid)), 3)
 
         # Data-driven certainty calibration: combines true statistical win probability and spread edge
-        cert = min(0.95, max(target_fv, 0.50 + chosen_edge * 3.5))
-        if cert < 0.65:
-            note_reject(learned, "MAKER", "certainty_below_floor", f"{cert:.1%} < 65%")
+        cert = min(0.95, max(target_fv, 0.50 + chosen_edge * CERT_EDGE_WEIGHT))
+        if cert < CERT_FLOOR:
+            # This is the gate that actually decides MAKER's entries, not the
+            # fv >= 0.62 direction gate above: cert = max(fv, 0.50 + 3.5*edge),
+            # so a candidate needs fv >= 0.65 OR an edge of 4.29c. Say so,
+            # because tuning the 0.62 looks like a lever and is not.
+            note_reject(
+                learned, "MAKER", "certainty_below_floor",
+                f"{cert:.1%} < {CERT_FLOOR:.0%} — cert=max(fv, 0.50+{CERT_EDGE_WEIGHT}*edge), "
+                f"so this needs fv>={CERT_FLOOR:.3f} or edge>={MIN_EDGE_FOR_CERT_FLOOR:+.3f} "
+                f"(fv={target_fv:.3f}, edge={chosen_edge:+.3f})",
+            )
             log.info(f"MAKER SKIP {asset} — certainty {cert:.1%} below 65% conviction floor")
             return None
 

@@ -1625,6 +1625,9 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
         stall.note_evaluation(
             chat_id,
             markets_total=len(active_markets),
+            # The scanner holds markets whose status is not "open" as well, so
+            # len(active_markets) is a discovery count, not an open count.
+            open_markets=len(active_markets) - skipped_status,
             in_scope=in_scope,
             evaluated=evaluated,
             signals=len(all_signals),
@@ -1706,8 +1709,24 @@ def _on_spot_price(asset: str, price: float):
         asyncio.create_task(_evaluate_all_users_for_asset(asset, penalty=0.0))
         return
     penalty = 0.0010 if lag["status"] == "degraded" else 0.0
-    strategy.update_price_history(asset, lag["price"])
-    recorder.record_spot_tick(asset, lag["price"])
+    # This history feeds the measured volatility, the 5-minute momentum, the
+    # Kalman drift and the GARCH variance — so it must be the independent
+    # oracle series. check_lag hands back the *relay* price once its oracle
+    # sample is 2s old, because it is answering "which price is fresher right
+    # now". That was harmless while the relay was Binance-derived; since
+    # 2026-09-26 the relay is a Chainlink 60-second TWAP, so the substitution
+    # injects a smoothed series that understates all four estimators. A
+    # 5-second-old Binance print is still a Binance print: use the oracle until
+    # it is stale by the same standard the rest of the bot applies, and fall
+    # back to the relay only past that.
+    direct_price, direct_time = feeds_direct.get_direct_price(asset)
+    history_price = (
+        direct_price
+        if direct_price and (time.time() - direct_time) <= config.FEED_STALE_SEC
+        else lag["price"]
+    )
+    strategy.update_price_history(asset, history_price)
+    recorder.record_spot_tick(asset, history_price)
     asyncio.create_task(_evaluate_all_users_for_asset(asset, penalty))
 
 
@@ -1969,25 +1988,34 @@ async def _check_trading_stalls() -> None:
             continue
         try:
             context = _stall_context(chat_id, user)
-            data = stall.report(chat_id, **context)
+            # One instant for the whole alert. The header, the report body and
+            # the NO_CONFIRMED_FILL detail all print "minutes since the last
+            # confirmed fill"; they disagreed inside a single message (observed:
+            # "stall — 1573 min" over "Last confirmed fill: 1572 min ago"). The
+            # rounding itself is fixed in stall.format_gap_minutes — every
+            # renderer goes through it — and reading one clock here keeps a
+            # sub-second drift from straddling a minute boundary as well.
+            now = time.time()
+            data = stall.report(chat_id, now=now, **context)
             verdict = data["verdict"]
-            gap = stall.trade_gap_minutes(chat_id)
+            gap = stall.trade_gap_minutes(chat_id, now=now)
             severe = verdict.get("severity") == "critical"
             if gap < limit and not severe:
                 health.touch("trading_stall", chat_id=chat_id, verdict=verdict["code"],
                              gap_min=round(gap, 1))
                 continue
-            if not stall.note_alert(chat_id, verdict["code"]):
+            if not stall.note_alert(chat_id, verdict["code"], now=now):
                 continue
+            gap_text = stall.format_gap_minutes(gap)
             log.warning(
-                f"[{chat_id}] TRADING STALL after {gap:.0f} min — {verdict['code']}: "
+                f"[{chat_id}] TRADING STALL after {gap_text} min — {verdict['code']}: "
                 f"{verdict['headline']} | {verdict['detail']} | action: {verdict['action']}"
             )
             if severe:
                 health.fail("trading_stall", f"{chat_id}: {verdict['code']}", gap_min=round(gap))
             if _tg_app:
                 text = stall.format_report(
-                    chat_id, markdown=True,
+                    chat_id, markdown=True, now=now,
                     **{k: v for k, v in context.items()
                        if k in ("equity", "min_viable", "feed_age_sec",
                                 "eval_max_age_sec", "resting_now")},
@@ -1997,7 +2025,8 @@ async def _check_trading_stalls() -> None:
                 # just placed quotes that never filled.
                 await telegram_bot.send_message(
                     _tg_app, chat_id,
-                    f"🩺 *Trading stall — {gap:.0f} min without a confirmed fill*\n\n{text[:3500]}",
+                    f"🩺 *Trading stall — {gap_text} min without a confirmed fill*\n\n"
+                    f"{text[:3500]}",
                     parse_mode="Markdown",
                 )
         except Exception as stall_err:

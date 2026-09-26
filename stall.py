@@ -23,6 +23,7 @@ public entry point swallows its own errors.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from typing import Any
@@ -43,6 +44,19 @@ TRADE_COOLDOWN_SEC_REFERENCE = 60
 # is not why the account is quiet *now*. Valve verdicts (exposure cap,
 # cooldown, MAKER book position) only consider hits inside this window.
 RECENT_WINDOW_SEC = 900
+
+# An empty scope has to *persist* before it is called a configuration error.
+# The scanner only lists a short-term market between its opening and closing
+# timestamps (scanner._enrich drops ``secs_to_open > 0`` and
+# ``secs_to_close < 0``), so in the minutes around every series boundary an
+# account scoped to 15-minute markets legitimately has nothing in scope: the
+# round just closed and the next one has not opened. In production that gap
+# produced a SCOPE_EMPTY alert every 15 minutes telling the operator to
+# "check /settings" — and because a changed verdict code bypasses the alert
+# rate limit, it also produced a second alert one minute later when the scope
+# came back. One full cycle of the longest supported timeframe is long enough
+# to separate "between rounds" from "this scope can never match".
+SCOPE_EMPTY_CONFIRM_SEC = 900.0
 
 # Reject codes that say "this market/strategy is excluded by configuration",
 # recorded on every pass before any candidate is weighed. Counted alongside real
@@ -92,9 +106,19 @@ def _blank() -> dict[str, Any]:
         "last_trade": 0.0,
         "trades": 0,
         "markets_total": 0,
+        # Open markets inside the last pass, when the caller can tell us.
+        # ``markets_total`` counts every market the scanner is holding, which
+        # includes ones that have closed or not opened yet, so it must not be
+        # labelled "open" on its own.
+        "markets_open": None,
         "markets_in_scope": 0,
         "markets_evaluated": 0,
         "skips": {},
+        # Skip counts of the *last* pass only. The lifetime counters answer
+        # "what has this process spent its time on", never "why did this pass
+        # match nothing", which is the question SCOPE_EMPTY has to answer.
+        "last_pass_skips": {},
+        "scope_empty_since": 0.0,
         "rejects": {},
         "recent": [],
         "paused": False,
@@ -173,7 +197,7 @@ def note_state(chat_id: str | None, *, paused: bool | None = None,
 
 def note_evaluation(chat_id: str | None, *, markets_total: int, in_scope: int,
                     evaluated: int, signals: int, skips: dict[str, int] | None = None,
-                    detail: str = "") -> None:
+                    detail: str = "", open_markets: int | None = None) -> None:
     """One completed evaluation pass for a user."""
     try:
         with _lock:
@@ -184,9 +208,23 @@ def note_evaluation(chat_id: str | None, *, markets_total: int, in_scope: int,
             state["last_evaluation"] = now
             state["evaluations"] += 1
             state["markets_total"] = int(markets_total)
+            if open_markets is not None:
+                state["markets_open"] = int(open_markets)
             state["markets_in_scope"] = int(in_scope)
             state["markets_evaluated"] = int(evaluated)
             state["last_detail"] = str(detail or "")[:300]
+            # Last pass only: a scope that matched nothing has to be explained
+            # by *this* pass, not by counters accumulated over the process.
+            state["last_pass_skips"] = {
+                str(code): int(count) for code, count in (skips or {}).items() if count
+            }
+            # A consecutive run of empty-scope passes is what separates a
+            # configuration error from the gap between two rounds of a series.
+            if int(in_scope) <= 0:
+                if not float(state.get("scope_empty_since", 0.0)):
+                    state["scope_empty_since"] = now
+            else:
+                state["scope_empty_since"] = 0.0
             for code, count in (skips or {}).items():
                 if count:
                     entry = state["skips"].setdefault(
@@ -211,8 +249,15 @@ def note_signal(chat_id: str | None, strategy: str, asset: str) -> None:
         log.debug("note_signal telemetry error", exc_info=True)
 
 
-def note_order(chat_id: str | None, strategy: str, *, placed: bool, reason: str = "") -> None:
-    """Records an execution attempt that reached the executor, and its outcome."""
+def note_order(chat_id: str | None, strategy: str, *, placed: bool, reason: str = "",
+               detail: str = "") -> None:
+    """Records an execution attempt that reached the executor, and its outcome.
+
+    A skipped attempt is counted once, here. Callers must not also call
+    :func:`reject` for the same ``exec:`` code: the executor did both, so every
+    number the report printed for an execution outcome — including the
+    "×37" in a MAKER_QUOTE_UNCOMPETITIVE detail — was twice the real count.
+    """
     try:
         with _lock:
             state = _bucket(chat_id)
@@ -232,7 +277,7 @@ def note_order(chat_id: str | None, strategy: str, *, placed: bool, reason: str 
                     state["orders_resting"] += 1
                 _remember(state, f"ORDER PLACED {label}")
             else:
-                _bump(state["rejects"], f"exec:{reason or 'rejected'}", label)
+                _bump(state["rejects"], f"exec:{reason or 'rejected'}", detail or label)
                 _remember(state, f"ORDER SKIPPED {label}")
     except Exception:
         log.debug("note_order telemetry error", exc_info=True)
@@ -319,6 +364,35 @@ def _remember(state: dict[str, Any], line: str) -> None:
 
 # ── Diagnosis ────────────────────────────────────────────────────────────────
 
+# Skip reasons that explain *why a market was not in this account's scope*,
+# in the order an operator would act on them. The remaining counters
+# (``trigger``, ``halted``, ``stale_feed``, ``no_spot``) describe markets that
+# were in scope but not evaluated this pass, so they cannot explain an empty
+# scope and are left out.
+_SCOPE_SKIP_LABELS = (
+    ("timeframe", "excluded by timeframe"),
+    ("asset", "excluded by asset"),
+    ("status", "not open (closed or not started)"),
+)
+
+
+def _scope_gap_detail(snapshot: dict[str, Any]) -> str:
+    """Why the last pass matched nothing, from that pass's own skip counts."""
+    total = int(snapshot.get("markets_total", 0))
+    skips = {str(k): int(v) for k, v in (snapshot.get("last_pass_skips") or {}).items()}
+    parts = [
+        f"{skips[code]} {label}"
+        for code, label in _SCOPE_SKIP_LABELS
+        if skips.get(code)
+    ]
+    if parts:
+        detail = f"Last pass saw {total} market(s): " + ", ".join(parts) + "."
+    else:
+        detail = f"Last pass saw {total} market(s), none of them in scope."
+    scope = str(snapshot.get("last_detail") or "").strip()
+    return f"{detail} Scope: {scope}" if scope else detail
+
+
 def _top(counters: dict[str, Any], limit: int = 4, *, structural: bool | None = False,
          since: float | None = None) -> list[tuple[str, int, float, str]]:
     """Most frequent codes. By default candidate gates only (``structural=False``);
@@ -376,7 +450,9 @@ def verdict(chat_id: str | None, *, now: float | None = None,
             "action": action,
             "severity": severity,
             "secondary": extras,
-            "trade_gap_min": round(trade_gap_min, 1) if trade_gap_min is not None else None,
+            # Unrounded: format_gap_minutes is the only thing allowed to round
+            # it, and it must round the same value the header rounds.
+            "trade_gap_min": trade_gap_min if trade_gap_min is not None else None,
         }
 
     # ── Paused / dry-run checks FIRST ──────────────────────────────────
@@ -454,14 +530,24 @@ def verdict(chat_id: str | None, *, now: float | None = None,
             "warn",
         )
     if int(snapshot.get("markets_in_scope", 0)) <= 0 and int(snapshot.get("markets_total", 0)) > 0:
-        return out(
-            "SCOPE_EMPTY",
-            f"None of the {int(snapshot['markets_total'])} open markets match this account's scope.",
-            str(snapshot.get("last_detail") or ""),
-            "Check /settings assets, timeframes and strategies; quarantined strategies are "
-            "removed by global policy and can require ALLOW_EXPERIMENTAL_STRATEGIES.",
-            "warn",
-        )
+        scope_empty_since = float(snapshot.get("scope_empty_since", 0.0))
+        scope_empty_sec = (now - scope_empty_since) if scope_empty_since else 0.0
+        # Only a *persistent* empty scope is a configuration finding. Around
+        # every series boundary the in-scope markets are briefly absent from
+        # discovery, which is the exchange's calendar, not the account's
+        # settings; alerting on it told the operator to fix /settings every
+        # 15 minutes and hid the verdict that was actually true.
+        if scope_empty_sec >= SCOPE_EMPTY_CONFIRM_SEC:
+            return out(
+                "SCOPE_EMPTY",
+                f"None of the {int(snapshot['markets_total'])} discovered markets match this "
+                f"account's scope, and none has for {scope_empty_sec / 60:.0f} min.",
+                _scope_gap_detail(snapshot),
+                "Check /settings assets, timeframes and strategies; quarantined strategies are "
+                "removed by global policy and can require ALLOW_EXPERIMENTAL_STRATEGIES.",
+                "warn",
+            )
+
     stale = int(skip_counts.get("stale_feed", 0))
     if (feed_age_sec is not None and feed_age_sec > 60) or (
         stale and int(snapshot.get("markets_evaluated", 0)) == 0 and stale >= last_skip > 0
@@ -559,7 +645,7 @@ def verdict(chat_id: str | None, *, now: float | None = None,
         else:
             resting_text = ""
         gap_text = (
-            f" No confirmed fill for {trade_gap_min:.0f} min."
+            f" No confirmed fill for {format_gap_minutes(trade_gap_min)} min."
             if trade_gap_min is not None else " No confirmed fill yet in this process."
         )
         book_text = ""
@@ -591,18 +677,70 @@ def verdict(chat_id: str | None, *, now: float | None = None,
             "check whether one strategy is churning the market with re-quotes.",
             "info",
         )
+    # Everything below is reached only with no order ever placed: an order
+    # with no fill returns NO_CONFIRMED_FILL above, and signals that reached
+    # the executor without an order return EXECUTION_BLOCKED.
+    signals_total = int(snapshot.get("signals", 0))
+    placed_total = int(snapshot.get("orders_placed", 0))
+    attempts_total = int(snapshot.get("order_attempts", 0))
+    if placed_total <= 0 and signals_total <= 0:
+        # The process evaluated a lot and never produced a candidate. This is
+        # the same finding as the last-pass NO_EDGE above, so it must not be
+        # reported as "healthy" just because the *last* pass happened to
+        # evaluate nothing: a scanner-triggered pass covers no market, and the
+        # account then alternated between NO_EDGE and HEALTHY every minute —
+        # with an alert on each flip, because a changed verdict code bypasses
+        # the rate limit.
+        top = _top(rejects) or _top(rejects, structural=True)
+        detail = "; ".join(f"{code}×{count}" for code, count, _, _ in top) or "no gate counters recorded"
+        return out(
+            "NO_EDGE",
+            f"{int(snapshot.get('evaluations', 0))} evaluation(s) in this process, "
+            f"{int(snapshot.get('markets_evaluated', 0))} market(s) in the last pass; "
+            "no candidate has cleared its gates.",
+            f"Dominant rejections: {detail}",
+            "Absence of qualifying edge is the correct outcome on a quiet tape. Lowering a gate "
+            "to manufacture activity is not a fix.",
+            "info",
+        )
+    if placed_total <= 0 and attempts_total <= 0:
+        # Signals exist but the executor was never asked: merge_signals keeps
+        # one signal per market/strategy and drops the weaker of two opposing
+        # sides, so a burst of raw signals can legitimately collapse to nothing.
+        # What must never happen is reporting that as a healthy pipeline.
+        return out(
+            "SIGNALS_NOT_EXECUTED",
+            f"{signals_total} signal(s) were produced but none reached the executor.",
+            "No execution attempt was recorded for any of them. Signals are merged before "
+            "execution (one per market/strategy, and the weaker of two opposing sides is "
+            "dropped), so some collapse is expected — but every signal that survives the "
+            "merge stamps an executor outcome, and none did.",
+            "Check the service log for a crashed user loop or an exception in signal merging; "
+            "/why's 'Executor outcomes' line should list an outcome for each surviving signal.",
+            "warn",
+        )
     return out(
         "HEALTHY",
-        "The trading pipeline is evaluating and has placed orders.",
-        f"{int(snapshot.get('evaluations', 0))} evaluation(s), {int(snapshot.get('signals', 0))} signal(s), "
-        f"{int(snapshot.get('orders_placed', 0))} order(s) placed in this process.",
+        "The trading pipeline is evaluating, placing orders and recording fills.",
+        f"{int(snapshot.get('evaluations', 0))} evaluation(s), {signals_total} signal(s), "
+        f"{placed_total} order(s) placed, {int(snapshot.get('trades', 0))} confirmed fill(s) "
+        "in this process"
+        + (f"; last confirmed fill {format_gap_minutes(trade_gap_min)} min ago."
+           if trade_gap_min is not None else "."),
         "",
         "info",
     )
 
-def report(chat_id: str | None, **context: Any) -> dict[str, Any]:
-    """Full structured diagnosis for one account (safe for logs and /api/stats)."""
-    now = time.time()
+def report(chat_id: str | None, *, now: float | None = None, **context: Any) -> dict[str, Any]:
+    """Full structured diagnosis for one account (safe for logs and /api/stats).
+
+    ``now`` pins every age in the report — and the verdict inside it — to one
+    instant. Callers that also print the drought clock (the watchdog header)
+    should pass the same value to :func:`trade_gap_minutes` so a sub-second
+    drift cannot straddle a minute boundary; the rounding itself is centralised
+    in :func:`format_gap_minutes`.
+    """
+    now = time.time() if now is None else float(now)
     with _lock:
         state = _bucket(chat_id)
         snapshot = dict(state) if state else _blank()
@@ -613,7 +751,18 @@ def report(chat_id: str | None, **context: Any) -> dict[str, Any]:
     return {
         "chat_id": str(chat_id),
         "markets_total": int(snapshot.get("markets_total", 0)),
+        # ``None`` when no pass has reported it; never guess from markets_total.
+        "markets_open": (
+            int(snapshot["markets_open"]) if snapshot.get("markets_open") is not None else None
+        ),
         "markets_in_scope": int(snapshot.get("markets_in_scope", 0)),
+        # How long the scope has been empty, for "between rounds" vs "broken
+        # settings". 0 when the last pass had something in scope.
+        # Unrounded: a gap that started this instant must still read as a gap.
+        "scope_empty_sec": (
+            now - float(snapshot["scope_empty_since"])
+            if float(snapshot.get("scope_empty_since", 0.0)) else 0.0
+        ),
         "markets_evaluated": int(snapshot.get("markets_evaluated", 0)),
         "evaluations": int(snapshot.get("evaluations", 0)),
         "signals": int(snapshot.get("signals", 0)),
@@ -645,6 +794,24 @@ def report(chat_id: str | None, **context: Any) -> dict[str, Any]:
             {"code": code, "count": count, "age_sec": round(now - last, 1), "detail": detail}
             for code, count, last, detail in _top(snapshot["rejects"], 4, structural=True)
         ],
+        # Executor outcomes inside the recency window, market_cooldown included.
+        # The gate counters above are process-lifetime and dominated by strategy
+        # gates counted thousands of times, which is why a report reading
+        # "12 signals | 2 orders placed" explained neither the 10 that never
+        # became orders nor the quotes the executor refused as unfillable.
+        "recent_exec": [
+            {"code": code, "count": count, "age_sec": round(now - last, 1), "detail": detail}
+            for code, count, last, detail in sorted(
+                (
+                    (str(code), int(entry.get("count", 0)), float(entry.get("last", 0.0)),
+                     str(entry.get("detail", "")))
+                    for code, entry in snapshot["rejects"].items()
+                    if str(code).startswith("exec:")
+                    and float(entry.get("last", 0.0)) >= now - RECENT_WINDOW_SEC
+                ),
+                key=lambda row: (-row[1], -row[2]),
+            )[:6]
+        ],
         "recent": list(snapshot["recent"])[-6:],
         "scan": {
             "age_sec": round(now - float(_global.get("last_scan_ok", 0.0)), 1)
@@ -656,6 +823,29 @@ def report(chat_id: str | None, **context: Any) -> dict[str, Any]:
     }
 
 
+def format_gap_minutes(minutes: float) -> str:
+    """Render the drought clock, half-up, from the unrounded value.
+
+    One alert prints this number in three places: the watchdog header, the
+    "Last confirmed fill" line, and the NO_CONFIRMED_FILL detail. Formatting
+    each with ``f"{x:.0f}"`` disagreed inside a single message because Python
+    rounds halves to *even* — and the verdict pre-rounded to one decimal
+    first, which moved values onto an exact half:
+
+    ========  =================  =========================
+    raw       ``f"{raw:.0f}"``   pre-rounded, then ``.0f``
+    ========  =================  =========================
+    1512.5001 ``1513``           1512.5 → ``1512``
+    1513.4999 ``1513``           1513.5 → ``1514``
+    ========  =================  =========================
+
+    Both patterns appeared in one operator paste ("stall — 1573 min" over
+    "Last confirmed fill: 1572 min ago"). Every renderer must therefore go
+    through this one function, on the unrounded gap.
+    """
+    return str(int(math.floor(float(minutes) + 0.5)))
+
+
 def md_escape(text: Any) -> str:
     """Escape Telegram legacy-Markdown control characters in free text."""
     out = str(text)
@@ -664,7 +854,8 @@ def md_escape(text: Any) -> str:
     return out
 
 
-def format_report(chat_id: str | None, *, markdown: bool = False, **context: Any) -> str:
+def format_report(chat_id: str | None, *, markdown: bool = False, now: float | None = None,
+                  **context: Any) -> str:
     """Telegram-shaped rendering of :func:`report`.
 
     ``markdown=True`` escapes every free-text line for Telegram's legacy
@@ -672,8 +863,11 @@ def format_report(chat_id: str | None, *, markdown: bool = False, **context: Any
     (``exec:market_cooldown``, ``MAKER_ORDER_TIMEOUT``); unescaped, Telegram
     rendered them as italics ("blockedbypolicy", "MAKERORDERTIMEOUT") or, with
     an odd count, rejected the whole alert.
+
+    ``now`` is forwarded to :func:`report` so a caller that prints the drought
+    clock next to this text renders both from the same instant.
     """
-    data = report(chat_id, **context)
+    data = report(chat_id, now=now, **context)
     esc = md_escape if markdown else str
     verdict_data = data["verdict"]
     icon = {"critical": "🔴", "warn": "🟠", "config": "⚙️", "info": "🟢"}.get(
@@ -686,7 +880,9 @@ def format_report(chat_id: str | None, *, markdown: bool = False, **context: Any
         f"Code: `{verdict_data['code']}`",
     ]
     if verdict_data.get("trade_gap_min") is not None:
-        lines.append(f"Last confirmed fill: {verdict_data['trade_gap_min']:.0f} min ago")
+        lines.append(
+            f"Last confirmed fill: {format_gap_minutes(verdict_data['trade_gap_min'])} min ago"
+        )
     elif int(data.get("orders_placed", 0)):
         lines.append(
             "Last confirmed fill: none yet — every order so far is resting or "
@@ -705,17 +901,39 @@ def format_report(chat_id: str | None, *, markdown: bool = False, **context: Any
     totals += f" | {data['trades']} confirmed fills"
     if data.get("resting_now") is not None:
         totals += f" | {data['resting_now']} resting now"
+    # ``markets_total`` counts every market the scanner is holding, including
+    # ones that are not open, so it was mislabelled "open" before. The open
+    # count comes from the last pass; when no pass has reported one, say only
+    # what is known.
+    discovered = (
+        f"{data['markets_total']} discovered ({data['markets_open']} open)"
+        if data.get("markets_open") is not None else f"{data['markets_total']} discovered"
+    )
+    scope_note = ""
+    scope_empty_sec = float(data.get("scope_empty_sec", 0.0) or 0.0)
+    if int(data.get("markets_in_scope", 0)) <= 0 and scope_empty_sec > 0:
+        # A short gap here is the exchange's calendar between two rounds of the
+        # same series, not a settings fault; showing the duration says which.
+        gap_text = (
+            f"{scope_empty_sec / 60:.0f} min" if scope_empty_sec >= 60
+            else f"{scope_empty_sec:.0f}s"
+        )
+        scope_note = f" — nothing in scope for {gap_text}"
     lines += [
         "",
         # A feed-triggered pass evaluates one asset, so this is "last pass",
         # not a per-cycle rate.
-        f"Markets: {data['markets_total']} open, {data['markets_in_scope']} in scope, "
-        f"{data['markets_evaluated']} evaluated in the last pass",
+        f"Markets: {discovered}, {data['markets_in_scope']} in scope, "
+        f"{data['markets_evaluated']} evaluated in the last pass{scope_note}",
         esc(totals),
     ]
     if data["top_rejects"]:
         lines += ["", "🚪 Gates that stopped candidates:"]
         for row in data["top_rejects"]:
+            lines.append(esc(f"  {row['code']}: {row['count']}× (last {row['age_sec']:.0f}s ago)"))
+    if data.get("recent_exec"):
+        lines += ["", esc(f"🛠 Executor outcomes (last {RECENT_WINDOW_SEC / 60:.0f} min):")]
+        for row in data["recent_exec"]:
             lines.append(esc(f"  {row['code']}: {row['count']}× (last {row['age_sec']:.0f}s ago)"))
     if data.get("structural_rejects"):
         parts = []

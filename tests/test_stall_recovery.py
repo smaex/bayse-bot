@@ -382,11 +382,17 @@ def test_snipe_gates_are_satisfiable_and_counted(spot, expected_signal):
         # dropped on the floor.
         counters = stall._users[chat]["rejects"]
         assert counters, "a rejected candidate produced no gate counter"
+        # ``no_raw_edge_or_trend_alignment`` used to cover four independent
+        # conditions in one counter; it is now split (see
+        # tests/test_snipe_entry_gates.py), so the markers are the new names.
         assert any(
             marker in code
             for code in counters
-            for marker in ("distance", "no_raw_edge", "market_prices_unusable")
+            for marker in ("distance", "model_prob_below_floor", "raw_edge_below_floor",
+                           "momentum_opposing", "side_mismatch", "spot_on_threshold",
+                           "market_prices_unusable")
         ), f"unhelpful gate attribution: {list(counters)}"
+        assert not any("no_raw_edge_or_trend_alignment" in code for code in counters)
 
 
 def test_evaluate_markets_records_the_pass_for_the_right_reason(monkeypatch):

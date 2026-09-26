@@ -17,9 +17,18 @@ from strategies.utils import (
     gbm_win_probability,
     note_reject,
     probability_to_certainty,
+    realized_twap_integral,
     realized_vol_hourly,
+    twap_win_probability,
 )
 log = logging.getLogger("strat.snipe")
+
+
+# Model-probability floor and momentum tolerance for the side spot is already
+# on. Named because they are reported: a candidate that dies here has to say
+# which of the four conditions stopped it (see _alignment_rejection).
+MIN_MODEL_PROBABILITY = 0.55
+MOMENTUM_TOLERANCE = 0.0008
 
 
 def blend_with_market(
@@ -39,6 +48,87 @@ def blend_with_market(
     log_odds = weight * math.log(q / (1.0 - q))
     log_odds += (1.0 - weight) * math.log(p / (1.0 - p))
     return 1.0 / (1.0 + math.exp(-log_odds))
+
+
+def effective_raw_edge_floor(market_price: float,
+                             model_weight: float = config.SNIPE_MODEL_WEIGHT,
+                             blended_min: float = config.SNIPE_MIN_BLENDED_EDGE) -> float:
+    """Raw model-vs-market edge a candidate actually needs, after shrinkage.
+
+    ``SNIPE_MIN_RAW_MODEL_EDGE`` (0.035) is *not* the operative threshold, and
+    reading the config alone says otherwise. The raw edge gate is followed by
+    :func:`blend_with_market` at ``SNIPE_MODEL_WEIGHT`` = 0.35 — which gives the
+    market 65% of the log-odds — and then by ``SNIPE_MIN_BLENDED_EDGE`` = 0.025
+    measured *against the same market price*. Shrinking toward the market and
+    then re-imposing a gap from it means most of the raw edge is spent before
+    the second gate looks at it.
+
+    Solved by bisection on the real blend, so this tracks config changes:
+
+    ==============  ====================  =================================
+    market price    raw edge needed       ``SNIPE_MIN_RAW_MODEL_EDGE``
+    ==============  ====================  =================================
+    0.45            0.0717                0.035
+    0.55            0.0703                0.035
+    0.65            0.0688                0.035
+    ==============  ====================  =================================
+
+    Both gates are deliberate — the shrinkage exists because the production
+    sample showed raw directional confidence was not calibrated — so this is
+    reported, not relaxed. It matters because lowering
+    ``SNIPE_MIN_RAW_MODEL_EDGE`` changes nothing at all while the blended gate
+    binds, which is the kind of knob that looks like a fix and is not.
+    """
+    p = min(0.999999, max(1e-6, float(market_price)))
+    lo, hi = p, 0.999999
+    for _ in range(80):
+        mid = (lo + hi) / 2.0
+        if blend_with_market(mid, p, model_weight) - p >= blended_min:
+            hi = mid
+        else:
+            lo = mid
+    return max(0.0, hi - p)
+
+
+def _alignment_rejection(distance_pct: float, raw_w_yes: float, raw_w_no: float,
+                         yes_price: float, no_price: float, mom_5m: float) -> tuple[str, str]:
+    """Name the single condition that stopped this candidate, with the numbers.
+
+    These four conditions shared one counter, ``no_raw_edge_or_trend_alignment``,
+    which was the largest number in every drought report (9998 hits in one
+    process) while saying nothing about which of them bound — so "the tape is
+    quiet" and "the momentum veto is mis-tuned" were indistinguishable. The
+    detail now carries the effective raw-edge floor from
+    :func:`effective_raw_edge_floor`, not just the advertised one.
+    """
+    if distance_pct > 0:
+        raw_probability, market_price, side = raw_w_yes, yes_price, "YES"
+        momentum_ok = mom_5m >= -MOMENTUM_TOLERANCE
+    elif distance_pct < 0:
+        raw_probability, market_price, side = raw_w_no, no_price, "NO"
+        momentum_ok = mom_5m <= MOMENTUM_TOLERANCE
+    else:
+        # Exactly on the strike: neither side is the one spot is on.
+        raw_probability, market_price, side = max(raw_w_yes, raw_w_no), 0.5, "NEITHER"
+        momentum_ok = True
+    raw_edge = raw_probability - market_price
+    effective = effective_raw_edge_floor(market_price) if market_price > 0 else 0.0
+    detail = (
+        f"{side} p={raw_probability:.1%} vs mkt={market_price:.3f} "
+        f"edge={raw_edge:+.3f} (needs >={config.SNIPE_MIN_RAW_MODEL_EDGE:.3f} raw, "
+        f">={effective:.3f} after {config.SNIPE_MODEL_WEIGHT:.2f}-weight shrinkage) "
+        f"dist={distance_pct:+.3%} mom_5m={mom_5m:+.4f}"
+    )
+    if side == "NEITHER":
+        return "spot_on_threshold", detail
+    if raw_probability < MIN_MODEL_PROBABILITY:
+        return "model_prob_below_floor", detail
+    if raw_edge < config.SNIPE_MIN_RAW_MODEL_EDGE:
+        return "raw_edge_below_floor", detail
+    if not momentum_ok:
+        return "momentum_opposing", detail
+    # Distance sign disagreed with the side the model prefers.
+    return "side_mismatch", detail
 
 
 class SnipeStrategy(BaseStrategy):
@@ -132,14 +222,38 @@ class SnipeStrategy(BaseStrategy):
         if secs < 300:
             rv *= 1.0 + 0.25 * ((300.0 - secs) / 240.0)
 
-        raw_w_yes = gbm_win_probability(
-            spot=live_spot,
-            threshold=threshold,
-            secs=secs,
-            hourly_vol=rv,
-            hourly_drift=0.0,
-            horizon_cap=0.0,
-        )
+        # Bayse settles these crypto markets on a Chainlink 60-second TWAP, not
+        # the spot print at close, so the random variable is the average over
+        # the final window and not the terminal spot. Pricing the terminal spot
+        # overstates how much the last minute can still move the outcome —
+        # SNIPE_MIN_SECS_TO_CLOSE is exactly 60s, so every entry here has the
+        # whole window in front of it. SETTLEMENT_TWAP_SEC = 0 restores the
+        # terminal-spot model.
+        twap_sec = float(getattr(config, "SETTLEMENT_TWAP_SEC", 0.0) or 0.0)
+        if twap_sec > 0:
+            integral, elapsed = (
+                realized_twap_integral(asset, state, twap_sec - secs)
+                if secs < twap_sec else (0.0, 0.0)
+            )
+            raw_w_yes = twap_win_probability(
+                spot=live_spot,
+                threshold=threshold,
+                secs=secs,
+                hourly_vol=rv,
+                window_sec=twap_sec,
+                realized_integral=integral,
+                realized_secs=elapsed,
+                hourly_drift=0.0,
+            )
+        else:
+            raw_w_yes = gbm_win_probability(
+                spot=live_spot,
+                threshold=threshold,
+                secs=secs,
+                hourly_vol=rv,
+                hourly_drift=0.0,
+                horizon_cap=0.0,
+            )
         raw_w_no = 1.0 - raw_w_yes
 
         yes_price = market.get("yes_price", 0.50)
@@ -168,27 +282,29 @@ class SnipeStrategy(BaseStrategy):
         # Momentum must not be actively opposing the thesis.
         if (
             distance_pct > 0
-            and raw_w_yes >= 0.55
+            and raw_w_yes >= MIN_MODEL_PROBABILITY
             and raw_edge_yes >= config.SNIPE_MIN_RAW_MODEL_EDGE
-            and mom_5m >= -0.0008
+            and mom_5m >= -MOMENTUM_TOLERANCE
         ):
             direction = "YES"
             raw_probability = raw_w_yes
             market_price = yes_price
         elif (
             distance_pct < 0
-            and raw_w_no >= 0.55
+            and raw_w_no >= MIN_MODEL_PROBABILITY
             and raw_edge_no >= config.SNIPE_MIN_RAW_MODEL_EDGE
-            and mom_5m <= 0.0008
+            and mom_5m <= MOMENTUM_TOLERANCE
         ):
             direction = "NO"
             raw_probability = raw_w_no
             market_price = no_price
         else:
-            note_reject(learned, "SNIPE", "no_raw_edge_or_trend_alignment",
-                        f"yes={raw_w_yes:.1%}/{yes_price:.3f} no={raw_w_no:.1%}/{no_price:.3f}")
+            code, why = _alignment_rejection(
+                distance_pct, raw_w_yes, raw_w_no, yes_price, no_price, mom_5m
+            )
+            note_reject(learned, "SNIPE", code, why)
             log.info(
-                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — no raw edge/trend alignment "
+                f"SNIPE {asset} {tf} mkt={mkt_id[:8]} — {code} "
                 f"(raw_yes={raw_w_yes:.1%} vs {yes_price:.3f}, "
                 f"raw_no={raw_w_no:.1%} vs {no_price:.3f}, "
                 f"dist={distance_pct:+.3%}, mom_5m={mom_5m:+.4f})"
@@ -291,10 +407,15 @@ class SnipeStrategy(BaseStrategy):
             "full_send": 0.03,
             "custom": 0.03,
         }.get(mode, 0.03)
-        ev_ceil = min(
-            config.SNIPE_MAX_MARKET_PRICE,
-            max_ev_price(w_est, market_price, fee_rate, min_margin=margin),
-        )
+        # The EV ceiling is economics; the entry band above is price policy.
+        # They used to be combined with min(SNIPE_MAX_MARKET_PRICE, ...), which
+        # made the band cap double as a ceiling: at market_price == 0.65 the
+        # comparison `market_price >= ev_ceil` was true for *any* model
+        # probability, so the top of the advertised band could never be entered
+        # no matter how strong the model was (verified: raw 0.9995 still
+        # refused). The band gate at SNIPE_MIN_ENTRY_PRICE..MAX already owns
+        # the price limit, so the ceiling here is purely fee+margin economics.
+        ev_ceil = max_ev_price(w_est, market_price, fee_rate, min_margin=margin)
         if market_price >= ev_ceil:
             note_reject(learned, "SNIPE", "price_at_or_above_ev_ceiling",
                         f"price={market_price:.3f} ceiling={ev_ceil:.3f}")

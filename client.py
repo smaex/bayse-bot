@@ -363,6 +363,52 @@ class BayseClient:
     async def get_pnl(self) -> dict:
         return await self._get("/v1/pm/pnl")
 
+    async def get_liquidity_rewards(self, page: int = 1, size: int = 100) -> dict:
+        """Liquidity reward payouts — GET /v1/pm/liquidity-rewards.
+
+        MAKER's entire premise is earning these, and until now nothing in the
+        bot read the endpoint, so a strategy that rests quotes all day and
+        earns nothing was indistinguishable from one that is being paid.
+        Each record carries: epochId, eventId, marketId, accumulatedShares,
+        sampleCount, payout, isPaid, epochStart, epochEnd, status
+        (``active`` | ``completed``).
+        """
+        return await self._get("/v1/pm/liquidity-rewards",
+                               {"page": page, "size": size})
+
+    @staticmethod
+    def summarize_liquidity_rewards(payload: dict) -> dict:
+        """Total payout / epoch / market counts from a rewards response.
+
+        Pure so it can be tested without a network, and so the stall report
+        can state whether MAKER's resting quotes actually earned anything.
+        """
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            return {"epochs": 0, "markets": 0, "payout": 0.0, "paid": 0.0,
+                    "unpaid": 0.0, "samples": 0}
+        payout = paid = unpaid = 0.0
+        samples = 0
+        markets = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                amount = float(row.get("payout") or 0.0)
+                count = int(row.get("sampleCount") or 0)
+            except (TypeError, ValueError):
+                continue
+            payout += amount
+            samples += count
+            if row.get("isPaid"):
+                paid += amount
+            else:
+                unpaid += amount
+            if row.get("marketId"):
+                markets.add(row["marketId"])
+        return {"epochs": len(rows), "markets": len(markets), "payout": payout,
+                "paid": paid, "unpaid": unpaid, "samples": samples}
+
     async def get_portfolio(self) -> dict:
         return await self._get("/v1/pm/portfolio")
 

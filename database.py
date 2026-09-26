@@ -539,6 +539,32 @@ def last_filled_trade_at(chat_id: str):
     return row.get("created_at") if row else None
 
 
+def calibration_rows(chat_id: str | None = None, limit: int = 5000) -> list[dict]:
+    """Resolved trades paired with the probability the model claimed at entry.
+
+    ``trades.certainty`` is the composite certainty the strategy stored, which
+    is the inverse of ``strategies.utils.probability_to_certainty`` — i.e. the
+    blended win probability is ``0.50 + 0.45 * certainty``. That makes the
+    model's own forecast recoverable for every trade ever resolved, which is
+    what a reliability curve needs.
+    """
+    if chat_id:
+        return _fetch_all("""
+            SELECT strategy, certainty, won, entry_price, created_at
+            FROM trades
+            WHERE chat_id = %s AND won IS NOT NULL AND certainty IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (chat_id, limit))
+    return _fetch_all("""
+        SELECT strategy, certainty, won, entry_price, created_at
+        FROM trades
+        WHERE won IS NOT NULL AND certainty IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT %s
+    """, (limit,))
+
+
 def recent_stats(chat_id: str, days: int = 30, after_dt=None) -> list[dict]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     if after_dt:

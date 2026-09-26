@@ -51,8 +51,11 @@ def _stall_skip(chat_id: str, sig, code: str, detail: str = "") -> None:
     minimum, and a genuinely edge-free market all looked the same from outside.
     """
     try:
-        stall.note_order(chat_id, getattr(sig, "strategy", "?"), placed=False, reason=code)
-        stall.reject(chat_id, "exec", code, detail)
+        # One call: note_order records the attempt *and* the exec: counter.
+        # Calling stall.reject here as well counted every skip twice, so every
+        # executor-outcome number in /why was double the real count.
+        stall.note_order(chat_id, getattr(sig, "strategy", "?"), placed=False,
+                         reason=code, detail=detail)
     except Exception:
         pass
 

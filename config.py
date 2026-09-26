@@ -97,6 +97,19 @@ ASSET_ORACLE = {
     "EURUSD": "TWELVEDATA", "GBPUSD": "TWELVEDATA", "XAUUSD": "TWELVEDATA",
 }
 
+# Settlement reference for the crypto series. Operator notice 2026-09-26: these
+# markets resolve on a Chainlink 60-second time-weighted average price, not the
+# Binance spot print at close. Two consequences the code has to respect:
+#   1. The random variable is the average over the final minute, so the last
+#      60s of diffusion is partly averaged away — see
+#      strategies.utils.twap_win_probability. Set 0 to model the close print.
+#   2. ASSET_ORACLE above is now the *independent* feed we cross-check with, not
+#      the settlement source. Binance spot and the Chainlink TWAP differ by
+#      both aggregation basis and the averaging lag, so the minimum-distance
+#      calibrations are measured against a proxy, not against the settling
+#      series.
+SETTLEMENT_TWAP_SEC = _env_float("SETTLEMENT_TWAP_SEC", 60.0)
+
 # ── Strategies ────────────────────────────────────────────────────────────────
 ACTIVE_STRATEGIES = [
     "SNIPE", "MAKER", "ORACLE_ARB", "FRONTRUN", "CORRELATE",
@@ -149,7 +162,17 @@ SNIPE_MAX_MARKET_PRICE = 0.65   # Restored 2026-09-25 by operator decision: PR #
 SNIPE_MIN_ENTRY_PRICE  = 0.35   # Allow attractive underdog mispricings while blocking extreme lotteries.
 SNIPE_MIN_DISTANCE_PCT = 0.0010 # Base minimum spot/threshold separation (calibrated by asset).
 SNIPE_MIN_RAW_MODEL_EDGE = 0.035 # Independent model must exceed market price by at least 3.5% (comfortably clearing fees).
-SNIPE_MIN_BLENDED_EDGE = 0.025  # Required after shrinking toward market consensus.
+                                # NOT the binding threshold: the blend below gives the market 65%
+                                # of the log-odds and SNIPE_MIN_BLENDED_EDGE then re-imposes a gap
+                                # from that same market price, so the raw edge actually required is
+                                # ~0.069-0.072 across the whole entry band. Lowering this value
+                                # alone changes nothing. See
+                                # snipe.effective_raw_edge_floor() and
+                                # reports/snipe_no_entry_diagnosis.md.
+SNIPE_MIN_BLENDED_EDGE = 0.025  # Required after shrinking toward market consensus. This is the gate
+                                # that actually decides: measured against the market price *after*
+                                # a 0.35-weight shrinkage toward it, so it costs ~2x the raw edge
+                                # the line above appears to ask for.
 SNIPE_MODEL_WEIGHT = 0.35       # Market gets 65% weight until calibration improves.
 SNIPE_VOL_SAFETY_MULTIPLIER = 1.25
 MAKER_ORDER_TIMEOUT = 60        # Seconds before cancelling stale resting maker quote.
@@ -247,6 +270,14 @@ ASSET_HOURLY_VOL = {
     "GBPUSD": 0.0007,
     "XAUUSD": 0.0015,
 }
+
+# These are priors, not measurements: BTC at 1.8%/h is roughly 4x a typical
+# calm-market hourly vol, and every probability the diffusion model produces
+# scales with it. realized_vol_hourly() now prefers a vol measured from the
+# live tick history (see strategies.utils.measured_vol_hourly) and falls back
+# to these values when there is not enough history. Set false to restore the
+# constant/GARCH-only behaviour.
+USE_MEASURED_VOL = _env_bool("USE_MEASURED_VOL", True)
 
 # ── Kelly sizing ──────────────────────────────────────────────────────────────
 # Min: 3% — smallest useful bet on Bayse (100₦ min, 3% of ₦30k = ₦900)

@@ -21,6 +21,80 @@ _BINARY_SETTLEMENT_STRATEGIES = {
 }
 
 
+def certainty_to_win_prob(certainty: float) -> float:
+    """Inverse of strategies.utils.probability_to_certainty (w = 0.5 + 0.45c)."""
+    try:
+        return 0.50 + 0.45 * float(certainty)
+    except (TypeError, ValueError):
+        return 0.50
+
+
+def reliability_table(rows: list[dict], buckets: int = 10) -> list[dict]:
+    """Predicted vs realised win rate, bucketed by the model's own forecast.
+
+    This is the measurement that decides whether a certainty floor is
+    protecting the book or suppressing profitable entries: where the realised
+    win rate sits *above* the predicted probability the gate is too strict,
+    and where it sits below, the model is overconfident and the gate is
+    earning its keep. Pure and side-effect free so it can be tested without a
+    database, and so ``database.calibration_rows`` can stay a thin query.
+
+    ``rows`` are ``database.calibration_rows`` dicts: certainty, won,
+    entry_price, strategy.
+    """
+    prepared = []
+    for row in rows or []:
+        if not isinstance(row, dict) or row.get("won") is None:
+            continue
+        predicted = certainty_to_win_prob(row.get("certainty"))
+        won = 1.0 if int(row.get("won") or 0) else 0.0
+        try:
+            price = float(row.get("entry_price") or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        prepared.append((predicted, won, price, str(row.get("strategy") or "")))
+    if not prepared:
+        return []
+
+    width = 1.0 / max(1, buckets)
+    out = []
+    for i in range(buckets):
+        lo, hi = i * width, (i + 1) * width
+        group = [p for p in prepared
+                 if (lo <= p[0] < hi or (i == buckets - 1 and p[0] >= hi))]
+        if not group:
+            continue
+        n = len(group)
+        mean_pred = sum(g[0] for g in group) / n
+        realised = sum(g[1] for g in group) / n
+        priced = [g for g in group if g[2] > 0]
+        mean_price = sum(g[2] for g in priced) / len(priced) if priced else 0.0
+        out.append({
+            "bucket": f"{lo:.1f}-{hi:.1f}",
+            "n": n,
+            "predicted": mean_pred,
+            "realised": realised,
+            "gap": realised - mean_pred,
+            "avg_entry_price": mean_price,
+            # EV per share if the realised rate is the truth: win pays 1.0.
+            "ev_per_share": realised - mean_price if mean_price else None,
+        })
+
+    brier = sum((g[0] - g[1]) ** 2 for g in prepared) / len(prepared)
+    out.append({
+        "bucket": "ALL",
+        "n": len(prepared),
+        "predicted": sum(g[0] for g in prepared) / len(prepared),
+        "realised": sum(g[1] for g in prepared) / len(prepared),
+        "gap": (sum(g[1] for g in prepared) - sum(g[0] for g in prepared))
+               / len(prepared),
+        "avg_entry_price": None,
+        "ev_per_share": None,
+        "brier": brier,
+    })
+    return out
+
+
 def _break_even_rate(bucket: dict) -> float | None:
     """Capital-weighted binary break-even hit rate from effective fills."""
     deployed = float(bucket.get("deployed") or 0.0)
