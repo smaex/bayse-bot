@@ -25,6 +25,9 @@ class FakeExitClient:
     async def get_order(self, _order_id):
         return self.order_state
 
+    async def get_orderbooks(self, _outcome_ids, depth=5):
+        return {}
+
     async def get_position(self, _outcome_id):
         return {
             "availableBalance": 10,
@@ -62,7 +65,7 @@ def _risk_with_position(*, maker=False, confirmed=True):
             "amount_ngn": 600,
             "filled_quantity": 10 if confirmed else 0,
             "confirmed_filled": confirmed,
-            "strategy": "MAKER" if maker else "SNIPE",
+            "strategy": "MAKER" if maker else "TAKER",
             "asset": "BTC",
             "timeframe": "5min",
         },
@@ -84,9 +87,11 @@ def _install_market(monkeypatch):
             "fee_rate": 0.02,
         }],
     )
+    # The exit policy prices off strategies.model.fair_value. These spots are
+    # several sigma from the strike with two minutes left, so the real model
+    # decides the same way a pinned probability would -- and the test then
+    # exercises the policy, not a mock of it.
     monkeypatch.setattr(bot.feeds_direct, "get_direct_price", lambda _asset: (99, time.time()))
-    monkeypatch.setattr(bot, "win_probability", lambda *_a, **_kw: 0.2)
-    monkeypatch.setattr(bot, "realized_vol_hourly", lambda *_a, **_kw: 0.1)
     monkeypatch.setattr(bot, "_tg_app", None)
 
 
@@ -163,7 +168,6 @@ def test_model_probability_cannot_invent_an_executable_take_profit(monkeypatch):
     _install_market(monkeypatch)
     bot.active_markets[0]["yes_price"] = 0.59
     monkeypatch.setattr(bot.feeds_direct, "get_direct_price", lambda _asset: (101, time.time()))
-    monkeypatch.setattr(bot, "win_probability", lambda *_a, **_kw: 0.99)
     risk = _risk_with_position()
     client = FakeExitClient(current_value=700, sell_price=0.70)
 
@@ -177,7 +181,6 @@ def test_take_profit_requires_at_least_five_percent_net_quote(monkeypatch):
     _install_market(monkeypatch)
     bot.active_markets[0]["yes_price"] = 0.70
     monkeypatch.setattr(bot.feeds_direct, "get_direct_price", lambda _asset: (101, time.time()))
-    monkeypatch.setattr(bot, "win_probability", lambda *_a, **_kw: 0.90)
     risk = _risk_with_position()
     client = FakeExitClient(current_value=620, sell_price=0.62)
 

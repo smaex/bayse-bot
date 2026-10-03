@@ -16,7 +16,10 @@ import scanner
 import stall
 import telegram_bot
 import strategy
-from config import ARB_MAX_SIZE_NGN, CURRENCY, MIN_PAYOUT_RATIO, FEE_FLOOR
+import dataclasses
+
+from config import CURRENCY, FEE_FLOOR, MIN_PAYOUT_RATIO
+from strategies import book as booklib
 
 log = logging.getLogger("executor")
 
@@ -38,8 +41,8 @@ def _cooldown_key(chat_id: str, market_id: str, strategy: str = "") -> tuple[str
     # The strategy is part of the key for the same reason, one level down:
     # MAKER re-quotes inside a single candle (60s timeout, 0.10% oracle move),
     # and each placement stamped the *market* cooldown. That let passive
-    # liquidity provision repeatedly silence a directional SNIPE on the very
-    # same market — the exact "SNIPE never enters" drought this key caused.
+    # liquidity provision repeatedly silence a directional taker on the very
+    # same market — the exact "no taker entries" drought this key caused.
     return str(chat_id), market_id, str(strategy or "").upper()
 
 
@@ -176,76 +179,66 @@ def _maker_quote_against_book(
     tick: float | None = None,
     max_ticks_behind: int | None = None,
 ) -> tuple[float | None, str, str]:
-    """Price a post-only MAKER BUY against the live order book.
+    """Price one post-only MAKER BUY against the live order book.
 
-    ``max_price`` is the strategy's number: the most MAKER will pay (fair value
-    minus its half-spread, clamped to ``MAKER_MAX_BID``). It is derived from
-    Bayse's outcome *probability* price, which is not the best bid, so sent
-    as-is it lands in one of two dead zones:
+    ``max_price`` is the strategy's number: the most MAKER will pay. It is a
+    hard ceiling and is never exceeded -- a risk/reward ceiling is not a
+    liquidity setting, so no amount of "but it would fill" raises it.
 
-    * at/through the best ask — a post-only order is rejected by the exchange;
-    * several ticks under the best bid — every seller hits the bids above it
-      first, so it rests until MAKER_ORDER_TIMEOUT cancels it and the next
-      signal re-places the same dead quote (the zero-fill churn observed in
-      production: five 0.58 quotes, zero fills, ~19 hours without a fill).
+    The mechanics live in :func:`strategies.book.passive_bid_price` so the
+    strategy and the executor cannot disagree about what "passive and
+    competitive" means. This wrapper exists to keep the executor's historical
+    skip-code names, which the drought report and its tests key off.
 
-    ``fair_value`` is optional diagnostic context only. When supplied, a skip
-    reports model-implied gross returns at the current best bid and ask. It
-    never changes admission or pricing.
-
-    Returns ``(price, "", detail)`` for a quote worth resting, or
-    ``(None, code, detail)`` with a stable skip code. Never raises the price
-    above ``max_price``: the risk/reward ceiling is not a liquidity setting.
+    ``fair_value`` is diagnostic only: a skip then reports the model-implied
+    gross return at the current best bid and ask. It never changes admission
+    or pricing.
     """
-    min_price = config.MAKER_MIN_BID if min_price is None else float(min_price)
-    tick = config.MAKER_TICK if tick is None else float(tick)
-    if max_ticks_behind is None:
-        max_ticks_behind = config.MAKER_MAX_TICKS_BEHIND_BEST_BID
-
-    bids = _level_prices(book.get("bids"))
-    asks = _level_prices(book.get("asks"))
-    best_bid = max(bids) if bids else None
-    best_ask = min(asks) if asks else None
-    book_text = (
-        (f"best bid {best_bid:.3f}" if best_bid is not None else "no bids")
-        + (f" / best ask {best_ask:.3f}" if best_ask is not None else " / no asks")
+    price, code, detail = booklib.passive_bid_price(
+        book,
+        max_price,
+        floor=config.MAKER_MIN_LEG_BID if min_price is None else float(min_price),
+        tick=tick,
+        max_ticks_behind=max_ticks_behind,
     )
-    model_at_book = ""
+
+    if price is None:
+        code = {
+            "behind_book": "maker_quote_behind_book",
+            "would_cross_book": "maker_would_cross_book",
+            "no_passive_price": "maker_no_passive_price",
+        }.get(code, f"maker_{code}")
+        detail += _model_at_book(book, fair_value)
+        return None, code, detail
+    return price, "", detail + _model_at_book(book, fair_value)
+
+
+def _model_at_book(book: dict, fair_value: float | None) -> str:
+    """Model-implied gross return at the current best bid and ask.
+
+    Diagnostic text appended to a skip. It exists because "the quote was
+    uncompetitive" and "the quote was uncompetitive and the model thought it
+    was worth 30% more" are very different operational signals, and only the
+    second one argues for revisiting the ceiling.
+    """
     try:
         fv = float(fair_value)
     except (TypeError, ValueError):
-        fv = math.nan
-    if math.isfinite(fv) and 0.0 < fv < 1.0:
-        modeled_prices = []
-        if best_bid is not None:
-            modeled_prices.append(f"at best bid {fv / best_bid - 1.0:+.1%}")
-        if best_ask is not None:
-            modeled_prices.append(f"at best ask {fv / best_ask - 1.0:+.1%}")
-        if modeled_prices:
-            model_at_book = (
-                f"; model FV {fv:.3f} -> gross ROI " + " and ".join(modeled_prices)
-                + " if filled (model estimate only; before fees/adverse selection)"
-            )
-
-    price = round(float(max_price), 3)
-    if best_ask is not None and price >= best_ask - 1e-9:
-        # Post-only would cross. Rest one tick inside the ask instead: that is
-        # a *lower* price than intended, and the top of the book.
-        stepped = round(best_ask - tick, 3)
-        if stepped < min_price - 1e-9:
-            return None, "maker_would_cross_book", (
-                f"{book_text}: no passive price >= {min_price:.2f} exists below the ask"
-                f"{model_at_book}"
-            )
-        price = stepped
+        return ""
+    if not math.isfinite(fv) or not (0.0 < fv < 1.0):
+        return ""
+    best_bid, best_ask = booklib.best_bid(book), booklib.best_ask(book)
+    parts = []
     if best_bid is not None:
-        ticks_behind = round((best_bid - price) / tick, 6)
-        if ticks_behind > max_ticks_behind:
-            return None, "maker_quote_behind_book", (
-                f"max bid {max_price:.3f} is {ticks_behind:.0f} tick(s) under the "
-                f"{book_text}{model_at_book}; a post-only bid there cannot fill before timeout"
-            )
-    return price, "", f"{book_text} -> bid {price:.3f}"
+        parts.append(f"at best bid {fv / best_bid - 1.0:+.1%}")
+    if best_ask is not None:
+        parts.append(f"at best ask {fv / best_ask - 1.0:+.1%}")
+    if not parts:
+        return ""
+    return (
+        f"; model FV {fv:.3f} -> gross ROI " + " and ".join(parts)
+        + " if filled (model estimate only; before fees/adverse selection)"
+    )
 
 
 def _book_is_stale(
@@ -352,8 +345,8 @@ async def _execute_logic(
     chat_id: str, sig, client, risk, settings: dict,
     equity: float, free_cash: float, *, is_hedge: bool = False,
 ):
-    is_oracle_arb = (sig.strategy == "ORACLE_ARB")
-    is_maker      = (sig.strategy == "MAKER")
+    is_maker = (sig.strategy == "MAKER")
+    legs     = sig.ensure_legs()
     mode      = settings.get("mode", "balanced")
     min_t     = settings.get("mintrade", MIN_TRADE_NGN)
     max_t     = settings.get("maxtrade", 5_000)
@@ -428,7 +421,12 @@ async def _execute_logic(
     market_min = float((market_meta or {}).get("minimum_order_amount") or MIN_TRADE_NGN)
     effective_min = max(MIN_TRADE_NGN, float(min_t), market_min)
     effective_max = max(0.0, float(max_t))
-    hard_cap = min(equity * allowed_pct, effective_max, free_cash)
+    # ``size_pct`` is per leg. A two-sided quote commits it twice, so each leg
+    # may only spend its share of free cash -- otherwise a pair can reserve
+    # money the wallet does not have and the second placement fails after the
+    # first has already filled.
+    per_leg_free_cash = free_cash / max(1, len(legs))
+    hard_cap = min(equity * allowed_pct, effective_max, per_leg_free_cash)
 
     if hard_cap < effective_min:
         # If the account has sufficient free cash and bankroll for the exchange minimum order (e.g. ₦100),
@@ -479,191 +477,151 @@ async def _execute_logic(
             )
             return
 
-    # ── ORACLE_ARB: skip EV and price ceiling — certainty is the gate ──────
-    if is_oracle_arb:
-        log.info(
-            f"[{chat_id}] ORACLE_ARB FAST PATH | {sig.asset} {sig.outcome} "
-            f"certainty={sig.certainty:.0%} entry_price={sig.market_price:.3f} ₦{amount:,.0f}"
-        )
-        # Fall through directly to order placement
-    else:
-        # ── Engine detection ────────────────────────────────────────────────
-        market   = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
-        declared = market.get("engine") if market else None
-        if declared:
-            engine = declared
-        elif market:
-            engine = await _infer_engine(client, market)
-        else:
-            engine = "AMM"
-
-        # ── EV check with pre-trade Quote ───────────────────────────────────
-        target_margin = {
-            "safe": 0.03, "balanced": 0.01, "aggressive": 0.00,
-            "full_send": 0.00, "custom": 0.01,
-        }.get(mode, 0.01)
-
-        is_probe = sig.certainty < sig.mode_floor
-        if is_probe:
-            # Live-money exploration turns uncertainty into losses. Shadow
-            # tracking can collect calibration data without placing an order.
-            _stall_skip(chat_id, sig, "below_mode_floor",
-                        f"{sig.certainty:.1%} < {sig.mode_floor:.1%}")
-            log.info(
-                f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — certainty "
-                f"{sig.certainty:.1%} below mode floor {sig.mode_floor:.1%}"
-            )
-            return
-
-        quote_price = sig.market_price
-        if engine == "AMM":
-            try:
-                quote = await client.get_quote(
-                    event_id=sig.event_id, market_id=sig.market_id,
-                    outcome_id=sig.outcome_id, side="BUY", amount=amount,
-                    currency=CURRENCY
-                )
-                q_price = float(quote.get("price") or sig.market_price)
-                q_qty = float(quote.get("quantity") or 0)
-                if quote.get("completeFill") is not True or q_qty <= 0:
-                    _stall_skip(chat_id, sig, "quote_not_complete_fill")
-                    log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — quote does not confirm a complete fill")
-                    return
-                if quote.get("tradeGoesOverMaxLiability") is True:
-                    _stall_skip(chat_id, sig, "quote_over_max_liability")
-                    log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — quote exceeds market liability")
-                    return
-
-                quote_price = _quote_effective_buy_price(quote)
-                if quote_price <= 0:
-                    # Compatibility fallback for old quote payloads that omit
-                    # amount/cost but still expose a quoted marginal price.
-                    fee_rate = _get_market_fee(sig.market_id)
-                    quote_price = _clob_buy_effective_price(q_price, fee_rate)
-
-                if quote_price <= 0:
-                    log.warning(f"[{chat_id}] Invalid quote price {quote_price} returned. Skipping EV calculation.")
-                    return
-                ev = sig.win_prob / quote_price - 1.0
-
-                if ev < target_margin:
-                    log.info(f"[{chat_id}] EV {ev:+.1%} too low at size ₦{amount:,.0f} (price={quote_price:.3f}). Scaling down...")
-                    scaled_success = False
-                    for scale in [0.5, 0.25]:
-                        scaled_amount = max(MIN_TRADE_NGN, round(amount * scale, -2))
-                        if scaled_amount <= MIN_TRADE_NGN or scaled_amount >= amount:
-                            scaled_amount = MIN_TRADE_NGN
-
-                        try:
-                            scaled_quote = await client.get_quote(
-                                event_id=sig.event_id, market_id=sig.market_id,
-                                outcome_id=sig.outcome_id, side="BUY", amount=scaled_amount,
-                                currency=CURRENCY
-                            )
-                            if (
-                                scaled_quote.get("completeFill") is not True
-                                or scaled_quote.get("tradeGoesOverMaxLiability") is True
-                            ):
-                                continue
-                            sq_price = float(scaled_quote.get("price") or sig.market_price)
-                            sq_qty = float(scaled_quote.get("quantity") or 0)
-                            if sq_qty <= 0:
-                                continue
-                            scaled_price = _quote_effective_buy_price(
-                                scaled_quote
-                            )
-                            if scaled_price <= 0:
-                                fee_rate = _get_market_fee(sig.market_id)
-                                scaled_price = _clob_buy_effective_price(
-                                    sq_price, fee_rate
-                                )
-
-                            scaled_ev = sig.win_prob / scaled_price - 1.0
-                            if scaled_ev >= target_margin:
-                                log.info(
-                                    f"[{chat_id}] Sizing down success! ₦{amount:,.0f} → ₦{scaled_amount:,.0f} "
-                                    f"(EV={scaled_ev:.2%}, price={scaled_price:.3f})"
-                                )
-                                amount = scaled_amount
-                                quote_price = scaled_price
-                                ev = scaled_ev
-                                scaled_success = True
-                                break
-                        except Exception as q_err:
-                            log.debug(f"Sizing down quote failed for size ₦{scaled_amount}: {q_err}")
-
-                    if not scaled_success:
-                        _stall_skip(chat_id, sig, "no_profitable_size", f"EV {ev:.2%}")
-                        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — no profitable size (quoted_price={quote_price:.3f} EV={ev:.2%})")
-                        return
-            except Exception as e:
-                # A stale displayed price is not an executable price. Trading
-                # through a quote outage converts unknown slippage into risk.
-                _stall_skip(chat_id, sig, "quote_request_failed", str(e)[:120])
-                log.warning(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — executable quote failed: {e}")
-                return
-        else:
-            # CLOB or probe: evaluate EV using worst-case price (inclusive of spread buffer & fees)
-            fee_rate = _get_market_fee(sig.market_id)
-            slip_map_ev = {"safe": 0.008, "balanced": 0.015, "aggressive": 0.020, "full_send": 0.025, "custom": 0.015}
-            slip_ev = slip_map_ev.get(mode, 0.015) if not is_maker else 0.0
-            taker_buf = max(0.012, sig.market_price * slip_ev) if not is_maker else 0.0
-            worst_case_p = min(sig.market_price + taker_buf, 0.99)
-            effective_worst_p = _clob_buy_effective_price(
-                worst_case_p, fee_rate
-            )
-            ev = sig.win_prob / effective_worst_p - 1.0
-            if not is_probe and ev < target_margin:
-                _stall_skip(chat_id, sig, "worst_case_ev_below_margin", f"{ev:+.1%} < {target_margin:.0%}")
-                log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — worst-case EV {ev:+.1%} < {target_margin:.0%} (worst_price={worst_case_p:.3f})")
-                return
-
-        # ── Global entry price ceiling ───────────────────────────────────────
-        # DATA-DRIVEN (Audit Aug 13-23 2026): entries >= 0.80 → -₦314 net loss at 57% win rate.
-        # Buying at 0.85 means: +₦7 net on a WIN (after fees), -₦100 on a LOSS.
-        # You need a 93%+ win rate just to break even. That never happens.
-        # Hard cap at 0.75 — SNIPE_MAX_MARKET_PRICE is now 0.65, so this is a
-        # final backstop that catches any unexpected rounding or overrides.
-        if quote_price > 0.75:
-            _stall_skip(chat_id, sig, "price_above_ev_ceiling", f"{quote_price:.3f} > 0.75")
-            log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — price {quote_price:.3f} > 0.75 ceiling (fee drag kills EV above 0.75)")
-            return
-
-    # ── Shared exposure check ──────────────────────────────────────────────
+    # ── Engine detection ───────────────────────────────────────────────────
     market   = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
-    if not is_oracle_arb:
-        # Engine may not be set if we went the oracle_arb path
-        if not market:
-            engine = "AMM"
-        elif not declared:
-            engine = await _infer_engine(client, market)
-    engine = str(engine or "AMM").upper()
+    declared = market.get("engine") if market else None
+    if declared:
+        engine = declared
+    elif market:
+        engine = await _infer_engine(client, market)
+    else:
+        engine = "AMM"
 
-    # ORACLE_ARB used to bypass the quote and EV gates entirely. It is still a
-    # probabilistic trade before close, so verify the executable AMM price.
-    if is_oracle_arb and engine == "AMM":
+    # ── EV check with pre-trade Quote ──────────────────────────────────────
+    target_margin = {
+        "safe": 0.03, "balanced": 0.01, "aggressive": 0.00,
+        "full_send": 0.00, "custom": 0.01,
+    }.get(mode, 0.01)
+
+    is_probe = sig.certainty < sig.mode_floor
+    if is_probe:
+        # Live-money exploration turns uncertainty into losses. A signal below
+        # the account's own conviction floor is not a trade.
+        _stall_skip(chat_id, sig, "below_mode_floor",
+                    f"{sig.certainty:.1%} < {sig.mode_floor:.1%}")
+        log.info(
+            f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — certainty "
+            f"{sig.certainty:.1%} below mode floor {sig.mode_floor:.1%}"
+        )
+        return
+
+    quote_price = sig.market_price
+    if engine == "AMM":
         try:
             quote = await client.get_quote(
-                sig.event_id, sig.market_id, sig.outcome_id,
-                "BUY", amount, CURRENCY,
+                event_id=sig.event_id, market_id=sig.market_id,
+                outcome_id=sig.outcome_id, side="BUY", amount=amount,
+                currency=CURRENCY
             )
-            if quote.get("completeFill") is False or quote.get("tradeGoesOverMaxLiability") is True:
+            q_price = float(quote.get("price") or sig.market_price)
+            q_qty = float(quote.get("quantity") or 0)
+            if quote.get("completeFill") is not True or q_qty <= 0:
+                _stall_skip(chat_id, sig, "quote_not_complete_fill")
+                log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — quote does not confirm a complete fill")
                 return
-            quote_price = (
-                _quote_effective_buy_price(quote)
-                or float(quote.get("price") or sig.market_price)
-            )
-            oracle_cap = min(0.75, sig.win_prob / 1.03)
-            if quote_price > oracle_cap:
-                log.info(
-                    f"[{chat_id}] SKIP ORACLE_ARB {sig.asset} — executable price "
-                    f"{quote_price:.3f} > cap {oracle_cap:.3f}"
-                )
+            if quote.get("tradeGoesOverMaxLiability") is True:
+                _stall_skip(chat_id, sig, "quote_over_max_liability")
+                log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — quote exceeds market liability")
                 return
-        except Exception as exc:
-            # A latency trade without a fresh quote is not safe.
-            log.warning(f"[{chat_id}] SKIP ORACLE_ARB {sig.asset} — quote failed: {exc}")
+
+            quote_price = _quote_effective_buy_price(quote)
+            if quote_price <= 0:
+                # Compatibility fallback for old quote payloads that omit
+                # amount/cost but still expose a quoted marginal price.
+                fee_rate = _get_market_fee(sig.market_id)
+                quote_price = _clob_buy_effective_price(q_price, fee_rate)
+
+            if quote_price <= 0:
+                log.warning(f"[{chat_id}] Invalid quote price {quote_price} returned. Skipping EV calculation.")
+                return
+            ev = sig.win_prob / quote_price - 1.0
+
+            if ev < target_margin:
+                log.info(f"[{chat_id}] EV {ev:+.1%} too low at size ₦{amount:,.0f} (price={quote_price:.3f}). Scaling down...")
+                scaled_success = False
+                for scale in [0.5, 0.25]:
+                    scaled_amount = max(MIN_TRADE_NGN, round(amount * scale, -2))
+                    if scaled_amount <= MIN_TRADE_NGN or scaled_amount >= amount:
+                        scaled_amount = MIN_TRADE_NGN
+
+                    try:
+                        scaled_quote = await client.get_quote(
+                            event_id=sig.event_id, market_id=sig.market_id,
+                            outcome_id=sig.outcome_id, side="BUY", amount=scaled_amount,
+                            currency=CURRENCY
+                        )
+                        if (
+                            scaled_quote.get("completeFill") is not True
+                            or scaled_quote.get("tradeGoesOverMaxLiability") is True
+                        ):
+                            continue
+                        sq_price = float(scaled_quote.get("price") or sig.market_price)
+                        sq_qty = float(scaled_quote.get("quantity") or 0)
+                        if sq_qty <= 0:
+                            continue
+                        scaled_price = _quote_effective_buy_price(
+                            scaled_quote
+                        )
+                        if scaled_price <= 0:
+                            fee_rate = _get_market_fee(sig.market_id)
+                            scaled_price = _clob_buy_effective_price(
+                                sq_price, fee_rate
+                            )
+
+                        scaled_ev = sig.win_prob / scaled_price - 1.0
+                        if scaled_ev >= target_margin:
+                            log.info(
+                                f"[{chat_id}] Sizing down success! ₦{amount:,.0f} → ₦{scaled_amount:,.0f} "
+                                f"(EV={scaled_ev:.2%}, price={scaled_price:.3f})"
+                            )
+                            amount = scaled_amount
+                            quote_price = scaled_price
+                            ev = scaled_ev
+                            scaled_success = True
+                            break
+                    except Exception as q_err:
+                        log.debug(f"Sizing down quote failed for size ₦{scaled_amount}: {q_err}")
+
+                if not scaled_success:
+                    _stall_skip(chat_id, sig, "no_profitable_size", f"EV {ev:.2%}")
+                    log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — no profitable size (quoted_price={quote_price:.3f} EV={ev:.2%})")
+                    return
+        except Exception as e:
+            # A stale displayed price is not an executable price. Trading
+            # through a quote outage converts unknown slippage into risk.
+            _stall_skip(chat_id, sig, "quote_request_failed", str(e)[:120])
+            log.warning(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — executable quote failed: {e}")
             return
+    else:
+        # CLOB or probe: evaluate EV using worst-case price (inclusive of spread buffer & fees)
+        fee_rate = _get_market_fee(sig.market_id)
+        slip_map_ev = {"safe": 0.008, "balanced": 0.015, "aggressive": 0.020, "full_send": 0.025, "custom": 0.015}
+        slip_ev = slip_map_ev.get(mode, 0.015) if not is_maker else 0.0
+        taker_buf = max(0.012, sig.market_price * slip_ev) if not is_maker else 0.0
+        worst_case_p = min(sig.market_price + taker_buf, 0.99)
+        effective_worst_p = _clob_buy_effective_price(
+            worst_case_p, fee_rate
+        )
+        ev = sig.win_prob / effective_worst_p - 1.0
+        if not is_probe and ev < target_margin:
+            _stall_skip(chat_id, sig, "worst_case_ev_below_margin", f"{ev:+.1%} < {target_margin:.0%}")
+            log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — worst-case EV {ev:+.1%} < {target_margin:.0%} (worst_price={worst_case_p:.3f})")
+            return
+
+    # ── Global entry price ceiling ───────────────────────────────────────
+    # DATA-DRIVEN (Audit Aug 13-23 2026): entries >= 0.80 → -₦314 net loss at 57% win rate.
+    # Buying at 0.85 means: +₦7 net on a WIN (after fees), -₦100 on a LOSS.
+    # You need a 93%+ win rate just to break even. That never happens.
+    # Hard cap at 0.75 — TAKER_MAX_EFFECTIVE_PRICE is 0.65, so this is a
+    # final backstop that catches any unexpected rounding or overrides.
+    if quote_price > 0.75:
+        _stall_skip(chat_id, sig, "price_above_ev_ceiling", f"{quote_price:.3f} > 0.75")
+        log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — price {quote_price:.3f} > 0.75 ceiling (fee drag kills EV above 0.75)")
+        return
+
+    # ── Shared exposure check ──────────────────────────────────────────────
+    market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
+    engine = str(engine or "AMM").upper()
 
     if not risk.can_trade(equity, amount, max_exp):
         _stall_skip(
@@ -678,24 +636,50 @@ async def _execute_logic(
         )
         return
 
-    # ── MAKER Individual Asset Guard ──────────────────────────────────────
-    # Limit resting/open MAKER trades to at most 1 per individual asset (e.g. 1 BTC, 1 ETH, 1 SOL),
-    # allowing independent evaluation and trading across all eligible assets without cross-blocking.
+    # ── MAKER quote-pair guard ────────────────────────────────────────────
+    # One quote per market. A second quote on a market we are already quoting
+    # is either a duplicate of the first (wasted wallet reservation) or a
+    # conflicting price from a different model reading, and neither should be
+    # sent. Per-asset limiting is what let a single resting quote on BTC block
+    # a better opportunity elsewhere on BTC.
     if is_maker:
-        asset_makers = sum(
-            1 for p in risk.open_positions.values()
-            if p.get("strategy") == "MAKER" and p.get("asset") == sig.asset
+        existing = sum(
+            1 for key, p in risk.open_positions.items()
+            if p.get("strategy") == "MAKER"
+            and (p.get("market_id", key) == sig.market_id
+                 or str(key).startswith(f"{sig.market_id}:"))
         )
-        if asset_makers >= 1:
-            _stall_skip(chat_id, sig, "maker_asset_guard",
-                        f"{asset_makers} MAKER order(s) already resting/held for {sig.asset}")
+        if existing:
+            _stall_skip(chat_id, sig, "maker_quote_already_resting",
+                        f"{existing} MAKER leg(s) already resting on {sig.market_id}")
             log.info(
-                f"[{chat_id}] SKIP MAKER {sig.asset} — active MAKER order already resting/held for {sig.asset}"
+                f"[{chat_id}] SKIP MAKER {sig.asset} — a quote is already resting on "
+                f"{sig.market_id}"
+            )
+            return
+        # Maker capital budget. Resting quotes reserve wallet funds and a
+        # one-sided fill carries real directional risk, so the maker book gets
+        # its own ceiling instead of borrowing the directional one.
+        maker_notional = sum(
+            float(p.get("amount_ngn") or 0.0)
+            for p in risk.open_positions.values()
+            if p.get("strategy") == "MAKER"
+        )
+        if maker_notional + amount > equity * config.MAX_MAKER_NOTIONAL_PCT:
+            _stall_skip(
+                chat_id, sig, "maker_notional_cap",
+                f"₦{maker_notional:,.0f} + ₦{amount:,.0f} > "
+                f"{config.MAX_MAKER_NOTIONAL_PCT:.0%} of ₦{equity:,.0f}",
+            )
+            log.info(
+                f"[{chat_id}] SKIP MAKER {sig.asset} — maker notional "
+                f"₦{maker_notional:,.0f} + ₦{amount:,.0f} exceeds the "
+                f"{config.MAX_MAKER_NOTIONAL_PCT:.0%} budget"
             )
             return
 
     # ── Correlated crypto exposure cap ─────────────────────────────────────
-    if not is_oracle_arb and risk.has_correlated_open_position(sig.asset, sig.outcome, sig.timeframe, certainty=sig.certainty, strategy=sig.strategy):
+    if risk.has_correlated_open_position(sig.asset, sig.outcome, sig.timeframe, certainty=sig.certainty, strategy=sig.strategy):
         _stall_skip(chat_id, sig, "correlated_asset_cap",
                     f"same-direction {sig.asset} {sig.outcome} already open on {sig.timeframe}")
         log.info(
@@ -724,10 +708,10 @@ async def _execute_logic(
             return
 
     # ── Strict Price-Capped Execution ─────────────────────────────────────
-    # MAKER: places a passive LIMIT GTC order to capture the spread.
-    # All taker strategies (SNIPE, ORACLE_ARB, CORRELATE, FRONTRUN): use LIMIT FAK
-    # (Fill-And-Kill / IOC) with a strict price ceiling passed directly to the exchange.
-    # This physically FORBIDS the exchange from ever filling orders at 0.990 or 0.830!
+    # MAKER places passive LIMIT GTC orders to capture the spread; TAKER uses
+    # LIMIT FAK (Fill-And-Kill / IOC) with a strict price ceiling passed
+    # directly to the exchange. That physically forbids the exchange from ever
+    # filling a taker order at 0.990 or 0.830.
     fee_rate      = _get_market_fee(sig.market_id)
     slip_map      = {"safe": 0.008, "balanced": 0.015, "aggressive": 0.020, "full_send": 0.025, "custom": 0.015}
     slippage      = slip_map.get(mode, 0.015)
@@ -742,54 +726,89 @@ async def _execute_logic(
             return
         time_in_force = "GTC"
         post_only     = True  # never accidentally cross and pay taker fees
-        # ── Book-aware passive price ──────────────────────────────────────
-        # The strategy's bid is the most MAKER will pay, not a competitive
-        # price (see _maker_quote_against_book). Check it against the live
-        # book so MAKER only rests quotes that can fill, and a quote that
-        # cannot is reported as such instead of churning every 60s.
-        cooldown_key = _cooldown_key(chat_id, sig.market_id, sig.strategy)
+        cooldown_key  = _cooldown_key(chat_id, sig.market_id, sig.strategy)
+
+        # ── Re-verify every leg against ONE fresh book ─────────────────────
+        # The strategy priced this quote off the snapshot it was handed. By the
+        # time we are here the book may have moved, so each leg is re-priced
+        # with the same function the strategy used -- never a second opinion --
+        # and the pair lock is re-asserted on the prices we are about to send.
+        # That last step matters: two independently-valid prices are not a
+        # locked spread unless they still sum below one *now*.
+        outcome_ids = [leg.outcome_id for leg in legs if leg.outcome_id]
         book_error = ""
         try:
-            ob = await asyncio.wait_for(
-                client.get_orderbook(sig.outcome_id, depth=5), timeout=1.5
+            books = await asyncio.wait_for(
+                client.get_orderbooks(outcome_ids, depth=5), timeout=2.5
             )
         except Exception as obe:
-            ob, book_error = {}, str(obe)[:120]
-        if not isinstance(ob, dict) or not ob or _book_is_stale(ob):
-            # Same rule as every other entry: no fresh market state, no order.
-            code = "maker_book_stale" if isinstance(ob, dict) and ob else "maker_book_unavailable"
-            _stall_skip(chat_id, sig, code, book_error or "order book could not be verified")
+            books, book_error = {}, str(obe)[:120]
+
+        usable = {oid: b for oid, b in (books or {}).items()
+                  if isinstance(b, dict) and booklib.is_usable(b)}
+        if any(oid not in usable for oid in outcome_ids):
+            # No fresh market state, no order -- the same rule every entry
+            # obeys, applied to both legs rather than just the first.
+            code = "maker_book_stale" if usable else "maker_book_unavailable"
+            _stall_skip(chat_id, sig, code,
+                        book_error or f"{len(outcome_ids) - len(usable)}/{len(outcome_ids)} "
+                                      f"outcome book(s) unreadable")
             log.info(
-                f"[{chat_id}] SKIP MAKER {sig.asset} {sig.outcome} — {code.replace('_', ' ')}"
+                f"[{chat_id}] SKIP MAKER {sig.asset} — {code.replace('_', ' ')}"
                 + (f": {book_error}" if book_error else "")
             )
             _trade_cooldown[cooldown_key] = time.time()
             return
-        limit_price, book_skip, book_detail = _maker_quote_against_book(
-            ob, sig.market_price, fair_value=sig.win_prob
-        )
-        if limit_price is None:
-            if book_skip in {"maker_quote_behind_book", "maker_would_cross_book"}:
-                try:
-                    import maker_shadow
-                    # The quote was declined already; collect read-only price
-                    # feasibility data without adding work to the order path.
-                    await asyncio.to_thread(maker_shadow.record_candidate, sig, ob)
-                except Exception as shadow_error:
-                    log.debug("MAKER shadow audit failed: %s", shadow_error)
-            _stall_skip(chat_id, sig, book_skip, book_detail)
-            log.info(f"[{chat_id}] SKIP MAKER {sig.asset} {sig.outcome} — {book_detail}")
-            # One book check per market per cooldown window, not per signal.
+
+        stale = [oid for oid, b in usable.items() if booklib.book_is_stale(b)]
+        if stale:
+            _stall_skip(chat_id, sig, "maker_book_stale", f"{len(stale)} leg(s) stale")
+            log.info(f"[{chat_id}] SKIP MAKER {sig.asset} — order book timestamp is stale")
             _trade_cooldown[cooldown_key] = time.time()
             return
-        if abs(limit_price - sig.market_price) > 1e-9:
-            log.info(
-                f"[{chat_id}] MAKER re-priced {sig.asset} {sig.outcome} "
-                f"{sig.market_price:.3f} -> {limit_price:.3f} ({book_detail})"
+
+        repriced: list = []
+        for leg in legs:
+            price, book_skip, book_detail = _maker_quote_against_book(
+                usable.get(leg.outcome_id) or {}, leg.price, fair_value=leg.fair_value
             )
-            # Downstream (notification, DB row, requote tracking) must show the
-            # price actually sent, which is never above the strategy's bid.
-            sig.market_price = limit_price
+            if price is None:
+                _stall_skip(chat_id, sig, book_skip, f"{leg.outcome}: {book_detail}")
+                log.info(
+                    f"[{chat_id}] SKIP MAKER {sig.asset} {leg.outcome} — {book_detail}"
+                )
+                # One book check per market per cooldown window, not per signal.
+                _trade_cooldown[cooldown_key] = time.time()
+                return
+            if abs(price - leg.price) > 1e-9:
+                log.info(
+                    f"[{chat_id}] MAKER re-priced {sig.asset} {leg.outcome} "
+                    f"{leg.price:.3f} -> {price:.3f} ({book_detail})"
+                )
+                # QuoteLeg is frozen: a leg is a quote that was priced, and a
+                # quote that silently mutates is how the risk book and the
+                # order end up disagreeing about what was sent.
+                leg = dataclasses.replace(leg, price=price)
+            repriced.append(leg)
+        legs = repriced
+
+        if len(legs) > 1:
+            lock = 1.0 - sum(float(leg.price) for leg in legs)
+            if lock < config.MAKER_PAIR_MIN_EDGE:
+                prices = "/".join(f"{leg.outcome}@{leg.price:.3f}" for leg in legs)
+                _stall_skip(
+                    chat_id, sig, "maker_pair_no_longer_locks",
+                    f"{prices} locks {lock:+.3f} < {config.MAKER_PAIR_MIN_EDGE:+.3f}",
+                )
+                log.info(
+                    f"[{chat_id}] SKIP MAKER {sig.asset} — pair no longer locks "
+                    f"({prices}, lock={lock:+.3f})"
+                )
+                _trade_cooldown[cooldown_key] = time.time()
+                return
+
+        limit_price = max(float(leg.price) for leg in legs)
+
     elif engine == "CLOB":
         # ── CLOB Taker Execution: Price to match real Order Book Asks ────────
         # On a CLOB, buying into a book requires crossing the spread to the lowest ask.
@@ -802,10 +821,7 @@ async def _execute_logic(
         dynamic_cap = (
             sig.win_prob * (1.0 - fee_fraction) / (1.0 + target_margin)
         )
-        strategy_cap = (
-            config.SNIPE_MAX_MARKET_PRICE
-            if sig.strategy == "SNIPE" else 0.75
-        )
+        strategy_cap = 0.75
         cap = min(strategy_cap, dynamic_cap, max_valid)
         if cap <= 0.01:
             _stall_skip(chat_id, sig, "clob_ev_cap_below_floor",
@@ -922,6 +938,25 @@ async def _execute_logic(
         time_in_force = "FAK"
         limit_price = None
 
+    # A complete-set take is two orders forming one position, so it cannot go
+    # through the single-order path below.
+    if len(legs) > 1 and not is_maker:
+        return await _place_complete_set_take(
+            chat_id, sig, client, risk, settings, legs, amount,
+            market=market, fee_rate=fee_rate, slippage=slippage,
+            max_valid=max_valid,
+        )
+
+    # Every MAKER order goes through the quote path -- a one-leg quote and a
+    # two-leg quote differ only in length. The single-order path below assumes
+    # one order means one immediate fill means one position, and a resting
+    # quote is none of those.
+    if is_maker:
+        return await _place_maker_quote(
+            chat_id, sig, client, risk, settings, legs, amount,
+            market=market, equity=equity, max_exp=max_exp,
+        )
+
     execution_price = f"cap={limit_price:.3f}" if limit_price is not None else f"quote={quote_price:.3f}"
     log.info(
         f"[{chat_id}] PLACING {sig.strategy} {sig.asset} {sig.timeframe} "
@@ -944,107 +979,6 @@ async def _execute_logic(
         )
         rtt_ms = (time.time() - t_order_start) * 1000.0
         order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
-
-        # For LIMIT (MAKER) orders, the order is placed as a passive bid.
-        # Track it for requoting and record as pending.
-        if is_maker:
-            order_id = order.get("id") or order.get("orderId") or order.get("order_id")
-            if order_id:
-                import feeds_direct
-                binance_now, _ = feeds_direct.get_direct_price(sig.asset)
-                _get_maker().track_order(
-                    market_id    = sig.market_id,
-                    order_id     = order_id,
-                    placed_price = limit_price,
-                    binance_price= binance_now,
-                    amount       = amount,
-                    outcome_id   = sig.outcome_id,
-                    asset        = sig.asset,
-                )
-                log.info(
-                    f"[{chat_id}] MAKER LIMIT PLACED | {sig.asset} {sig.outcome} "
-                    f"@ {limit_price:.3f} ₦{amount:,.0f} | order={order_id} | rtt={rtt_ms:.0f}ms"
-                )
-                # A resting post-only quote is an order, NOT a trade: nothing
-                # has been executed yet. Recording it as a trade reset the
-                # trading-drought clock every time MAKER re-quoted, so the
-                # account could go hours with zero fills and still report
-                # HEALTHY. Confirmed fills call note_trade instead (bot.py).
-                stall.note_order(chat_id, sig.strategy, placed=True, reason="clob_limit_resting")
-                app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
-                if app_to_use:
-                    try:
-                        await telegram_bot.notify_trade(
-                            app_to_use, chat_id, sig, amount, engine="CLOB_LIMIT"
-                        )
-                    except Exception as ne:
-                        log.error(f"[{chat_id}] Limit order notification failed: {ne}")
-
-                # Record limit order in DB and risk manager so resolution_monitor tracks settlement & sends WIN/LOSS notifications
-                spot_vs_thresh = 0.0
-                if market and market.get("threshold") and feeds.spot.get(sig.asset):
-                    spot_vs_thresh = (feeds.spot[sig.asset] - market["threshold"]) / market["threshold"]
-
-                trade_id = None
-                for db_attempt in range(3):
-                    try:
-                        trade_id = await asyncio.to_thread(
-                            database.record_trade,
-                            chat_id=chat_id,
-                            strategy=sig.strategy, asset=sig.asset, timeframe=sig.timeframe,
-                            outcome=sig.outcome, outcome_id=sig.outcome_id,
-                            market_id=sig.market_id, event_id=sig.event_id, order_id=order_id,
-                            entry_price=_safe_float(limit_price),
-                            amount_ngn=_safe_float(amount),
-                            certainty=_safe_float(sig.certainty),
-                            secs_to_close=_safe_float(market["secs_to_close"] if market else 0),
-                            spot_vs_threshold_pct=_safe_float(spot_vs_thresh),
-                            market_price_at_entry=_safe_float(limit_price),
-                            engine="CLOB_LIMIT",
-                            filled_quantity=0.0,
-                        )
-                        break
-                    except Exception as db_err:
-                        if db_attempt < 2:
-                            await asyncio.sleep(0.5 * (db_attempt + 1))
-                            continue
-                        log.error(f"[{chat_id}] MAKER DB record failed: {db_err}; cancelling untracked order")
-                        try:
-                            await client.cancel_order(order_id)
-                        except Exception as cancel_error:
-                            log.critical(
-                                f"[{chat_id}] UNTRACKED MAKER ORDER {order_id}; cancellation failed: {cancel_error}"
-                            )
-
-                if trade_id:
-                    # risk.already_in lets a MAKER quote coexist with a SNIPE
-                    # position on the same market (same side only). Keying by
-                    # the bare market id here silently overwrote that filled
-                    # SNIPE position, dropping it from exit management. Use the
-                    # same collision-free key as the taker fill path.
-                    maker_key = (
-                        f"{sig.market_id}:{sig.outcome}:{order_id}"
-                        if sig.market_id in risk.open_positions
-                        else sig.market_id
-                    )
-                    risk.add_position(maker_key, {
-                        "market_id":   sig.market_id,
-                        "trade_id":    trade_id,    "event_id":   sig.event_id,
-                        "order_id":    order_id,
-                        "outcome":     sig.outcome, "outcome_id": sig.outcome_id,
-                        "entry_price": limit_price, "amount_ngn": amount,
-                        "filled_quantity": 0.0, "confirmed_filled": False,
-                        "strategy":    sig.strategy, "asset":      sig.asset,
-                        "timeframe":   sig.timeframe,
-                        "threshold":   market.get("threshold") if market else getattr(sig, "threshold", None),
-                        "closing_date": market.get("closing_date") if market else "",
-                        "placed_at":   time.time(),
-                    })
-
-                _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
-            else:
-                log.warning(f"[{chat_id}] MAKER order placed but no order_id returned")
-            return  # Limit order is tracked in DB and will be resolved by resolution_monitor
 
         shares_filled = client.parse_filled_shares(order)
         filled_price  = float(order.get("avgFillPrice") or order.get("price") or quote_price)
@@ -1249,523 +1183,401 @@ async def _execute_logic(
     _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
 
 
-def _get_market_fee(market_id: str) -> float:
-    market = next((m for m in active_markets if m["market_id"] == market_id), None)
-    return market.get("fee_rate", 0.02) if market else 0.02
+async def _place_maker_quote(
+    chat_id: str, sig, client, risk, settings: dict,
+    legs: list, amount: float, *, market: dict | None, equity: float,
+    max_exp: float,
+) -> None:
+    """Place both legs of a two-sided MAKER quote and track them as one quote.
 
+    Why sequential rather than batch: the response shape for per-order results
+    in Bayse's batch endpoint is not something this code can verify, and an
+    order that gets placed but never tracked is the worst outcome available --
+    it holds wallet funds with no record, no requote and no cancel. Two
+    well-understood calls beat one whose failure mode is an orphan.
 
-# ── ARB execution ─────────────────────────────────────────────────────────────
-
-# ARB gets its OWN lock namespace, independent of risk.pending_markets/
-# open_positions. Those are shared by SNIPE/FRONTRUN/CORRELATE for directional
-# exposure tracking — but ARB's mint/burn arbitrage doesn't economically
-# conflict with a directional position on the same market (different
-# mechanism, but it still has execution/cancellation risk and separate accounting). Sharing the
-# lock meant ARB was almost permanently starved out: confirmed in production,
-# 40 consecutive "already in/pending" skips and zero actual attempts in one
-# session, simply because SNIPE had open positions on the same BTC/ETH/SOL
-# markets ARB also targets. ARB only needs protection against racing against
-# ITSELF (the original concurrent-execution bug from session 2).
-_arb_pending: set[tuple[str, str]] = set()
-
-
-async def execute_arb(chat_id: str, sig, client, risk, equity: float, free_cash: float, settings: dict):
-    if not config.LIVE_TRADING:
-        log.info(f"[{chat_id}] DRY RUN ARB {sig.asset} — LIVE_TRADING=false")
-        return
-    market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
-    if not market or str(market.get("engine") or "").upper() != "CLOB":
-        log.debug(f"[{chat_id}] ARB SKIP {sig.asset} — active CLOB market not found")
-        return
-
-    arb_key = _cooldown_key(chat_id, sig.market_id, sig.strategy)
-    if arb_key in _arb_pending:
-        log.info(f"[{chat_id}] ARB SKIP {sig.asset} — already pending on {sig.market_id}")
-        return
-    last = _trade_cooldown.get(_cooldown_key(chat_id, sig.market_id, sig.strategy), 0.0)
-    if time.time() - last < TRADE_COOLDOWN_SEC:
-        return
-
-    _arb_pending.add(arb_key)
-    try:
-        await _execute_arb_logic(chat_id, sig, client, market, equity, free_cash, risk, settings)
-    finally:
-        _arb_pending.discard(arb_key)
-        _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
-
-
-async def _execute_arb_logic(
-    chat_id: str, sig, client, market: dict, equity: float, free_cash: float,
-    risk, settings: dict | None = None,
-):
+    Sequential placement is safe *because of the strategy's design*, not in
+    spite of it: each leg clears the directional EV gate on its own, so if the
+    second leg fails after the first has filled we are left holding a trade we
+    were willing to own anyway. We then cancel the first rather than leave a
+    quote half-built -- a lone leg is a directional order nobody hedged.
     """
-    Safe ARB execution using actual filled-share counts for burn sizing.
-    Fetches quotes for both YES and NO outcomes before trading to improve
-    profitability, then sizes the burn from real order responses (not pre-trade
-    estimates) and rolls back both legs atomically on any failure.
-    """
-    yes_p = market["yes_price"]
-    no_p  = market["no_price"]
+    placed: list[dict] = []
 
-    # ── Extreme-price guard ───────────────────────────────────────────────
-    # Only block genuinely broken/zero markets (< 2 cents). The old 0.08 floor
-    # was killing arb on near-resolved markets like YES=0.95 NO=0.03 — the most
-    # profitable arbs. The leg-size check below (amount < MIN_TRADE_NGN) handles
-    # any cases where a cheap side makes the trade uneconomical.
-    if min(yes_p, no_p) < 0.02:
-        log.info(
-            f"[{chat_id}] ARB SKIP {sig.asset} — near-zero price market "
-            f"(yes={yes_p:.3f} no={no_p:.3f}), likely broken/settled market"
-        )
-        return
-
-    # ── Budget allocation ─────────────────────────────────────────────────
-    min_leg = max(MIN_TRADE_NGN, float(settings.get("mintrade", MIN_TRADE_NGN))) if settings else MIN_TRADE_NGN
-    max_exp = min(
-        float((settings or {}).get("maxexposure", 10.0)) / 100.0,
-        config.MAX_PORTFOLIO_EXPOSURE,
-    )
-    arb_risk_pct = min(float((settings or {}).get("risk_pct", 1.0)) / 100.0, 0.02)
-    budget = min(ARB_MAX_SIZE_NGN, free_cash, equity * arb_risk_pct)
-    if budget < min_leg * 2.0 or not risk.can_trade(equity, budget, max_exp):
-        log.info(
-            f"[{chat_id}] ARB SKIP {sig.asset} — two-leg minimum ₦{min_leg*2:,.0f} "
-            f"does not fit risk budget ₦{budget:,.0f}"
-        )
-        return
-
-    total_p = yes_p + no_p
-    amount_yes = round(budget * (yes_p / total_p), 2)
-    amount_no  = round(budget * (no_p  / total_p), 2)
-
-    if amount_yes < min_leg or amount_no < min_leg:
-        log.info(
-            f"[{chat_id}] ARB SKIP {sig.asset} — leg sizes too small "
-            f"(yes=₦{amount_yes:,.0f} no=₦{amount_no:,.0f}, min=₦{min_leg:,.0f})"
-        )
-        return
-
-    # ── Fetch pre-trade quotes ───────────────────────────────────────────
-    try:
-        quote_yes = await client.get_quote(
-            event_id=sig.event_id, market_id=sig.market_id,
-            outcome_id=market["yes_id"], side="BUY", amount=amount_yes,
-            currency=CURRENCY
-        )
-        quote_no = await client.get_quote(
-            event_id=sig.event_id, market_id=sig.market_id,
-            outcome_id=market["no_id"], side="BUY", amount=amount_no,
-            currency=CURRENCY
-        )
-    except Exception as q_err:
-        log.warning(f"[{chat_id}] ARB SKIP {sig.asset} — failed to get pre-trade quotes: {q_err}")
-        return
-
-    if quote_yes.get("completeFill") is not True or quote_no.get("completeFill") is not True:
-        log.info(f"[{chat_id}] ARB SKIP {sig.asset} — both legs lack confirmed complete-fill quotes")
-        return
-    if quote_yes.get("tradeGoesOverMaxLiability") or quote_no.get("tradeGoesOverMaxLiability"):
-        return
-
-    q_yes_p = float(quote_yes.get("price") or yes_p)
-    q_no_p  = float(quote_no.get("price") or no_p)
-    total_q_p = q_yes_p + q_no_p
-
-    from config import ARB_TRIGGER
-    if total_q_p > ARB_TRIGGER:
-        log.info(
-            f"[{chat_id}] ARB SKIP {sig.asset} — sum of quotes {total_q_p:.3f} "
-            f"exceeds trigger {ARB_TRIGGER:.3f} (yes_quote={q_yes_p:.3f} no_quote={q_no_p:.3f})"
-        )
-        return
-
-    # ── Pre-trade share estimate (for profitability gate only) ──────────────
-    # BUG FIX: in NGN mode 1 share costs price×100 NGN, so the fallback must
-    # divide by 100. The old code divided only by price, producing a share count
-    # 100× too large — burn_shares then failed with "insufficient shares".
-    _sdiv = 100.0 if CURRENCY == "NGN" else 1.0
-    est_yes = float(quote_yes.get("quantity") or (amount_yes / (q_yes_p * _sdiv)))
-    est_no  = float(quote_no.get("quantity")  or (amount_no  / (q_no_p  * _sdiv)))
-
-    est_burn = min(est_yes, est_no) * 0.97
-    quote_fees = float(quote_yes.get("fee") or 0.0) + float(quote_no.get("fee") or 0.0)
-    pair_cost_est = est_burn * total_q_p * config.CURRENCY_BASE_MULTIPLIER
-    profit_est = (
-        est_burn * config.CURRENCY_BASE_MULTIPLIER
-        - pair_cost_est
-        - quote_fees
-    )
-
-    if est_burn < 1.0:
-        log.info(
-            f"[{chat_id}] ARB SKIP {sig.asset} — est matched inventory {est_burn:.2f} shares below 1"
-        )
-        return
-
-    if profit_est < 20.0:
-        log.info(
-            f"[{chat_id}] ARB SKIP {sig.asset} — profit too thin "
-            f"(burn≈{est_burn:.1f} gap={1.0-total_q_p:.4f} est=₦{profit_est:.2f} < ₦20 min)"
-        )
-        return
-
-    log.info(
-        f"[{chat_id}] ARB PLACING {sig.asset} | "
-        f"yes=₦{amount_yes:.0f}(≈{est_yes:.1f}sh) "
-        f"no=₦{amount_no:.0f}(≈{est_no:.1f}sh) "
-        f"est_burn≈{est_burn:.1f} est_profit=₦{profit_est:.2f}"
-    )
-
-    # ── Order execution — sized from ACTUAL fills, not quotes ───────────────
-    # Upgrade: Place BOTH legs in parallel via asyncio.gather to eliminate execution latency gap.
-    # Sized from real filled share counts with atomic dual-leg rollback.
-    yes_shares_filled = 0.0
-    no_shares_filled  = 0.0
-    yes_order: dict = {}
-    no_order: dict = {}
-    yes_ok = False
-    no_ok  = False
-
-    try:
-        t_yes = client.place_order(
-            event_id=sig.event_id, market_id=sig.market_id,
-            outcome_id=market["yes_id"], side="BUY",
-            amount=amount_yes, order_type="LIMIT", currency=CURRENCY,
-            price=min(0.99, q_yes_p + 0.003), time_in_force="FOK",
-        )
-        t_no = client.place_order(
-            event_id=sig.event_id, market_id=sig.market_id,
-            outcome_id=market["no_id"], side="BUY",
-            amount=amount_no, order_type="LIMIT", currency=CURRENCY,
-            price=min(0.99, q_no_p + 0.003), time_in_force="FOK",
-        )
-
-        results = await asyncio.gather(t_yes, t_no, return_exceptions=True)
-        resp_yes, resp_no = results[0], results[1]
-
-        if isinstance(resp_yes, Exception):
-            log.warning(f"[{chat_id}] ARB YES leg order failed: {resp_yes}")
-        else:
-            yes_order = resp_yes.get("order") or resp_yes.get("clobOrder") or resp_yes.get("ammOrder") or resp_yes
-            yes_shares_filled = client.parse_filled_shares(yes_order)
-            yes_ok = yes_shares_filled > 0
-            if not yes_ok:
-                log.warning(f"[{chat_id}] ARB YES leg returned no confirmed fill")
-
-        if isinstance(resp_no, Exception):
-            log.warning(f"[{chat_id}] ARB NO leg order failed: {resp_no}")
-        else:
-            no_order = resp_no.get("order") or resp_no.get("clobOrder") or resp_no.get("ammOrder") or resp_no
-            no_shares_filled = client.parse_filled_shares(no_order)
-            no_ok = no_shares_filled > 0
-            if not no_ok:
-                log.warning(f"[{chat_id}] ARB NO leg returned no confirmed fill")
-
-        if not (yes_ok and no_ok):
-            failed_leg = "NO" if yes_ok else ("YES" if no_ok else "BOTH")
-            raise RuntimeError(f"Parallel ARB leg failure: {failed_leg} leg failed")
-
-        # Burn actual filled pairs (subtract tiny epsilon to avoid precision errors)
-        burn_qty = round(min(yes_shares_filled, no_shares_filled) - 0.001, 4)
-        if burn_qty < 1.0:
-            raise ValueError(
-                f"burn_qty {burn_qty:.4f} too small "
-                f"(yes_filled={yes_shares_filled:.2f} no_filled={no_shares_filled:.2f})"
+    for leg in legs:
+        try:
+            resp = await client.place_order(
+                event_id=sig.event_id, market_id=sig.market_id,
+                outcome_id=leg.outcome_id, side="BUY",
+                amount=amount, order_type="LIMIT",
+                price=leg.price, currency=CURRENCY,
+                time_in_force="GTC", post_only=True,
+                stp_mode="CANCEL_OLDEST",
             )
+        except Exception as exc:
+            await _unwind_maker_legs(chat_id, client, placed, sig,
+                                     reason=f"placement failed: {exc}")
+            _stall_skip(chat_id, sig, "maker_place_failed", f"{leg.outcome}: {exc}"[:200])
+            log.warning(f"[{chat_id}] MAKER {leg.outcome} placement failed: {exc}")
+            _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+            return
 
-        # Bayse burn request quantity is a wallet amount, while its response
-        # quantity is normalized shares. In NGN, one pair redeems for ₦100.
-        burn_wallet_amount = burn_qty * config.CURRENCY_BASE_MULTIPLIER
-        burn_response = await client.burn_shares(sig.market_id, burn_wallet_amount, CURRENCY)
-        proceeds = float(burn_response.get("proceeds") or burn_wallet_amount)
+        order = resp.get("order") or resp.get("clobOrder") or resp
+        order_id = order.get("id") or order.get("orderId") or order.get("order_id")
+        if not order_id:
+            await _unwind_maker_legs(chat_id, client, placed, sig,
+                                     reason=f"no order id for {leg.outcome}")
+            _stall_skip(chat_id, sig, "maker_place_no_order_id", leg.outcome)
+            log.error(f"[{chat_id}] MAKER {leg.outcome} placed with no order id")
+            _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+            return
 
-        yes_price_filled = float(yes_order.get("avgFillPrice") or yes_order.get("price") or q_yes_p)
-        no_price_filled = float(no_order.get("avgFillPrice") or no_order.get("price") or q_no_p)
-        yes_fee = float(yes_order.get("fee") or 0.0)
-        no_fee = float(no_order.get("fee") or 0.0)
-        matched_cost = (
-            burn_qty * (yes_price_filled + no_price_filled) * config.CURRENCY_BASE_MULTIPLIER
-            + yes_fee * (burn_qty / yes_shares_filled)
-            + no_fee * (burn_qty / no_shares_filled)
-        )
-        profit = proceeds - matched_cost
-        if profit <= 0:
-            log.error(f"[{chat_id}] ARB burn completed with non-positive matched PnL: ₦{profit:.2f}")
-        else:
-            log.info(f"[{chat_id}] ARB ✅ {sig.asset} | {burn_qty:.3f} pairs | ₦{profit:+,.2f}")
-
-        trade_id = await asyncio.to_thread(
-            database.record_trade,
-            chat_id=chat_id, strategy="ARB", asset=sig.asset,
-            timeframe=sig.timeframe, outcome="ARB", outcome_id="burn",
-            market_id=sig.market_id, event_id=sig.event_id,
-            entry_price=_safe_float(total_q_p),
-            amount_ngn=_safe_float(matched_cost),
-            certainty=_safe_float(sig.certainty), secs_to_close=0,
-            filled_quantity=_safe_float(burn_qty),
-        )
-        await asyncio.to_thread(database.resolve_trade, trade_id, profit > 0, profit)
-        if _tg_app:
-            await telegram_bot.notify_arb(_tg_app, chat_id, sig, burn_qty, profit)
-
-    except Exception as e:
-        log.error(f"[{chat_id}] ARB error: {e}")
-
-        # ── Atomic dual-leg rollback ──────────────────────────────────────
-        # Handles all 3 asymmetric scenarios:
-        #   1. YES-only filled → sell YES shares
-        #   2. NO-only filled  → sell NO shares
-        #   3. Both filled but burn failed → sell BOTH legs to clear all exposure
-        yes_rb = False
-        no_rb  = False
-
-        if yes_ok and not no_ok:
-            try:
-                await client.place_order(
-                    sig.event_id, sig.market_id, market["yes_id"],
-                    "SELL", _sell_proceeds_for_shares(yes_shares_filled, q_yes_p, market.get("fee_rate", 0.02)), "MARKET", currency=CURRENCY,
-                )
-                yes_rb = True
-                log.info(f"[{chat_id}] ARB rollback ✅ YES sold ({yes_shares_filled:.3f}sh)")
-            except Exception as re_:
-                log.critical(f"[{chat_id}] ARB ROLLBACK YES FAILED — manual action needed: {re_}")
-
-        elif not yes_ok and no_ok:
-            try:
-                await client.place_order(
-                    sig.event_id, sig.market_id, market["no_id"],
-                    "SELL", _sell_proceeds_for_shares(no_shares_filled, q_no_p, market.get("fee_rate", 0.02)), "MARKET", currency=CURRENCY,
-                )
-                no_rb = True
-                log.info(f"[{chat_id}] ARB rollback ✅ NO sold ({no_shares_filled:.3f}sh)")
-            except Exception as re_:
-                log.critical(f"[{chat_id}] ARB ROLLBACK NO FAILED — manual action needed: {re_}")
-
-        elif yes_ok and no_ok:
-            # Both legs filled but burn failed — must clear both
-            try:
-                await client.place_order(
-                    sig.event_id, sig.market_id, market["yes_id"],
-                    "SELL", _sell_proceeds_for_shares(yes_shares_filled, q_yes_p, market.get("fee_rate", 0.02)), "MARKET", currency=CURRENCY,
-                )
-                yes_rb = True
-                log.info(f"[{chat_id}] ARB rollback ✅ YES sold ({yes_shares_filled:.3f}sh)")
-            except Exception as re_:
-                log.critical(f"[{chat_id}] ARB ROLLBACK YES FAILED — YES exposure remains: {re_}")
-            try:
-                await client.place_order(
-                    sig.event_id, sig.market_id, market["no_id"],
-                    "SELL", _sell_proceeds_for_shares(no_shares_filled, q_no_p, market.get("fee_rate", 0.02)), "MARKET", currency=CURRENCY,
-                )
-                no_rb = True
-                log.info(f"[{chat_id}] ARB rollback ✅ NO sold ({no_shares_filled:.3f}sh)")
-            except Exception as re_:
-                log.critical(f"[{chat_id}] ARB ROLLBACK NO FAILED — NO exposure remains: {re_}")
-
-        fully_rb = (
-            (yes_ok and not no_ok and yes_rb) or
-            (not yes_ok and no_ok and no_rb) or
-            (yes_ok and no_ok and yes_rb and no_rb)
+        # A post-only order can still cross in flight if the book moved between
+        # our read and this call. Treat any immediate fill as a real fill.
+        filled = client.parse_filled_shares(order)
+        placed.append({
+            "outcome":    leg.outcome,
+            "outcome_id": leg.outcome_id,
+            "order_id":   order_id,
+            "price":      float(leg.price),
+            "amount":     float(amount),
+            "filled":     filled,
+        })
+        log.info(
+            f"[{chat_id}] MAKER LEG PLACED | {sig.asset} {leg.outcome} "
+            f"@ {leg.price:.3f} ₦{amount:,.0f} | order={order_id}"
         )
 
+    # Track the quote as a unit so requote and cancel always act on both legs.
+    spot_now = feeds.spot.get(sig.asset) or 0.0
+    _get_maker().track_quote(
+        sig.market_id, placed, spot=spot_now,
+        fv_yes=next((leg.fair_value for leg in legs if leg.outcome == "YES"), 0.0),
+    )
+
+    # A resting post-only quote is an order, NOT a trade: nothing has been
+    # executed yet. Recording it as a trade reset the drought clock every time
+    # MAKER re-quoted, so an account could go hours with zero fills and still
+    # report HEALTHY. Confirmed fills call note_trade instead (bot.py).
+    stall.note_order(chat_id, sig.strategy, placed=True, reason="clob_limit_resting")
+
+    spot_vs_thresh = 0.0
+    if market and market.get("threshold") and spot_now:
+        spot_vs_thresh = (spot_now - market["threshold"]) / market["threshold"]
+
+    tracked = 0
+    for entry in placed:
+        trade_id = await _record_maker_leg(
+            chat_id, sig, client, risk, entry,
+            market=market, spot_vs_thresh=spot_vs_thresh,
+        )
+        if trade_id:
+            tracked += 1
+
+    if tracked == 0:
+        # Nothing recorded means nothing is being watched. An order that holds
+        # wallet funds with no DB row and no risk entry is unreconcileable, so
+        # withdraw the whole quote rather than leave it resting.
+        log.error(f"[{chat_id}] MAKER quote placed but no leg recorded — cancelling all")
+        await _unwind_maker_legs(chat_id, client, placed, sig, reason="no leg recorded")
+        return
+
+    if tracked < len(placed):
+        # A half-tracked quote is worse than no quote: one leg is managed, the
+        # other is not. Withdraw it and re-quote cleanly next pass.
+        log.error(
+            f"[{chat_id}] MAKER quote only {tracked}/{len(placed)} legs recorded — "
+            f"cancelling all"
+        )
+        await _unwind_maker_legs(chat_id, client, placed, sig, reason="partial tracking")
+        return
+
+    _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+
+    app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+    if app_to_use:
+        try:
+            await telegram_bot.notify_trade(
+                app_to_use, chat_id, sig, amount * len(placed), engine="CLOB_LIMIT"
+            )
+        except Exception as ne:
+            log.error(f"[{chat_id}] MAKER quote notification failed: {ne}")
+
+
+async def _record_maker_leg(
+    chat_id: str, sig, client, risk, entry: dict, *,
+    market: dict | None, spot_vs_thresh: float,
+) -> str | None:
+    """Persist one resting leg and register it with the risk book."""
+    trade_id = None
+    for db_attempt in range(3):
         try:
             trade_id = await asyncio.to_thread(
                 database.record_trade,
-                chat_id=chat_id, strategy="ARB", asset=sig.asset,
-                timeframe=sig.timeframe, outcome="ARB", outcome_id="burn_failed",
+                chat_id=chat_id,
+                strategy=sig.strategy, asset=sig.asset, timeframe=sig.timeframe,
+                outcome=entry["outcome"], outcome_id=entry["outcome_id"],
                 market_id=sig.market_id, event_id=sig.event_id,
-                entry_price=_safe_float(total_q_p),
-                amount_ngn=_safe_float(amount_yes + amount_no),
-                certainty=_safe_float(sig.certainty), secs_to_close=0,
+                order_id=entry["order_id"],
+                entry_price=_safe_float(entry["price"]),
+                amount_ngn=_safe_float(entry["amount"]),
+                certainty=_safe_float(sig.certainty),
+                secs_to_close=_safe_float(market["secs_to_close"] if market else 0),
+                spot_vs_threshold_pct=_safe_float(spot_vs_thresh),
+                market_price_at_entry=_safe_float(entry["price"]),
+                engine="CLOB_LIMIT",
+                filled_quantity=_safe_float(entry.get("filled") or 0.0),
             )
-            est_loss = 0.0 if fully_rb else -(amount_yes + amount_no)
-            await asyncio.to_thread(database.resolve_trade, trade_id, False, est_loss)
+            break
         except Exception as db_err:
-            log.error(f"[{chat_id}] ARB failure could not be recorded: {db_err}")
+            if db_attempt < 2:
+                await asyncio.sleep(0.5 * (db_attempt + 1))
+                continue
+            log.error(f"[{chat_id}] MAKER DB record failed: {db_err}")
+            return None
+    if not trade_id:
+        return None
+
+    # Keys include outcome and order id: a single market can carry a filled
+    # taker position AND two maker legs, and keying by market id alone let one
+    # silently overwrite another, dropping it from exit management.
+    leg_key = f"{sig.market_id}:{entry['outcome']}:{entry['order_id']}"
+    is_filled = float(entry.get("filled") or 0.0) > 0
+    risk.add_position(leg_key, {
+        "market_id":       sig.market_id,
+        "trade_id":        trade_id,
+        "event_id":        sig.event_id,
+        "order_id":        entry["order_id"],
+        "outcome":         entry["outcome"],
+        "outcome_id":      entry["outcome_id"],
+        "entry_price":     entry["price"],
+        "amount_ngn":      entry["amount"],
+        "filled_quantity": float(entry.get("filled") or 0.0),
+        "confirmed_filled": is_filled,
+        "strategy":        sig.strategy,
+        "asset":           sig.asset,
+        "timeframe":       sig.timeframe,
+        "threshold":       (market or {}).get("threshold"),
+        "closing_date":    (market or {}).get("closing_date", ""),
+        "placed_at":       time.time(),
+        "quote_leg":       True,
+    })
+    if is_filled:
+        risk.current_free_cash -= float(entry["amount"])
+        _get_maker().record_fill(sig.market_id, entry["outcome"], entry["filled"])
+    return trade_id
 
 
-# ── Active Mid-Market Market Making Execution ─────────────────────────────────
+async def _unwind_maker_legs(
+    chat_id: str, client, placed: list[dict], sig, *, reason: str
+) -> None:
+    """Withdraw every leg of a partially-placed quote.
 
-async def execute_midmarket_maker(
-    chat_id: str, sig, client, risk, equity: float, free_cash: float, settings: dict
-):
+    Cancelling one leg and leaving the other is how a market maker acquires an
+    unintended position: the survivor is now a one-sided bet nobody is
+    hedging. All or nothing, every time.
     """
-    Executes simultaneous dual-sided resting limit orders near mid-market
-    on dislocated or wide orderbooks to capture locked arbitrage spread.
+    for entry in placed:
+        try:
+            await client.cancel_order(entry["order_id"])
+            log.info(
+                f"[{chat_id}] MAKER unwound {entry['outcome']} {entry['order_id']} ({reason})"
+            )
+        except Exception as exc:
+            log.critical(
+                f"[{chat_id}] MAKER LEG {entry['order_id']} ({entry['outcome']}) "
+                f"could not be cancelled after {reason}: {exc}"
+            )
+    if placed:
+        _get_maker().drop(sig.market_id)
+
+
+async def _place_complete_set_take(
+    chat_id: str, sig, client, risk, settings: dict,
+    legs: list, amount: float, *, market: dict | None, fee_rate: float,
+    slippage: float, max_valid: float,
+) -> None:
+    """Take both outcomes of a market whose asks sum below one.
+
+    A complete set settles to exactly 1.00, so paying less than 1.00 for it is
+    a locked profit with no forecast involved. Both legs are crossed with FAK
+    orders at the ask plus a buffer.
+
+    Placement is sequential, and that is safe *because of the strategy's
+    design*: each leg cleared the directional EV gate on its own before this
+    was ever signalled, so a partial fill leaves us holding a trade we were
+    happy to own -- not a half of something that only worked as a pair. The
+    completed set is upside, not a requirement.
+
+    If the second leg fails, we do not sell the first in a panic: it is an
+    EV-positive position, it is tracked, and the exit policy manages it.
     """
-    if not config.LIVE_TRADING:
-        log.info(f"[{chat_id}] DRY RUN MIDMARKET_MAKER {sig.asset} — LIVE_TRADING=false")
-        return
-    market = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
-    if not market or str(market.get("engine") or "").upper() != "CLOB":
-        return
+    placed: list[dict] = []
+    total_cost = 0.0
 
-    last = _trade_cooldown.get(_cooldown_key(chat_id, sig.market_id, sig.strategy), 0.0)
-    if time.time() - last < TRADE_COOLDOWN_SEC:
-        return
+    for leg in legs:
+        # Cross the ask with a small buffer, capped so a gap in the book
+        # cannot turn a locked spread into an overpay.
+        cap = min(leg.price + max(0.012, leg.price * slippage), max_valid)
+        try:
+            resp = await client.place_order(
+                event_id=sig.event_id, market_id=sig.market_id,
+                outcome_id=leg.outcome_id, side="BUY",
+                amount=amount, order_type="LIMIT", price=cap,
+                currency=CURRENCY, time_in_force="FAK",
+                max_slippage=slippage, stp_mode="SKIP",
+            )
+        except Exception as exc:
+            _stall_skip(chat_id, sig, "complete_set_leg_failed",
+                        f"{leg.outcome}: {exc}"[:200])
+            log.warning(f"[{chat_id}] complete-set {leg.outcome} leg failed: {exc}")
+            _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+            return
 
-    if not hasattr(sig, "converged_with") or len(sig.converged_with) < 4:
-        return
+        order = resp.get("order") or resp.get("clobOrder") or resp
+        shares = client.parse_filled_shares(order)
+        if shares <= 0:
+            _stall_skip(chat_id, sig, "complete_set_leg_zero_fill",
+                        f"{leg.outcome} @ {cap:.3f} did not fill")
+            log.info(
+                f"[{chat_id}] complete-set {leg.outcome} leg did not fill "
+                f"@{cap:.3f}"
+            )
+            _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+            return
 
-    bid_yes, bid_no, yes_id, no_id = sig.converged_with[:4]
-    min_leg = max(MIN_TRADE_NGN, float(settings.get("mintrade", MIN_TRADE_NGN))) if settings else MIN_TRADE_NGN
-
-    pair_amount = min_leg * 2.0
-    max_exp = min(float(settings.get("maxexposure", 10.0)) / 100.0, config.MAX_PORTFOLIO_EXPOSURE)
-    risk_cap = equity * min(float(settings.get("risk_pct", 1.0)) / 100.0, 0.02)
-    if free_cash < pair_amount or pair_amount > risk_cap or not risk.can_trade(equity, pair_amount, max_exp):
+        fill_price = float(order.get("avgFillPrice") or order.get("price") or cap)
+        cost = shares * fill_price * config.CURRENCY_BASE_MULTIPLIER
+        placed.append({
+            "outcome":    leg.outcome,
+            "outcome_id": leg.outcome_id,
+            "order_id":   order.get("id") or order.get("orderId") or order.get("order_id"),
+            "price":      fill_price,
+            "shares":     shares,
+            "amount":     cost,
+        })
+        total_cost += cost
         log.info(
-            f"[{chat_id}] MIDMARKET_MAKER SKIP: ₦{pair_amount:,.0f} pair does not fit "
-            f"free cash/risk/exposure budget (risk cap ₦{risk_cap:,.0f})"
+            f"[{chat_id}] COMPLETE-SET LEG | {sig.asset} {leg.outcome} "
+            f"{shares:.2f}sh @ {fill_price:.3f} ₦{cost:,.0f}"
         )
+
+    if len(placed) < 2:
         return
 
-    amount_leg = min_leg
+    stall.note_trade(chat_id, market_id=sig.market_id)
+
+    spot_vs_thresh = 0.0
+    spot_now = feeds.spot.get(sig.asset) or 0.0
+    if market and market.get("threshold") and spot_now:
+        spot_vs_thresh = (spot_now - market["threshold"]) / market["threshold"]
+
+    for entry in placed:
+        try:
+            trade_id = await asyncio.to_thread(
+                database.record_trade,
+                chat_id=chat_id,
+                strategy=sig.strategy, asset=sig.asset, timeframe=sig.timeframe,
+                outcome=entry["outcome"], outcome_id=entry["outcome_id"],
+                market_id=sig.market_id, event_id=sig.event_id,
+                order_id=entry["order_id"],
+                entry_price=_safe_float(entry["price"]),
+                amount_ngn=_safe_float(entry["amount"]),
+                certainty=_safe_float(sig.certainty),
+                secs_to_close=_safe_float((market or {}).get("secs_to_close", 0)),
+                spot_vs_threshold_pct=_safe_float(spot_vs_thresh),
+                market_price_at_entry=_safe_float(entry["price"]),
+                engine="CLOB",
+                filled_quantity=_safe_float(entry["shares"]),
+            )
+        except Exception as db_err:
+            log.error(f"[{chat_id}] complete-set DB record failed: {db_err}")
+            trade_id = None
+
+        leg_key = f"{sig.market_id}:{entry['outcome']}:{entry['order_id']}"
+        risk.add_position(leg_key, {
+            "market_id":        sig.market_id,
+            "trade_id":         trade_id,
+            "event_id":         sig.event_id,
+            "order_id":         entry["order_id"],
+            "outcome":          entry["outcome"],
+            "outcome_id":       entry["outcome_id"],
+            "entry_price":      entry["price"],
+            "amount_ngn":       entry["amount"],
+            "filled_quantity":  entry["shares"],
+            "confirmed_filled": True,
+            "strategy":         sig.strategy,
+            "asset":            sig.asset,
+            "timeframe":        sig.timeframe,
+            "threshold":        (market or {}).get("threshold"),
+            "closing_date":     (market or {}).get("closing_date", ""),
+            "placed_at":        time.time(),
+            "complete_set_leg": True,
+        })
+
+    risk.current_free_cash -= total_cost
+
+    # Burn immediately: a complete set held is a complete set at risk of
+    # nothing, but a set burned is cash, and cash does not need managing.
+    sets = min(entry["shares"] for entry in placed)
+    if sets > 0:
+        try:
+            resp = await client.burn_shares(sig.market_id, sets, CURRENCY)
+            proceeds = float(
+                resp.get("amount") or resp.get("proceeds")
+                or (sets * 1.0 * config.CURRENCY_BASE_MULTIPLIER)
+            )
+            pnl = proceeds - total_cost
+            risk.current_free_cash += proceeds
+            risk.add_pnl(pnl)
+            # Capture the trade ids before the legs leave the risk book:
+            # looking them up afterwards finds nothing and the rows would stay
+            # unresolved forever.
+            trade_ids = [
+                (risk.open_positions.get(
+                    f"{sig.market_id}:{entry['outcome']}:{entry['order_id']}"
+                ) or {}).get("trade_id")
+                for entry in placed
+            ]
+            for entry in placed:
+                risk.remove_position(
+                    f"{sig.market_id}:{entry['outcome']}:{entry['order_id']}"
+                )
+            for tid in trade_ids:
+                if tid:
+                    try:
+                        await asyncio.to_thread(database.resolve_trade, tid, True, pnl / 2.0)
+                    except Exception as db_err:
+                        log.error(f"[{chat_id}] burn reconciliation failed: {db_err}")
+            log.info(
+                f"[{chat_id}] COMPLETE SET LOCKED | {sig.asset} {sig.timeframe} "
+                f"{sets:.2f} sets cost ₦{total_cost:,.0f} → ₦{proceeds:,.0f} "
+                f"| PnL ₦{pnl:+,.0f}"
+            )
+            app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+            if app_to_use:
+                try:
+                    await telegram_bot.send_message(
+                        app_to_use, chat_id,
+                        f"🔒 *Complete set taken and burned*\n"
+                        f"Asset: {sig.asset} {sig.timeframe}\n"
+                        f"Sets: {sets:.2f} for ₦{total_cost:,.0f} → ₦{proceeds:,.0f}\n"
+                        f"PnL: ₦{pnl:+,.0f} (locked, direction-independent)",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+        except Exception as exc:
+            # Burning is the payoff, but failing to burn is not a loss: the set
+            # still settles to 1.00. Say so and let the exit policy manage it.
+            log.error(
+                f"[{chat_id}] complete-set burn failed on {sig.market_id}: {exc} "
+                f"— the set still settles to 1.00; managing it as a position"
+            )
+
     _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
 
-    try:
-        t0 = time.time()
-        batch = await client.place_batch_orders(
-            [
-                {
-                    "outcomeId": yes_id, "side": "BUY", "type": "LIMIT",
-                    "amount": amount_leg, "currency": CURRENCY,
-                    "price": bid_yes, "timeInForce": "GTC", "postOnly": True,
-                    "stpMode": "CANCEL_OLDEST", "clientOrderId": "mid-yes",
-                },
-                {
-                    "outcomeId": no_id, "side": "BUY", "type": "LIMIT",
-                    "amount": amount_leg, "currency": CURRENCY,
-                    "price": bid_no, "timeInForce": "GTC", "postOnly": True,
-                    "stpMode": "CANCEL_OLDEST", "clientOrderId": "mid-no",
-                },
-            ],
-            idempotency_key=uuid.uuid4().hex,
-        )
-        results = batch.get("results", []) if isinstance(batch, dict) else []
-        order_yes = results[0].get("order", {}) if len(results) > 0 and results[0].get("success") else {}
-        order_no = results[1].get("order", {}) if len(results) > 1 and results[1].get("success") else {}
-        rtt_ms = (time.time() - t0) * 1000
 
-        id_yes = order_yes.get("id") or order_yes.get("orderId") if isinstance(order_yes, dict) else None
-        id_no  = order_no.get("id") or order_no.get("orderId") if isinstance(order_no, dict) else None
-
-        if not id_yes and not id_no:
-            log.warning(f"[{chat_id}] MIDMARKET_MAKER dual orders failed: yes={order_yes}, no={order_no}")
-            return
-        if bool(id_yes) != bool(id_no):
-            orphan_id = id_yes or id_no
-            log.warning(
-                f"[{chat_id}] MIDMARKET_MAKER only one resting leg was accepted; "
-                f"cancelling orphan {orphan_id}"
-            )
-            try:
-                await client.cancel_order(orphan_id)
-            except Exception as cancel_error:
-                log.critical(f"[{chat_id}] Failed to cancel orphan maker order {orphan_id}: {cancel_error}")
-            return
-
-        log.info(
-            f"[{chat_id}] MIDMARKET_MAKER DUAL ORDERS PLACED | {sig.asset} {sig.timeframe} | "
-            f"YES@{bid_yes:.3f} (id={id_yes}) + NO@{bid_no:.3f} (id={id_no}) | "
-            f"Locked Spread=+{sig.edge_at_entry:.1%} | rtt={rtt_ms:.0f}ms"
-        )
-
-        if _tg_app:
-            try:
-                await telegram_bot.notify_midmarket(_tg_app, chat_id, sig, bid_yes, bid_no, amount_leg)
-            except Exception as te:
-                log.warning(f"[{chat_id}] Telegram notify midmarket error: {te}")
-
-        # Record each placed leg in DB & risk manager
-        for oid, bid_p, outcome, token_id in [
-            (id_yes, bid_yes, "YES", yes_id),
-            (id_no, bid_no, "NO", no_id),
-        ]:
-            if oid:
-                try:
-                    trade_id = await asyncio.to_thread(
-                        database.record_trade,
-                        chat_id=chat_id,
-                        strategy="MIDMARKET_MAKER",
-                        asset=sig.asset,
-                        timeframe=sig.timeframe,
-                        outcome=outcome,
-                        outcome_id=token_id,
-                        market_id=sig.market_id,
-                        event_id=sig.event_id,
-                        order_id=oid,
-                        entry_price=_safe_float(bid_p),
-                        amount_ngn=_safe_float(amount_leg),
-                        certainty=0.95,
-                        secs_to_close=_safe_float(market.get("secs_to_close", 0)),
-                        spot_vs_threshold_pct=0.0,
-                        market_price_at_entry=_safe_float(bid_p),
-                        engine="CLOB_LIMIT",
-                        filled_quantity=0.0,
-                    )
-                    risk.add_position(sig.market_id + f"_{outcome}", {
-                        "market_id": sig.market_id,
-                        "trade_id": trade_id, "event_id": sig.event_id,
-                        "order_id": oid, "outcome": outcome, "outcome_id": token_id,
-                        "entry_price": bid_p, "amount_ngn": amount_leg,
-                        "filled_quantity": 0.0, "confirmed_filled": False,
-                        "strategy": "MIDMARKET_MAKER", "asset": sig.asset,
-                        "timeframe": sig.timeframe,
-                        "threshold": market.get("threshold"),
-                        "closing_date": market.get("closing_date", ""),
-                        "placed_at": time.time(),
-                    })
-                except Exception as dbe:
-                    log.error(f"[{chat_id}] DB record midmarket leg failed: {dbe}; cancelling {oid}")
-                    try:
-                        await client.cancel_order(oid)
-                    except Exception as cancel_error:
-                        log.critical(f"[{chat_id}] Untracked midmarket order {oid}: {cancel_error}")
-
-        # Start 45s adverse selection watchdog
-        if id_yes and id_no:
-            asyncio.create_task(
-                _midmarket_watchdog(client, chat_id, sig.market_id, id_yes, id_no, bid_yes, bid_no)
-            )
-
-    except Exception as e:
-        log.error(f"[{chat_id}] execute_midmarket_maker error: {e}", exc_info=True)
-
-
-async def _midmarket_watchdog(client, chat_id: str, market_id: str, id_yes: str, id_no: str, bid_yes: float, bid_no: float):
-    """
-    Guards against adverse selection in dual-sided market making:
-    After 45s, checks if only one leg was filled.
-    If one leg filled and the other is still resting, cancels the resting order
-    to prevent directional run-away drift into trending moves.
-    """
-    await asyncio.sleep(45.0)
-    try:
-        o_yes, o_no = await asyncio.gather(
-            client.get_order(id_yes),
-            client.get_order(id_no),
-            return_exceptions=True,
-        )
-        status_yes = str(o_yes.get("status", "")).lower() if isinstance(o_yes, dict) else "unknown"
-        status_no  = str(o_no.get("status", "")).lower() if isinstance(o_no, dict) else "unknown"
-
-        filled_yes = status_yes in ("filled", "completed")
-        filled_no  = status_no in ("filled", "completed")
-
-        if filled_yes and filled_no:
-            log.info(f"[{chat_id}] 🏆 MIDMARKET DUAL FILL SUCCESS on {market_id}! +{(1.0-(bid_yes+bid_no)):.1%} locked")
-        elif filled_yes and not filled_no:
-            log.warning(f"[{chat_id}] ⚠️ MIDMARKET partial fill: YES filled, NO unfilled. Cancelling NO order {id_no}")
-            try:
-                await client.cancel_order(id_no)
-            except Exception as ce:
-                log.error(f"[{chat_id}] Failed to cancel unhedged NO order: {ce}")
-        elif filled_no and not filled_yes:
-            log.warning(f"[{chat_id}] ⚠️ MIDMARKET partial fill: NO filled, YES unfilled. Cancelling YES order {id_yes}")
-            try:
-                await client.cancel_order(id_yes)
-            except Exception as ce:
-                log.error(f"[{chat_id}] Failed to cancel unhedged YES order: {ce}")
-    except Exception as we:
-        log.error(f"[{chat_id}] Midmarket watchdog error: {we}")
+def _get_market_fee(market_id: str) -> float:
+    market = next((m for m in active_markets if m["market_id"] == market_id), None)
+    return market.get("fee_rate", 0.02) if market else 0.02

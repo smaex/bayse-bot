@@ -715,7 +715,12 @@ def get_alpha_trend(chat_id: str, strategy: str, asset: str, days: int = 7) -> f
         row = _fetch_one("""
             SELECT
                 COUNT(*)                                        AS total,
-                SUM(CASE WHEN won = 1 THEN 1 ELSE 0 END)       AS wins
+                SUM(CASE WHEN won = 1 THEN 1 ELSE 0 END)       AS wins,
+                SUM(COALESCE(amount_ngn, 0))                    AS deployed,
+                SUM(
+                    COALESCE(amount_ngn, 0)
+                    / NULLIF(COALESCE(entry_price, 0), 0)
+                )                                               AS payout
             FROM trades
             WHERE chat_id = %s
               AND strategy = %s
@@ -731,7 +736,18 @@ def get_alpha_trend(chat_id: str, strategy: str, asset: str, days: int = 7) -> f
         wins     = int(row.get("wins") or 0)
         win_rate = wins / total
 
-        expected = 0.65 if strategy == "SNIPE" else 0.55
+        # The benchmark is the break-even rate implied by the prices actually
+        # paid, not a constant. A strategy that buys at 0.30 does not need a
+        # 65% hit rate to be healthy; one that buys at 0.80 needs 80%. Judging
+        # both against the same number called the cheap entries unhealthy and
+        # the expensive ones healthy, which is backwards.
+        deployed = float(row.get("deployed") or 0.0)
+        payout   = float(row.get("payout") or 0.0)
+        expected = (deployed / payout) if payout > 0 else 0.0
+        # Break-even alone is not a target: it means zero profit. A gross-up
+        # stands in for the edge the strategy claimed when it entered, floored
+        # so an absurd price cannot set an absurd benchmark.
+        expected = min(0.95, max(0.30, expected * 1.10))
 
         if win_rate >= expected:
             return 1.0

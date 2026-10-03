@@ -28,12 +28,12 @@ import config
 import stall
 import feeds_direct
 import health
+import maintenance
 from risk import RiskManager, position_is_filled
 from client import BayseClient
 from config import (TELEGRAM_TOKEN, CURRENCY, SCAN_INTERVAL_SECONDS,
-                    SYSTEMIC_RISK_HALT_MINS, EXIT_EV_THRESHOLD, MIN_EXIT_TIME_REMAINING,
-                    TAKE_PROFIT_GAIN_PCT, TAKE_PROFIT_MIN_SECS_REMAINING)
-from strategies.utils import win_probability, realized_vol_hourly
+                    SYSTEMIC_RISK_HALT_MINS)
+from strategies.utils import realized_vol_hourly
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -660,19 +660,33 @@ async def _resolve_unfilled_position(chat_id: str, risk, pos: dict, position_key
 
 async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: dict):
     """
-    Actively monitors resting maker limit orders on the CLOB:
-    - If filled: updates DB, records position as confirmed filled, notifies user via notify_fill.
-    - If cancelled/expired: removes from tracker, resolves DB trade as won=None (0.0 PnL), notifies user.
-    - If stale (>120s or oracle moved > 0.15% or secs < 180): cancels order, frees capital, resolves trade as 0.0 PnL, notifies user via notify_unfilled.
-    - If the cancel cannot be confirmed: tells the user the order is still resting
-      instead of silently keeping it, and never drops it from the risk book.
+    Lifecycle management for resting two-sided quotes.
+
+    For every resting MAKER leg:
+      * filled            -> update the DB and the risk book, and skew the
+                             next quote toward completing the set;
+      * both legs filled  -> burn the complete set and realise the lock;
+      * cancelled/expired -> settle the row at zero and free the reservation;
+      * stale or the oracle moved -> withdraw BOTH legs and re-quote.
+
+    The rule that runs through all of it: **legs are withdrawn together.**
+    Cancelling one leg of a two-sided quote and leaving the other resting is
+    how a market maker acquires an unintended position -- the survivor is now
+    a one-sided bet nobody is hedging.
+
+    A cancelled-but-unconfirmable order is reported as still resting rather
+    than dropped, so an operator is never told the book is clean when it is
+    not.
     """
     if not risk.open_positions:
         return
 
+    from strategies import book as booklib
     from strategies.maker import maker_strategy
 
     for position_key, pos in list(risk.open_positions.items()):
+        if str(pos.get("strategy") or "").upper() != "MAKER":
+            continue
         if pos.get("confirmed_filled"):
             continue
         order_id = pos.get("order_id")
@@ -694,160 +708,384 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                     or order_data.get("price")
                     or pos.get("entry_price", 0.5)
                 )
-                fill_fee = float(order_data.get("fee") or 0.0)
-                confirmed_cost = (
-                    shares * fill_price * config.CURRENCY_BASE_MULTIPLIER + fill_fee
-                )
+                # Makers pay no fee on Bayse CLOB. The old code added the
+                # order's `fee` field to the cost of a maker fill, which
+                # understated every maker profit by the taker fee -- the one
+                # economic advantage this leg exists to capture.
+                confirmed_cost = shares * fill_price * config.CURRENCY_BASE_MULTIPLIER
+
                 pos["confirmed_filled"] = True
                 pos["filled_quantity"] = shares
                 pos["entry_price"] = fill_price
                 pos["amount_ngn"] = confirmed_cost
-
                 trade_id = pos.get("trade_id")
                 if trade_id:
                     await asyncio.to_thread(
                         database.update_trade_fill,
                         trade_id, confirmed_cost, shares, fill_price,
                     )
-                pos["unfilled_alerted"] = False
+                    stall.note_trade(chat_id, market_id=market_id)
+                risk.current_free_cash -= confirmed_cost
+
+                # Skew the next quote toward completing this set: a fill on one
+                # leg makes the opposite leg more valuable, not less.
+                maker_strategy.record_fill(market_id, pos.get("outcome", ""), shares)
                 log.info(
-                    f"[{chat_id}] MAKER LIMIT ORDER FILLED | {pos.get('asset')} {pos.get('outcome')} "
-                    f"@ {fill_price:.3f} | {shares:.2f} shares (₦{confirmed_cost:,.0f})"
+                    f"[{chat_id}] MAKER FILL | {pos.get('asset')} {pos.get('outcome')} "
+                    f"{shares:.2f}sh @ {fill_price:.3f} ₦{confirmed_cost:,.0f} "
+                    f"(fee-free) | order={order_id}"
                 )
-                # Exchange-confirmed: only now does the drought clock move.
-                stall.note_trade(chat_id, market_id=market_id)
                 app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
                 if app_to_use:
                     try:
                         await telegram_bot.notify_fill(
-                            app_to_use, chat_id, pos.get("strategy", "MAKER"),
-                            pos.get("asset", ""), pos.get("timeframe", ""),
-                            pos.get("outcome", ""), fill_price, confirmed_cost,
+                            app_to_use, chat_id, pos, shares, fill_price
                         )
-                    except Exception as ne:
-                        log.debug(f"notify_fill failed: {ne}")
-                continue
+                    except Exception:
+                        pass
 
-            if status in ("cancelled", "expired", "rejected", "killed"):
-                await _resolve_unfilled_position(
-                    chat_id, risk, pos, position_key, f"exchange status={status}"
-                )
-                continue
-
-            # If still open, check if stale / needs requote / late in candle
-            order_age = time.time() - pos.get("placed_at", time.time())
-            timeout_sec = getattr(config, "MAKER_ORDER_TIMEOUT", 120.0)
-            is_stale_quote = (
-                order_age > timeout_sec
-                or maker_strategy.should_requote(market_id)
-                or (secs > 0 and secs < 180)
-            )
-
-            if is_stale_quote:
-                log.info(
-                    f"[{chat_id}] Cancelling stale resting maker order {order_id} on {market_id} "
-                    f"(age={order_age:.0f}s, secs_to_close={secs:.0f}s)"
-                )
-                try:
-                    await client.cancel_order(order_id)
-                except Exception as ce:
-                    log.warning(f"[{chat_id}] cancel_order call error for {order_id}: {ce}")
-
-                # ALWAYS verify ground truth on exchange after cancel attempt
-                try:
-                    order_data = await client.get_order(order_id)
-                    status = str(order_data.get("status") or "").lower()
-                    shares = client.parse_filled_shares(order_data)
-
-                    if status in ("filled", "completed") or shares > 0:
-                        fill_price = float(
-                            order_data.get("avgFillPrice")
-                            or order_data.get("price")
-                            or pos.get("entry_price", 0.5)
-                        )
-                        fill_fee = float(order_data.get("fee") or 0.0)
-                        confirmed_cost = (
-                            shares * fill_price * config.CURRENCY_BASE_MULTIPLIER + fill_fee
-                        )
-                        pos["confirmed_filled"] = True
-                        pos["filled_quantity"] = shares
-                        pos["entry_price"] = fill_price
-                        pos["amount_ngn"] = confirmed_cost
-
-                        trade_id = pos.get("trade_id")
-                        if trade_id:
-                            await asyncio.to_thread(
-                                database.update_trade_fill,
-                                trade_id, confirmed_cost, shares, fill_price,
-                            )
-                        pos["unfilled_alerted"] = False
-                        log.info(
-                            f"[{chat_id}] MAKER LIMIT ORDER FILLED during cancel check | "
-                            f"{pos.get('asset')} {pos.get('outcome')} @ {fill_price:.3f} | {shares:.2f} shares"
-                        )
-                        stall.note_trade(chat_id, market_id=market_id)
-                        app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
-                        if app_to_use:
-                            try:
-                                await telegram_bot.notify_fill(
-                                    app_to_use, chat_id, pos.get("strategy", "MAKER"),
-                                    pos.get("asset", ""), pos.get("timeframe", ""),
-                                    pos.get("outcome", ""), fill_price, confirmed_cost,
-                                )
-                            except Exception as ne:
-                                log.debug(f"notify_fill failed: {ne}")
-                        continue
-
-                    if status in ("cancelled", "canceled", "expired", "rejected", "killed"):
-                        await _resolve_unfilled_position(
-                            chat_id, risk, pos, position_key,
-                            f"cancelled unfilled (status={status})",
-                        )
-                        continue
-
-                    # If still open on Bayse: DO NOT DROP! Retain in open_positions
-                    log.warning(
-                        f"[{chat_id}] Maker order {order_id} remains {status} on Bayse after cancel attempt. "
-                        "Retaining in open_positions to prevent ghost trade."
+                # Both legs filled -> the set is complete. Burn it and take the
+                # locked profit rather than carrying it to settlement.
+                paired = _paired_leg(risk, position_key, market_id)
+                if paired is not None:
+                    await _burn_complete_set(
+                        chat_id, client, risk, pos, position_key, market_id=market_id
                     )
-                    # Retaining is correct — but it was also silent, so an order
-                    # that never filled produced no message at all. Notify once
-                    # per order with the fact that matters: it is still resting.
-                    if not pos.get("unfilled_alerted"):
-                        pos["unfilled_alerted"] = True
-                        app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
-                        if app_to_use:
-                            try:
-                                await telegram_bot.notify_order_resting(
-                                    app_to_use, chat_id, pos.get("strategy", "MAKER"),
-                                    pos.get("asset", ""), pos.get("timeframe", ""),
-                                    pos.get("outcome", ""), pos.get("amount_ngn", 0),
-                                    price=float(pos.get("entry_price") or 0.0),
-                                    reason=f"cancel not confirmed (exchange status: {status or 'open'})",
-                                )
-                            except Exception as ne:
-                                log.warning(f"notify_order_resting failed: {ne}")
-                except Exception as ve:
-                    log.warning(f"[{chat_id}] Verification of cancelled order {order_id} failed: {ve}")
+                continue
+
+            if status in ("cancelled", "canceled", "expired", "rejected", "killed"):
+                await _resolve_unfilled_position(
+                    chat_id, risk, pos, position_key,
+                    f"exchange reported the order as {status}",
+                )
+                risk.remove_position(position_key)
+                maker_strategy.open_quotes.pop(market_id, None)
+                continue
+
+            # Still resting. Withdraw both legs when the quote is stale, when
+            # the oracle has moved through it, or when settlement is close.
+            quote = maker_strategy.open_quotes.get(market_id) or {}
+            spot = feeds.spot.get(pos.get("asset", "")) or 0.0
+            oracle_moved = bool(
+                spot and quote.get("spot")
+                and abs(spot - quote["spot"]) / quote["spot"]
+                > config.MAKER_REQUOTE_THRESHOLD
+            )
+            too_old = (
+                time.time() - float(quote.get("placed_at", 0))
+                > config.MAKER_ORDER_TIMEOUT
+            )
+            near_close = 0 < secs < config.MAKER_MIN_SECS_TO_CLOSE
+
+            if oracle_moved or too_old or near_close:
+                reason = (
+                    "oracle moved through the quote" if oracle_moved
+                    else "quote timed out" if too_old
+                    else "too close to settlement"
+                )
+                await _withdraw_resting_quote(
+                    chat_id, client, risk, pos, position_key, reason=reason
+                )
 
         except Exception as e:
-            log.warning(f"[{chat_id}] Order management check error for {order_id}: {e}")
+            log.error(f"[{chat_id}] Maker order management error on {order_id}: {e}")
+
+
+def _paired_leg(risk, position_key: str, market_id: str):
+    """The sibling leg of a two-sided quote, if it has also filled."""
+    this = risk.open_positions.get(position_key)
+    if not this or not this.get("confirmed_filled"):
+        return None
+    for key, other in risk.open_positions.items():
+        if key == position_key:
+            continue
+        if (other.get("market_id") or key) != market_id:
+            continue
+        if str(other.get("strategy") or "").upper() != "MAKER":
+            continue
+        if not other.get("confirmed_filled"):
+            continue
+        if str(other.get("outcome", "")).upper() == str(this.get("outcome", "")).upper():
+            continue
+        if float(other.get("filled_quantity") or 0.0) <= 0:
+            continue
+        return key, other
+    return None
+
+
+
+def _exit_plan(market_id, position_key, pos, market, *, w_est, current_price,
+               ev_hold, exit_reason):
+    """One queued exit decision."""
+    return {
+        "market_id":     market_id,
+        "position_key":  position_key,
+        "pos":           pos,
+        "market":        market,
+        "w_est":         w_est,
+        "current_price": current_price,
+        "ev_hold":       ev_hold,
+        "exit_reason":   exit_reason,
+    }
+
+
+async def _burn_complete_set(
+    chat_id: str, client, risk, pos: dict, position_key: str, *, market_id: str
+) -> bool:
+    """Burn a complete set and book the lock.
+
+    A complete set always settles to exactly 1.00, so holding it is a bond and
+    selling it is a mistake: a sale pays the best bid and a taker fee to
+    receive something less than the unit the set is worth. Burning pays the
+    full unit with no fee. This is the moment the maker's edge becomes cash.
+
+    Cost basis is the sum of what we paid for both legs -- the set is one
+    asset assembled from two, and its profit is the difference.
+    """
+    paired = _paired_leg(risk, position_key, market_id)
+    if not paired:
+        # The sibling has not filled (or no longer exists). Half a set is not a
+        # set; leave it for the next pass, when it either pairs or is managed
+        # as a directional position.
+        log.debug(
+            f"[{chat_id}] complete set on {market_id} not yet paired — "
+            f"no sibling leg has filled"
+        )
+        return False
+
+    other_key, other = paired
+    qty = min(
+        float(pos.get("filled_quantity") or pos.get("shares") or 0.0),
+        float(other.get("filled_quantity") or other.get("shares") or 0.0),
+    )
+    if qty <= 0:
+        return False
+
+    try:
+        resp = await client.burn_shares(market_id, qty, config.CURRENCY)
+    except Exception as exc:
+        # Not burning is not losing: the set still settles to 1.00. Say so and
+        # let the next pass try again rather than treating it as a position to
+        # be stopped out of.
+        log.error(
+            f"[{chat_id}] burn failed on {market_id}: {exc} — "
+            f"the set still settles to 1.00; leaving it to resolve"
+        )
+        return False
+
+    proceeds = float(
+        resp.get("amount")
+        or resp.get("proceeds")
+        or resp.get("payout")
+        or (qty * 1.0 * config.CURRENCY_BASE_MULTIPLIER)
+    )
+    cost = sum(
+        float(p.get("amount_ngn") or 0.0)
+        for p in (pos, other)
+    )
+    pnl = proceeds - cost
+    risk.current_free_cash += proceeds
+    risk.add_pnl(pnl)
+
+    trade_ids = [
+        (risk.open_positions.get(k) or {}).get("trade_id")
+        for k in (position_key, other_key)
+    ]
+    for k in (position_key, other_key):
+        risk.remove_position(k)
+    try:
+        from strategies import maker as maker_mod
+        maker_mod.maker_strategy.open_quotes.pop(market_id, None)
+    except Exception:
+        pass
+
+    for tid in trade_ids:
+        if tid:
+            try:
+                await asyncio.to_thread(
+                    database.resolve_trade, tid, True, pnl / 2.0
+                )
+            except Exception as db_err:
+                log.error(f"[{chat_id}] burn reconciliation failed: {db_err}")
+
+    log.info(
+        f"[{chat_id}] COMPLETE SET BURNED | {pos.get('asset', '?')} "
+        f"{pos.get('timeframe', '?')} {qty:.2f} sets | "
+        f"cost ₦{cost:,.0f} → ₦{proceeds:,.0f} | PnL ₦{pnl:+,.0f}"
+    )
+    app_to_use = _tg_app if "_tg_app" in globals() else None
+    if app_to_use:
+        try:
+            await telegram_bot.send_message(
+                app_to_use, chat_id,
+                f"🔥 *Complete set burned*\n"
+                f"Asset: {pos.get('asset', '?')} {pos.get('timeframe', '?')}\n"
+                f"Sets: {qty:.2f} → ₦{proceeds:,.0f}\n"
+                f"PnL: ₦{pnl:+,.0f}",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+    return True
+
+
+async def _withdraw_resting_quote(
+    chat_id: str, client, risk, pos: dict, position_key: str, *, reason: str
+) -> bool:
+    """Cancel both legs of a resting two-sided quote and settle their rows.
+
+    Cancelling one leg and leaving the other resting is how a market maker
+    acquires a position it did not intend to hold: the surviving leg fills
+    against whoever was happy to trade with it, and we are long a thesis we
+    priced as a spread. Both legs go, or neither does -- if the second cancel
+    fails, the first leg's removal is the smaller of two errors, since a lone
+    resting bid is exactly the exposure this function exists to prevent.
+    """
+    market_id = pos.get("market_id") or position_key
+    sibling = None
+    for key, other in risk.open_positions.items():
+        if key == position_key:
+            continue
+        if (other.get("market_id") or key) != market_id:
+            continue
+        if str(other.get("strategy") or "").upper() != "MAKER":
+            continue
+        if other.get("confirmed_filled"):
+            continue
+        sibling = (key, other)
+        break
+
+    victims = [(position_key, pos)] + ([sibling] if sibling else [])
+
+    for key, p in victims:
+        order_id = p.get("order_id")
+        if order_id:
+            try:
+                await client.cancel_order(order_id)
+            except Exception as exc:
+                log.debug(
+                    f"[{chat_id}] cancel of resting leg {order_id} "
+                    f"({p.get('outcome')}) failed: {exc}"
+                )
+            # Confirm before forgetting, and require a terminal answer. Two
+            # things can go wrong here and both are worse than a stale row:
+            # a cancel and a fill can cross in flight (we would drop shares
+            # the risk book never knew about), and our cancel may simply not
+            # have taken effect yet (we would stop managing an order the
+            # exchange still considers live).
+            try:
+                state = await client.get_order(order_id)
+                status = str(state.get("status") or "").lower()
+                filled = client.parse_filled_shares(state)
+                if filled > 0 or status in ("filled", "completed"):
+                    log.warning(
+                        f"[{chat_id}] resting leg {order_id} ({p.get('outcome')}) "
+                        f"filled in the cancel race — keeping it as a position"
+                    )
+                    p["confirmed_filled"] = True
+                    p["filled_quantity"] = filled
+                    p["entry_price"] = float(
+                        state.get("avgFillPrice")
+                        or state.get("price")
+                        or p.get("entry_price") or 0.0
+                    )
+                    continue
+                if status not in ("cancelled", "canceled", "expired",
+                                  "rejected", "killed"):
+                    log.warning(
+                        f"[{chat_id}] cancel of resting leg {order_id} "
+                        f"({p.get('outcome')}) not confirmed — the exchange still "
+                        f"reports it as '{status or 'unknown'}'; keeping it tracked"
+                    )
+                    # Say so once. An order we asked to cancel and cannot
+                    # confirm is the one state an operator most needs to see:
+                    # it may still fill, and nothing downstream will mention
+                    # it again.
+                    if not p.get("unfilled_alerted"):
+                        p["unfilled_alerted"] = True
+                        p["pending_cancel"] = True
+                        app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                        if app_to_use:
+                            try:
+                                await telegram_bot.notify_unfilled(
+                                    app_to_use, chat_id, p.get("strategy", "MAKER"),
+                                    p.get("asset", "?"), p.get("timeframe", ""),
+                                    p.get("outcome", ""), p.get("amount_ngn", 0),
+                                )
+                            except Exception as ne:
+                                log.warning(f"[{chat_id}] notify_unfilled failed: {ne}")
+                    continue
+            except Exception as exc:
+                log.debug(f"[{chat_id}] post-cancel check on {order_id}: {exc}")
+                continue
+
+        trade_id = p.get("trade_id")
+        if trade_id:
+            try:
+                await asyncio.to_thread(database.resolve_trade, trade_id, None, 0.0)
+            except Exception as db_err:
+                log.error(f"[{chat_id}] resting-quote settle failed: {db_err}")
+        risk.remove_position(key)
+
+    try:
+        from strategies import maker as maker_mod
+        maker_mod.maker_strategy.open_quotes.pop(market_id, None)
+    except Exception:
+        pass
+
+    log.info(
+        f"[{chat_id}] MAKER QUOTE WITHDRAWN | {market_id} | {reason} | "
+        f"legs cancelled: {[p.get('outcome') for _, p in victims]}"
+    )
+    return True
 
 
 async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dict):
     """
-    Soft model-based exit: re-evaluate every open position using the diffusion
-    model's updated win probability. If EV drops below EXIT_EV_THRESHOLD
-    (default -15%), the thesis is mathematically wrong — exit the position.
+    Priced exit policy.
 
-    This runs every 5s inside _user_loop (was 30s). It does NOT use a hard price-based
-    stop-loss (that's suboptimal for binary options that settle at 0 or 1).
-    Instead, it compares the model's estimated win probability against the
-    current market price to determine if holding is still +EV.
-    Also fires a take-profit exit if the position gained >35% and <5 mins remain.
+    A binary held to resolution is worth ``fv`` per share -- the model's
+    estimate of ``P(this outcome wins)``, since a winning share pays 1.00.
+    A binary sold now is worth ``bid * (1 - taker fee)`` per share. Every exit
+    decision is a comparison of those two numbers, and nothing else enters it:
+
+      TAKE PROFIT  the market is offering more than the position is worth,
+                   by enough to compensate for the option value of holding
+                   and for the model being wrong.
+      STOP         the model's estimate has fallen below what we paid.
+
+    Neither rule is a fixed percentage stop. A stop that triggers on P&L alone
+    sells precisely when a binary is cheapest and its expected value is
+    unchanged -- it converts recoverable variance into a realised loss. A stop
+    that triggers on the estimate sells when we were wrong, which is the only
+    time selling is correct.
+
+    A hard price backstop remains, because a model is not the only thing that
+    can go wrong and a catastrophic move should not need the model's
+    permission to exit.
     """
     if not risk.open_positions:
         return
+
+    from strategies import book as booklib
+    from strategies.model import fair_value
+
+    # One book round-trip for every held outcome rather than one per position:
+    # the per-position loop runs every 5s and a call per position would rival
+    # the scan itself in request volume.
+    outcome_ids = sorted({
+        pos.get("outcome_id")
+        for pos in risk.open_positions.values()
+        if pos.get("outcome_id")
+    })
+    books: dict[str, dict] = {}
+    if outcome_ids:
+        try:
+            books = await asyncio.wait_for(
+                client.get_orderbooks(outcome_ids, depth=5), timeout=3.0
+            )
+        except Exception as exc:
+            log.debug(f"[{chat_id}] exit-eval book fetch failed: {exc}")
 
     positions_to_exit = []
     stale_positions = []
@@ -856,11 +1094,10 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         market_id = pos.get("market_id") or position_key
         market = next((m for m in active_markets if m["market_id"] == market_id), None)
 
-        # ── CRITICAL FIX: If the market rotated out of active_markets ─────────
-        # (new candle started, scanner replaced the old market_id), we MUST still
-        # evaluate the position. Use stored position data + live Binance spot feed.
-        # Without this, the exit engine silently skips the position and it rides
-        # all the way to resolution at 0.00 or 1.00 with zero protection!
+        # ── CRITICAL: if the market rotated out of active_markets ─────────
+        # (new candle started, scanner replaced the old market_id), we MUST
+        # still evaluate. Without this a position rides all the way to
+        # resolution at 0.00 or 1.00 with zero protection.
         asset       = pos.get("asset", "")
         outcome     = pos.get("outcome", "YES")
         entry_price = float(pos.get("entry_price") or 0.5)
@@ -873,16 +1110,16 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         else:
             spot_price = None
 
-        # Retrieve market metadata from active scanner or stored position dictionary
-        threshold   = (market.get("threshold") if market else None) or pos.get("threshold")
-        closing_date = (market.get("closing_date") if market else "") or pos.get("closing_date", "")
-        secs        = market.get("secs_to_close", 0) if market else (scanner._seconds_to_close(closing_date) if closing_date else 0)
+        threshold    = (market.get("threshold") if market else None) or pos.get("threshold")
+        closing_date = ((market.get("closing_date") if market else "")
+                        or pos.get("closing_date", ""))
+        secs = (market.get("secs_to_close", 0) if market
+                else (scanner._seconds_to_close(closing_date) if closing_date else 0))
 
         if not market:
-            # Market has rotated out — if candle has fully elapsed (secs <= 0), clean up stale positions
             if secs <= 0:
                 age_secs = time.time() - pos.get("placed_at", 0)
-                if age_secs > 960:  # 16 minutes
+                if age_secs > 960:  # 16 minutes — well past any 15m candle
                     log.warning(
                         f"[{chat_id}] Cleaning stale resolved position on {market_id} "
                         f"(age={age_secs:.0f}s, asset={asset}, strategy={pos.get('strategy')})"
@@ -890,143 +1127,143 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                     stale_positions.append((position_key, pos))
                 continue
 
-        # Don't try to exit in the final 45 seconds — settlement/oracle resolution
-        # risk makes exit prices unreliable and the market is about to close anyway
-        if secs < MIN_EXIT_TIME_REMAINING:
+        # Inside the final seconds, settlement risk dominates any exit price
+        # and the outcome is decided anyway. Let it resolve.
+        if secs < config.EXIT_MIN_SECS_REMAINING:
             continue
 
-        if not threshold or not spot_price:
+        if not threshold or not spot_price or not entry_price:
             continue
 
-        # Re-estimate win probability using the diffusion model
-        dist_pct = (spot_price - threshold) / threshold
-        rv = realized_vol_hourly(asset, strategy.global_state)
-        w_est = win_probability(dist_pct, secs, asset, sigma_override=rv)
+        # ── Re-price the position ─────────────────────────────────────────
+        synthetic_market = market or {
+            "asset": asset, "threshold": threshold, "secs_to_close": secs,
+            "timeframe": pos.get("timeframe", ""),
+        }
+        p_yes = fair_value(asset, synthetic_market, strategy.global_state, spot_price)
+        if p_yes is None:
+            continue
+        # We hold one side; our win probability is that side's probability.
+        w_est = p_yes if outcome == "YES" else (1.0 - p_yes)
+        if str(outcome).upper() == "BOTH":
+            # A complete set pays 1.00 whichever outcome resolves. There is no
+            # thesis to invalidate and nothing for a stop to protect: the only
+            # correct action is to burn the set and realise the lock.
+            positions_to_exit.append(_exit_plan(
+                market_id, position_key, pos, market, w_est=1.0,
+                current_price=1.0, ev_hold=0.0, exit_reason="BURN_COMPLETE_SET",
+            ))
+            continue
 
-        # If we hold NO, our win prob is the probability price stays BELOW threshold
-        if outcome == "NO":
-            w_est = 1.0 - w_est
+        # Executable bid for the side we hold -- we are selling, so the bid is
+        # the price we can actually hit. A mid is not executable.
+        book = books.get(pos.get("outcome_id") or "")
+        bid = booklib.best_bid(book) if booklib.is_usable(book) else None
+        if bid is None:
+            bid = (market.get("yes_price") if outcome == "YES"
+                   else market.get("no_price")) if market else None
+        if bid is None:
+            bid = entry_price
+        current_price = float(bid)
 
-        # Current market price for our held outcome (use live price or estimated thesis value)
-        if market:
-            current_price = market.get("yes_price", 0.5) if outcome == "YES" else market.get("no_price", 0.5)
-        else:
-            current_price = entry_price
+        pos["peak_price"] = max(pos.get("peak_price", entry_price), current_price)
+        peak_price = float(pos["peak_price"])
 
-        # The diffusion estimate is useful for thesis invalidation, but it is
-        # not executable cash. Profit locks and trailing peaks must use market
-        # price only; otherwise model optimism can label a loss as take-profit.
-        pos["peak_price"] = max(
-            pos.get("peak_price", entry_price), current_price
+        # Cost basis per share. A taker paid the fee inside the fill (it came
+        # out of the shares received); a maker paid none at all.
+        fee_rate = float((market or {}).get("fee_rate") or config.DEFAULT_FEE_RATE)
+        is_maker_pos = str(pos.get("strategy") or "").upper() in config.MAKER_STRATEGIES
+        entry_cost_per_share = (
+            entry_price if is_maker_pos
+            else booklib.effective_buy_price(entry_price, fee_rate, is_maker=False)
         )
-        peak_price = pos["peak_price"]
 
-        # ── Proactive Threat Warning Nudge (Spot Compression Alert) ───────────
-        # If spot compresses to within 0.08% of strike and threat has not been alerted yet:
-        is_threatened = (outcome == "YES" and dist_pct < 0.0008) or (outcome == "NO" and dist_pct > -0.0008)
-        if is_threatened and not pos.get("threat_alerted") and _tg_app:
-            pos["threat_alerted"] = True
-            try:
-                tf = pos.get("timeframe", "15min")
-                strat = pos.get("strategy", "?")
-                threat_msg = (
-                    f"⚠️ *POSITION THREAT WARNING*\n\n"
-                    f"Strategy: *{strat}* | *{asset} {tf}* (*{outcome}*)\n"
-                    f"Strike Distance: *{dist_pct:+.3%}* (compressing!)\n"
-                    f"Time Remaining: *{secs:.0f}s*\n"
-                    f"Status: *Proactively cancelled resting orders & armed emergency SL*"
-                )
-                asyncio.create_task(telegram_bot.send_message(_tg_app, chat_id, threat_msg, parse_mode="Markdown"))
-            except Exception:
-                pass
+        # Value per share if we sell now, net of the taker fee on the exit.
+        exit_value_per_share = booklib.effective_sell_proceeds(
+            current_price, 1.0, fee_rate, is_maker=False
+        )
+        # Value per share if we hold to resolution: a win pays 1.00.
+        hold_value_per_share = w_est
 
-        # ── 1. DYNAMIC TAKE-PROFIT & TRAILING PROFIT LOCK ─────────────────────
-        # Locks in profit whenever:
-        # A) Near-close profit target: secs < 450 and gain_pct >= TAKE_PROFIT_GAIN_PCT (15%).
-        # B) Absolute high price target: current_price >= TAKE_PROFIT_PRICE_TARGET (0.82) with gain_pct >= 20%.
-        # C) Trailing reversal protection: Market price peaked >= +15% and then declines by >= 8%.
-        gain_pct = (
-            (current_price - entry_price) / entry_price
-            if entry_price > 0 else 0.0
+        # ── 1. TAKE PROFIT: the market is paying more than it is worth ────
+        premium = config.EXIT_TAKE_PROFIT_PREMIUM * max(entry_cost_per_share, 1e-6)
+        # Selling must also clear our cost basis. Without this the rule fires
+        # on any position where the bid merely exceeds a depressed model
+        # estimate -- realising a loss while logging it as profit taking, which
+        # is the one thing a profit rule must never do.
+        worth_selling = (
+            exit_value_per_share > hold_value_per_share + premium
+            and exit_value_per_share > entry_cost_per_share
+            and secs >= config.EXIT_TAKE_PROFIT_MIN_SECS
         )
-        peak_gain_pct = (
-            (peak_price - entry_price) / entry_price
-            if entry_price > 0 else 0.0
-        )
+        # Trailing protection: a gain that has started to evaporate is still a
+        # gain. This is the one price-based rule, and it only ever sells into
+        # profit -- a reversal below entry is the stop's job, not this one's.
         dropped_from_peak = (
-            (peak_price - current_price) / peak_price
-            if peak_price > 0 else 0.0
+            (peak_price - current_price) / peak_price if peak_price > 0 else 0.0
         )
-        target_tp_price = getattr(config, "TAKE_PROFIT_PRICE_TARGET", 0.82)
+        peak_gain = (
+            (peak_price - entry_cost_per_share) / entry_cost_per_share
+            if entry_cost_per_share > 0 else 0.0
+        )
+        trailing_lock = (
+            peak_gain >= config.EXIT_TAKE_PROFIT_PREMIUM
+            and dropped_from_peak >= config.EXIT_TRAILING_DROP
+            and current_price >= entry_cost_per_share
+        )
 
-        if (
-            (secs < TAKE_PROFIT_MIN_SECS_REMAINING and gain_pct >= TAKE_PROFIT_GAIN_PCT)
-            or (current_price >= target_tp_price and gain_pct >= 0.20)
-            or (gain_pct >= 0.40)
-        ):
-            positions_to_exit.append({
-                "market_id": market_id,
-                "position_key": position_key,
-                "pos": pos,
-                "market": market,
-                "w_est": w_est,
-                "current_price": current_price,
-                "ev_hold": gain_pct,
-                "exit_reason": "TAKE_PROFIT",
-            })
+        if worth_selling:
+            positions_to_exit.append(_exit_plan(
+                market_id, position_key, pos, market, w_est=w_est,
+                current_price=current_price,
+                ev_hold=(exit_value_per_share - entry_cost_per_share)
+                        / max(entry_cost_per_share, 1e-6),
+                exit_reason="TAKE_PROFIT",
+            ))
+            continue
+        if trailing_lock:
+            positions_to_exit.append(_exit_plan(
+                market_id, position_key, pos, market, w_est=w_est,
+                current_price=current_price,
+                ev_hold=(exit_value_per_share - entry_cost_per_share)
+                        / max(entry_cost_per_share, 1e-6),
+                exit_reason="REVERSAL_EXIT",
+            ))
             continue
 
-        if (
-            peak_gain_pct >= 0.15
-            and dropped_from_peak >= 0.08
-            and current_price >= entry_price
-        ):
-            positions_to_exit.append({
-                "market_id": market_id,
-                "position_key": position_key,
-                "pos": pos,
-                "market": market,
-                "w_est": w_est,
-                "current_price": current_price,
-                "ev_hold": gain_pct,
-                "exit_reason": "REVERSAL_EXIT",
-            })
+        # ── 2. STOP: the thesis is worth materially less than we paid ─────
+        thesis_broken = hold_value_per_share < entry_cost_per_share * (
+            1.0 - config.EXIT_STOP_DRAWDOWN
+        )
+        # Hard backstop. The model is not the only thing that can go wrong.
+        hard_stop = (
+            current_price <= entry_cost_per_share
+            * (1.0 - config.EXIT_HARD_STOP_LOSS_PCT)
+            and current_price >= config.EXIT_MIN_SALVAGE_PRICE
+        )
+        # A resting maker quote still unfilled near close is not a position we
+        # want to acquire: withdraw it rather than let it fill into settlement.
+        maker_late = (
+            is_maker_pos
+            and not pos.get("confirmed_filled")
+            and secs < config.MAKER_LATE_CANCEL_SECS
+        )
+
+        if maker_late:
+            positions_to_exit.append(_exit_plan(
+                market_id, position_key, pos, market, w_est=w_est,
+                current_price=current_price, ev_hold=0.0,
+                exit_reason="CANCEL_RESTING",
+            ))
             continue
+        if thesis_broken or hard_stop:
+            positions_to_exit.append(_exit_plan(
+                market_id, position_key, pos, market, w_est=w_est,
+                current_price=current_price,
+                ev_hold=hold_value_per_share - entry_cost_per_share,
+                exit_reason="STOP_LOSS",
+            ))
 
-        # ── 2. DYNAMIC REAL-TIME STOP-LOSS (SPOT INVALIDATION) ─────────────────
-        # Dumps position if thesis is mathematically broken or risk is severe:
-        # A) Early/Mid-candle (secs > 300): only exit if w_est < 0.30 and loss_pct >= 0.15, or loss_pct >= 0.30
-        # B) Late-candle (secs <= 300): exit if spot is on losing side by >= 0.03% AND w_est < 0.40, or loss_pct >= 0.20
-        # C) Late unconfirmed MAKER limit order: cancel resting order before close
-        loss_pct = (entry_price - current_price) / entry_price if entry_price > 0 else 0.0
-        is_maker_late = (pos.get("strategy") == "MAKER" and secs < 300 and not pos.get("confirmed_filled"))
-
-        late_adverse_flip = (
-            secs <= 300
-            and ((outcome == "YES" and dist_pct < -0.0003) or (outcome == "NO" and dist_pct > 0.0003))
-            and w_est < 0.40
-        )
-        early_thesis_broken = (
-            secs > 300
-            and w_est < 0.30
-            and loss_pct >= 0.15
-        )
-        hard_loss_stop = (
-            (secs <= 300 and loss_pct >= 0.20 and current_price >= 0.05)
-            or (secs > 300 and loss_pct >= 0.30 and current_price >= 0.05)
-        )
-
-        if is_maker_late or late_adverse_flip or early_thesis_broken or hard_loss_stop:
-            positions_to_exit.append({
-                "market_id": market_id,
-                "position_key": position_key,
-                "pos": pos,
-                "market": market,
-                "w_est": w_est,
-                "current_price": current_price,
-                "ev_hold": w_est - 0.5,
-                "exit_reason": "STOP_LOSS",
-            })
 
     # Execute exits
     for exit_info in positions_to_exit:
@@ -1047,6 +1284,25 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         if not outcome_id or not event_id:
             continue
 
+        # A complete set settles to 1.00 whichever outcome wins. Selling it is
+        # strictly worse than burning it: a sale pays the bid and a taker fee,
+        # while a burn pays the full unit. Realise the lock and stop managing
+        # it as a position.
+        if exit_reason == "BURN_COMPLETE_SET":
+            await _burn_complete_set(
+                chat_id, client, risk, pos, position_key, market_id=market_id
+            )
+            continue
+
+        # A resting quote late in the candle: withdraw both legs rather than
+        # let someone fill us into settlement.
+        if exit_reason == "CANCEL_RESTING":
+            await _withdraw_resting_quote(
+                chat_id, client, risk, pos, position_key,
+                reason="too close to settlement",
+            )
+            continue
+
         if exit_reason == "TAKE_PROFIT":
             log.info(
                 f"[{chat_id}] TAKE-PROFIT SIGNAL | {pos.get('strategy', '?')} {pos.get('asset', '?')} "
@@ -1063,7 +1319,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             log.info(
                 f"[{chat_id}] EXIT SIGNAL | {pos.get('strategy', '?')} {pos.get('asset', '?')} "
                 f"{pos.get('outcome', '?')} | w_est={w_est:.1%} price={current_price:.3f} "
-                f"EV={ev_hold:+.1%} < {EXIT_EV_THRESHOLD:.0%} | "
+                f"hold_vs_cost={ev_hold:+.4f}/share | "
                 f"entry={entry_price:.3f} → now={current_price:.3f}"
             )
 
@@ -1098,11 +1354,12 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                     or order_state.get("price")
                     or entry_price
                 )
-                confirmed_fee = float(order_state.get("fee") or 0.0)
+                # Makers pay no CLOB fee on Bayse. Adding the order's `fee`
+                # field here was charging a maker fill the taker fee and
+                # understating every maker profit by it.
                 confirmed_cost = (
                     confirmed_qty * confirmed_entry
                     * config.CURRENCY_BASE_MULTIPLIER
-                    + confirmed_fee
                 )
                 pos["confirmed_filled"] = True
                 pos["filled_quantity"] = confirmed_qty
@@ -1561,9 +1818,8 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
                 skipped_halted += 1
                 continue
             evaluated += 1
-            # Use a fresh independent oracle for crypto probability models,
-            # while strategies such as FRONTRUN can still inspect the Bayse
-            # relay separately. Never trade on an indefinitely cached tick.
+            # Use a fresh independent oracle for crypto probability models.
+            # Never trade on an indefinitely cached tick.
             asset = market["asset"]
             relay_price = feeds.spot.get(asset)
             relay_time = feeds.spot_updated_at.get(asset, 0.0)
@@ -1587,8 +1843,25 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
             if not spot_price:
                 skipped_no_spot += 1
                 continue
+            # Both legs must be priced off ONE book snapshot. Fetching it
+            # inside each strategy let a tick between the two calls turn a
+            # spread that looked locked into one that is not -- and a pair
+            # priced off two different books is not a locked spread at all.
+            books = {}
+            if str(market.get("engine") or "").upper() == "CLOB":
+                ids = [i for i in (market.get("yes_id"), market.get("no_id")) if i]
+                if ids:
+                    try:
+                        books = await asyncio.wait_for(
+                            client.get_orderbooks(ids, depth=5), timeout=2.5
+                        )
+                    except Exception as be:
+                        log.debug(f"[{chat_id}] book fetch failed for {asset}: {be}")
+                        books = {}
+
             sigs = await strategies.evaluate_all(
-                market, learned, strategy.global_state, spot_price=spot_price
+                market, learned, strategy.global_state,
+                spot_price=spot_price, books=books,
             )
             all_signals.extend(sigs)
 
@@ -1642,12 +1915,9 @@ async def _evaluate_markets(chat_id, settings, client, risk, equity, free_cash,
 
         final = strategies.merge_signals(all_signals, strategy.global_state)
         for sig in final:
-            if sig.strategy == "ARB":
-                await executor.execute_arb(chat_id, sig, client, risk, equity, free_cash, settings)
-            elif sig.strategy == "MIDMARKET_MAKER":
-                await executor.execute_midmarket_maker(chat_id, sig, client, risk, equity, free_cash, settings)
-            else:
-                await executor.execute_trade(chat_id, sig, client, risk, settings, equity, free_cash)
+            await executor.execute_trade(
+                chat_id, sig, client, risk, settings, equity, free_cash
+            )
         health.touch("evaluation", chat_id=chat_id, markets=evaluated, signals=len(final))
         return True
     except Exception as e:
@@ -1672,19 +1942,6 @@ async def _scan_loop():
             executor.init_executor(active_markets, _tg_app)
             log.info(f"Scan: {len(active_markets)} markets")
             feeds.restart_bayse_feed(active_markets, _on_market_update)
-            try:
-                import shadow_tracker
-                shadow_tracker.on_market_scan(active_markets)
-            except Exception as se:
-                log.debug(f"Shadow tracker scan hook: {se}")
-            try:
-                import complete_set_shadow
-                await complete_set_shadow.scan_markets(
-                    _scan_client, active_markets
-                )
-            except Exception as se:
-                # Shadow research must never interrupt market discovery.
-                log.debug(f"Complete-set shadow scan hook: {se}")
         except Exception as e:
             health.fail("scanner", e)
             # Keep the last known market count honest (the loop may still be
@@ -1760,10 +2017,6 @@ def _on_market_update(market_id: str, prices: dict):
     if not market:
         return
     asset = market.get("asset", "")
-    if asset == "BTC":
-        # Uses the OLD (pre-update) yes_price as the move-detection baseline —
-        # this must happen BEFORE we write the new price below.
-        strategy.record_btc_move(market, prices.get("yes", market["yes_price"]))
 
     # Commit live price updates to market state in real time
     new_yes = prices.get("yes")
@@ -1773,11 +2026,6 @@ def _on_market_update(market_id: str, prices: dict):
         if 0.01 <= ny <= 0.99 and 0.01 <= nn <= 0.99:
             market["yes_price"] = ny
             market["no_price"]  = nn
-        try:
-            import shadow_tracker
-            shadow_tracker.on_price_update(market_id, prices)
-        except Exception:
-            pass
 
     asyncio.create_task(_evaluate_all_users_for_asset(asset, penalty=0.0))
 
@@ -2417,6 +2665,21 @@ async def main():
             # Non-zero so the platform (and the deploy log) shows a failure
             # instead of a clean stop that quietly restarts.
             raise SystemExit(1)
+
+    # Data hygiene before the first decision is taken. A stale lease must be
+    # cleared before we try to take it (otherwise the deploy cannot trade),
+    # and a contradictory trade row must be corrected before the risk manager
+    # reads exposure from it. Both run off the event loop and neither is
+    # allowed to stop startup.
+    try:
+        hygiene = await asyncio.to_thread(maintenance.run, False)
+        if hygiene.total:
+            log.warning("Startup data hygiene found issues:\\n%s", hygiene.text())
+            applied = await asyncio.to_thread(maintenance.apply_safe)
+            if applied.total:
+                log.info("Startup data hygiene applied:\\n%s", applied.text())
+    except Exception as exc:
+        log.error(f"Startup maintenance failed (non-fatal): {exc}")
 
     if hasattr(database, "force_acquire_singleton_lock"):
         owned = await _acquire_singleton_lease(database.force_acquire_singleton_lock)

@@ -23,7 +23,7 @@ import bot
 import config
 import stall
 from risk import RiskManager
-from strategies.snipe import SnipeStrategy
+from strategies.taker import TakerStrategy
 from strategies.base import global_state
 
 REPO = Path(__file__).resolve().parents[1]
@@ -58,6 +58,16 @@ def _favorable_market(**overrides) -> dict:
     }
     market.update(overrides)
     return market
+
+
+def _favorable_books() -> dict:
+    """A book deep enough to trade against, matching _favorable_market's prices."""
+    return {
+        "yes-1": {"bids": [{"price": 0.58, "quantity": 800.0}],
+                  "asks": [{"price": 0.60, "quantity": 800.0}]},
+        "no-1":  {"bids": [{"price": 0.38, "quantity": 800.0}],
+                  "asks": [{"price": 0.40, "quantity": 800.0}]},
+    }
 
 
 # ── the stuck-pause regression ───────────────────────────────────────────────
@@ -217,8 +227,8 @@ def test_verdict_flags_signals_that_never_become_orders():
     chat = "u-exec"
     stall.note_state(chat, paused=False, dry_run=False)
     stall.note_evaluation(chat, markets_total=4, in_scope=4, evaluated=4, signals=2)
-    stall.note_signal(chat, "SNIPE", "SOL")
-    stall.note_order(chat, "SNIPE", placed=False, reason="risk_budget_below_platform_minimum")
+    stall.note_signal(chat, "TAKER", "SOL")
+    stall.note_order(chat, "TAKER", placed=False, reason="risk_budget_below_platform_minimum")
     data = stall.verdict(chat)
     assert data["code"] == "EXECUTION_BLOCKED"
     assert "risk_budget_below_platform_minimum" in data["detail"]
@@ -250,7 +260,7 @@ def test_verdict_flags_low_balance(monkeypatch):
 def test_reject_counters_are_bounded():
     chat = "u-bounded"
     for i in range(200):
-        stall.reject(chat, "SNIPE", f"code_{i}", "detail")
+        stall.reject(chat, "TAKER", f"code_{i}", "detail")
     report = stall.report(chat)
     assert len(report["top_rejects"]) <= 6
     # The bucket itself stays bounded so a long-running process cannot grow
@@ -350,27 +360,28 @@ def test_watchdog_never_raises_when_a_feed_lookup_breaks(monkeypatch):
         (200.05, False),
     ],
 )
-def test_snipe_gates_are_satisfiable_and_counted(spot, expected_signal):
+def test_taker_gates_are_satisfiable_and_counted(spot, expected_signal):
     import strategies
 
     chat = "u-live"
     learned = {
         "mode": "balanced",
-        "strategies": ["SNIPE"],
+        "strategies": ["TAKER"],
         "certainty_multipliers": {},
         "size_multipliers": {},
-        "snipe_min_certainty": config.SNIPE_MIN_CERTAINTY,
+        "taker_min_net_ev": config.TAKER_MIN_NET_EV_DEFAULT,
         "chat_id": chat,
     }
     signals = asyncio.run(
         strategies.evaluate_all(
-            _favorable_market(), learned, global_state, spot_price=spot
+            _favorable_market(), learned, global_state,
+            spot_price=spot, books=_favorable_books(),
         )
     )
     if expected_signal:
-        assert signals, "no market can pass the live SNIPE gates — the strategy is dead, not cautious"
+        assert signals, "no market can pass the live TAKER gates — the strategy is dead, not cautious"
         sig = signals[0]
-        assert sig.strategy == "SNIPE"
+        assert sig.strategy == "TAKER"
         assert sig.asset == "SOL" and sig.timeframe == "15min"
         assert 0.40 <= sig.market_price <= 0.65
         assert sig.win_prob > sig.market_price
@@ -382,17 +393,17 @@ def test_snipe_gates_are_satisfiable_and_counted(spot, expected_signal):
         # dropped on the floor.
         counters = stall._users[chat]["rejects"]
         assert counters, "a rejected candidate produced no gate counter"
-        # ``no_raw_edge_or_trend_alignment`` used to cover four independent
-        # conditions in one counter; it is now split (see
-        # tests/test_snipe_entry_gates.py), so the markers are the new names.
+        # Every gate emits its own counter. A single umbrella counter hides
+        # which condition is actually binding, which is the difference between
+        # tuning the bot and guessing.
         assert any(
             marker in code
             for code in counters
-            for marker in ("distance", "model_prob_below_floor", "raw_edge_below_floor",
-                           "momentum_opposing", "side_mismatch", "spot_on_threshold",
-                           "market_prices_unusable")
+            for marker in ("distance", "model_prob_below_floor", "momentum_veto",
+                           "net_ev_below_margin", "outside_entry_window",
+                           "market_prices_unusable", "side_book_unusable",
+                           "price_above_ev_ceiling", "price_below_band")
         ), f"unhelpful gate attribution: {list(counters)}"
-        assert not any("no_raw_edge_or_trend_alignment" in code for code in counters)
 
 
 def test_evaluate_markets_records_the_pass_for_the_right_reason(monkeypatch):
@@ -406,17 +417,11 @@ def test_evaluate_markets_records_the_pass_for_the_right_reason(monkeypatch):
             stall.note_order(cid, sig.strategy, placed=True, reason="test")
             stall.note_trade(cid, market_id=sig.market_id)
 
-        async def execute_arb(self, *a, **k):
-            calls.append("arb")
-
-        async def execute_midmarket_maker(self, *a, **k):
-            calls.append("midmarket")
-
-    async def fake_evaluate_all(market, learned, state, spot_price=None):
+    async def fake_evaluate_all(market, learned, state, spot_price=None, books=None):
         from strategies.base import TradeSignal
 
         return [TradeSignal(
-            strategy="SNIPE", event_id=market["event_id"], market_id=market["market_id"],
+            strategy="TAKER", event_id=market["event_id"], market_id=market["market_id"],
             asset=market["asset"], timeframe=market["timeframe"], outcome="YES",
             outcome_id=market["yes_id"], certainty=0.35, win_prob=0.66,
             market_price=0.60, size_pct=0.02, reason="test signal",
@@ -432,12 +437,12 @@ def test_evaluate_markets_records_the_pass_for_the_right_reason(monkeypatch):
 
     ok = asyncio.run(bot._evaluate_markets(
         chat, {}, client=None, risk=RiskManager(), equity=5_000.0, free_cash=5_000.0,
-        learned={"strategies": ["SNIPE"], "chat_id": chat}, max_exp=0.15,
+        learned={"strategies": ["TAKER"], "chat_id": chat}, max_exp=0.15,
         user_assets=["SOL"], user_tfs=["15min"],
     ))
 
     assert ok is True
-    assert calls == ["execute:SNIPE"]
+    assert calls == ["execute:TAKER"]
     report = stall.report(chat)
     assert report["markets_evaluated"] == 1
     assert report["signals"] == 1

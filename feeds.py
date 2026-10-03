@@ -25,7 +25,7 @@ spot_updated_at: dict[str, float] = {}
 # Bayse market YES/NO prices — {market_id: {"yes": float, "no": float}}
 market_prices: dict[str, dict] = {}
 
-# Previous YES prices — used by CORRELATE to detect BTC moves
+# Previous YES prices — used to detect directional moves in the relay
 prev_yes: dict[str, float] = {}
 
 _bayse_task: asyncio.Task | None = None
@@ -97,7 +97,7 @@ async def realtime_feed(on_price=None):
             log.warning(f"Realtime feed error: {e}. Reconnect in {backoff}s")
             # DO NOT clear spot prices on disconnect.
             # Strategies use feeds.spot.get(asset) — clearing it silences every
-            # strategy (SNIPE, FRONTRUN, CORRELATE all return None without a
+            # strategy (both legs return None without a
             # live price) for the entire backoff period (up to 60s per cycle).
             # Instead, prices age naturally; strategies that need freshness can
             # check feeds_direct for oracle confirmation.
@@ -177,7 +177,7 @@ def _handle_market(msg: dict, on_update=None):
                 "yes": yes_val, "no": no_val, "timestamp": time.time()
             }
 
-        # Track favourite flips (used by SNIPE conviction boost)
+        # Track favourite flips (used by directional conviction)
         fav = "YES" if yes_val > no_val else ("NO" if no_val > yes_val else None)
         if fav:
             if mid not in global_state.market_last_fav:

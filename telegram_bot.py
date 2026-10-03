@@ -41,20 +41,11 @@ _user_daily:     dict = {}
 _active_markets: list = []
 _start_user_fn       = None
 
-_VALID_STRATEGIES = {"SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"}
-_STRATEGY_ALIASES = {
-    "MIDMARKET": "MIDMARKET_MAKER",
-    "MID_MARKET": "MIDMARKET_MAKER",
-    "MID-MARKET": "MIDMARKET_MAKER",
-    "MIDMARKET_MAKER": "MIDMARKET_MAKER",
-    "MID": "MIDMARKET_MAKER",
-    "PAIRED": "PAIRED_SNIPER",
-    "PAIREDSNIPER": "PAIRED_SNIPER",
-    "ORACLE": "ORACLE_ARB",
-    "ORACLEARB": "ORACLE_ARB",
-    "FRONT_RUN": "FRONTRUN",
-    "CORRELATION": "CORRELATE",
-}
+_VALID_STRATEGIES = set(config.ACTIVE_STRATEGIES)
+# Aliases kept for strategies that no longer exist resolve to nothing, which
+# makes `/set strategies SNIPE` an error rather than a silent no-op that looks
+# like a working configuration for a strategy that is not running.
+_STRATEGY_ALIASES = {}
 
 def _normalize_strat(s: str) -> str:
     cleaned = s.strip().upper().replace("-", "_")
@@ -104,9 +95,6 @@ def build_app() -> Application:
         ("disconnect",    cmd_disconnect),
         ("rekey",         cmd_rekey),
         ("wallet",        cmd_wallet),
-        ("shadow",        cmd_shadow),
-        ("makershadow",   cmd_makershadow),
-        ("arbshadow",     cmd_arbshadow),
         ("help",          cmd_help),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
@@ -377,7 +365,10 @@ async def cmd_strategies(update: Update, _ctx):
         else:
             status = "✅ ACTIVE" if strat in active else "⚪ OFF"
         lines.append(f"{icon} *{strat}*: {status}")
-    lines.append("\n*To enable or set strategies:*\n`/set strategies SNIPE MAKER MIDMARKET_MAKER PAIRED_SNIPER`")
+    lines.append(
+        "\n*To enable or set strategies:*\n"
+        f"`/set strategies {' '.join(config.ACTIVE_STRATEGIES)}`"
+    )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 @_guard
@@ -389,7 +380,7 @@ async def cmd_set(update: Update, _ctx):
             "*Usage:*\n"
             "`/set assets BTC ETH SOL`\n"
             "`/set timeframes 15min 1h`\n"
-            "`/set strategies SNIPE ARB`\n"
+            "`/set strategies TAKER MAKER`\n"
             "`/set risk 2`\n"
             "`/set mintrade 100`\n"
             "`/set maxtrade 5000`\n"
@@ -696,29 +687,6 @@ async def cmd_disconnect(update: Update, _ctx):
     log.info(f"[{cid}] DISCONNECTED")
     await update.message.reply_text("🔌 Disconnected. Trade history preserved. /start to reconnect.")
 
-@_guard
-async def cmd_shadow(update: Update, _ctx):
-    import shadow_tracker
-    report = shadow_tracker.get_summary_report()
-    await update.message.reply_text(report, parse_mode="Markdown")
-
-
-@_guard
-async def cmd_makershadow(update: Update, _ctx):
-    import maker_shadow
-    await update.message.reply_text(
-        maker_shadow.get_summary_report(), parse_mode="Markdown"
-    )
-
-
-@_guard
-async def cmd_arbshadow(update: Update, _ctx):
-    import complete_set_shadow
-    await update.message.reply_text(
-        complete_set_shadow.get_summary_report(), parse_mode="Markdown"
-    )
-
-
 async def cmd_help(update: Update, _ctx):
     await update.message.reply_text(
         "*Commands*\n\n"
@@ -735,9 +703,6 @@ async def cmd_help(update: Update, _ctx):
         "/set — change a setting\n"
         "/pause — stop trading\n"
         "/resume — resume trading\n"
-        "/shadow — view mid-market shadow tracker report\n"
-        "/makershadow — view read-only MAKER quote-ladder observations\n"
-        "/arbshadow — view read-only complete-set arbitrage observations\n"
         "/debug — diagnose why trades aren't firing\n"
         "/why — the single reason nothing has traded, with evidence\n"
         "/disconnect — remove account",
@@ -777,7 +742,7 @@ _MODES = {
         "settings": {
             "mode": "aggressive", "assets": list(config.DEFAULT_ASSETS),
             "timeframes": list(config.DEFAULT_TIMEFRAMES),
-            "strategies": ["MAKER", "SNIPE", "FRONTRUN", "CORRELATE"],
+            "strategies": list(config.ACTIVE_STRATEGIES),
             "risk_pct": min(2.0, config.MAX_TRADE_RISK * 100),
             "mintrade": MIN_TRADE_NGN,
             "maxexposure": config.MAX_PORTFOLIO_EXPOSURE * 100,
@@ -828,7 +793,7 @@ async def _status_text(cid: str) -> str:
     # against an equity baseline understated "today's profit" and
     # overstated "drawdown from peak" by exactly the deployed amount —
     # every single time the user checked /status while holding a position,
-    # which based on production logs is most of the time (0-5 open SNIPE
+    # which based on production logs is most of the time (0-5 open
     # positions is the normal state, not the exception).
     equity = free_cash + deployed
 
@@ -1011,14 +976,11 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
     """
     strat = sig.strategy.upper()
     strat_meta = {
-        "SNIPE":         ("🎯", "*SNIPE Signal*"),
-        "ORACLE_ARB":    ("⚡", "*ORACLE ARB* (Latency Edge)"),
-        "MAKER":         ("📊", "*MAKER* (Limit Order)" if engine == "CLOB_LIMIT" else "*MAKER*"),
-        "FRONTRUN":      ("🏎️", "*FRONTRUN* (Binance Impulse)"),
-        "CORRELATE":     ("🔗", "*CORRELATION* (Lead-Lag)"),
-        "ARB":             ("⚖️", "*TWO-SIDED ARB* (Experimental)"),
-        "PAIRED_SNIPER":   ("⚡", "*PAIRED SNIPER* (Ohioism Engine)"),
-        "MIDMARKET_MAKER": ("🎯", "*MID-MARKET MAKER* (Dual Liquidity Trap)"),
+        "TAKER": ("🎯", "*TAKER* (Crossing the spread)"),
+        "MAKER": (
+            "📊",
+            "*MAKER* (Two-sided quote)" if engine == "CLOB_LIMIT" else "*MAKER*",
+        ),
     }
     icon_strat, title_strat = strat_meta.get(strat, ("🔔", f"*{strat} Trade*"))
     
@@ -1070,14 +1032,8 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
 
 
 _STRAT_ICONS = {
-    "SNIPE":           ("🎯", "SNIPE"),
-    "ORACLE_ARB":      ("⚡", "ORACLE ARB"),
-    "MAKER":           ("📊", "MAKER"),
-    "FRONTRUN":        ("🏎️", "FRONTRUN"),
-    "CORRELATE":       ("🔗", "CORRELATION"),
-    "ARB":             ("⚖️", "TWO-SIDED ARB"),
-    "PAIRED_SNIPER":   ("⚡", "PAIRED SNIPER"),
-    "MIDMARKET_MAKER": ("🎯", "MID-MARKET MAKER"),
+    "TAKER": ("🎯", "TAKER"),
+    "MAKER": ("📊", "MAKER"),
 }
 
 async def notify_win(app, cid, _mid, asset, tf, strat, pnl):
@@ -1130,9 +1086,14 @@ async def notify_loss(app, cid, _mid, asset, tf, strat, pnl):
         except Exception as e2:
             log.error(f"notify_loss failed completely for {cid}: {e2}")
 
-async def notify_fill(app, cid, strat, asset, tf, outcome, price, amount_ngn):
+async def notify_fill(app, cid, pos, shares, price):
     """Notify user when a resting limit order is filled on the exchange."""
     app = app or _bot_app
+    strat   = (pos or {}).get("strategy", "MAKER")
+    asset   = (pos or {}).get("asset", "?")
+    tf      = (pos or {}).get("timeframe", "")
+    outcome = (pos or {}).get("outcome", "?")
+    amount_ngn = float((pos or {}).get("amount_ngn") or 0.0)
     if not app:
         log.warning(f"notify_fill dropped for {cid}: no Telegram app available")
         return
@@ -1149,8 +1110,10 @@ async def notify_fill(app, cid, strat, asset, tf, outcome, price, amount_ngn):
         f"Strategy: *{_esc(name)}*\n"
         f"Market: *{_esc(asset)} {_esc(tf)}* (*{_esc(outcome)}*)\n"
         f"Fill Price: *{price_val:.3f}*\n"
+        f"Shares: *{float(shares or 0.0):.2f}*\n"
         f"Amount: *₦{amt_val:,.0f}*\n"
-        f"_Matched by taker on CLOB. Position is now actively tracked._"
+        f"_Matched by a taker on the CLOB — no maker fee. The opposite leg is "
+        f"now more valuable: the next quote skews to complete the set._"
     )
     try:
         await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
@@ -1309,23 +1272,8 @@ async def notify_drawdown(app, cid, balance, peak, dd):
         f"Drawdown: {dd:.1%}\n\n/resume to override.",
         parse_mode="Markdown")
 
-async def notify_arb(app, cid, sig, pairs, profit):
-    await send_message(app, cid,
-        f"⚖️ *ARB* | {sig.asset} {sig.timeframe}\n{pairs:.3f} pairs → ₦{profit:,.2f}",
-        parse_mode="Markdown")
-
 async def notify_deposit_detected(app, cid, amount, currency):
     await send_message(app, cid,
         f"💸 *Deposit detected* +{currency} {amount:,.0f}\n"
         f"Drawdown baseline reset. Send /resume if trading was paused.",
-        parse_mode="Markdown")
-
-async def notify_midmarket(app, cid, sig, bid_yes, bid_no, amount_leg):
-    await send_message(app, cid,
-        f"🎯 *MID-MARKET LIQUIDITY TRAP*\n"
-        f"Asset: *{sig.asset} {sig.timeframe}*\n"
-        f"• YES Bid: *{bid_yes:.3f}* (₦{amount_leg:,.0f})\n"
-        f"• NO Bid: *{bid_no:.3f}* (₦{amount_leg:,.0f})\n"
-        f"• Locked Return: *+{sig.edge_at_entry:.1%}*\n"
-        f"• 45s adverse selection watchdog active",
         parse_mode="Markdown")

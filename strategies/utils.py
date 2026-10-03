@@ -97,15 +97,12 @@ def projected_drift_pct(asset: str, secs: float, state, horizon_cap: float = Non
     """
     Kalman-filter projected price drift over the next `secs` seconds (or
     `horizon_cap` seconds if provided and shorter), expressed as a fraction
-    of current price — i.e. the same units as distance_pct in
-    win_probability().
+    of current price — the same units as `strategies.model.distance_pct`.
 
     This is a real drift term for a GBM-with-drift probability estimate,
-    NOT a normalised [-1,1] heuristic score (that's what momentum_score is
-    for, used by CORRELATE). SNIPE uses this raw value to fold momentum
-    directly into its diffusion model rather than bolting it on afterward
-    as a separate additive bonus — the textbook-correct way to incorporate
-    drift into a boundary-crossing probability estimate.
+    NOT a normalised [-1,1] heuristic score (that's what momentum_score is).
+    Folding drift into the diffusion model is the textbook-correct way to
+    account for momentum; adding it afterwards as a bonus double-counts it.
 
     horizon_cap limits how far the instantaneous velocity reading gets
     extrapolated. Verified directly against production data: across 6 real
@@ -128,55 +125,6 @@ def projected_drift_pct(asset: str, secs: float, state, horizon_cap: float = Non
         return 0.0
     horizon = min(secs, horizon_cap) if horizon_cap is not None else secs
     return (velocity / price) * horizon
-
-
-def velocity_score(asset: str, threshold: float, direction: str, state) -> float:
-    """Measures how fast price is heading toward (negative) or away from (positive) threshold."""
-    if not hasattr(state, "kalman_state"):
-        return 0.0
-    k = state.kalman_state.get(asset)
-    if not k:
-        return 0.0
-    price, velocity = k["x"]
-    if price <= 0:
-        return 0.0
-    gap = abs(price - threshold)
-    if (direction == "YES" and price < threshold) or (direction == "NO" and price > threshold):
-        return -1.0
-    move = velocity * config.SNIPE_VELOCITY_WINDOW
-    change = move if direction == "YES" else -move
-    return change / max(gap, 1e-9)
-
-
-def regime_score(asset: str, state) -> float:
-    """Bayesian HMM proxy: probability that the asset is in a trending regime (0–1)."""
-    if not hasattr(state, "price_history"):
-        return 0.5
-    hist = list(state.price_history.get(asset, []))
-    n = min(len(hist), 60)
-    if n < 10:
-        return 0.5
-
-    prices  = [p for _, p in hist[-n:]]
-    returns = [math.log(prices[i] / prices[i-1])
-               for i in range(1, len(prices)) if prices[i-1] > 0]
-    if not returns:
-        return 0.5
-
-    mean = sum(returns) / len(returns)
-    var  = sum((r - mean)**2 for r in returns) / len(returns)
-    std  = math.sqrt(var) if var > 0 else 1e-9
-
-    p = 0.5
-    for r in returns:
-        z = abs(r) / std
-        lk_trend = min(0.95, max(0.05, z / 2.0))
-        lk_chop  = 1.0 - lk_trend
-        marg = lk_trend * p + lk_chop * (1.0 - p)
-        if marg > 0:
-            p = lk_trend * p / marg
-    return p
-
 
 def _norm_cdf(x: float) -> float:
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
@@ -347,73 +295,6 @@ def twap_win_probability(spot: float, threshold: float, secs: float,
     if denominator <= 0:
         return 1.0 if spot > target else 0.0
     return _norm_cdf(numerator / denominator)
-
-
-def win_probability(dist_pct: float, secs: float, asset: str,
-                    sigma_override: float = None) -> float:
-    """
-    Backward-compatible wrapper — used by frontrun.py and the exit evaluator
-    in bot.py, which pass a pre-computed linear distance (S−K)/K and have
-    no Kalman drift available.
-
-    Routes through the GBM formula with zero drift (conservative: no
-    momentum assumption when called without velocity data) so the Jensen
-    correction is still applied, fixing the vol-overestimation bias.
-    Reconstructs spot/threshold from dist_pct as spot = K*(1+dist_pct),
-    so log(spot/threshold) = log(1+dist_pct) ≈ dist_pct for small values
-    but is exact for larger moves.
-    """
-    if secs <= 0:
-        return 1.0 if dist_pct > 0 else 0.0
-    sigma = sigma_override if sigma_override is not None else config.ASSET_HOURLY_VOL.get(asset, 0.022)
-
-    # Reconstruct exact log-distance from linear approximation.
-    # For |dist_pct| < 5% the difference is negligible; for larger moves
-    # (e.g. +10% away from threshold) the log is materially more accurate.
-    spot      = 1.0 + dist_pct          # normalised: threshold = 1.0
-    threshold = 1.0
-
-    return gbm_win_probability(
-        spot=spot,
-        threshold=threshold,
-        secs=secs,
-        hourly_vol=sigma,
-        hourly_drift=0.0,    # no Kalman data available here — zero-drift assumption
-        horizon_cap=0.0,     # irrelevant when drift=0
-    )
-
-
-def btc_spot_move_pct(window_sec: float = 300, state=None) -> tuple:
-    """Returns (move_pct, direction) of BTC over last window_sec."""
-    if not hasattr(state, "price_history"):
-        return 0.0, ""
-    import time
-    hist   = list(state.price_history.get("BTC", []))
-    if len(hist) < 6:
-        return 0.0, ""
-    cutoff = time.time() - window_sec
-    past   = next(((t, p) for t, p in hist if t >= cutoff), None)
-    if past is None:
-        return 0.0, ""
-    move = (hist[-1][1] - past[1]) / past[1]
-    return abs(move), ("UP" if move > 0 else "DOWN")
-
-
-def record_btc_move(market: dict, yes_price_new: float, state=None):
-    """Record BTC market repricing for CORRELATE lead-lag detection."""
-    if market.get("asset") != "BTC":
-        return
-    import time
-    tf     = market["timeframe"]
-    prev_p = market.get("yes_price", 0.5)
-    if prev_p <= 0:
-        return
-    move = (yes_price_new - prev_p) / prev_p
-    if abs(move) >= 0.01 and state:
-        state.btc_signal_time[tf]      = time.time()
-        state.btc_signal_direction[tf] = "UP" if move > 0 else "DOWN"
-        state.btc_signal_move[tf]      = abs(move)
-
 
 def certainty_to_prob(certainty: float) -> float:
     return 0.50 + 0.45 * min(max(certainty, 0.0), 1.0)

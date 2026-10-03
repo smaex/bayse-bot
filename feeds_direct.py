@@ -1,11 +1,11 @@
 """
 Direct oracle feed — Binance WebSocket for BTC/ETH/SOL.
 Purpose: secondary ground-truth to detect lag between the Bayse relay
-and the actual Binance price.  Used by FRONTRUN and the infra guard.
+and the actual Binance price. Used by the cross-check and the infra guard.
 Removed vs previous version:
   - Tiingo FX feed (EURUSD/GBPUSD are now on the Bayse realtime WS directly)
   - Hardened WS pool (overkill for a single feed)
-  - Macro bias signals (too noisy, hurt SNIPE certainty)
+  - Macro bias signals (too noisy to trade on)
 """
 import asyncio
 import json

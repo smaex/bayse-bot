@@ -41,9 +41,9 @@ import analysis
 import config
 import stall
 from client import BayseClient
-from strategies import snipe as snipe_module
+from strategies import model as model_module
 from strategies.manager import max_ev_price
-from strategies.snipe import SnipeStrategy
+from strategies.taker import TakerStrategy
 from strategies.utils import (
     gbm_win_probability,
     measured_vol_hourly,
@@ -55,8 +55,6 @@ from strategies.utils import (
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     stall.reset()
-    monkeypatch.setattr(snipe_module.global_state, "price_history", {})
-    monkeypatch.setattr(snipe_module.global_state, "market_flips", {})
     yield
     stall.reset()
 
@@ -150,34 +148,59 @@ def _market(yes: float, market_id: str, secs: float = 400.0):
     }
 
 
+def _books_for(market):
+    """A book that simply shows the market's displayed prices."""
+    yes, no = market["yes_price"], market["no_price"]
+    return {
+        market["yes_id"]: {"timestamp": time.time(),
+                           "bids": [{"price": round(yes - 0.01, 4), "quantity": 900.0}],
+                           "asks": [{"price": yes, "quantity": 900.0}]},
+        market["no_id"]: {"timestamp": time.time(),
+                          "bids": [{"price": round(no - 0.01, 4), "quantity": 900.0}],
+                          "asks": [{"price": no, "quantity": 900.0}]},
+    }
+
+
 def _evaluate(monkeypatch, market, model_probability):
-    # Both entry points: SNIPE prices the settlement TWAP by default and only
-    # falls back to the close print when SETTLEMENT_TWAP_SEC = 0. These tests
-    # are about the gates, so pin whichever one the pipeline calls.
-    monkeypatch.setattr(snipe_module, "gbm_win_probability",
+    # Both model entry points: TAKER prices the settlement TWAP by default and
+    # only falls back to the close print when SETTLEMENT_TWAP_SEC = 0. These
+    # tests are about the gates, so pin whichever one the pipeline calls.
+    monkeypatch.setattr(model_module, "gbm_win_probability",
                         lambda **kwargs: model_probability)
-    monkeypatch.setattr(snipe_module, "twap_win_probability",
+    monkeypatch.setattr(model_module, "twap_win_probability",
                         lambda **kwargs: model_probability)
     learned = {"chat_id": "u-band", "mode": "balanced"}
-    signal = asyncio.run(SnipeStrategy().evaluate(
-        market, learned, _state(), spot_price=market["threshold"] * 1.002))
+    signal = asyncio.run(TakerStrategy().evaluate(
+        market, learned, _state(), spot_price=market["threshold"] * 1.002,
+        books=_books_for(market)))
     rejects = set(stall._users["u-band"]["rejects"]) if "u-band" in stall._users else set()
     return signal, rejects
 
 
-def test_the_ev_ceiling_no_longer_blocks_the_top_of_the_band(monkeypatch):
-    """0.65 is inside the advertised band and a strong model can now enter it."""
+def test_the_ev_ceiling_is_on_what_we_pay_not_what_the_screen_shows(monkeypatch):
+    """The ceiling binds the fee-inclusive price, which is the real cost.
+
+    A screen price of 0.64 costs 0.64 / (1 - 0.02 x 0.5) = 0.6465 all in,
+    inside the 0.65 audit ceiling. A screen price of 0.65 costs 0.6566 and is
+    outside it. Constraining the displayed number instead would let the fee
+    decide the trade, which is the thing the ceiling exists to prevent.
+    """
     assert max_ev_price(0.80, 0.65, 0.02, min_margin=0.03) > 0.65
-    signal, rejects = _evaluate(monkeypatch, _market(0.65, "mkt-065"), 0.95)
-    assert "price_at_or_above_ev_ceiling" not in rejects
+    signal, rejects = _evaluate(monkeypatch, _market(0.64, "mkt-064"), 0.95)
+    assert "price_above_ev_ceiling" not in rejects
     assert signal is not None, rejects
-    assert signal.market_price == pytest.approx(0.65)
+    assert signal.market_price == pytest.approx(0.64)
+
+    # One tick higher and the fee carries it over the ceiling.
+    signal, rejects = _evaluate(monkeypatch, _market(0.65, "mkt-065"), 0.95)
+    assert signal is None
+    assert "TAKER:price_above_ev_ceiling" in rejects
 
 
 def test_the_band_gate_still_caps_the_price(monkeypatch):
     signal, rejects = _evaluate(monkeypatch, _market(0.66, "mkt-066"), 0.95)
     assert signal is None
-    assert "SNIPE:entry_price_out_of_band" in rejects
+    assert any("out_of_band" in c or "ev_ceiling" in c for c in rejects), rejects
 
 
 # ── 3. Is the model actually right? ───────────────────────────────────────────
@@ -190,7 +213,7 @@ def test_certainty_to_win_prob_inverts_probability_to_certainty():
 
 def test_reliability_table_flags_an_overconfident_model():
     rows = [{"certainty": 0.6, "won": 1 if i % 4 else 0, "entry_price": 0.55,
-             "strategy": "SNIPE"} for i in range(40)]
+             "strategy": "TAKER"} for i in range(40)]
     table = {row["bucket"]: row for row in analysis.reliability_table(rows, buckets=5)}
     overall = table["ALL"]
     assert overall["predicted"] == pytest.approx(0.77, abs=0.01)

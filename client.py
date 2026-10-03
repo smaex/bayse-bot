@@ -6,7 +6,7 @@ import json
 import asyncio
 import logging
 import aiohttp
-from typing import Optional
+from typing import Optional, Sequence
 from config import (
     API_CONNECT_TIMEOUT_SEC,
     API_READ_RETRIES,
@@ -121,7 +121,9 @@ class BayseClient:
         except (TypeError, ValueError):
             return min(2 ** attempt, 8.0)
 
-    async def _get(self, path: str, params: dict = None, auth: str = "read") -> dict:
+    async def _get(
+        self, path: str, params: "dict | list[tuple[str, str]] | None" = None, auth: str = "read"
+    ) -> dict:
         session = await self._get_session()
         headers = self._read_headers() if auth == "read" else {}
         last_error: Exception | None = None
@@ -240,17 +242,38 @@ class BayseClient:
         return data if isinstance(data, list) else data.get("events", [])
 
     async def get_orderbook(self, outcome_id: str, depth: int = 5, currency: str = CURRENCY) -> dict:
+        books = await self.get_orderbooks([outcome_id], depth=depth, currency=currency)
+        return books.get(outcome_id) or {}
+
+    async def get_orderbooks(
+        self, outcome_ids: Sequence[str], depth: int = 5, currency: str = CURRENCY
+    ) -> dict[str, dict]:
+        """Fetch several outcome books in ONE round trip, keyed by outcome id.
+
+        Both legs of a two-sided quote have to be priced off the *same*
+        snapshot. Fetching them separately means a tick between the two calls
+        can turn a spread that looked locked into one that is not, and the
+        pair constraint is only as good as the book it was computed from.
+        The documented endpoint accepts repeated ``outcomeId[]`` parameters.
+        """
+        ids = [str(oid) for oid in (outcome_ids or []) if oid]
+        if not ids:
+            return {}
         try:
             res = await self._get(
                 "/v1/pm/books",
-                params={"outcomeId[]": outcome_id, "depth": depth, "currency": currency},
+                params=[("outcomeId[]", oid) for oid in ids]
+                       + [("depth", depth), ("currency", currency)],
                 auth="public",
             )
-            if isinstance(res, list) and len(res) > 0:
-                return res[0]
-            return res if isinstance(res, dict) else {}
         except Exception:
             return {}
+        rows = res if isinstance(res, list) else (res.get("data") or []) if isinstance(res, dict) else []
+        out: dict[str, dict] = {}
+        for row in rows:
+            if isinstance(row, dict) and row.get("outcomeId"):
+                out[str(row["outcomeId"])] = row
+        return out
 
     # ── Orders ────────────────────────────────────────────────────────────────
 
@@ -334,7 +357,7 @@ class BayseClient:
                 # availableBalance was transiently absent (e.g. right after
                 # placing an order, or simply because all cash was deployed
                 # in open positions — this account regularly has 2-3 open
-                # SNIPE positions), the old code fell through to
+                # taker positions), the old code fell through to
                 # balance/total and returned a larger number that included
                 # locked funds, registering as a fake deposit. The next
                 # correct read then looked like a withdrawal, and the false

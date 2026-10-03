@@ -5,6 +5,7 @@ import sys
 import time
 
 import config
+import database
 import health
 from client import BayseClient
 from executor import _safe_float, _sell_proceeds_for_shares
@@ -95,7 +96,16 @@ def test_unsafe_float_values_are_not_written_to_real_columns():
     assert _safe_float(4e38, 7.0) == 7.0
 
 
-def test_fresh_install_is_dry_run_and_experimental_strategies_are_blocked():
+def test_fresh_install_is_dry_run_and_the_roster_is_just_two_strategies():
+    """A fresh install must not trade, and must not secretly trade anything
+    other than TAKER and MAKER.
+
+    The quarantine list (ARB, PAIRED_SNIPER, MIDMARKET_MAKER) and the
+    "experimental" flag that used to gate it are gone: those strategies were
+    deleted rather than fenced off. What replaces the check is a harder
+    assertion -- nothing outside the two-roster may appear in any of the
+    scopes a new account can be given.
+    """
     env = os.environ.copy()
     env.pop("LIVE_TRADING", None)
     result = subprocess.run(
@@ -106,18 +116,19 @@ def test_fresh_install_is_dry_run_and_experimental_strategies_are_blocked():
         env=env,
     )
     assert result.stdout.strip() == "False"
-    if not config.ALLOW_EXPERIMENTAL_STRATEGIES:
-        assert not (set(config.PERMITTED_STRATEGIES) & config.EXPERIMENTAL_STRATEGIES)
-        assert "MAKER" in config.PERMITTED_STRATEGIES
-        # Single-leg ORACLE_ARB is promoted to permitted active strategies;
-        # only multi-leg / pair strategies remain quarantined.
-        assert "ORACLE_ARB" in config.PERMITTED_STRATEGIES
-        assert config.EXPERIMENTAL_STRATEGIES == {
-            "ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
-        }
-        assert {
-            "ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER",
-        }.isdisjoint(config.PERMITTED_STRATEGIES)
+
+    assert set(config.ACTIVE_STRATEGIES) == {"TAKER", "MAKER"}
+    assert set(config.PERMITTED_STRATEGIES) == {"TAKER", "MAKER"}
+    assert set(config.DEFAULT_STRATEGIES) == {"TAKER", "MAKER"}
+    # A maker and a taker are charged differently, so both families are named.
+    assert set(config.MAKER_STRATEGIES) == {"MAKER"}
+    assert set(config.TAKER_STRATEGIES) == {"TAKER"}
+
+
+def test_new_accounts_start_paused():
+    """The single most expensive mistake available is a fresh install that
+    starts trading before anyone has looked at it."""
+    assert database.DEFAULT_SETTINGS["paused"] is True
 
 
 def test_readiness_requires_declared_startup_and_recent_core_progress():

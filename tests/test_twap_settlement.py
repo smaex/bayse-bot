@@ -12,9 +12,9 @@ spot, and the difference is largest exactly where this bot trades:
 
 * the last minute of diffusion is averaged away, so the variance acts over
   ``secs - 2w/3`` instead of ``secs``;
-* at 60 seconds to close — ``SNIPE_MIN_SECS_TO_CLOSE``, the latest SNIPE will
-  ever enter — the terminal-spot model **understates** the win probability of
-  an above-strike spot by ~2.3 points (verified against simulation below);
+* at 60 seconds to close — the latest TAKER will ever enter — the
+  terminal-spot model **understates** the win probability of an above-strike
+  spot by ~2.3 points (verified against simulation below);
 * inside the window the elapsed part of the average is already known, which a
   terminal-spot model cannot express at all.
 """
@@ -31,8 +31,7 @@ import pytest
 
 import config
 import stall
-from strategies import snipe as snipe_module
-from strategies.snipe import SnipeStrategy
+from strategies import model as model_module
 from strategies.utils import (
     gbm_win_probability,
     realized_twap_integral,
@@ -163,29 +162,30 @@ def _market(secs: float):
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     stall.reset()
-    monkeypatch.setattr(snipe_module.global_state, "price_history", {})
-    monkeypatch.setattr(snipe_module.global_state, "market_flips", {})
     yield
     stall.reset()
 
 
 def _model_probability(monkeypatch, secs: float) -> float:
-    """Capture the probability SNIPE's own pipeline computes, at 0.1% above."""
+    """Capture the probability the shared model computes, at 0.1% above strike.
+
+    Every strategy prices through ``strategies.model.fair_value`` now, so
+    patching that one seam proves the settlement model is used everywhere
+    rather than only in the strategy that happened to own it before.
+    """
     seen = {}
-    monkeypatch.setattr(snipe_module, "twap_win_probability",
+    monkeypatch.setattr(model_module, "twap_win_probability",
                         lambda **kw: (seen.__setitem__("p", twap_win_probability(**kw)),
                                       seen["p"])[1])
-    monkeypatch.setattr(snipe_module, "gbm_win_probability",
+    monkeypatch.setattr(model_module, "gbm_win_probability",
                         lambda **kw: (seen.__setitem__("p", gbm_win_probability(**kw)),
                                       seen["p"])[1])
     state = SimpleNamespace(price_history={}, kalman_state={}, garch_state={})
-    asyncio.run(SnipeStrategy().evaluate(
-        _market(secs), {"chat_id": "u-twap", "mode": "balanced"}, state,
-        spot_price=100_000.0 * 1.001))
+    model_module.fair_value("BTC", _market(secs), state, spot=100_000.0 * 1.001)
     return seen.get("p", 0.5)
 
 
-def test_snipe_prices_the_twap_and_not_the_close_print(monkeypatch):
+def test_the_model_prices_the_twap_and_not_the_close_print(monkeypatch):
     at_deadline_twap = _model_probability(monkeypatch, 60.0)
     monkeypatch.setattr(config, "SETTLEMENT_TWAP_SEC", 0.0)
     at_deadline_spot = _model_probability(monkeypatch, 60.0)
@@ -210,12 +210,11 @@ def test_the_drift_cap_survives_a_zero_window():
 
 
 def _maker_fv(monkeypatch, secs: float, drift: bool = False) -> float:
-    from strategies.maker import MakerStrategy
+    from strategies.model import fair_value
     kalman = {"BTC": {"x": [100_000.0, 100_000.0 * 0.03 / 3600.0]}} if drift else {}
     state = SimpleNamespace(price_history={}, kalman_state=kalman, garch_state={})
     market = {"asset": "BTC", "threshold": 100_000.0, "secs_to_close": secs}
-    return MakerStrategy()._fair_value("BTC", market, state=state,
-                                       spot=100_000.0 * 1.002)
+    return fair_value("BTC", market, state, spot=100_000.0 * 1.002)
 
 
 def test_maker_prices_the_settlement_twap_too(monkeypatch):
