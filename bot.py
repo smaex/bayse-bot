@@ -916,13 +916,9 @@ async def _burn_complete_set(
     app_to_use = _tg_app if "_tg_app" in globals() else None
     if app_to_use:
         try:
-            await telegram_bot.send_message(
-                app_to_use, chat_id,
-                f"🔥 *Complete set burned*\n"
-                f"Asset: {pos.get('asset', '?')} {pos.get('timeframe', '?')}\n"
-                f"Sets: {qty:.2f} → ₦{proceeds:,.0f}\n"
-                f"PnL: ₦{pnl:+,.0f}",
-                parse_mode="Markdown",
+            await telegram_bot.notify_set_burned(
+                app_to_use, chat_id, pos.get("asset", "?"),
+                pos.get("timeframe", "?"), qty, cost, proceeds, pnl,
             )
         except Exception:
             pass
@@ -1007,13 +1003,18 @@ async def _withdraw_resting_quote(
                         app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
                         if app_to_use:
                             try:
-                                await telegram_bot.notify_unfilled(
+                                # Not notify_unfilled: that message says the
+                                # money came back. Here it may not have — the
+                                # order can still fill.
+                                await telegram_bot.notify_order_resting(
                                     app_to_use, chat_id, p.get("strategy", "MAKER"),
                                     p.get("asset", "?"), p.get("timeframe", ""),
                                     p.get("outcome", ""), p.get("amount_ngn", 0),
+                                    price=float(p.get("entry_price") or 0.0),
+                                    reason="cancel not confirmed by the exchange",
                                 )
                             except Exception as ne:
-                                log.warning(f"[{chat_id}] notify_unfilled failed: {ne}")
+                                log.warning(f"[{chat_id}] notify_order_resting failed: {ne}")
                     continue
             except Exception as exc:
                 log.debug(f"[{chat_id}] post-cancel check on {order_id}: {exc}")

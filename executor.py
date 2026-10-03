@@ -341,6 +341,103 @@ async def execute_trade(chat_id: str, sig, client, risk, settings: dict,
         risk.unlock_market(sig.market_id)
 
 
+
+@dataclasses.dataclass(frozen=True)
+class _Sizing:
+    """How much one signal is allowed to commit, and why that is the cap.
+
+    Kept separate from the order-placement flow because this is the number
+    that decides whether a mistake is survivable. Everything here is a
+    ceiling: the strategy's own size, the mode cap, the account's risk
+    setting, the free cash actually available.
+    """
+    final_pct: float      # fraction of equity this leg may commit
+    allowed_pct: float    # the binding risk ceiling, for messaging
+    hard_cap: float       # absolute ₦ ceiling for one leg
+    effective_min: float  # smallest order the exchange and user accept
+    effective_max: float  # largest order the user allows
+
+
+async def _size_for_signal(
+    sig, settings: dict, risk, *, chat_id: str, equity: float, free_cash: float,
+    n_legs: int, mode: str, mult: float, user_risk: float,
+    min_t: float, max_t: float,
+) -> _Sizing:
+    """Compute the position size for one signal.
+
+    Extracted from ``_execute_logic`` so the most safety-critical arithmetic in
+    the bot can be tested on its own. The rules, in the order they bind:
+
+    * the strategy's own Kelly size, scaled by its settled performance;
+    * a conviction tier when the strategy expressed no size of its own;
+    * halved when the strategy's realised edge is decaying, or the account is
+      on probation;
+    * capped by the account's ``risk_pct`` and the mode ceiling -- a ceiling,
+      never a suggestion;
+    * capped in cash by the free balance divided across the legs, so a
+      two-sided quote cannot reserve money the wallet does not have.
+    """
+    kelly_pct = float(getattr(sig, "size_pct", 0.0) or 0.0)
+    if kelly_pct > 0.0:
+        raw_pct = kelly_pct * mult
+    else:
+        if sig.certainty >= 0.90:   tier = 2.0
+        elif sig.certainty >= 0.70: tier = 1.5
+        elif sig.certainty >= 0.55: tier = 1.0
+        else:                       tier = 0.5
+        fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
+        raw_pct   = user_risk * tier * mult * fx_factor
+
+    if sig.certainty >= 0.95 and kelly_pct == 0.0:
+        raw_pct *= 1.5
+
+    # `risk_pct` is a ceiling, not a suggestion. Previously Kelly-sized signals
+    # bypassed it, and the ₦100 platform minimum could force a 20% bet on a
+    # ₦500 account.
+    raw_pct = min(raw_pct, config.MAX_TRADE_RISK)
+
+    if hasattr(database, "get_alpha_trend"):
+        decay = await asyncio.to_thread(
+            database.get_alpha_trend, chat_id, sig.strategy, sig.asset
+        )
+        if decay < 0.85:
+            raw_pct *= 0.5
+
+    if risk.is_on_probation():
+        raw_pct *= 0.50
+
+    mode_cap_pct = {
+        "safe": 0.03,
+        "balanced": 0.05,
+        "aggressive": 0.08,
+        "full_send": 0.10,
+        "custom": 0.05,
+    }.get(mode, 0.05)
+    allowed_pct = min(user_risk, mode_cap_pct)
+    final_pct = min(raw_pct, allowed_pct)
+
+    market_meta = next(
+        (m for m in active_markets if m.get("market_id") == sig.market_id), None
+    )
+    market_min = float((market_meta or {}).get("minimum_order_amount") or MIN_TRADE_NGN)
+    effective_min = max(MIN_TRADE_NGN, float(min_t), market_min)
+    effective_max = max(0.0, float(max_t))
+    # ``size_pct`` is per leg. A two-sided quote commits it twice, so each leg
+    # may only spend its share of free cash -- otherwise a pair can reserve
+    # money the wallet does not have and the second placement fails after the
+    # first has already filled.
+    per_leg_free_cash = free_cash / max(1, n_legs)
+    hard_cap = min(equity * allowed_pct, effective_max, per_leg_free_cash)
+
+    return _Sizing(
+        final_pct=final_pct,
+        allowed_pct=allowed_pct,
+        hard_cap=hard_cap,
+        effective_min=effective_min,
+        effective_max=effective_max,
+    )
+
+
 async def _execute_logic(
     chat_id: str, sig, client, risk, settings: dict,
     equity: float, free_cash: float, *, is_hedge: bool = False,
@@ -374,59 +471,16 @@ async def _execute_logic(
         log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — strict mode (near daily target), certainty {sig.certainty:.0%} < 40%")
         return
 
-    # ── Sizing (Kelly / Conviction) ────────────────────────────────────────
-    kelly_pct = getattr(sig, "size_pct", 0.0)
-    if kelly_pct > 0.0:
-        raw_pct = kelly_pct * mult
-    else:
-        if sig.certainty >= 0.90:   tier = 2.0
-        elif sig.certainty >= 0.70: tier = 1.5
-        elif sig.certainty >= 0.55: tier = 1.0
-        else:                       tier = 0.5
-        fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
-        raw_pct   = user_risk * tier * mult * fx_factor
-
-    if sig.certainty >= 0.95 and kelly_pct == 0.0:
-        raw_pct *= 1.5
-
-    # ── Hard risk budget ────────────────────────────────────────────────
-    # `risk_pct` is a ceiling, not a suggestion. Previously Kelly-sized signals
-    # bypassed it, and the ₦100 platform minimum could force a 20% bet on a
-    # ₦500 account. If the minimum order does not fit the risk budget, skip.
-    raw_pct = min(raw_pct, config.MAX_TRADE_RISK)
-
-    if hasattr(database, "get_alpha_trend"):
-        decay = await asyncio.to_thread(
-            database.get_alpha_trend, chat_id, sig.strategy, sig.asset
-        )
-        if decay < 0.85:
-            raw_pct *= 0.5
-
-    if risk.is_on_probation():
-        raw_pct *= 0.50
-
-    mode_cap_pct = {
-        "safe": 0.03,
-        "balanced": 0.05,
-        "aggressive": 0.08,
-        "full_send": 0.10,
-        "custom": 0.05,
-    }.get(mode, 0.05)
-    allowed_pct = min(user_risk, mode_cap_pct)
-    final_pct = min(raw_pct, allowed_pct)
-
-    market_meta = next(
-        (m for m in active_markets if m.get("market_id") == sig.market_id), None
+    sizing = await _size_for_signal(
+        sig, settings, risk, chat_id=chat_id,
+        equity=equity, free_cash=free_cash, n_legs=len(legs),
+        mode=mode, mult=mult, user_risk=user_risk, min_t=min_t, max_t=max_t,
     )
-    market_min = float((market_meta or {}).get("minimum_order_amount") or MIN_TRADE_NGN)
-    effective_min = max(MIN_TRADE_NGN, float(min_t), market_min)
-    effective_max = max(0.0, float(max_t))
-    # ``size_pct`` is per leg. A two-sided quote commits it twice, so each leg
-    # may only spend its share of free cash -- otherwise a pair can reserve
-    # money the wallet does not have and the second placement fails after the
-    # first has already filled.
-    per_leg_free_cash = free_cash / max(1, len(legs))
-    hard_cap = min(equity * allowed_pct, effective_max, per_leg_free_cash)
+    allowed_pct   = sizing.allowed_pct
+    final_pct     = sizing.final_pct
+    hard_cap      = sizing.hard_cap
+    effective_min = sizing.effective_min
+    effective_max = sizing.effective_max
 
     if hard_cap < effective_min:
         # If the account has sufficient free cash and bankroll for the exchange minimum order (e.g. ₦100),
@@ -1557,13 +1611,9 @@ async def _place_complete_set_take(
             app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
             if app_to_use:
                 try:
-                    await telegram_bot.send_message(
-                        app_to_use, chat_id,
-                        f"🔒 *Complete set taken and burned*\n"
-                        f"Asset: {sig.asset} {sig.timeframe}\n"
-                        f"Sets: {sets:.2f} for ₦{total_cost:,.0f} → ₦{proceeds:,.0f}\n"
-                        f"PnL: ₦{pnl:+,.0f} (locked, direction-independent)",
-                        parse_mode="Markdown",
+                    await telegram_bot.notify_set_burned(
+                        app_to_use, chat_id, sig.asset, sig.timeframe,
+                        sets, total_cost, proceeds, pnl, structural=True,
                     )
                 except Exception:
                     pass
