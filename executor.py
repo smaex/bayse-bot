@@ -381,15 +381,22 @@ async def _size_for_signal(
     if kelly_pct > 0.0:
         raw_pct = kelly_pct * mult
     else:
-        if sig.certainty >= 0.90:   tier = 2.0
-        elif sig.certainty >= 0.70: tier = 1.5
-        elif sig.certainty >= 0.55: tier = 1.0
-        else:                       tier = 0.5
+        # Conviction can only reduce a position, never restore one.
+        #
+        # This used to scale *up* as well (1.5x above 0.70, 2.0x above 0.90,
+        # plus another 1.5x above 0.95). Those multipliers are still there in
+        # spirit but they no longer exist here, because they cancelled the
+        # learner's performance decay exactly when it mattered: a strategy the
+        # learner had halved (mult 0.5) still bet the full risk_pct whenever a
+        # signal looked confident, since 2.0 x 1.5 x 0.5 = 1.5 > 1.
+        #
+        # `mult` is the learner's verdict on this strategy based on settled
+        # results, and `certainty` is a heuristic score, not a calibrated
+        # probability -- the notification calls it one. Letting a heuristic
+        # undo evidence is how a bot sizes up into its own worst strategy.
+        tier = 1.0 if sig.certainty >= 0.55 else 0.5
         fx_factor = 0.5 if sig.asset in _FX_ASSETS else 1.0
         raw_pct   = user_risk * tier * mult * fx_factor
-
-    if sig.certainty >= 0.95 and kelly_pct == 0.0:
-        raw_pct *= 1.5
 
     # `risk_pct` is a ceiling, not a suggestion. Previously Kelly-sized signals
     # bypassed it, and the ₦100 platform minimum could force a 20% bet on a

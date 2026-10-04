@@ -1041,6 +1041,112 @@ async def _withdraw_resting_quote(
     return True
 
 
+
+def _exit_decision(
+    *,
+    outcome: str,
+    w_est: float,
+    bid: float,
+    peak_price: float,
+    entry_price: float,
+    secs: float,
+    fee_rate: float,
+    is_maker_pos: bool,
+    confirmed_filled: bool,
+) -> dict | None:
+    """Decide whether one position should be exited, and why.
+
+    Pure: no exchange, no database, no risk book. Everything the policy needs
+    is in the arguments, which is the point -- this is the single most
+    money-relevant decision the bot makes, and it can now be tested on a grid
+    of prices and probabilities instead of through a mock exchange client.
+
+    The comparison underneath every rule:
+
+      * held to resolution, a share is worth ``w_est`` (a win pays 1.00);
+      * sold now, it is worth ``bid`` less the taker fee on the exit.
+
+    Returns ``{"reason", "current_price", "ev_hold"}`` or None to hold.
+    """
+    from strategies import book as booklib
+
+    # A complete set pays 1.00 whichever outcome resolves. There is no thesis
+    # to invalidate and nothing for a stop to protect: the only correct action
+    # is to burn the set and realise the lock.
+    if str(outcome).upper() == "BOTH":
+        return {"reason": "BURN_COMPLETE_SET", "current_price": 1.0, "ev_hold": 0.0}
+
+    current_price = float(bid)
+
+    # Cost basis per share. A taker paid the fee inside the fill (it came out
+    # of the shares received); a maker paid none at all.
+    entry_cost_per_share = (
+        entry_price if is_maker_pos
+        else booklib.effective_buy_price(entry_price, fee_rate, is_maker=False)
+    )
+    basis = max(entry_cost_per_share, 1e-6)
+
+    # Value per share if we sell now, net of the taker fee on the exit.
+    exit_value_per_share = booklib.effective_sell_proceeds(
+        current_price, 1.0, fee_rate, is_maker=False
+    )
+    # Value per share if we hold to resolution: a win pays 1.00.
+    hold_value_per_share = float(w_est)
+
+    # A resting maker quote still unfilled near close is not a position we
+    # want to acquire: withdraw it rather than let it fill into settlement.
+    if (is_maker_pos and not confirmed_filled
+            and secs < config.MAKER_LATE_CANCEL_SECS):
+        return {"reason": "CANCEL_RESTING", "current_price": current_price,
+                "ev_hold": 0.0}
+
+    # ── 1. TAKE PROFIT: the market is paying more than it is worth ───────
+    premium = config.EXIT_TAKE_PROFIT_PREMIUM * basis
+    # Selling must also clear our cost basis. Without this the rule fires on
+    # any position where the bid merely exceeds a depressed model estimate --
+    # realising a loss while logging it as profit taking, which is the one
+    # thing a profit rule must never do.
+    if (exit_value_per_share > hold_value_per_share + premium
+            and exit_value_per_share > entry_cost_per_share
+            and secs >= config.EXIT_TAKE_PROFIT_MIN_SECS):
+        return {"reason": "TAKE_PROFIT", "current_price": current_price,
+                "ev_hold": (exit_value_per_share - entry_cost_per_share) / basis}
+
+    # Trailing protection: a gain that has started to evaporate is still a
+    # gain. This is the one price-based rule, and it only ever sells into
+    # profit -- a reversal below entry is the stop's job, not this one's.
+    dropped_from_peak = (
+        (peak_price - current_price) / peak_price if peak_price > 0 else 0.0
+    )
+    peak_gain = (peak_price - entry_cost_per_share) / basis
+    if (peak_gain >= config.EXIT_TAKE_PROFIT_PREMIUM
+            and dropped_from_peak >= config.EXIT_TRAILING_DROP
+            and current_price >= entry_cost_per_share):
+        return {"reason": "REVERSAL_EXIT", "current_price": current_price,
+                "ev_hold": (exit_value_per_share - entry_cost_per_share) / basis}
+
+    # ── 2. STOP: the thesis is worth materially less than we paid ────────
+    # Not a P&L stop. A stop that triggers on P&L alone sells precisely when a
+    # binary is cheapest and its expected value is unchanged -- it converts
+    # recoverable variance into a realised loss. Selling is correct when the
+    # estimate moved against us, and that is the only time this fires.
+    thesis_broken = hold_value_per_share < entry_cost_per_share * (
+        1.0 - config.EXIT_STOP_DRAWDOWN
+    )
+    # Hard backstop. The model is not the only thing that can go wrong, and a
+    # catastrophic move should not need the model's permission to exit. The
+    # salvage floor stops us paying a fee to sell something for nothing.
+    hard_stop = (
+        current_price <= entry_cost_per_share * (1.0 - config.EXIT_HARD_STOP_LOSS_PCT)
+        and current_price >= config.EXIT_MIN_SALVAGE_PRICE
+    )
+    if thesis_broken or hard_stop:
+        return {"reason": "STOP_LOSS", "current_price": current_price,
+                "ev_hold": hold_value_per_share - entry_cost_per_share}
+
+    return None
+
+
 async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dict):
     """
     Priced exit policy.
@@ -1146,15 +1252,6 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             continue
         # We hold one side; our win probability is that side's probability.
         w_est = p_yes if outcome == "YES" else (1.0 - p_yes)
-        if str(outcome).upper() == "BOTH":
-            # A complete set pays 1.00 whichever outcome resolves. There is no
-            # thesis to invalidate and nothing for a stop to protect: the only
-            # correct action is to burn the set and realise the lock.
-            positions_to_exit.append(_exit_plan(
-                market_id, position_key, pos, market, w_est=1.0,
-                current_price=1.0, ev_hold=0.0, exit_reason="BURN_COMPLETE_SET",
-            ))
-            continue
 
         # Executable bid for the side we hold -- we are selling, so the bid is
         # the price we can actually hit. A mid is not executable.
@@ -1165,105 +1262,28 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                    else market.get("no_price")) if market else None
         if bid is None:
             bid = entry_price
-        current_price = float(bid)
 
-        pos["peak_price"] = max(pos.get("peak_price", entry_price), current_price)
-        peak_price = float(pos["peak_price"])
+        pos["peak_price"] = max(pos.get("peak_price", entry_price), float(bid))
 
-        # Cost basis per share. A taker paid the fee inside the fill (it came
-        # out of the shares received); a maker paid none at all.
-        fee_rate = float((market or {}).get("fee_rate") or config.DEFAULT_FEE_RATE)
-        is_maker_pos = str(pos.get("strategy") or "").upper() in config.MAKER_STRATEGIES
-        entry_cost_per_share = (
-            entry_price if is_maker_pos
-            else booklib.effective_buy_price(entry_price, fee_rate, is_maker=False)
+        decision = _exit_decision(
+            outcome=outcome,
+            w_est=w_est,
+            bid=float(bid),
+            peak_price=float(pos["peak_price"]),
+            entry_price=entry_price,
+            secs=secs,
+            fee_rate=float((market or {}).get("fee_rate") or config.DEFAULT_FEE_RATE),
+            is_maker_pos=str(pos.get("strategy") or "").upper() in config.MAKER_STRATEGIES,
+            confirmed_filled=bool(pos.get("confirmed_filled")),
         )
-
-        # Value per share if we sell now, net of the taker fee on the exit.
-        exit_value_per_share = booklib.effective_sell_proceeds(
-            current_price, 1.0, fee_rate, is_maker=False
-        )
-        # Value per share if we hold to resolution: a win pays 1.00.
-        hold_value_per_share = w_est
-
-        # ── 1. TAKE PROFIT: the market is paying more than it is worth ────
-        premium = config.EXIT_TAKE_PROFIT_PREMIUM * max(entry_cost_per_share, 1e-6)
-        # Selling must also clear our cost basis. Without this the rule fires
-        # on any position where the bid merely exceeds a depressed model
-        # estimate -- realising a loss while logging it as profit taking, which
-        # is the one thing a profit rule must never do.
-        worth_selling = (
-            exit_value_per_share > hold_value_per_share + premium
-            and exit_value_per_share > entry_cost_per_share
-            and secs >= config.EXIT_TAKE_PROFIT_MIN_SECS
-        )
-        # Trailing protection: a gain that has started to evaporate is still a
-        # gain. This is the one price-based rule, and it only ever sells into
-        # profit -- a reversal below entry is the stop's job, not this one's.
-        dropped_from_peak = (
-            (peak_price - current_price) / peak_price if peak_price > 0 else 0.0
-        )
-        peak_gain = (
-            (peak_price - entry_cost_per_share) / entry_cost_per_share
-            if entry_cost_per_share > 0 else 0.0
-        )
-        trailing_lock = (
-            peak_gain >= config.EXIT_TAKE_PROFIT_PREMIUM
-            and dropped_from_peak >= config.EXIT_TRAILING_DROP
-            and current_price >= entry_cost_per_share
-        )
-
-        if worth_selling:
-            positions_to_exit.append(_exit_plan(
-                market_id, position_key, pos, market, w_est=w_est,
-                current_price=current_price,
-                ev_hold=(exit_value_per_share - entry_cost_per_share)
-                        / max(entry_cost_per_share, 1e-6),
-                exit_reason="TAKE_PROFIT",
-            ))
+        if decision is None:
             continue
-        if trailing_lock:
-            positions_to_exit.append(_exit_plan(
-                market_id, position_key, pos, market, w_est=w_est,
-                current_price=current_price,
-                ev_hold=(exit_value_per_share - entry_cost_per_share)
-                        / max(entry_cost_per_share, 1e-6),
-                exit_reason="REVERSAL_EXIT",
-            ))
-            continue
-
-        # ── 2. STOP: the thesis is worth materially less than we paid ─────
-        thesis_broken = hold_value_per_share < entry_cost_per_share * (
-            1.0 - config.EXIT_STOP_DRAWDOWN
-        )
-        # Hard backstop. The model is not the only thing that can go wrong.
-        hard_stop = (
-            current_price <= entry_cost_per_share
-            * (1.0 - config.EXIT_HARD_STOP_LOSS_PCT)
-            and current_price >= config.EXIT_MIN_SALVAGE_PRICE
-        )
-        # A resting maker quote still unfilled near close is not a position we
-        # want to acquire: withdraw it rather than let it fill into settlement.
-        maker_late = (
-            is_maker_pos
-            and not pos.get("confirmed_filled")
-            and secs < config.MAKER_LATE_CANCEL_SECS
-        )
-
-        if maker_late:
-            positions_to_exit.append(_exit_plan(
-                market_id, position_key, pos, market, w_est=w_est,
-                current_price=current_price, ev_hold=0.0,
-                exit_reason="CANCEL_RESTING",
-            ))
-            continue
-        if thesis_broken or hard_stop:
-            positions_to_exit.append(_exit_plan(
-                market_id, position_key, pos, market, w_est=w_est,
-                current_price=current_price,
-                ev_hold=hold_value_per_share - entry_cost_per_share,
-                exit_reason="STOP_LOSS",
-            ))
+        positions_to_exit.append(_exit_plan(
+            market_id, position_key, pos, market, w_est=w_est,
+            current_price=decision["current_price"],
+            ev_hold=decision["ev_hold"],
+            exit_reason=decision["reason"],
+        ))
 
 
     # Execute exits

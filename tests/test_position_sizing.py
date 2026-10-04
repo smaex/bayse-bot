@@ -76,17 +76,14 @@ def test_settled_performance_scales_the_strategys_own_size():
 
 
 def test_low_conviction_is_sized_down_and_high_conviction_is_capped():
-    """The conviction tier is a downward adjustment, not a size multiplier.
+    """At the default risk setting every signal at or above 0.55 certainty
+    sizes at exactly the account ceiling: conviction never buys more size, it
+    only costs you some when the signal is weak.
 
-    This is the behaviour as found and deliberately pinned: at the default
-    2% risk setting every signal at or above 0.55 certainty sizes at exactly
-    the account ceiling. The 1.5x and 2.0x tiers in the source therefore never
-    increase a position -- they only make low-certainty trades smaller.
-
-    That is defensible (``risk_pct`` is the operator's stated ceiling and a
-    model's confidence is not a licence to exceed it) but it does mean the bot
-    risks the same on a 70% signal as on a 96% one. Changing that is a risk
-    decision, not a refactor, so it is asserted here rather than changed.
+    Deliberately so. ``risk_pct`` is the operator's stated ceiling and
+    ``certainty`` is a heuristic score, not a calibrated probability -- the
+    Telegram notification calls it one. Letting a heuristic raise the stake is
+    how a bot sizes up into its own worst strategy.
     """
     weak   = _run(_sig(size_pct=0.0, certainty=0.40)).final_pct
     mid    = _run(_sig(size_pct=0.0, certainty=0.60)).final_pct
@@ -137,6 +134,36 @@ def test_a_decaying_edge_halves_the_size(monkeypatch):
     monkeypatch.setattr(executor.database, "get_alpha_trend", lambda *a, **k: 0.5)
     decaying = _run(_sig(size_pct=0.02)).final_pct
     assert decaying == pytest.approx(healthy * 0.5)
+
+
+def test_confidence_never_cancels_the_learners_performance_decay():
+    """The regression this extraction was for.
+
+    Conviction used to scale size *up* (2.0x above 0.90 certainty, plus
+    another 1.5x above 0.95). With the learner saying "this strategy is
+    underperforming, halve it" (mult 0.5), those multipliers multiplied back
+    out: 2.0 x 0.5 = 1.0, so a halved strategy still bet the full risk_pct
+    whenever a signal looked confident. The performance control was being
+    overridden precisely where overconfidence is most likely.
+    """
+    decaying = _run(_sig(size_pct=0.0, certainty=0.96), mult=0.5).final_pct
+    healthy  = _run(_sig(size_pct=0.0, certainty=0.96), mult=1.0).final_pct
+    assert decaying == pytest.approx(healthy * 0.5)
+
+    for certainty in (0.60, 0.75, 0.90, 0.96):
+        assert _run(_sig(size_pct=0.0, certainty=certainty), mult=0.5).final_pct \
+            == pytest.approx(
+                _run(_sig(size_pct=0.0, certainty=certainty), mult=1.0).final_pct * 0.5
+            )
+
+
+def test_a_halved_strategy_never_bets_more_than_a_healthy_one():
+    """The property version: decay must bind at every conviction level."""
+    for certainty in (0.40, 0.60, 0.75, 0.90, 0.96):
+        for mult in (0.25, 0.5, 0.75, 1.0):
+            base = _run(_sig(size_pct=0.0, certainty=certainty), mult=1.0).final_pct
+            got = _run(_sig(size_pct=0.0, certainty=certainty), mult=mult).final_pct
+            assert got <= base * mult + 1e-9, (certainty, mult, got, base)
 
 
 def test_probation_halves_the_size():
