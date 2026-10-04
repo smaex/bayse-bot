@@ -10,8 +10,7 @@ from client import BayseClient
 from risk import RiskManager
 from strategies.base import MarketState
 from strategies.maker import MakerStrategy
-from strategies.oracle_arb import OracleArbStrategy
-from strategies.snipe import SnipeStrategy
+from strategies.taker import TakerStrategy
 
 
 class MockClient(BayseClient):
@@ -27,6 +26,9 @@ class MockClient(BayseClient):
     async def cancel_order(self, order_id):
         self.cancelled_orders.append(order_id)
         return self.cancel_response
+
+    async def get_orderbooks(self, outcome_ids, depth=5):
+        return {}
 
     async def get_position(self, outcome_id):
         return {
@@ -51,7 +53,13 @@ class MockClient(BayseClient):
 
 
 def test_early_candle_small_noise_does_not_trigger_panic_stop_loss(monkeypatch):
-    """At 10 minutes remaining (secs=600), a 0.01% dip below strike is normal noise and must NOT trigger stop loss."""
+    """At 10 minutes remaining, a 0.01% dip below strike is noise, not a broken thesis.
+
+    This is the whole reason the exit policy is priced rather than
+    percentage based: spot is on the wrong side of the strike and the mark is
+    below entry, yet the position's expected value is essentially unchanged.
+    Selling here converts recoverable variance into a realised loss.
+    """
     risk = RiskManager()
     risk.add_position(
         "market-1",
@@ -64,7 +72,7 @@ def test_early_candle_small_noise_does_not_trigger_panic_stop_loss(monkeypatch):
             "amount_ngn": 500,
             "filled_quantity": 9.09,
             "confirmed_filled": True,
-            "strategy": "SNIPE",
+            "strategy": "TAKER",
             "asset": "BTC",
             "timeframe": "15min",
         },
@@ -85,7 +93,6 @@ def test_early_candle_small_noise_does_not_trigger_panic_stop_loss(monkeypatch):
     )
     # Spot is slightly below threshold ($59,994 -> -0.01% dip)
     monkeypatch.setattr(bot.feeds_direct, "get_direct_price", lambda _a: (59_994.0, time.time()))
-    monkeypatch.setattr(bot, "win_probability", lambda *_a, **_kw: 0.48)  # Model is 48% (normal noise)
     monkeypatch.setattr(bot, "_tg_app", None)
 
     client = MockClient()
@@ -110,7 +117,7 @@ def test_late_candle_adverse_move_triggers_protective_stop_loss(monkeypatch):
             "amount_ngn": 500,
             "filled_quantity": 9.09,
             "confirmed_filled": True,
-            "strategy": "SNIPE",
+            "strategy": "TAKER",
             "asset": "BTC",
             "timeframe": "15min",
         },
@@ -131,7 +138,6 @@ def test_late_candle_adverse_move_triggers_protective_stop_loss(monkeypatch):
     )
     # Spot is decisively below threshold ($59,800 -> -0.33% dip)
     monkeypatch.setattr(bot.feeds_direct, "get_direct_price", lambda _a: (59_800.0, time.time()))
-    monkeypatch.setattr(bot, "win_probability", lambda *_a, **_kw: 0.15)  # Thesis broken
     monkeypatch.setattr(bot, "_tg_app", None)
 
     client = MockClient()
@@ -141,8 +147,15 @@ def test_late_candle_adverse_move_triggers_protective_stop_loss(monkeypatch):
     assert "market-1" not in risk.open_positions
 
 
-def test_take_profit_triggers_on_price_target(monkeypatch):
-    """If market price reaches 0.85 (>= 0.82 target), take-profit locks in the gain."""
+def test_take_profit_does_not_fire_just_because_the_price_rose(monkeypatch):
+    """A mark of 0.85 against a near-certain model is not a reason to sell.
+
+    The old rule sold at a fixed percentage gain. Under it, a position the
+    model prices at ~1.00 with five minutes left was sold for 0.85 and a fee,
+    handing away ~0.15 of expected value per share every time the market
+    simply came round to our view. Exit value has to beat hold value, and
+    here it does not.
+    """
     risk = RiskManager()
     risk.add_position(
         "market-1",
@@ -155,7 +168,56 @@ def test_take_profit_triggers_on_price_target(monkeypatch):
             "amount_ngn": 500,
             "filled_quantity": 9.09,
             "confirmed_filled": True,
-            "strategy": "SNIPE",
+            "strategy": "TAKER",
+            "asset": "SOL",
+            "timeframe": "15min",
+        },
+    )
+
+    monkeypatch.setattr(
+        bot,
+        "active_markets",
+        [{
+            "market_id": "market-1",
+            "threshold": 100.0,
+            "secs_to_close": 300,
+            "yes_price": 0.80,  # the book is bidding far above our estimate
+            "no_price": 0.20,
+            "minimum_order_amount": 100,
+            "fee_rate": 0.02,
+        }],
+    )
+    monkeypatch.setattr(bot.feeds_direct, "get_direct_price", lambda _a: (103.0, time.time()))
+    monkeypatch.setattr(bot, "_tg_app", None)
+
+    client = MockClient()
+    asyncio.run(bot._evaluate_and_exit_positions("chat-1", client, risk, {}))
+
+    # The market agreeing with us is not an exit signal.
+    assert "market-1" in risk.open_positions
+    assert len(client.cancelled_orders) == 0
+
+
+def test_take_profit_fires_when_the_market_overpays_the_model(monkeypatch):
+    """Sell when the bid exceeds what the position is actually worth.
+
+    The one time selling a winner is correct: someone is paying more than our
+    own estimate of the outcome. That is edge, and it is the only form of
+    profit-taking that survives the fee.
+    """
+    risk = RiskManager()
+    risk.add_position(
+        "market-1",
+        {
+            "market_id": "market-1",
+            "event_id": "event-1",
+            "outcome_id": "yes-1",
+            "outcome": "YES",
+            "entry_price": 0.55,
+            "amount_ngn": 500,
+            "filled_quantity": 9.09,
+            "confirmed_filled": True,
+            "strategy": "TAKER",
             "asset": "SOL",
             "timeframe": "15min",
         },
@@ -174,31 +236,39 @@ def test_take_profit_triggers_on_price_target(monkeypatch):
             "fee_rate": 0.02,
         }],
     )
-    monkeypatch.setattr(bot.feeds_direct, "get_direct_price", lambda _a: (103.0, time.time()))
-    monkeypatch.setattr(bot, "win_probability", lambda *_a, **_kw: 0.92)
+    # Spot barely above the strike with five minutes left: the model prices
+    # this around a coin flip, but the book is bidding 0.80 for it.
+    monkeypatch.setattr(bot.feeds_direct, "get_direct_price", lambda _a: (100.02, time.time()))
     monkeypatch.setattr(bot, "_tg_app", None)
 
-    client = MockClient()
+    client = MockClient(order_response={"status": "open", "filledSize": 10})
     asyncio.run(bot._evaluate_and_exit_positions("chat-1", client, risk, {}))
 
-    # Position was exited for profit
+    # Position was sold into the overpay.
     assert "market-1" not in risk.open_positions
     assert risk.daily_realized_pnl > 0
 
 
 def test_unfilled_maker_order_management(monkeypatch):
-    """Stale maker orders are cancelled; if the exchange still reports them open
-    the position is RETAINED (never dropped while it may still fill) and the user
-    is told once that it is still resting.
+    """A maker quote past its timeout is withdrawn, both legs, and settled.
 
-    This previously asserted that the position was removed from the risk book.
-    It was: silently, with the order possibly still live on the exchange — the
-    exact behaviour that let three unfilled MAKER entries resolve with no
-    Telegram message and no cancelled order.
+    Three things have to be true at once, and each was previously violated:
+
+    * the order is actually cancelled on the exchange (it used to be dropped
+      from the risk book while still live, so three unfilled MAKER entries
+      resolved with no cancel and no message);
+    * the position leaves the risk book only once the exchange confirms the
+      cancel left nothing filled — a cancel and a fill can cross in flight,
+      and deleting a filled leg would leave untracked shares;
+    * the trade row is settled rather than left dangling.
+
+    The sibling leg is withdrawn with it: cancelling one leg of a two-sided
+    quote and leaving the other resting is how a market maker acquires a
+    position it never meant to hold.
     """
     risk = RiskManager()
     risk.add_position(
-        "market-resting",
+        "market-resting:yes",
         {
             "market_id": "market-resting",
             "event_id": "event-resting",
@@ -212,8 +282,30 @@ def test_unfilled_maker_order_management(monkeypatch):
             "strategy": "MAKER",
             "asset": "SOL",
             "timeframe": "15min",
-            "placed_at": time.time() - 200,  # 200s old (stale)
+            "placed_at": time.time() - 60_000,  # far past the quote timeout
         },
+    )
+    risk.add_position(
+        "market-resting:no",
+        {
+            "market_id": "market-resting",
+            "event_id": "event-resting",
+            "outcome_id": "no-1",
+            "order_id": "maker-order-2",
+            "outcome": "NO",
+            "entry_price": 0.46,
+            "amount_ngn": 500,
+            "filled_quantity": 0.0,
+            "confirmed_filled": False,
+            "strategy": "MAKER",
+            "asset": "SOL",
+            "timeframe": "15min",
+            "placed_at": time.time() - 60_000,
+        },
+    )
+    monkeypatch.setattr(
+        bot.strategies.maker.maker_strategy, "open_quotes",
+        {"market-resting": {"spot": 100.0, "legs": [], "placed_at": time.time() - 60_000}},
     )
 
     monkeypatch.setattr(
@@ -225,23 +317,95 @@ def test_unfilled_maker_order_management(monkeypatch):
             "secs_to_close": 400,
             "yes_price": 0.52,
             "no_price": 0.48,
+            "engine": "CLOB",
+            "fee_rate": 0.02,
         }],
     )
     monkeypatch.setattr(bot, "_tg_app", None)
 
-    client = MockClient(order_response={"status": "open", "filledSize": 0})
+    class _CancellingClient(MockClient):
+        """Resting when polled, cancelled once we ask it to cancel."""
+
+        async def get_order(self, order_id):
+            if order_id in self.cancelled_orders:
+                return {"status": "cancelled", "filledSize": 0}
+            return {"status": "open", "filledSize": 0}
+
+    client = _CancellingClient()
     asyncio.run(bot._manage_unfilled_maker_orders("chat-1", client, risk, {}))
 
-    # The stale order was cancelled, but the exchange still reports it OPEN, so
-    # the position stays tracked until the exchange confirms otherwise.
+    # Both legs went, not one.
     assert "maker-order-1" in client.cancelled_orders
-    assert "market-resting" in risk.open_positions
-    assert risk.open_positions["market-resting"]["unfilled_alerted"] is True
+    assert "maker-order-2" in client.cancelled_orders
+    # The exchange confirmed nothing filled, so the whole quote is gone.
+    assert risk.open_positions == {}
+    assert "market-resting" not in bot.strategies.maker.maker_strategy.open_quotes
 
 
-def test_oracle_arb_evaluates_near_close():
-    """Oracle Arb fires in final 120s with high distance and price capped at 0.75."""
-    strat = OracleArbStrategy()
+def test_a_leg_that_fills_in_the_cancel_race_is_kept(monkeypatch):
+    """The exchange reporting a fill after our cancel must not erase the leg."""
+    risk = RiskManager()
+    risk.add_position(
+        "market-resting:yes",
+        {
+            "market_id": "market-resting",
+            "event_id": "event-resting",
+            "outcome_id": "yes-1",
+            "order_id": "maker-order-1",
+            "outcome": "YES",
+            "entry_price": 0.52,
+            "amount_ngn": 500,
+            "filled_quantity": 0.0,
+            "confirmed_filled": False,
+            "strategy": "MAKER",
+            "asset": "SOL",
+            "timeframe": "15min",
+            "placed_at": time.time() - 60_000,
+        },
+    )
+    monkeypatch.setattr(
+        bot.strategies.maker.maker_strategy, "open_quotes",
+        {"market-resting": {"spot": 100.0, "legs": [], "placed_at": time.time() - 60_000}},
+    )
+    monkeypatch.setattr(
+        bot,
+        "active_markets",
+        [{
+            "market_id": "market-resting",
+            "threshold": 100.0,
+            "secs_to_close": 400,
+            "yes_price": 0.52,
+            "no_price": 0.48,
+            "engine": "CLOB",
+            "fee_rate": 0.02,
+        }],
+    )
+    monkeypatch.setattr(bot, "_tg_app", None)
+
+    class RaceClient(MockClient):
+        """Open and empty when polled, filled once we try to cancel it."""
+
+        async def get_order(self, order_id):
+            if order_id in self.cancelled_orders:
+                return {"status": "filled", "filledSize": 9.6, "avgFillPrice": 0.52}
+            return {"status": "open", "filledSize": 0}
+
+    client = RaceClient()
+    asyncio.run(bot._manage_unfilled_maker_orders("chat-1", client, risk, {}))
+
+    # We still hold it: untracked shares are a worse outcome than a stale row.
+    assert "market-resting:yes" in risk.open_positions
+    assert risk.open_positions["market-resting:yes"]["confirmed_filled"] is True
+
+
+def test_taker_fires_on_a_near_certain_setup_near_close():
+    """TAKER fires in the final minute on a large distance, at a capped price.
+
+    The price ceiling is what keeps this honest: a near-certain outcome still
+    has to be priced inside the band where the fee-adjusted EV can clear the
+    margin, so the strategy refuses to pay 0.95 for a 0.97 shot.
+    """
+    strat = TakerStrategy()
     market = {
         "event_id": "e",
         "market_id": "m",
@@ -249,18 +413,29 @@ def test_oracle_arb_evaluates_near_close():
         "timeframe": "15min",
         "secs_to_close": 60,
         "threshold": 60_000.0,
-        "yes_price": 0.65,
-        "no_price": 0.35,
+        "yes_price": 0.60,
+        "no_price": 0.40,
+        "engine": "CLOB",
+        "fee_rate": 0.02,
+        "status": "open",
         "yes_id": "y",
         "no_id": "n",
         "title": "BTC > 60k",
     }
-    # Direct price is $60,350 (+0.58% distance) and 1s old
-    strat._get_oracle_price = lambda _a: (60_350.0, 1.0)
-
-    sig = asyncio.run(strat.evaluate(market, {}, MarketState()))
+    # Spot is $60,350 (+0.58% distance) with a minute left: near-certain.
+    books = {
+        "y": {"bids": [{"price": 0.58, "quantity": 900.0}],
+              "asks": [{"price": 0.60, "quantity": 900.0}]},
+        "n": {"bids": [{"price": 0.38, "quantity": 900.0}],
+              "asks": [{"price": 0.40, "quantity": 900.0}]},
+    }
+    sig = asyncio.run(strat.evaluate(
+        market, {"chat_id": "u-near-close", "mode": "balanced"},
+        MarketState(), spot_price=60_350.0, books=books,
+    ))
     assert sig is not None
-    assert sig.strategy == "ORACLE_ARB"
+    assert sig.strategy == "TAKER"
     assert sig.outcome == "YES"
     assert sig.certainty >= 0.90
-    assert sig.market_price == 0.65
+    assert sig.market_price == 0.60
+    assert 0.0 < sig.size_pct <= config.TAKER_MAX_SIZE_PCT

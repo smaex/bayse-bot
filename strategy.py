@@ -1,6 +1,9 @@
 """
 Quant state: Kalman filter (price + velocity) and GARCH(1,1) variance.
-Drives momentum_score, regime_score, velocity_score, realized_vol_hourly.
+
+This is the tick-level state both legs price off: a filtered price and
+velocity for the drift term, and a variance estimate for the diffusion term.
+It holds no strategy logic and no position state.
 """
 
 import logging
@@ -87,22 +90,6 @@ def update_price_history(asset: str, price: float, state: MarketState = None):
     state.price_history[asset].append((time.time(), price))
     _kalman_update(asset, price, state)
     _garch_update(asset, price, state)
-
-
-def record_btc_move(market: dict, yes_price_new: float, state: MarketState = None):
-    if state is None:
-        state = global_state
-    if market.get("asset") != "BTC":
-        return
-    tf     = market["timeframe"]
-    prev_p = market.get("yes_price", 0.5)
-    if prev_p <= 0:
-        return
-    move = (yes_price_new - prev_p) / prev_p
-    if abs(move) >= 0.01:
-        state.btc_signal_time[tf]      = time.time()
-        state.btc_signal_direction[tf] = "UP" if move > 0 else "DOWN"
-        state.btc_signal_move[tf]      = abs(move)
 
 
 _strategy_results: dict[str, list[int]] = {}

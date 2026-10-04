@@ -16,12 +16,19 @@ import database
 log = logging.getLogger("learner")
 
 DEFAULT_LEARNED: dict = {
-    "snipe_min_certainty":      config.SNIPE_MIN_CERTAINTY,
-    "correlation_threshold":    config.CORRELATION_THRESHOLD,
+    # Required net EV for a TAKER entry, learned from settled outcomes. Starts
+    # at the config default and is only ever moved by evidence, within the
+    # bounds below -- a gate that tunes itself without a clamp is a gate that
+    # eventually deletes itself.
+    "taker_min_net_ev":         config.TAKER_MIN_NET_EV_DEFAULT,
     "size_multipliers":         {s: 1.0 for s in config.ACTIVE_STRATEGIES},
     "certainty_multipliers":    {s: 1.0 for s in config.ACTIVE_STRATEGIES},
     "trade_counts":             {},
 }
+
+# Hard bounds on the self-tuned TAKER EV gate.
+TAKER_NET_EV_FLOOR = 0.03
+TAKER_NET_EV_CEILING = 0.15
 
 
 def get_learned_overrides(chat_id: str) -> dict:
@@ -41,9 +48,9 @@ def binomial_cdf(k: int, n: int, p: float) -> float:
     return cdf
 
 
-_BINARY_SETTLEMENT_STRATEGIES = {
-    "SNIPE", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB",
-}
+# Strategies whose positions settle to either 1.00 or nothing. Both of ours
+# do; the distinction matters only if a future strategy does not.
+_BINARY_SETTLEMENT_STRATEGIES = set(config.ACTIVE_STRATEGIES)
 
 
 def capital_weighted_break_even(rows: list[dict], default: float = 0.55) -> float:
@@ -168,7 +175,7 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
     window where Bayse's real balance already reflected a trade's
     resolution while our own risk.deployed() tracking hadn't caught up yet
     — directly contributing to false deposit/withdrawal detection on 15-min
-    markets where SNIPE often enters in the final seconds before close.
+    markets where a taker often enters in the final seconds before close.
     """
     import telegram_bot as tgb
 
@@ -460,17 +467,20 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
             m = min(1.25, m + 0.10)
         mults[strat] = round(m, 2)
 
-        # SNIPE threshold tuning follows its observed payoff break-even point.
-        if strat == "SNIPE" and win_rate is not None:
-            cur = learned.get("snipe_min_certainty", config.SNIPE_MIN_CERTAINTY)
+        # The TAKER EV gate follows its observed payoff break-even point. It
+        # tightens after losses and eases only on demonstrated profitability,
+        # and both directions are clamped: a self-tuning gate without bounds
+        # is a gate that eventually erases itself.
+        if strat == "TAKER" and win_rate is not None:
+            cur = float(learned.get("taker_min_net_ev", config.TAKER_MIN_NET_EV_DEFAULT))
             if strat_pnl < 0 and win_rate < expected_wr:
-                new = min(round(cur + 0.02, 2), 0.70)
-                learned["snipe_min_certainty"] = new
-                changes.append(f"🎯 SNIPE certainty raised {cur} → {new}")
-            elif roi >= 0.02 and win_rate >= expected_wr + 0.05 and cur > 0.20:
-                new = max(round(cur - 0.02, 2), 0.20)
-                learned["snipe_min_certainty"] = new
-                changes.append(f"🎯 SNIPE certainty eased {cur} → {new}")
+                new = min(round(cur + 0.01, 3), TAKER_NET_EV_CEILING)
+                learned["taker_min_net_ev"] = new
+                changes.append(f"🎯 TAKER min EV raised {cur:.1%} → {new:.1%}")
+            elif roi >= 0.02 and win_rate >= expected_wr + 0.05 and cur > TAKER_NET_EV_FLOOR:
+                new = max(round(cur - 0.01, 3), TAKER_NET_EV_FLOOR)
+                learned["taker_min_net_ev"] = new
+                changes.append(f"🎯 TAKER min EV eased {cur:.1%} → {new:.1%}")
 
     # Combo-level self-correction. A profitable BTC/SOL strategy must not hide
     # the same strategy losing on ETH, or vice versa.

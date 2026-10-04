@@ -4,9 +4,22 @@ Risk manager: position sizing, drawdown control, exposure limits.
 
 import logging
 import time
+
+import config
 from config import MAX_DRAWDOWN_STOP, MAX_PORTFOLIO_EXPOSURE, TRADING_TIMEZONE
 
 log = logging.getLogger(__name__)
+
+
+# Strategies that post passive liquidity. Maker and taker positions on the
+# same asset are different trades with different economics, so the dedup rules
+# below compare families rather than strategy names.
+_MAKER_STRATEGIES = frozenset(getattr(config, "MAKER_STRATEGIES", ("MAKER",)))
+
+
+def _is_maker(strategy: str) -> bool:
+    """True for strategies that post passive liquidity rather than cross."""
+    return str(strategy or "").upper() in _MAKER_STRATEGIES
 
 
 def position_is_filled(pos: dict) -> bool:
@@ -132,7 +145,7 @@ class RiskManager:
         directional risk (and its cash is already excluded from free_cash), so
         charging it against MAX_PORTFOLIO_EXPOSURE let a single unfilled quote
         exhaust the whole budget for every other strategy on the account —
-        observed in production as "MAKER resting orders freeze SNIPE", logged
+        observed in production as "resting orders freeze the taker", logged
         at INFO with no gate counter and no notification.
         """
         return sum(
@@ -216,11 +229,11 @@ class RiskManager:
         if asset not in crypto_assets:
             return False
         
-        is_maker_strat = strategy.upper() in {"MAKER", "MIDMARKET_MAKER"}
+        is_maker_strat = strategy.upper() in _MAKER_STRATEGIES
 
         for pos in self.open_positions.values():
             pos_strat = pos.get("strategy", "").upper()
-            pos_is_maker = pos_strat in {"MAKER", "MIDMARKET_MAKER"}
+            pos_is_maker = pos_strat in _MAKER_STRATEGIES
             # Only correlate directional taker positions against directional taker positions
             if strategy and (is_maker_strat != pos_is_maker):
                 continue
@@ -238,7 +251,6 @@ class RiskManager:
             return False
         if market_id in self.pending_markets:
             return True
-        makers = {"MAKER", "MIDMARKET_MAKER"}
         incoming_strat = (strategy or "").upper()
         # A market can hold more than one tracked entry: the executor keys a
         # second position as "<market_id>:<outcome>:<order_id>". Looking up the
@@ -247,19 +259,29 @@ class RiskManager:
             if key != market_id and not str(key).startswith(f"{market_id}:"):
                 continue
             existing_strat = str(pos.get("strategy") or "").upper()
+            existing_outcome = str(pos.get("outcome") or "").upper()
             is_maker_pair = bool(incoming_strat and existing_strat) and (
-                (incoming_strat in makers) != (existing_strat in makers)
+                (incoming_strat in _MAKER_STRATEGIES)
+                != (existing_strat in _MAKER_STRATEGIES)
             )
             if not is_maker_pair:
                 # Active position or pending limit order already exists for this
                 # exact market and strategy family.
                 return True
+            if "BOTH" in (str(outcome or "").upper(), existing_outcome):
+                # A two-sided quote is not two opposite bets: it is one
+                # position that pays out whichever outcome wins, entered at a
+                # cost the strategy proved is below 1.00. The rule below exists
+                # to stop *opposite* bets, and a locked pair is the opposite of
+                # that. The pair constraint itself is enforced in
+                # strategies/maker.py and re-asserted by the executor against a
+                # fresh book before any order is sent.
+                continue
             # A passive MAKER quote and a directional taker may share a market
             # only on the SAME outcome. On opposite outcomes exactly one leg can
             # pay out, so the two strategies would be betting against each
             # other, and the pair loses outright whenever the two entry prices
             # sum to more than 1.00. An unknown side is treated as a conflict.
-            existing_outcome = str(pos.get("outcome") or "").upper()
             if not outcome or existing_outcome != str(outcome).upper():
                 log.info(
                     f"BLOCK opposite-side entry on {market_id}: {incoming_strat} "
@@ -267,18 +289,18 @@ class RiskManager:
                 )
                 return True
 
-        # Asset-level deduplication:
-        # Directional takers (SNIPE, FRONTRUN, CORRELATE) deduplicate against each other.
-        # Passive liquidity makers (MAKER) deduplicate against MAKER.
-        # MAKER and SNIPE do NOT block each other on the asset level.
+        # Asset-level deduplication: takers deduplicate against takers and
+        # makers against makers, but a maker quote and a taker position on the
+        # same asset are different trades with different economics and do not
+        # block each other.
         if asset:
-            incoming_is_maker = strategy.upper() in {"MAKER", "MIDMARKET_MAKER"}
+            incoming_is_maker = strategy.upper() in _MAKER_STRATEGIES
             for existing_pos in self.open_positions.values():
                 if existing_pos.get("asset") == asset:
-                    existing_is_maker = existing_pos.get("strategy", "").upper() in {"MAKER", "MIDMARKET_MAKER"}
+                    existing_is_maker = (
+                        existing_pos.get("strategy", "").upper() in _MAKER_STRATEGIES
+                    )
                     if strategy and (incoming_is_maker != existing_is_maker):
-                        # Different execution nature: MAKER spread capture vs SNIPE directional take.
-                        # Do not block across the boundary!
                         continue
 
                     log.info(

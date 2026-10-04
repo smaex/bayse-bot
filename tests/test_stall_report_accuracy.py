@@ -337,22 +337,26 @@ def test_exchange_rejection_notice_is_valid_markdown():
     assert legacy_markdown_error(app.bot.calls[0][0]) is None
 
 
-def test_boosted_certainty_is_never_reported_as_100_percent(monkeypatch):
+def test_reported_certainty_is_never_100_percent(monkeypatch):
+    """A certainty of 1.00 reads as certainty to a human operator, and no
+    model of a 15-minute binary has any. It is clamped at the orchestrator so
+    the clamp holds for every strategy, including one added later."""
     import strategies
     from strategies.base import MarketState
 
-    class _Maker:
-        async def evaluate(self, market, learned, state, spot_price=None):
-            return _maker_sig()
+    class _Certain:
+        async def evaluate(self, market, learned, state, spot_price=None, books=None):
+            return _maker_sig(certainty=1.4)
 
-    monkeypatch.setattr(strategies, "_strategies", {"MAKER": _Maker()})
-    monkeypatch.setattr(strategies.regime_controller, "get_multipliers",
-                        lambda asset, state: {"SNIPE": 1.2, "TREND": 1.2})
-    market = {"asset": "BTC", "market_id": "m", "timeframe": "15min",
-              "yes_price": 0.66, "no_price": 0.34}
+    monkeypatch.setattr(strategies, "_strategies", {"MAKER": _Certain()})
+    market = {"asset": "BTC", "market_id": "m", "event_id": "e", "timeframe": "15min",
+              "yes_price": 0.66, "no_price": 0.34, "engine": "CLOB",
+              "secs_to_close": 400, "threshold": 100_000.0,
+              "yes_id": "y", "no_id": "n"}
     signals = asyncio.run(strategies.evaluate_all(
         market, {"strategies": ["MAKER"], "mode": "balanced"}, MarketState(),
+        spot_price=100_000.0, books={},
     ))
-    assert signals, "the boosted MAKER signal should still pass"
+    assert signals, "an overconfident signal should still be reported, clamped"
     assert signals[0].certainty == pytest.approx(strategies.MAX_REPORTED_CERTAINTY)
     assert signals[0].certainty < 1.0

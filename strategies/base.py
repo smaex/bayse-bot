@@ -7,6 +7,24 @@ from collections import deque
 log = logging.getLogger("strategies")
 
 
+@dataclass(frozen=True)
+class QuoteLeg:
+    """One order belonging to a (possibly multi-leg) decision.
+
+    A two-sided MAKER quote is *one* risk decision that happens to be two
+    orders. Modelling it as two independent signals would run the risk budget
+    check twice, let one leg be admitted and the other rejected, and leave the
+    intended pair half-built -- which is exactly the state the pair constraint
+    exists to prevent.
+    """
+
+    outcome: str
+    outcome_id: str
+    price: float
+    size_pct: float
+    fair_value: float = 0.0
+
+
 @dataclass
 class MarketState:
     price_history:         dict = field(default_factory=dict)   # asset → deque[(time, price)]
@@ -15,10 +33,6 @@ class MarketState:
     last_history_update:   dict = field(default_factory=dict)
     circuit_breakers:      dict = field(default_factory=dict)
     systemic_halt_until:   float = 0.0
-    # CORRELATE
-    btc_signal_time:       dict = field(default_factory=dict)
-    btc_signal_direction:  dict = field(default_factory=dict)
-    btc_signal_move:       dict = field(default_factory=dict)
     # Market state tracking
     market_flips:          dict = field(default_factory=dict)
     market_last_fav:       dict = field(default_factory=dict)
@@ -50,6 +64,33 @@ class TradeSignal:
     edge_at_entry:         float = 0.0
     realized_vol_at_entry: float = 0.0
     mode_floor:            float = 0.48
+    # Multi-leg decisions (two-sided MAKER quotes, complete-set takes).
+    # Empty means "derive a single leg from the flat fields above".
+    legs:                  list = field(default_factory=list)
+
+    def is_multi_leg(self) -> bool:
+        return bool(self.legs)
+
+    def ensure_legs(self) -> list:
+        """The legs to execute, materialising a single leg from flat fields."""
+        if self.legs:
+            return self.legs
+        self.legs = [QuoteLeg(
+            outcome=self.outcome,
+            outcome_id=self.outcome_id,
+            price=float(self.market_price),
+            size_pct=float(self.size_pct),
+            fair_value=float(self.win_prob),
+        )]
+        return self.legs
+
+    def total_size_pct(self) -> float:
+        """Fraction of bankroll the whole decision commits, all legs included.
+
+        Risk checks must use this, never ``size_pct``: for a two-sided quote
+        the exposure-relevant number is both legs together.
+        """
+        return sum(float(leg.size_pct) for leg in self.ensure_legs())
 
     def strength(self) -> str:
         if self.certainty >= 0.85: return "🔥 SUPERIOR"

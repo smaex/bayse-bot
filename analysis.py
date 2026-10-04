@@ -11,14 +11,15 @@ Produces a report on:
 
 import logging
 import asyncio
+
+import config
 import database
 from client import BayseClient
 
 log = logging.getLogger(__name__)
 
-_BINARY_SETTLEMENT_STRATEGIES = {
-    "SNIPE", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB",
-}
+# Both live strategies settle to either 1.00 or nothing.
+_BINARY_SETTLEMENT_STRATEGIES = set(config.ACTIVE_STRATEGIES)
 
 
 def certainty_to_win_prob(certainty: float) -> float:

@@ -62,7 +62,7 @@ SCOPE_EMPTY_CONFIRM_SEC = 900.0
 # recorded on every pass before any candidate is weighed. Counted alongside real
 # gates they dominate the report by construction: in production the top two
 # "gates that stopped candidates" were scope:blocked_by_policy and
-# SNIPE:asset_not_in_allowed_scope while the actual problem was that MAKER's
+# TAKER:asset_not_in_allowed_scope while the actual problem was that MAKER's
 # quotes never filled. They are reported on their own line instead.
 # scope:no_enabled_strategies is deliberately NOT here: it stops everything.
 _STRUCTURAL_CODES = frozenset({"scope:blocked_by_policy", "scope:suspended_by_learner"})
@@ -342,7 +342,7 @@ def trade_gap_minutes(chat_id: str | None, now: float | None = None) -> float:
 def reject(chat_id: str | None, stage: str, code: str, detail: str = "") -> None:
     """Record a candidate rejected by a named gate.
 
-    ``stage`` is the strategy or subsystem (``SNIPE``, ``MAKER``, ``scan``…),
+    ``stage`` is the strategy or subsystem (``TAKER``, ``MAKER``, ``scan``…),
     ``code`` is a stable short identifier for the gate. Codes are counted, never
     logged at INFO — the counters are what make a drought explainable.
     """

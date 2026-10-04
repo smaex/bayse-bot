@@ -12,6 +12,7 @@ import asyncio
 import time
 from datetime import datetime, timedelta, timezone
 
+import config
 import strategies
 from strategies.base import MarketState
 from strategies.maker import MakerStrategy
@@ -24,7 +25,7 @@ class _RecordingStrategy:
     def __init__(self, calls: list):
         self._calls = calls
 
-    async def evaluate(self, market, learned, state, spot_price=None):
+    async def evaluate(self, market, learned, state, spot_price=None, books=None):
         self._calls.append(market.get("yes_price"))
         return None
 
@@ -46,118 +47,100 @@ def _eval_market(**overrides):
     return market
 
 
-def test_confident_binary_market_does_not_suppress_takers(monkeypatch):
-    """YES=0.82/NO=0.18 (sum=1.00) is valid — takers must still be evaluated.
+def test_a_confident_binary_market_is_not_treated_as_dislocated(monkeypatch):
+    """YES=0.82/NO=0.18 (sum=1.00) is a valid, confident market.
 
-    In a genuinely dislocated book (sum=1.30) the orchestrator suppresses
-    aggressive latency takers, but SNIPE is deliberately exempt: it carries its
-    own fee-adjusted EV ceiling and price band, so a wide book is exactly where
-    it is allowed to look for a mispricing.
+    Both strategies must still be evaluated on it. Suppressing evaluation
+    because one side looks "too sure" would cut the bot out of exactly the
+    markets where the book and the model disagree most.
     """
-    snipe_calls: list = []
-    frontrun_calls: list = []
+    taker_calls: list = []
     maker_calls: list = []
     monkeypatch.setattr(
         strategies,
         "_strategies",
         {
-            "SNIPE": _RecordingStrategy(snipe_calls),
-            "FRONTRUN": _RecordingStrategy(frontrun_calls),
+            "TAKER": _RecordingStrategy(taker_calls),
             "MAKER": _RecordingStrategy(maker_calls),
         },
     )
-    learned = {"strategies": ["SNIPE", "FRONTRUN", "MAKER"], "mode": "balanced"}
+    learned = {"strategies": ["TAKER", "MAKER"], "mode": "balanced"}
 
     asyncio.run(strategies.evaluate_all(
         _eval_market(yes_price=0.82, no_price=0.18),
-        dict(learned), MarketState(), spot_price=60_500.0,
+        dict(learned), MarketState(), spot_price=60_500.0, books={},
     ))
-    assert snipe_calls == [0.82]
-    assert frontrun_calls == [0.82]
+    assert taker_calls == [0.82]
     assert maker_calls == [0.82]
 
-    # True sum dislocation (sum=1.30) still suppresses the latency taker.
-    snipe_calls.clear()
-    frontrun_calls.clear()
-    maker_calls.clear()
-    asyncio.run(strategies.evaluate_all(
-        _eval_market(yes_price=0.70, no_price=0.60),
-        dict(learned), MarketState(), spot_price=60_500.0,
-    ))
-    assert frontrun_calls == []
-    assert snipe_calls == [0.70]
-    assert maker_calls == [0.70]
+
+def test_the_pair_sum_sanity_gate_rejects_a_dislocated_book(monkeypatch):
+    """A book whose two sides cannot both be right (sum far from 1.00) is
+    either a broken payload or an arbitrage, and quoting into it is not
+    market making."""
+    from strategies.book import pair_sum_sane
+
+    assert pair_sum_sane(0.82, 0.18) is True    # sums to 1.00
+    assert pair_sum_sane(0.70, 0.60) is False   # sums to 1.30
+    assert pair_sum_sane(0.30, 0.20) is False   # sums to 0.50
 
 
-def test_scanner_infers_clob_engine_when_api_omits_it():
-    """Missing engine field → CLOB for crypto short-term series, else AMM."""
-    now = datetime.now(timezone.utc)
-    lean = {
-        "id": "event-1",
-        "closingDate": (now + timedelta(minutes=10)).isoformat(),
-        "openingDate": (now - timedelta(minutes=5)).isoformat(),
-    }
+def test_an_unknown_strategy_in_scope_is_reported_not_silently_ignored(monkeypatch):
+    """A saved preference naming a deleted strategy must not look like "no
+    signals" forever. It is named in the reject counters so /why can show it.
+    """
+    import stall
 
-    def _full(**market_overrides):
-        market = {
-            "id": "market-1",
-            "outcome1Id": "yes-1",
-            "outcome2Id": "no-1",
-            "outcome1Price": 0.55,
-            "outcome2Price": 0.45,
-            "feePercentage": 2,
-        }
-        market.update(market_overrides)
-        return {
-            "title": "BTC test",
-            "status": "open",
-            "eventThreshold": 60_000.0,
-            "markets": [market],
-        }
-
-    class _Client:
-        def __init__(self, payload):
-            self._payload = payload
-
-        async def get_event(self, _event_id, currency=None):
-            return self._payload
-
-    # Engine omitted on crypto 15min → CLOB (MAKER can quote).
-    enriched = asyncio.run(scanner._enrich(_Client(_full()), lean, "BTC", "15min"))
-    assert enriched is not None
-    assert enriched["engine"] == "CLOB"
-
-    # Engine omitted on crypto 5min / 1h → CLOB as well.
-    assert asyncio.run(
-        scanner._enrich(_Client(_full()), lean, "ETH", "5min")
-    )["engine"] == "CLOB"
-    assert asyncio.run(
-        scanner._enrich(_Client(_full()), lean, "SOL", "1h")
-    )["engine"] == "CLOB"
-
-    # Engine omitted on non-crypto / long series → AMM fallback preserved.
-    assert asyncio.run(
-        scanner._enrich(_Client(_full()), lean, "XAUUSD", "1h")
-    )["engine"] == "AMM"
-
-    # Explicitly declared engine is always respected.
-    assert asyncio.run(
-        scanner._enrich(_Client(_full(engine="amm")), lean, "BTC", "15min")
-    )["engine"] == "AMM"
-
-
-def test_maker_resting_order_staleness_by_age():
-    """is_stale() is False for fresh quotes and True once past timeout."""
-    strat = MakerStrategy()
-    strat.track_order(
-        market_id="market-1", order_id="order-1", placed_price=0.55,
-        binance_price=60_000.0, amount=500.0, outcome_id="yes-1", asset="",
+    chat = "u-scope"
+    stall.reset(chat)
+    taker_calls: list = []
+    monkeypatch.setattr(
+        strategies, "_strategies", {"TAKER": _RecordingStrategy(taker_calls)}
     )
-    assert strat.is_stale("market-1", timeout_sec=120.0) is False
+    asyncio.run(strategies.evaluate_all(
+        _eval_market(),
+        {"chat_id": chat, "strategies": ["TAKER", "SNIPE"], "mode": "balanced"},
+        MarketState(), spot_price=60_500.0, books={},
+    ))
+    assert len(taker_calls) == 1, "the known strategy must still be evaluated"
+    rejects = stall._users[chat]["rejects"]
+    assert any("unknown_strategy" in c for c in rejects), list(rejects)
 
-    # Unknown market → not stale (nothing to manage).
-    assert strat.is_stale("market-unknown", timeout_sec=120.0) is False
 
-    # Aged quote → stale.
-    strat.open_orders["market-1"]["placed_at"] = time.time() - 200.0
-    assert strat.is_stale("market-1", timeout_sec=120.0) is True
+def test_maker_resting_order_expiry_by_age():
+    """is_expired() is False for fresh quotes and True once past timeout."""
+    strat = MakerStrategy()
+    strat.track_quote(
+        market_id="market-1",
+        legs=[{"outcome": "YES", "outcome_id": "yes-1", "order_id": "order-1",
+               "price": 0.55, "amount": 500.0}],
+        spot=60_000.0,
+    )
+    assert strat.is_expired("market-1") is False
+
+    # Unknown market → not expired (nothing to manage).
+    assert strat.is_expired("market-unknown") is False
+
+    # Aged quote → expired.
+    strat.open_quotes["market-1"]["placed_at"] = time.time() - (
+        config.MAKER_ORDER_TIMEOUT + 60
+    )
+    assert strat.is_expired("market-1") is True
+
+
+def test_maker_wants_a_requote_when_the_oracle_moves_through_its_quote():
+    """A quote the oracle has walked away from is stale however young it is:
+    it is now an offer to trade at a price we would not repeat."""
+    import config as _config
+
+    strat = MakerStrategy()
+    spot = 60_000.0
+    strat.track_quote(
+        market_id="market-1",
+        legs=[{"outcome": "YES", "outcome_id": "yes-1", "order_id": "order-1",
+               "price": 0.55, "amount": 500.0}],
+        spot=spot,
+    )
+    assert strat.should_requote("market-1", spot * 1.0001) is False
+    moved = spot * (1.0 + _config.MAKER_REQUOTE_THRESHOLD * 2)
+    assert strat.should_requote("market-1", moved) is True

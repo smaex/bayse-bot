@@ -6,6 +6,7 @@ Fixes: engine label removed from notifications (always MARKET now),
 
 import logging
 import asyncio
+import time
 from datetime import date
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -41,24 +42,20 @@ _user_daily:     dict = {}
 _active_markets: list = []
 _start_user_fn       = None
 
-_VALID_STRATEGIES = {"SNIPE", "ARB", "FRONTRUN", "CORRELATE", "MAKER", "ORACLE_ARB", "PAIRED_SNIPER", "MIDMARKET_MAKER"}
-_STRATEGY_ALIASES = {
-    "MIDMARKET": "MIDMARKET_MAKER",
-    "MID_MARKET": "MIDMARKET_MAKER",
-    "MID-MARKET": "MIDMARKET_MAKER",
-    "MIDMARKET_MAKER": "MIDMARKET_MAKER",
-    "MID": "MIDMARKET_MAKER",
-    "PAIRED": "PAIRED_SNIPER",
-    "PAIREDSNIPER": "PAIRED_SNIPER",
-    "ORACLE": "ORACLE_ARB",
-    "ORACLEARB": "ORACLE_ARB",
-    "FRONT_RUN": "FRONTRUN",
-    "CORRELATION": "CORRELATE",
-}
+_VALID_STRATEGIES = set(config.ACTIVE_STRATEGIES)
+# Aliases kept for strategies that no longer exist resolve to nothing, which
+# makes `/set strategies SNIPE` an error rather than a silent no-op that looks
+# like a working configuration for a strategy that is not running.
+_STRATEGY_ALIASES = {}
 
 def _normalize_strat(s: str) -> str:
     cleaned = s.strip().upper().replace("-", "_")
     return _STRATEGY_ALIASES.get(cleaned, cleaned)
+
+_STRAT_ICONS = {
+    "TAKER": ("🎯", "TAKER"),
+    "MAKER": ("📊", "MAKER"),
+}
 
 _VALID_ASSETS     = {"BTC", "ETH", "SOL", "EURUSD", "GBPUSD", "XAUUSD"}
 _VALID_TIMEFRAMES = {"5min", "15min", "1h", "6h", "1d"}
@@ -101,12 +98,10 @@ def build_app() -> Application:
         ("debug",         cmd_debug),
         ("why",           cmd_why),
         ("whytrading",    cmd_why),
+        ("quotes",        cmd_quotes),
         ("disconnect",    cmd_disconnect),
         ("rekey",         cmd_rekey),
         ("wallet",        cmd_wallet),
-        ("shadow",        cmd_shadow),
-        ("makershadow",   cmd_makershadow),
-        ("arbshadow",     cmd_arbshadow),
         ("help",          cmd_help),
     ]:
         app.add_handler(CommandHandler(cmd, fn))
@@ -346,6 +341,67 @@ async def cmd_markets(update: Update, _ctx):
     await update.message.reply_text(await _markets_text(str(update.effective_chat.id)), parse_mode="Markdown")
 
 @_guard
+async def cmd_quotes(update: Update, _ctx):
+    """Resting maker quotes: what we are offering, at what price, for how long.
+
+    Half the bot is a market maker and its quotes have a lifecycle -- they are
+    placed, they age, they are withdrawn when the oracle moves through them.
+    Without this the only way to know a quote exists is to wait for a fill
+    message that may never come, which is how 19 hours went by with two
+    resting bids and no fills before anyone noticed.
+    """
+    import config as _cfg
+    from strategies.maker import maker_strategy
+
+    cid = str(update.effective_chat.id)
+    quotes = getattr(maker_strategy, "open_quotes", {}) or {}
+    if not quotes:
+        await update.message.reply_text(
+            "📭 *No resting maker quotes.*\n\n"
+            "MAKER re-quotes every cycle when a market is inside its window "
+            f"({_cfg.MAKER_MIN_SECS_TO_CLOSE:.0f}s–{_cfg.MAKER_MAX_SECS_TO_CLOSE:.0f}s "
+            "to close) and both books are readable. /why names the gate that "
+            "is stopping it.",
+            parse_mode="Markdown",
+        )
+        return
+
+    now = time.time()
+    lines = [f"📊 *Resting maker quotes* ({len(quotes)})\n"]
+    for market_id, info in sorted(quotes.items()):
+        age = now - float(info.get("placed_at") or now)
+        spot_then = float(info.get("spot") or 0.0)
+        legs = info.get("legs") or {}
+        inv = float(info.get("inventory") or 0.0)
+        expiry = max(0.0, _cfg.MAKER_ORDER_TIMEOUT - age)
+        flag = "🔴" if expiry <= 0 else ("🟡" if age > _cfg.MAKER_QUOTE_MAX_AGE_SEC else "🟢")
+        lines.append(
+            f"\n{flag} `{market_id[:18]}` — {age:.0f}s old, withdraws in {expiry:.0f}s"
+        )
+        if spot_then:
+            lines.append(f"   Oracle at placement: {spot_then:,.2f}")
+        for outcome in ("YES", "NO"):
+            leg = legs.get(outcome)
+            if leg is None:
+                continue
+            price = float(getattr(leg, "price", 0.0) or 0.0)
+            fv = float(getattr(leg, "fair_value", 0.0) or 0.0)
+            lines.append(f"   {outcome}: bid *{price:.3f}* (fv {fv:.3f})")
+        if inv:
+            side = "YES" if inv > 0 else "NO"
+            lines.append(
+                f"   ⚖️ Long {abs(inv):.2f} {side} — next quote skews to complete the set"
+            )
+    text = "\n".join(lines)
+    try:
+        await update.message.reply_text(text[:3900], parse_mode="Markdown")
+    except Exception as exc:
+        if not _is_markdown_parse_error(exc):
+            raise
+        await update.message.reply_text(_markdown_to_plain(text)[:3900])
+
+
+@_guard
 async def cmd_analysis(update: Update, _ctx):
     import analysis as anal
     cid    = str(update.effective_chat.id)
@@ -377,7 +433,10 @@ async def cmd_strategies(update: Update, _ctx):
         else:
             status = "✅ ACTIVE" if strat in active else "⚪ OFF"
         lines.append(f"{icon} *{strat}*: {status}")
-    lines.append("\n*To enable or set strategies:*\n`/set strategies SNIPE MAKER MIDMARKET_MAKER PAIRED_SNIPER`")
+    lines.append(
+        "\n*To enable or set strategies:*\n"
+        f"`/set strategies {' '.join(config.ACTIVE_STRATEGIES)}`"
+    )
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 @_guard
@@ -389,7 +448,7 @@ async def cmd_set(update: Update, _ctx):
             "*Usage:*\n"
             "`/set assets BTC ETH SOL`\n"
             "`/set timeframes 15min 1h`\n"
-            "`/set strategies SNIPE ARB`\n"
+            "`/set strategies TAKER MAKER`\n"
             "`/set risk 2`\n"
             "`/set mintrade 100`\n"
             "`/set maxtrade 5000`\n"
@@ -696,50 +755,33 @@ async def cmd_disconnect(update: Update, _ctx):
     log.info(f"[{cid}] DISCONNECTED")
     await update.message.reply_text("🔌 Disconnected. Trade history preserved. /start to reconnect.")
 
-@_guard
-async def cmd_shadow(update: Update, _ctx):
-    import shadow_tracker
-    report = shadow_tracker.get_summary_report()
-    await update.message.reply_text(report, parse_mode="Markdown")
-
-
-@_guard
-async def cmd_makershadow(update: Update, _ctx):
-    import maker_shadow
-    await update.message.reply_text(
-        maker_shadow.get_summary_report(), parse_mode="Markdown"
-    )
-
-
-@_guard
-async def cmd_arbshadow(update: Update, _ctx):
-    import complete_set_shadow
-    await update.message.reply_text(
-        complete_set_shadow.get_summary_report(), parse_mode="Markdown"
-    )
-
-
 async def cmd_help(update: Update, _ctx):
     await update.message.reply_text(
         "*Commands*\n\n"
+        "*Trading*\n"
         "/start — connect account\n"
         "/status — balance, PnL, positions\n"
         "/trades — last 10 trades\n"
-        "/markets — active markets\n"
+        "/quotes — resting maker quotes and their age\n"
+        "/markets — active markets\n\n"
+        "*Controls*\n"
+        "/pause — stop trading\n"
+        "/resume — resume trading\n"
+        "/mode — switch risk mode\n"
+        "/set — change a setting\n"
+        "/strategies — which strategies are on\n\n"
+        "*Diagnostics*\n"
+        "/why — the single reason nothing has traded, with evidence\n"
+        "/debug — strategy, feed and risk state\n"
         "/analysis — full performance report\n"
         "/learning — run AI learning cycle now\n"
         "/resetlearning — clear learned overrides\n"
-        "/learnstats — 7-day win rates\n"
+        "/learnstats — 7-day win rates\n\n"
+        "*Account*\n"
         "/settings — current config\n"
-        "/mode — switch risk mode\n"
-        "/set — change a setting\n"
-        "/pause — stop trading\n"
-        "/resume — resume trading\n"
-        "/shadow — view mid-market shadow tracker report\n"
-        "/makershadow — view read-only MAKER quote-ladder observations\n"
-        "/arbshadow — view read-only complete-set arbitrage observations\n"
-        "/debug — diagnose why trades aren't firing\n"
-        "/why — the single reason nothing has traded, with evidence\n"
+        "/balance — wallet balance\n"
+        "/wallet — raw wallet payload\n"
+        "/rekey — update API keys\n"
         "/disconnect — remove account",
         parse_mode="Markdown",
     )
@@ -777,7 +819,7 @@ _MODES = {
         "settings": {
             "mode": "aggressive", "assets": list(config.DEFAULT_ASSETS),
             "timeframes": list(config.DEFAULT_TIMEFRAMES),
-            "strategies": ["MAKER", "SNIPE", "FRONTRUN", "CORRELATE"],
+            "strategies": list(config.ACTIVE_STRATEGIES),
             "risk_pct": min(2.0, config.MAX_TRADE_RISK * 100),
             "mintrade": MIN_TRADE_NGN,
             "maxexposure": config.MAX_PORTFOLIO_EXPOSURE * 100,
@@ -828,7 +870,7 @@ async def _status_text(cid: str) -> str:
     # against an equity baseline understated "today's profit" and
     # overstated "drawdown from peak" by exactly the deployed amount —
     # every single time the user checked /status while holding a position,
-    # which based on production logs is most of the time (0-5 open SNIPE
+    # which based on production logs is most of the time (0-5 open
     # positions is the normal state, not the exception).
     equity = free_cash + deployed
 
@@ -1011,14 +1053,12 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
     """
     strat = sig.strategy.upper()
     strat_meta = {
-        "SNIPE":         ("🎯", "*SNIPE Signal*"),
-        "ORACLE_ARB":    ("⚡", "*ORACLE ARB* (Latency Edge)"),
-        "MAKER":         ("📊", "*MAKER* (Limit Order)" if engine == "CLOB_LIMIT" else "*MAKER*"),
-        "FRONTRUN":      ("🏎️", "*FRONTRUN* (Binance Impulse)"),
-        "CORRELATE":     ("🔗", "*CORRELATION* (Lead-Lag)"),
-        "ARB":             ("⚖️", "*TWO-SIDED ARB* (Experimental)"),
-        "PAIRED_SNIPER":   ("⚡", "*PAIRED SNIPER* (Ohioism Engine)"),
-        "MIDMARKET_MAKER": ("🎯", "*MID-MARKET MAKER* (Dual Liquidity Trap)"),
+        "TAKER": ("🎯", "*TAKER* (Crossing the spread)"),
+        "MAKER": (
+            "📊",
+            "*MAKER* (Two-sided quote)"
+            if getattr(sig, "is_multi_leg", lambda: False)() else "*MAKER* (Single leg)",
+        ),
     }
     icon_strat, title_strat = strat_meta.get(strat, ("🔔", f"*{strat} Trade*"))
     
@@ -1068,17 +1108,6 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
         except Exception as e:
             log.error(f"notify_trade failed: {e}")
 
-
-_STRAT_ICONS = {
-    "SNIPE":           ("🎯", "SNIPE"),
-    "ORACLE_ARB":      ("⚡", "ORACLE ARB"),
-    "MAKER":           ("📊", "MAKER"),
-    "FRONTRUN":        ("🏎️", "FRONTRUN"),
-    "CORRELATE":       ("🔗", "CORRELATION"),
-    "ARB":             ("⚖️", "TWO-SIDED ARB"),
-    "PAIRED_SNIPER":   ("⚡", "PAIRED SNIPER"),
-    "MIDMARKET_MAKER": ("🎯", "MID-MARKET MAKER"),
-}
 
 async def notify_win(app, cid, _mid, asset, tf, strat, pnl):
     app = app or _bot_app
@@ -1130,9 +1159,14 @@ async def notify_loss(app, cid, _mid, asset, tf, strat, pnl):
         except Exception as e2:
             log.error(f"notify_loss failed completely for {cid}: {e2}")
 
-async def notify_fill(app, cid, strat, asset, tf, outcome, price, amount_ngn):
+async def notify_fill(app, cid, pos, shares, price):
     """Notify user when a resting limit order is filled on the exchange."""
     app = app or _bot_app
+    strat   = (pos or {}).get("strategy", "MAKER")
+    asset   = (pos or {}).get("asset", "?")
+    tf      = (pos or {}).get("timeframe", "")
+    outcome = (pos or {}).get("outcome", "?")
+    amount_ngn = float((pos or {}).get("amount_ngn") or 0.0)
     if not app:
         log.warning(f"notify_fill dropped for {cid}: no Telegram app available")
         return
@@ -1149,8 +1183,10 @@ async def notify_fill(app, cid, strat, asset, tf, outcome, price, amount_ngn):
         f"Strategy: *{_esc(name)}*\n"
         f"Market: *{_esc(asset)} {_esc(tf)}* (*{_esc(outcome)}*)\n"
         f"Fill Price: *{price_val:.3f}*\n"
+        f"Shares: *{float(shares or 0.0):.2f}*\n"
         f"Amount: *₦{amt_val:,.0f}*\n"
-        f"_Matched by taker on CLOB. Position is now actively tracked._"
+        f"_Matched by a taker on the CLOB — no maker fee. The opposite leg is "
+        f"now more valuable: the next quote skews to complete the set._"
     )
     try:
         await app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
@@ -1189,6 +1225,47 @@ async def notify_unfilled(app, cid, strat, asset, tf, outcome, amount_ngn):
             await app.bot.send_message(chat_id=cid, text=f"⚪ UNFILLED | {name} | {asset} {tf} {outcome} | ₦{amt_val:,.0f} returned, no loss")
         except Exception as e2:
             log.error(f"notify_unfilled failed completely for {cid}: {e2}")
+
+async def notify_set_burned(app, cid, asset, tf, sets: float, cost_ngn: float,
+                            proceeds_ngn: float, pnl_ngn: float, *,
+                            structural: bool = False):
+    """A complete set was burned and the lock was realised.
+
+    A set settles to 1.00 whichever outcome wins, so paying less than 1.00
+    for both legs is profit that does not depend on the forecast. That makes
+    it the only trade this bot makes whose result is known at entry, and it
+    is worth telling the operator about in those terms.
+    """
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_set_burned dropped for {cid}: no Telegram app available")
+        return
+    _num = lambda v, d=0.0: v if isinstance(v, (int, float)) else d
+    sets, cost = _num(sets), _num(cost_ngn)
+    proceeds, pnl = _num(proceeds_ngn), _num(pnl_ngn)
+    _esc = lambda s: (s or "").replace("_", "\\_").replace("*", "\\*")
+    kind = "Structural take" if structural else "Maker pair completed"
+    edge = (proceeds / cost - 1.0) if cost > 0 else 0.0
+    msg = (
+        f"🔥 *Complete set burned*\n"
+        f"Asset: *{_esc(asset)} {_esc(tf)}*\n"
+        f"Source: {_esc(kind)}\n"
+        f"Sets: *{sets:.2f}* — cost ₦{cost:,.0f} → payout ₦{proceeds:,.0f}\n"
+        f"Locked edge: *{edge:+.1%}*\n"
+        f"PnL: *₦{pnl:+,.0f}*\n"
+        f"_Direction-independent: a set pays 1.00 whichever outcome resolves._"
+    )
+    plain = (
+        f"🔥 COMPLETE SET BURNED | {asset} {tf} | {kind} | "
+        f"{sets:.2f} sets ₦{cost:,.0f} -> ₦{proceeds:,.0f} | PnL ₦{pnl:+,.0f}"
+    )
+    await send_message(app, cid, msg, parse_mode="Markdown")
+    if not structural:
+        return
+    # send_message already falls back to plain text on a Markdown rejection,
+    # so this only guards the case where the fallback itself logged a failure.
+    log.debug(f"[{cid}] set burn plain summary: {plain}")
+
 
 async def notify_order_resting(app, cid, strat, asset, tf, outcome, amount_ngn,
                                price: float = 0.0, reason: str = ""):
@@ -1307,25 +1384,4 @@ async def notify_drawdown(app, cid, balance, peak, dd):
         f"⚠️ *Drawdown — Trading Paused*\n\n"
         f"Peak: ₦{peak:,.0f} → Now: ₦{balance:,.0f}\n"
         f"Drawdown: {dd:.1%}\n\n/resume to override.",
-        parse_mode="Markdown")
-
-async def notify_arb(app, cid, sig, pairs, profit):
-    await send_message(app, cid,
-        f"⚖️ *ARB* | {sig.asset} {sig.timeframe}\n{pairs:.3f} pairs → ₦{profit:,.2f}",
-        parse_mode="Markdown")
-
-async def notify_deposit_detected(app, cid, amount, currency):
-    await send_message(app, cid,
-        f"💸 *Deposit detected* +{currency} {amount:,.0f}\n"
-        f"Drawdown baseline reset. Send /resume if trading was paused.",
-        parse_mode="Markdown")
-
-async def notify_midmarket(app, cid, sig, bid_yes, bid_no, amount_leg):
-    await send_message(app, cid,
-        f"🎯 *MID-MARKET LIQUIDITY TRAP*\n"
-        f"Asset: *{sig.asset} {sig.timeframe}*\n"
-        f"• YES Bid: *{bid_yes:.3f}* (₦{amount_leg:,.0f})\n"
-        f"• NO Bid: *{bid_no:.3f}* (₦{amount_leg:,.0f})\n"
-        f"• Locked Return: *+{sig.edge_at_entry:.1%}*\n"
-        f"• 45s adverse selection watchdog active",
         parse_mode="Markdown")
