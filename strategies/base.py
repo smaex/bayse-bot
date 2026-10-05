@@ -63,7 +63,14 @@ class TradeSignal:
     regime_at_entry:       float = 0.0
     edge_at_entry:         float = 0.0
     realized_vol_at_entry: float = 0.0
-    mode_floor:            float = 0.48
+    # The account's conviction floor for this strategy, expressed on the SAME
+    # scale as ``certainty``. 0.0 means "no floor of its own": the strategy's
+    # admission gates already decide, which is the right default because a
+    # floor on the wrong scale is worse than no floor. A TAKER's certainty is
+    # a rescaled model probability and a MAKER pair's is a raw probability,
+    # so a single shared constant silently means "model probability >= 0.74"
+    # for one and ">= 0.48" for the other. Strategies set this explicitly.
+    mode_floor:            float = 0.0
     # Multi-leg decisions (two-sided MAKER quotes, complete-set takes).
     # Empty means "derive a single leg from the flat fields above".
     legs:                  list = field(default_factory=list)

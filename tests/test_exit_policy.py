@@ -148,6 +148,81 @@ def test_a_complete_set_is_burned_not_sold():
     assert d["reason"] == "BURN_COMPLETE_SET"
     assert d["current_price"] == 1.0
 
+    # A set held as two ordinary YES/NO positions is the same thing, and the
+    # flag is how the exit loop says so. Selling either leg pays the bid and a
+    # taker fee to give up a unit the burn pays in full.
+    d = _d(outcome="YES", complete_set=True, w_est=0.62, bid=0.71)
+    assert d["reason"] == "BURN_COMPLETE_SET"
+
+
+def _position(risk, key, outcome, qty, *, strategy="TAKER", market_id="m", **over):
+    risk.add_position(key, {
+        "market_id": market_id, "outcome": outcome, "outcome_id": outcome.lower(),
+        "entry_price": 0.50, "amount_ngn": 100.0, "strategy": strategy,
+        "filled_quantity": qty, "confirmed_filled": True, **over,
+    })
+
+
+def test_a_taker_complete_set_is_recognised_across_the_risk_book():
+    """`_paired_leg` used to require a MAKER sibling.
+
+    A complete-set TAKER is two immediate FAK legs, so it never passes through
+    the maker fill path that burns a resting pair; without this the lock would
+    be managed -- and sold leg by leg -- as two directional bets.
+    """
+    from risk import RiskManager
+
+    risk = RiskManager()
+    _position(risk, "m:YES:o1", "YES", 50.0)
+    _position(risk, "m:NO:o2", "NO", 50.0)
+
+    paired = bot._paired_leg(risk, "m:YES:o1", "m")
+    assert paired is not None and paired[0] == "m:NO:o2"
+
+
+def test_an_unbalanced_pair_is_never_burned():
+    """Only the overlap is a set, and the burn drops both entries.
+
+    Burning 20 of 50 held shares would leave 30 shares untracked on the
+    exchange, so an unbalanced pair is left alone: its overlap still settles
+    to 1.00 and the larger leg is managed as the directional position it is.
+    """
+    from risk import RiskManager
+
+    risk = RiskManager()
+    _position(risk, "m:YES:o1", "YES", 50.0)
+    _position(risk, "m:NO:o2", "NO", 20.0)
+    assert bot._paired_leg(risk, "m:YES:o1", "m") is None
+
+    # Same side is not a set.
+    risk2 = RiskManager()
+    _position(risk2, "m:YES:o1", "YES", 50.0)
+    _position(risk2, "m:YES:o2", "YES", 50.0)
+    assert bot._paired_leg(risk2, "m:YES:o1", "m") is None
+
+    # An unfilled sibling is not a set.
+    risk3 = RiskManager()
+    _position(risk3, "m:YES:o1", "YES", 50.0)
+    _position(risk3, "m:NO:o2", "NO", 50.0, confirmed_filled=False,
+              filled_quantity=0.0)
+    assert bot._paired_leg(risk3, "m:YES:o1", "m") is None
+
+    # Opposite-side positions from different strategy families are opposite
+    # bets (`already_in` blocks building them); they are not a set.
+    risk4 = RiskManager()
+    _position(risk4, "m:YES:o1", "YES", 50.0, strategy="TAKER")
+    _position(risk4, "m:NO:o2", "NO", 50.0, strategy="MAKER")
+    assert bot._paired_leg(risk4, "m:YES:o1", "m") is None
+
+
+def test_a_maker_pair_still_pairs():
+    from risk import RiskManager
+
+    risk = RiskManager()
+    _position(risk, "m:YES:o1", "YES", 40.0, strategy="MAKER")
+    _position(risk, "m:NO:o2", "NO", 40.0, strategy="MAKER")
+    assert bot._paired_leg(risk, "m:YES:o1", "m") is not None
+
 
 def test_a_resting_quote_near_settlement_is_withdrawn():
     d = _d(is_maker_pos=True, confirmed_filled=False,

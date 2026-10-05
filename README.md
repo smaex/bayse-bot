@@ -55,6 +55,8 @@ LIVE_TRADING=true
 
 Users connect their own Bayse API keys through `/start`. Keys are encrypted before being stored. New users must explicitly `/resume` because accounts start paused.
 
+`/resume` is an **override, not just an unpause**. The daily loss limit, the daily target and the drawdown stop are computed from a baseline captured at the start of the trading day, so simply clearing the pause flag left the same realised PnL to re-trip the same stop on the next cycle — the operator's override was silently discarded. An explicit resume therefore moves the baseline: today's already-realised PnL (positive or negative) stops counting, `start_balance` becomes the current equity, the daily counters and the daily target reset, and per-market trade cooldowns are dropped. The result is a fresh, bounded risk budget — the same `daily_loss_limit_pct` and `MAX_DAILY_LOSS_LIMIT_PCT` apply from the resume point, so resuming cannot create an unlimited-loss day. A daily stop that fires on its own still expires automatically at the trading-day boundary; only the operator can lift a manual `/pause`.
+
 ## Main Telegram commands
 
 | Command | Purpose |
@@ -68,7 +70,7 @@ Users connect their own Bayse API keys through `/start`. Keys are encrypted befo
 | `/mode` | Apply a bounded safe, balanced, or aggressive preset |
 | `/set ...` | Change assets, timeframes, strategies, or risk within operator limits |
 | `/pause` | Stop new entries; position monitoring continues |
-| `/resume` | Allow new entries |
+| `/resume` | Lift the pause and restart the session from the current balance |
 | `/rekey` | Replace Bayse API credentials |
 | `/debug` | Show feed, strategy, and risk diagnostics |
 | `/why` | The specific reason nothing has traded, with the gate counters behind it |
@@ -91,6 +93,8 @@ TRADING_TIMEZONE=Africa/Lagos
 ```
 
 Additional safeguards include bounded HTTP/WebSocket waits, conservative retries, user-scoped cooldowns, per-user evaluation locks, market-specific minimum orders, stale-feed rejection, fee-aware EV checks, capped slippage, partial-fill reconciliation, and exchange-side portfolio checks before exits.
+
+Two-sided quotes and complete sets are **balanced**: a set settles on `min(shares_yes, shares_no)`, so each leg is sized to buy the same number of shares (by the fee-inclusive price, since a taker's fee comes out of the shares received) rather than the same naira. Paying equal naira for a 0.46 leg and a 0.50 leg buys more of the cheaper side, and that excess is unhedged directional risk the pair's own accounting never charged for. A set that cannot be balanced above the per-order exchange minimum inside its budget is not sent at all, and one that completes is burned rather than sold — a sale pays the bid and a taker fee for a unit the burn pays in full.
 
 ## Health and dashboard
 

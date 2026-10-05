@@ -42,7 +42,7 @@ import config
 from strategies.base import QuoteLeg, TradeSignal, BaseStrategy
 from strategies import book as booklib
 from strategies.model import distance_pct, fair_value
-from strategies.utils import note_reject
+from strategies.utils import note_reject, probability_to_certainty
 
 log = logging.getLogger("strat.taker")
 
@@ -101,6 +101,8 @@ class TakerStrategy(BaseStrategy):
         price: float,
         fee_rate: float,
         min_net_ev: float,
+        *,
+        require_conviction: bool = True,
     ) -> tuple[float, float, Optional[str]]:
         """``(net_ev, effective_price, reject_code)`` for buying one side.
 
@@ -110,6 +112,16 @@ class TakerStrategy(BaseStrategy):
         approximation -- the fee enters through ``effective_price`` because
         Bayse takes it out of the shares we receive, not out of the cash we
         send.
+
+        ``require_conviction`` is the directional filter: never take a side the
+        model calls a coin flip (``TAKER_MIN_MODEL_PROB``). A *complete-set*
+        leg must not be asked for it. The two legs' probabilities are
+        complementary -- they sum to exactly 1.00 -- so requiring both to clear
+        0.55 is unsatisfiable, and the structural take could therefore never
+        fire at all. What a pair leg needs instead is the EV margin, which is
+        what makes an orphanned leg (a partial batch fill) a trade worth owning
+        on its own, plus the effective-price band, which already keeps both
+        legs out of the long-shot tail.
         """
         if price is None or not math.isfinite(price) or price <= 0:
             return 0.0, 0.0, "no_executable_price"
@@ -123,7 +135,7 @@ class TakerStrategy(BaseStrategy):
             return 0.0, effective, "price_above_ev_ceiling"
         if effective < config.TAKER_MIN_EFFECTIVE_PRICE:
             return 0.0, effective, "price_below_band"
-        if model_prob < config.TAKER_MIN_MODEL_PROB:
+        if require_conviction and model_prob < config.TAKER_MIN_MODEL_PROB:
             return 0.0, effective, "model_prob_below_floor"
         net_ev = model_prob / effective - 1.0
         if net_ev < min_net_ev:
@@ -147,6 +159,22 @@ class TakerStrategy(BaseStrategy):
         fee_rate = float(market.get("fee_rate") or 0.0)
         secs_to_close = float(market.get("secs_to_close") or 0.0)
         engine = str(market.get("engine") or "AMM").upper()
+
+        # ── Allowed scope ───────────────────────────────────────────────────
+        # TAKER_ALLOWED_ASSETS / TAKER_ALLOWED_TIMEFRAMES exist so the operator
+        # can widen or narrow what the crossing leg is allowed to touch. They
+        # were never read anywhere, so a scope of "BTC, ETH, SOL on 5/15-minute
+        # CLOBs" was documentation rather than a rule, and the taker was free
+        # to cross an AMM FX print. Enforced here, before any pricing work, and
+        # reported with the same `..._not_in_allowed_scope` code the drought
+        # report already treats as a configuration exclusion rather than a gate.
+        if str(asset).upper() not in config.TAKER_ALLOWED_ASSETS:
+            note_reject(learned, "TAKER", "asset_not_in_allowed_scope", str(asset))
+            return None
+        timeframe = str(market.get("timeframe") or "").upper()
+        if timeframe and timeframe not in config.TAKER_ALLOWED_TIMEFRAMES:
+            note_reject(learned, "TAKER", "timeframe_not_in_allowed_scope", timeframe)
+            return None
 
         # ── Time window ──────────────────────────────────────────────────────
         # Too early in the candle the model has almost no information and the
@@ -239,8 +267,20 @@ class TakerStrategy(BaseStrategy):
         # Both legs must independently be worth owning. See the module
         # docstring: a partial fill must leave us with a good trade, not a
         # hope. This is the gate that makes a best-effort batch safe.
-        ev_yes, _, fail_yes = self._leg_ev(p_yes, ask_yes, fee_rate, min_net_ev)
-        ev_no, _, fail_no = self._leg_ev(p_no, ask_no, fee_rate, min_net_ev)
+        #
+        # `require_conviction=False` is load-bearing, not a relaxation: the
+        # directional floor demands `model_prob >= TAKER_MIN_MODEL_PROB` on
+        # each leg, and these legs are complementary (`p_yes + p_no = 1.00`),
+        # so asking both for 0.55 is unsatisfiable and the structural take
+        # could never fire. The standalone test that matters is the EV margin
+        # below, and the effective-price band inside `_leg_ev` keeps both legs
+        # out of the long-shot tail.
+        ev_yes, _, fail_yes = self._leg_ev(
+            p_yes, ask_yes, fee_rate, min_net_ev, require_conviction=False
+        )
+        ev_no, _, fail_no = self._leg_ev(
+            p_no, ask_no, fee_rate, min_net_ev, require_conviction=False
+        )
         if fail_yes or fail_no:
             note_reject(
                 learned, "TAKER", "complete_set_leg_not_standalone",
@@ -270,6 +310,13 @@ class TakerStrategy(BaseStrategy):
             outcome="BOTH",
             outcome_id=market.get("yes_id", ""),
             certainty=min(0.99, max(p_yes, p_no)),
+            # No conviction floor of its own: a complete set is not a
+            # directional bet, and the gates that admitted it -- the lock edge,
+            # the per-leg EV margin and the effective-price band -- already
+            # decide. Declaring the directional floor here would re-impose, in
+            # the executor, the exactly-unsatisfiable "both complementary legs
+            # above 0.55" requirement that `_leg_ev` was just freed from.
+            mode_floor=0.0,
             win_prob=max(p_yes, p_no),
             market_price=max(ask_yes, ask_no),
             size_pct=config.TAKER_COMPLETE_SET_SIZE_PCT,
@@ -367,7 +414,20 @@ class TakerStrategy(BaseStrategy):
             timeframe=market.get("timeframe", ""),
             outcome=outcome,
             outcome_id=outcome_id,
-            certainty=min(0.95, max(0.0, (model_prob - 0.5) / 0.5)),
+            # Certainty on the system-wide scale (w = 0.50 + 0.45c), so the
+            # stored number, the calibration curve and the learner all read
+            # the same probability the model actually claimed. This used to
+            # divide by 0.5, i.e. claim a different certainty than every other
+            # strategy for the same probability.
+            certainty=probability_to_certainty(model_prob),
+            # The real floor for a directional take is TAKER_MIN_MODEL_PROB,
+            # already enforced in `_leg_ev` on the raw probability. Expressed
+            # here so the executor's floor check cannot silently become a much
+            # stricter, unrelated rule: with the old shared default of 0.48 on
+            # this scale, "certainty >= 0.48" meant "model probability >= 0.74"
+            # and a 0.65 model against a 0.55 ask was refused as a probe,
+            # after the EV gate had already approved it.
+            mode_floor=probability_to_certainty(config.TAKER_MIN_MODEL_PROB),
             win_prob=model_prob,
             market_price=ask,
             size_pct=size_pct,

@@ -342,6 +342,87 @@ async def execute_trade(chat_id: str, sig, client, risk, settings: dict,
 
 
 
+def _order_actual_cost(order: dict, shares: float, fill_price: float) -> float:
+    """Cash actually debited for one BUY fill, fee included.
+
+    A CLOB BUY fee is taken out of the shares received, so ``shares`` (the
+    exchange's ``quantity``) has already paid it and the wallet debit for that
+    fill is the *gross* value plus the fee -- not ``shares * price``, which
+    understates it by the fee. The complete-set path recorded exactly that
+    understated number, so every locked pair was flattered by its own fees
+    while the single-leg path added them back. One helper, both paths.
+
+    The exchange's own total wins when present; otherwise the fee reported on
+    the fill is added explicitly, and a response that reports neither is
+    reconstructed from the confirmed quantity.
+    """
+    unit = config.CURRENCY_BASE_MULTIPLIER
+    try:
+        fee = float(order.get("fee") or 0.0)
+    except (TypeError, ValueError):
+        fee = 0.0
+    total_cost = order.get("totalCost")
+    if total_cost is not None:
+        try:
+            return max(0.0, float(total_cost))
+        except (TypeError, ValueError):
+            pass
+    share_cost = order.get("costOfShares") or order.get("cost")
+    if share_cost is not None:
+        try:
+            return max(0.0, float(share_cost) + fee)
+        except (TypeError, ValueError):
+            pass
+    return max(0.0, float(shares) * float(fill_price) * unit + fee)
+
+
+def _balanced_pair_amounts(legs, amount: float, *, min_order: float = 0.0,
+                           fee_rate: float = 0.0, is_maker: bool = False):
+    """Per-leg stakes that buy the SAME number of shares on every leg.
+
+    A set settles on ``min(shares_yes, shares_no)``, so a locked spread needs
+    equal quantities on both legs. Spending the same naira amount on a 0.46
+    leg and a 0.50 leg buys more shares of the cheaper side; the excess is an
+    unhedged directional position that the strategy's sizing, its exemption
+    from performance shrinkage and the pair accounting never charged for. The
+    most expensive leg therefore sets the share count, and the cheaper leg
+    spends less than its ceiling rather than over-buying.
+
+    The stakes are apportioned by the *fee-inclusive* price, because a taker's
+    fee is taken out of the shares received: ``eff = price / (1 - fee)`` and
+    ``shares = amount / (eff * multiplier)``. For a maker (no fee) the two
+    prices are the same number.
+
+    Each leg's order must still clear the exchange's per-order minimum, so a
+    set that cannot be balanced inside the pair's two-leg budget raises the
+    whole set to the smallest size that clears it, and returns ``None`` when
+    even that cannot be afforded. ``None`` means "do not send either leg".
+    """
+    if len(legs) < 2 or amount <= 0:
+        return [amount] * len(legs)
+    effs = [
+        max(booklib.effective_buy_price(
+            float(getattr(leg, "price", 0.0) or 0.0), fee_rate, is_maker=is_maker
+        ), 1e-9)
+        for leg in legs
+    ]
+    eff_max, eff_min = max(effs), min(effs)
+
+    shares = amount / eff_max
+    if min_order > 0 and shares * eff_min < min_order:
+        shares = min_order / eff_min
+    amounts = [shares * eff for eff in effs]
+
+    # The pair's own ceiling is one per-leg budget for each leg: a balanced
+    # set may never cost more than two single-leg budgets, and every leg must
+    # clear the per-order minimum on its own or the exchange rejects it.
+    if sum(amounts) > 2.0 * amount + 1e-6:
+        return None
+    if min_order > 0 and min(amounts) < min_order - 1e-6:
+        return None
+    return amounts
+
+
 @dataclasses.dataclass(frozen=True)
 class _Sizing:
     """How much one signal is allowed to commit, and why that is the cap.
@@ -538,6 +619,79 @@ async def _execute_logic(
             )
             return
 
+    # ── Final size ─────────────────────────────────────────────────────────
+    # Sizing is closed here, before any budget is checked, so that everything
+    # downstream bounds the size that will actually be sent.
+    #
+    # The exchange remembers a market's true minimum from a rejected order; a
+    # size under it is bumped up, and one that would need more than the
+    # account allows is not sent at all.
+    cached_min = _market_min_cache.get(sig.market_id, 0.0)
+    if cached_min > 0 and amount < cached_min:
+        if cached_min <= hard_cap:
+            log.info(
+                f"[{chat_id}] BUMP {sig.strategy} {sig.asset} order ₦{amount:,.0f} → "
+                f"₦{cached_min:,.0f} (Bayse market minimum)"
+            )
+            amount = cached_min
+        else:
+            _stall_skip(chat_id, sig, "market_minimum_exceeds_budget",
+                        f"market min ₦{cached_min:,.0f} > max_trade ₦{max_t:,.0f} / free_cash ₦{free_cash:,.0f}")
+            log.info(
+                f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — market min ₦{cached_min:,.0f} "
+                f"exceeds max_trade(₦{max_t:,.0f}) or free_cash(₦{free_cash:,.0f})"
+            )
+            _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+            return
+
+    # Both multi-leg paths need equal share counts -- a set settles on
+    # min(shares_yes, shares_no) -- so their per-leg stakes are derived here,
+    # and the exposure ceiling is checked against what the whole decision
+    # commits rather than one leg of it.
+    min_order = max(effective_min, cached_min)
+    if len(legs) > 1:
+        # `fee_rate` is only known below (it is resolved with the engine), but
+        # the taker fee is a property of the market and is needed here to
+        # apportion the stakes by what a share actually costs. Resolve it now;
+        # the later read is the same cached value.
+        leg_amounts = _balanced_pair_amounts(
+            legs, amount, min_order=min_order,
+            fee_rate=_get_market_fee(sig.market_id), is_maker=is_maker,
+        )
+        if leg_amounts is None:
+            _stall_skip(
+                chat_id, sig, "pair_below_order_minimum",
+                f"no balanced set fits ₦{amount:,.0f}/leg above ₦{min_order:,.0f}/order "
+                f"at {[round(float(leg.price), 3) for leg in legs]}",
+            )
+            log.info(
+                f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — a balanced "
+                f"(equal-share) set needs more than ₦{2 * amount:,.0f} to clear "
+                f"the ₦{min_order:,.0f} per-order minimum on every leg"
+            )
+            return
+    else:
+        leg_amounts = [amount]
+    committed = sum(leg_amounts)
+
+    # A resting MAKER quote is not filled exposure (risk.deployed_filled) and
+    # is charged at the per-leg budget against the directional ceiling, with
+    # its own maker budget below. A TAKER complete set is two immediate FAK
+    # orders: its capital becomes a position at once, so it is charged in full.
+    exposure_amount = amount if is_maker else committed
+    if not risk.can_trade(equity, exposure_amount, max_exp):
+        _stall_skip(
+            chat_id, sig, "exposure_cap",
+            f"filled ₦{risk.deployed_filled():,.0f} + ₦{exposure_amount:,.0f} > "
+            f"{max_exp:.0%} of ₦{equity:,.0f}",
+        )
+        log.info(
+            f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — exposure cap "
+            f"(filled=₦{risk.deployed_filled():,.0f}, +₦{exposure_amount:,.0f} > "
+            f"{max_exp:.0%} of ₦{equity:,.0f})"
+        )
+        return
+
     # ── Engine detection ───────────────────────────────────────────────────
     market   = next((m for m in active_markets if m["market_id"] == sig.market_id), None)
     declared = market.get("engine") if market else None
@@ -664,7 +818,11 @@ async def _execute_logic(
             worst_case_p, fee_rate
         )
         ev = sig.win_prob / effective_worst_p - 1.0
-        if not is_probe and ev < target_margin:
+        # No "probe" exemption here: a signal below its own conviction floor
+        # returned above, so by this point every arrival has cleared it. The
+        # exemption the old code implied (`not is_probe`) could never be False
+        # and only made the gate look conditional when it was not.
+        if ev < target_margin:
             _stall_skip(chat_id, sig, "worst_case_ev_below_margin", f"{ev:+.1%} < {target_margin:.0%}")
             log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — worst-case EV {ev:+.1%} < {target_margin:.0%} (worst_price={worst_case_p:.3f})")
             return
@@ -726,18 +884,44 @@ async def _execute_logic(
             for p in risk.open_positions.values()
             if p.get("strategy") == "MAKER"
         )
-        if maker_notional + amount > equity * config.MAX_MAKER_NOTIONAL_PCT:
+        # `committed` is every leg of this decision, not one leg of it: a
+        # two-sided quote reserves twice the per-leg budget, and a budget that
+        # counts one leg lets the maker book hold twice its own ceiling.
+        if maker_notional + committed > equity * config.MAX_MAKER_NOTIONAL_PCT:
             _stall_skip(
                 chat_id, sig, "maker_notional_cap",
-                f"₦{maker_notional:,.0f} + ₦{amount:,.0f} > "
+                f"₦{maker_notional:,.0f} + ₦{committed:,.0f} > "
                 f"{config.MAX_MAKER_NOTIONAL_PCT:.0%} of ₦{equity:,.0f}",
             )
             log.info(
                 f"[{chat_id}] SKIP MAKER {sig.asset} — maker notional "
-                f"₦{maker_notional:,.0f} + ₦{amount:,.0f} exceeds the "
+                f"₦{maker_notional:,.0f} + ₦{committed:,.0f} exceeds the "
                 f"{config.MAX_MAKER_NOTIONAL_PCT:.0%} budget"
             )
             return
+
+        # A one-sided quote is directional risk with none of the pair's
+        # guarantee, and it gets its own, tighter ceiling. The knob existed and
+        # was validated at startup, but nothing read it, so the only limit on a
+        # one-sided quote was the whole maker budget. `_single_leg` is enabled
+        # by default, so that path is reachable on any market whose other side
+        # is priced through the model's ceiling -- which, on an
+        # arbitrage-free book, is most of them.
+        if len(legs) < 2:
+            unpaired = risk.maker_unpaired_notional()
+            if unpaired + amount > equity * config.MAX_MAKER_UNPAIRED_PCT:
+                _stall_skip(
+                    chat_id, sig, "maker_unpaired_cap",
+                    f"₦{unpaired:,.0f} + ₦{amount:,.0f} > "
+                    f"{config.MAX_MAKER_UNPAIRED_PCT:.0%} of ₦{equity:,.0f}",
+                )
+                log.info(
+                    f"[{chat_id}] SKIP MAKER {sig.asset} — one-sided quote would put "
+                    f"₦{unpaired + amount:,.0f} of the ₦{equity:,.0f} account into "
+                    f"unhedged maker risk (cap "
+                    f"{config.MAX_MAKER_UNPAIRED_PCT:.0%})"
+                )
+                return
 
     # ── Correlated crypto exposure cap ─────────────────────────────────────
     if risk.has_correlated_open_position(sig.asset, sig.outcome, sig.timeframe, certainty=sig.certainty, strategy=sig.strategy):
@@ -748,25 +932,6 @@ async def _execute_logic(
             f"correlated crypto position already open in same direction on {sig.timeframe} (certainty={sig.certainty:.2f} < 0.65)"
         )
         return
-
-    # ── Market-specific minimum ───────────────────────────────────────────
-    cached_min = _market_min_cache.get(sig.market_id, 0.0)
-    if cached_min > 0 and amount < cached_min:
-        if cached_min <= hard_cap:
-            log.info(
-                f"[{chat_id}] BUMP {sig.strategy} {sig.asset} order ₦{amount:,.0f} → "
-                f"₦{cached_min:,.0f} (Bayse market minimum)"
-            )
-            amount = cached_min
-        else:
-            _stall_skip(chat_id, sig, "market_minimum_exceeds_budget",
-                        f"market min ₦{cached_min:,.0f} > max_trade ₦{max_t:,.0f} / free_cash ₦{free_cash:,.0f}")
-            log.info(
-                f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — market min ₦{cached_min:,.0f} "
-                f"exceeds max_trade(₦{max_t:,.0f}) or free_cash(₦{free_cash:,.0f})"
-            )
-            _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
-            return
 
     # ── Strict Price-Capped Execution ─────────────────────────────────────
     # MAKER places passive LIMIT GTC orders to capture the spread; TAKER uses
@@ -854,6 +1019,21 @@ async def _execute_logic(
         legs = repriced
 
         if len(legs) > 1:
+            # The stakes were apportioned from the prices the strategy sent;
+            # the quote is about to go out at the re-priced ones. Rebalance on
+            # the legs actually being sent, or the equal-share property the
+            # lock depends on is only approximate.
+            rebalanced = _balanced_pair_amounts(
+                legs, amount, min_order=min_order, fee_rate=fee_rate, is_maker=True,
+            )
+            if rebalanced is None:
+                _stall_skip(chat_id, sig, "pair_below_order_minimum",
+                            f"re-priced legs cannot clear ₦{min_order:,.0f}/order "
+                            f"inside ₦{2 * amount:,.0f}")
+                _trade_cooldown[cooldown_key] = time.time()
+                return
+            leg_amounts = rebalanced
+
             lock = 1.0 - sum(float(leg.price) for leg in legs)
             if lock < config.MAKER_PAIR_MIN_EDGE:
                 prices = "/".join(f"{leg.outcome}@{leg.price:.3f}" for leg in legs)
@@ -953,14 +1133,18 @@ async def _execute_logic(
             )
 
             # ── Depth-Aware Sizing (Zero-Fill Eliminator) ─────────────────────
+            # Notional comes from the share count and the documented
+            # ``price * base multiplier`` cost, not from the book's ``total``
+            # field: ``total`` carries no unit in the payload, and taking an
+            # unscaled one as naira understates NGN depth by the 100x base
+            # multiplier -- real liquidity then looks like no liquidity.
             avail_ngn = 0.0
-            for ask_entry in asks:
+            for ask_entry in sorted(
+                asks, key=lambda level: float(level.get("price") or 0.0)
+            ):
                 ask_p = float(ask_entry.get("price", 0))
                 if ask_p <= limit_price:
-                    tot = float(ask_entry.get("total") or 0.0)
-                    if tot <= 0:
-                        tot = float(ask_entry.get("quantity", 0)) * ask_p * (100.0 if CURRENCY == "NGN" else 1.0)
-                    avail_ngn += tot
+                    avail_ngn += booklib.level_notional(ask_entry)
                 else:
                     break
 
@@ -1003,7 +1187,7 @@ async def _execute_logic(
     # through the single-order path below.
     if len(legs) > 1 and not is_maker:
         return await _place_complete_set_take(
-            chat_id, sig, client, risk, settings, legs, amount,
+            chat_id, sig, client, risk, settings, legs, leg_amounts,
             market=market, fee_rate=fee_rate, slippage=slippage,
             max_valid=max_valid,
         )
@@ -1014,7 +1198,7 @@ async def _execute_logic(
     # quote is none of those.
     if is_maker:
         return await _place_maker_quote(
-            chat_id, sig, client, risk, settings, legs, amount,
+            chat_id, sig, client, risk, settings, legs, leg_amounts,
             market=market, equity=equity, max_exp=max_exp,
         )
 
@@ -1105,20 +1289,10 @@ async def _execute_logic(
                     _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
                     return
 
-        fee_paid = float(order.get("fee") or 0.0)
-        total_cost = order.get("totalCost")
-        share_cost = order.get("costOfShares") or order.get("cost")
-        if total_cost is not None:
-            actual_ngn = float(total_cost)
-        elif share_cost is not None:
-            actual_ngn = float(share_cost) + fee_paid
-        else:
-            # `amount` is the requested budget and can exceed the cost of a
-            # partial FAK fill. Reconstruct cost only from confirmed shares.
-            actual_ngn = (
-                shares_filled * filled_price * config.CURRENCY_BASE_MULTIPLIER
-                + fee_paid
-            )
+        # `amount` is the requested budget and can exceed the cost of a
+        # partial FAK fill, so the debit is rebuilt from confirmed shares and
+        # the fee the exchange reported for this fill.
+        actual_ngn = _order_actual_cost(order, shares_filled, filled_price)
 
         spot_vs_thresh = 0.0
         if market and market.get("threshold") and feeds.spot.get(sig.asset):
@@ -1246,7 +1420,7 @@ async def _execute_logic(
 
 async def _place_maker_quote(
     chat_id: str, sig, client, risk, settings: dict,
-    legs: list, amount: float, *, market: dict | None, equity: float,
+    legs: list, leg_amounts: list, *, market: dict | None, equity: float,
     max_exp: float,
 ) -> None:
     """Place both legs of a two-sided MAKER quote and track them as one quote.
@@ -1265,12 +1439,18 @@ async def _place_maker_quote(
     """
     placed: list[dict] = []
 
-    for leg in legs:
+    for index, leg in enumerate(legs):
+        # Each leg's own stake. A two-sided set must buy the SAME number of
+        # shares on both sides, or the "lock" covers only the smaller quantity
+        # and the remainder is an unhedged directional position -- which is
+        # what paying the same naira for a cheaper side used to do (see
+        # `_balanced_pair_amounts`).
+        leg_amount = float(leg_amounts[index]) if index < len(leg_amounts) else float(leg_amounts[-1])
         try:
             resp = await client.place_order(
                 event_id=sig.event_id, market_id=sig.market_id,
                 outcome_id=leg.outcome_id, side="BUY",
-                amount=amount, order_type="LIMIT",
+                amount=leg_amount, order_type="LIMIT",
                 price=leg.price, currency=CURRENCY,
                 time_in_force="GTC", post_only=True,
                 stp_mode="CANCEL_OLDEST",
@@ -1301,12 +1481,12 @@ async def _place_maker_quote(
             "outcome_id": leg.outcome_id,
             "order_id":   order_id,
             "price":      float(leg.price),
-            "amount":     float(amount),
+            "amount":     leg_amount,
             "filled":     filled,
         })
         log.info(
             f"[{chat_id}] MAKER LEG PLACED | {sig.asset} {leg.outcome} "
-            f"@ {leg.price:.3f} ₦{amount:,.0f} | order={order_id}"
+            f"@ {leg.price:.3f} ₦{leg_amount:,.0f} | order={order_id}"
         )
 
     # Track the quote as a unit so requote and cancel always act on both legs.
@@ -1508,7 +1688,9 @@ async def _place_complete_set_take(
             return
 
         fill_price = float(order.get("avgFillPrice") or order.get("price") or cap)
-        cost = shares * fill_price * config.CURRENCY_BASE_MULTIPLIER
+        # Fee-inclusive: a BUY fill's fee is taken out of the shares received,
+        # so `shares * fill_price` is not what the wallet paid for them.
+        cost = _order_actual_cost(order, shares, fill_price)
         placed.append({
             "outcome":    leg.outcome,
             "outcome_id": leg.outcome_id,

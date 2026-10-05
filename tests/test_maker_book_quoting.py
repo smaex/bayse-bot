@@ -429,3 +429,46 @@ def test_a_complete_set_lock_is_always_allowed():
     risk = RiskManager()
     _open(risk, "m:YES:maker-1", strategy="MAKER", outcome="YES", confirmed_filled=False)
     assert risk.already_in("m", strategy="TAKER", outcome="BOTH") is False
+
+
+def test_a_two_leg_quote_is_placed_with_equal_share_counts(maker_env):
+    """A set settles on min(shares_yes, shares_no).
+
+    Placing the same *naira* amount on both legs bought more shares of the
+    cheaper side, so the "locked" part covered only the smaller quantity and
+    the remainder was unhedged directional risk that the strategy's sizing and
+    its exemption from directional shrinkage never charged for. Each leg now
+    gets the stake that buys the same number of shares, on the prices actually
+    sent (the executor re-prices both legs off one fresh book first).
+    """
+    from strategies.base import QuoteLeg
+
+    client = _MakerClient({
+        "yes": _book(bids=[0.46], asks=[0.52]),
+        "no": _book(bids=[0.50], asks=[0.56]),
+    })
+    client.books["no"] = {"marketId": "m", "outcomeId": "no", "timestamp": time.time(),
+                          "bids": [{"price": 0.50, "quantity": 500, "total": 250.0}],
+                          "asks": [{"price": 0.56, "quantity": 500, "total": 280.0}]}
+    signal = _maker_signal(
+        market_price=0.46, outcome="BOTH", certainty=0.60, win_prob=0.55,
+        legs=[QuoteLeg("YES", "yes", 0.46, 0.02, 0.55),
+              QuoteLeg("NO", "no", 0.50, 0.02, 0.45)],
+    )
+    risk = _run(maker_env, signal, client)
+
+    assert len(client.place_calls) == 2, client.place_calls
+    stakes = [call["amount"] for call in client.place_calls]
+    prices = [call["price"] for call in client.place_calls]
+    shares = [
+        stake / (price * config.CURRENCY_BASE_MULTIPLIER)
+        for stake, price in zip(stakes, prices)
+    ]
+    assert shares[0] == pytest.approx(shares[1], rel=1e-6), (
+        f"legs bought {shares[0]:.4f} vs {shares[1]:.4f} shares: the pair is "
+        "not locked on the full quantity"
+    )
+    # Both legs are resting orders in the risk book, keyed per leg.
+    assert len(risk.open_positions) == 2
+    assert all(p["amount_ngn"] == pytest.approx(stake)
+               for p, stake in zip(risk.open_positions.values(), stakes))

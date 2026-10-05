@@ -154,7 +154,10 @@ def _advance_trading_day(chat_id: str, balance: float, settings: dict) -> tuple[
 
     old_target_hit = bool(ds.get("target_hit", False))
     previous_date = ds.get("date") or "the previous session"
-    ds = {"date": today, "start_balance": balance, "target_hit": False}
+    # `pnl_baseline` is what an explicit /resume excludes from the day's
+    # target and loss-limit arithmetic. A fresh day has nothing to exclude.
+    ds = {"date": today, "start_balance": balance, "target_hit": False,
+          "pnl_baseline": 0.0}
     settings["daily_state"] = ds
     _user_daily[chat_id] = ds
 
@@ -205,6 +208,142 @@ def _daily(chat_id: str, balance: float, settings: dict) -> dict:
     return ds
 
 
+def reset_session_restrictions(chat_id: str, reason: str = "manual_resume") -> dict:
+    """Apply an explicit operator resume: lift this session's stops for real.
+
+    ``/resume`` used to clear only ``settings["paused"]``, the in-memory
+    ``risk.paused`` flag and the cached day record. Every gate it was supposed
+    to override is *recomputed from the database on the next cycle*:
+
+      * the daily loss stop compares today's realised PnL with a limit derived
+        from ``day["start_balance"]``;
+      * the daily target compares it with ``daily_multiplier`` of the same
+        baseline, and ``risk.target_hit`` (which blocks evaluation outright)
+        is set from that comparison;
+      * the drawdown stop compares equity with ``risk.peak_balance``.
+
+    So the account was paused again one cycle later, with a fresh Telegram
+    message saying the loss limit had been reached -- the operator's override
+    was silently discarded, and the bot looked broken. The stall report even
+    promises the opposite: "wait for the trading-day rollover, or /resume to
+    override {reason} explicitly".
+
+    An override therefore has to move the *baseline* the stops measure
+    against, which is what this does:
+
+      * ``start_balance`` becomes the current equity, so the daily loss limit
+        (and the daily target) are measured from the resume point;
+      * ``pnl_baseline`` records today's already-realised PnL, so the profit
+        that was booked before the override cannot re-trip the same stop;
+      * ``target_hit`` and the in-memory counters are cleared so
+        ``risk.target_hit`` stops blocking evaluation;
+      * per-market trade cooldowns are dropped, since the operator has just
+        said "trade this account";
+      * a persisted learner strategy suspension is dropped, because that key
+        removes strategies from the scope entirely and the operator overriding
+        the stops means "trade this account", not "trade nothing".
+
+    Deliberately *not* cleared: the learned size/certainty multipliers (they
+    are evidence, not a stop -- /resetlearning is the command that forgets
+    evidence), ``risk.pending_markets`` (a lock held in a ``finally``, so a
+    resume cannot leak it), the exchange-minimum cache (it is exchange fact)
+    and ``global_state.systemic_halt_until`` (process-wide, so one account's
+    resume must never lift a market-wide halt).
+
+    The result is a *fresh* risk budget, not an unlimited one: the same
+    ``daily_loss_limit_pct`` and ``MAX_DAILY_LOSS_LIMIT_PCT`` bounds apply from
+    the new baseline. Returns a summary for the operator.
+    """
+    today = _session_date()
+    risk = _user_risks.get(chat_id)
+    equity = 0.0
+    if risk is not None:
+        try:
+            equity = max(0.0, float(risk.current_free_cash) + float(risk.deployed()))
+        except (TypeError, ValueError):
+            equity = 0.0
+
+    user = database.get_user(chat_id, force_fresh=True)
+    if not user:
+        log.warning(f"[{chat_id}] session reset requested for an unknown user")
+        return {"equity": 0.0, "booked_pnl": 0.0, "cleared_cooldowns": 0}
+    settings = dict(user.get("settings") or {})
+
+    booked_pnl = 0.0
+    try:
+        booked_pnl = float(
+            database.get_daily_resolved_pnl(chat_id, today, config.TRADING_TIMEZONE)
+        )
+    except Exception as err:
+        log.warning(f"[{chat_id}] session reset could not read today's realised PnL: {err}")
+
+    day = {
+        "date": today,
+        "start_balance": equity,
+        "target_hit": False,
+        "pnl_baseline": booked_pnl,
+    }
+    settings["daily_state"] = day
+    settings["paused"] = False
+    settings.pop("paused_reason", None)
+    settings.pop("daily_loss_stopped_at", None)
+    settings["session_reset_at"] = datetime.now(timezone.utc).isoformat()
+    settings["session_reset_reason"] = reason
+    _user_daily[chat_id] = day
+
+    # A persisted strategy suspension removes strategies from the account's
+    # scope before any market is evaluated (`no_enabled_strategies` when it
+    # removes the last one), so an explicit resume must lift it. Nothing in
+    # this codebase writes the key today; it is read from whatever an earlier
+    # release stored in the user's settings, where it would otherwise block
+    # trading forever with no Telegram command that clears it.
+    cleared_suspensions: list[str] = []
+    try:
+        raw_learned = settings.get("learned")
+        if isinstance(raw_learned, dict) and raw_learned.get("suspended_strategies"):
+            learned = dict(raw_learned)
+            cleared_suspensions = list(learned.pop("suspended_strategies") or [])
+            settings["learned"] = learned
+    except Exception as suspension_err:
+        log.debug(f"[{chat_id}] suspension clear skipped: {suspension_err}")
+
+    if risk is not None:
+        risk.paused = False
+        risk.peak_balance = equity
+        risk._dd_breach_since = 0.0
+        risk.daily_realized_pnl = 0.0
+        risk.daily_target = 0.0
+        risk.last_reset_date = today
+
+    cleared_cooldowns = 0
+    try:
+        stale_keys = [key for key in list(executor._trade_cooldown) if key and key[0] == chat_id]
+        for key in stale_keys:
+            executor._trade_cooldown.pop(key, None)
+        cleared_cooldowns = len(stale_keys)
+    except Exception as cooldown_err:
+        log.debug(f"[{chat_id}] cooldown clear skipped: {cooldown_err}")
+
+    try:
+        database.update_settings(chat_id, settings)
+        database.invalidate_user_cache(chat_id)
+    except Exception as err:
+        log.error(f"[{chat_id}] session reset could not be persisted: {err}", exc_info=True)
+
+    log.warning(
+        f"[{chat_id}] SESSION RESET ({reason}) — baseline ₦{equity:,.0f}, "
+        f"today's PnL before the override ₦{booked_pnl:+,.0f} excluded, "
+        f"{cleared_cooldowns} cooldown(s) cleared, "
+        f"{len(cleared_suspensions)} suspension(s) cleared; stops now measure from now"
+    )
+    return {
+        "equity": equity,
+        "booked_pnl": booked_pnl,
+        "cleared_cooldowns": cleared_cooldowns,
+        "cleared_suspensions": cleared_suspensions,
+    }
+
+
 async def _roll_trading_day(chat_id: str, equity: float, settings: dict) -> None:
     """Advance the trading day and tell the operator if entries just re-opened."""
     _, resumed = _advance_trading_day(chat_id, equity, settings)
@@ -220,6 +359,22 @@ async def _roll_trading_day(chat_id: str, equity: float, settings: dict) -> None
             "Risk limits, scope and monitoring are unchanged; this is only the daily stop expiring.",
             parse_mode="Markdown",
         )
+
+
+def _session_pnl_for_day(profit: float, day: dict) -> float:
+    """Today's realised PnL measured from the session's own baseline.
+
+    ``pnl_baseline`` is what an explicit /resume records (see
+    ``reset_session_restrictions``): the result already booked when the
+    operator overrode the stop. Subtracting it is what makes the override
+    hold. Without a resume the baseline is ``0.0``, so this is the plain daily
+    PnL the stops have always used.
+    """
+    try:
+        baseline = float((day or {}).get("pnl_baseline") or 0.0)
+    except (TypeError, ValueError):
+        baseline = 0.0
+    return float(profit) - baseline
 
 
 def _daily_target(settings: dict, start: float) -> float:
@@ -538,6 +693,14 @@ async def _user_loop(chat_id: str):
             database.get_daily_resolved_pnl,
             chat_id, session_date, config.TRADING_TIMEZONE,
         )
+        # Everything already realised before an explicit /resume belongs to a
+        # baseline the operator has overridden (see
+        # `reset_session_restrictions`). Both the loss stop and the target are
+        # therefore measured on PnL *since the session reset*, which is what
+        # makes the override hold instead of being recomputed away one cycle
+        # later. It is 0.0 on a normal day, so this is a no-op without a
+        # manual resume.
+        session_profit = _session_pnl_for_day(profit, day)
         target = _daily_target(settings, day["start_balance"])
 
         # Sync ground-truth values onto risk so is_in_strict_mode() actually
@@ -545,7 +708,10 @@ async def _user_loop(chat_id: str):
         # it stayed at its 0.0 default permanently, silently disabling the
         # "tighten up near daily target" safety check with no error at all.
         risk.daily_target       = target
-        risk.daily_realized_pnl = profit
+        # The in-memory risk manager and the persisted stops must measure the
+        # same quantity, or `risk.target_hit`/`is_in_strict_mode` disagree with
+        # the messages the user receives.
+        risk.daily_realized_pnl = session_profit
         risk.last_reset_date    = session_date
 
         daily_loss_pct = min(
@@ -553,36 +719,38 @@ async def _user_loop(chat_id: str):
             config.MAX_DAILY_LOSS_LIMIT_PCT,
         )
         daily_loss_limit = day["start_balance"] * daily_loss_pct / 100.0
-        if profit <= -daily_loss_limit:
+        if session_profit <= -daily_loss_limit:
             settings["paused"] = True
             settings["paused_reason"] = "daily_loss_limit"
             risk.paused = True
             await asyncio.to_thread(database.update_settings, chat_id, settings)
             log.warning(
-                f"[{chat_id}] DAILY LOSS STOP ₦{profit:+,.0f} <= -₦{daily_loss_limit:,.0f}"
+                f"[{chat_id}] DAILY LOSS STOP ₦{session_profit:+,.0f} <= "
+                f"-₦{daily_loss_limit:,.0f} (baseline ₦{day['start_balance']:,.0f})"
             )
             app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
             if app_to_use:
                 await telegram_bot.send_message(
                     app_to_use, chat_id,
-                    f"🛑 *Daily loss limit reached* — ₦{profit:+,.0f}. "
-                    "New entries are paused; open positions remain monitored.",
+                    f"🛑 *Daily loss limit reached* — ₦{session_profit:+,.0f}. "
+                    "New entries are paused; open positions remain monitored.\n"
+                    "/resume restarts the session from the current balance.",
                     parse_mode="Markdown",
                 )
             continue
 
-        if target > 0 and profit >= target and not day["target_hit"]:
+        if target > 0 and session_profit >= target and not day["target_hit"]:
             day["target_hit"] = True
             settings["daily_state"] = day
             settings["paused"]       = True
             settings["paused_reason"] = "daily_target"
             await asyncio.to_thread(database.update_settings, chat_id, settings)
-            log.info(f"[{chat_id}] DAILY TARGET HIT ₦{profit:+,.0f} — trading paused")
+            log.info(f"[{chat_id}] DAILY TARGET HIT ₦{session_profit:+,.0f} — trading paused")
             app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
             if app_to_use:
                 await telegram_bot.send_message(
                     app_to_use, chat_id,
-                    f"🎯 *Daily target reached!* ₦{profit:+,.0f}\n/resume to override.",
+                    f"🎯 *Daily target reached!* ₦{session_profit:+,.0f}\n/resume to override.",
                     parse_mode="Markdown",
                 )
             continue
@@ -792,22 +960,48 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
 
 
 def _paired_leg(risk, position_key: str, market_id: str):
-    """The sibling leg of a two-sided quote, if it has also filled."""
+    """The sibling leg of a complete set, if it has also filled.
+
+    The property that matters is not the strategy name: two *opposite* outcomes
+    of the same market, both held, together pay 1.00 whichever resolves. That
+    is a MAKER pair resting under the book and it is equally a complete-set
+    TAKER, which is two immediate FAK fills and never passes through the maker
+    fill path. Requiring ``strategy == "MAKER"`` here is what left a taker set
+    to be managed -- and sold -- as two independent directional bets.
+
+    Quantities must match, because only the overlap is a set: ``_burn_complete_set``
+    burns ``min(shares)`` and then drops both entries from the risk book, so an
+    imbalanced pair would leave the excess shares untracked. A pair that does
+    not match is left alone; the overlap still settles to 1.00, nothing is
+    lost, and the larger leg is managed as the directional position it is.
+    """
     this = risk.open_positions.get(position_key)
     if not this or not this.get("confirmed_filled"):
         return None
+    this_qty = float(this.get("filled_quantity") or this.get("shares") or 0.0)
+    if this_qty <= 0:
+        return None
+    family = str(this.get("strategy") or "").upper()
     for key, other in risk.open_positions.items():
         if key == position_key:
             continue
         if (other.get("market_id") or key) != market_id:
             continue
-        if str(other.get("strategy") or "").upper() != "MAKER":
+        if str(other.get("strategy") or "").upper() != family:
             continue
         if not other.get("confirmed_filled"):
             continue
         if str(other.get("outcome", "")).upper() == str(this.get("outcome", "")).upper():
             continue
-        if float(other.get("filled_quantity") or 0.0) <= 0:
+        other_qty = float(other.get("filled_quantity") or other.get("shares") or 0.0)
+        if other_qty <= 0:
+            continue
+        if abs(other_qty - this_qty) > max(0.5, 0.005 * max(other_qty, this_qty)):
+            log.warning(
+                f"[{position_key}] complete set on {market_id} is unbalanced "
+                f"({this_qty:.2f} vs {other_qty:.2f} shares) — not burning it; "
+                f"burns settle the overlap and would leave the excess untracked"
+            )
             continue
         return key, other
     return None
@@ -1053,6 +1247,7 @@ def _exit_decision(
     fee_rate: float,
     is_maker_pos: bool,
     confirmed_filled: bool,
+    complete_set: bool = False,
 ) -> dict | None:
     """Decide whether one position should be exited, and why.
 
@@ -1072,8 +1267,11 @@ def _exit_decision(
 
     # A complete set pays 1.00 whichever outcome resolves. There is no thesis
     # to invalidate and nothing for a stop to protect: the only correct action
-    # is to burn the set and realise the lock.
-    if str(outcome).upper() == "BOTH":
+    # is to burn the set and realise the lock. `complete_set` says the caller
+    # found the opposite-outcome sibling already filled in the risk book --
+    # that is how a two-leg set is recognised at exit time, since its legs are
+    # stored as ordinary YES/NO positions.
+    if str(outcome).upper() == "BOTH" or complete_set:
         return {"reason": "BURN_COMPLETE_SET", "current_price": 1.0, "ev_hold": 0.0}
 
     current_price = float(bid)
@@ -1265,6 +1463,10 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
 
         pos["peak_price"] = max(pos.get("peak_price", entry_price), float(bid))
 
+        # Both legs of a complete set are held: the set pays 1.00 whatever
+        # happens, so it must be burned rather than stopped or sold. A taker
+        # complete set (two immediate FAK legs) is only ever seen here.
+        paired = _paired_leg(risk, position_key, market_id)
         decision = _exit_decision(
             outcome=outcome,
             w_est=w_est,
@@ -1275,6 +1477,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             fee_rate=float((market or {}).get("fee_rate") or config.DEFAULT_FEE_RATE),
             is_maker_pos=str(pos.get("strategy") or "").upper() in config.MAKER_STRATEGIES,
             confirmed_filled=bool(pos.get("confirmed_filled")),
+            complete_set=paired is not None,
         )
         if decision is None:
             continue
