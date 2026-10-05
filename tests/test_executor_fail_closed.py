@@ -205,6 +205,63 @@ def _run_clob(signal, client):
     ))
 
 
+class RecordingBookClient(BookClient):
+    """A tradable book, so a depth decision can be observed end to end."""
+
+    def __init__(self, asks, timestamp=None):
+        super().__init__(asks, timestamp)
+        self.placed = []
+
+    async def place_order(self, **kwargs):
+        self.placed.append(kwargs)
+        return {"order": {
+            "id": "o1", "status": "filled", "quantity": 100.0,
+            "avgFillPrice": kwargs.get("price") or 0.5,
+            "amount": kwargs.get("amount"),
+        }}
+
+    def parse_filled_shares(self, order):
+        return float(order.get("quantity") or 0.0)
+
+
+def test_clob_depth_is_measured_in_account_currency_not_raw_total(monkeypatch):
+    """`quantity` is shares; `total` carries no unit in the payload.
+
+    One share costs ``price * CURRENCY_BASE_MULTIPLIER`` (documented: ₦100 per
+    share at 1.00), so 3 shares at 0.50 is ₦150 of depth -- not the level's
+    unscaled ``total`` of 1.5. Reading that as naira turned a fundable market
+    into a false "insufficient resting depth" skip (₦1.50 < ₦100 minimum), and
+    on deeper books it clipped a sized order to a hundredth of the liquidity
+    that was actually there. The share count is the unambiguous number.
+    """
+    _install_clob(monkeypatch)
+    executor._market_min_cache.pop("m", None)
+    monkeypatch.setattr(executor.database, "record_trade", lambda **_kwargs: 1)
+    client = RecordingBookClient([
+        {"price": 0.50, "quantity": 3.0, "total": 1.5},
+    ])
+
+    # equity 20,000 at 1% -> ₦200 desired; ₦150 available -> clip to 142.5.
+    _run_clob(_clob_signal(win_prob=0.75, market_price=0.50), client)
+
+    assert client.placed, "a ₦150 book must be tradable at a ₦100 minimum"
+    assert client.placed[0]["amount"] == pytest.approx(142.5), (
+        "the clip must be 95% of the real NGN depth, not of an unscaled total"
+    )
+
+
+def test_level_notional_prefers_shares_and_falls_back_to_total():
+    from strategies.book import level_notional
+
+    # Shares are unambiguous and priced with the account currency's multiplier.
+    assert level_notional({"price": 0.50, "quantity": 3.0, "total": 1.5}) == 150.0
+    # No share count: the exchange's own notional is the only number left.
+    assert level_notional({"price": 0.50, "total": 150.0}) == 150.0
+    # Tuple levels and junk are handled without raising.
+    assert level_notional((0.50, 3.0)) == 150.0
+    assert level_notional({"price": 0.50}) == 0.0
+
+
 def test_clob_book_outage_fails_closed_instead_of_using_midpoint(monkeypatch):
     _install_clob(monkeypatch)
     client = FailingBookClient()

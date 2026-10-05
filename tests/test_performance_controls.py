@@ -22,7 +22,7 @@ from learner import (
     capital_weighted_break_even,
 )
 from strategies import (
-    _LOCKED_STRATEGIES,
+    _is_locked_pair,
     _performance_adjusted_probability,
     _score,
 )
@@ -65,18 +65,49 @@ def test_combo_loss_control_multiplies_strategy_size_control():
     ) == 0.75
 
 
-def test_a_locked_pair_is_exempt_from_directional_shrinkage():
+def test_only_a_two_leg_maker_quote_is_exempt_from_directional_shrinkage():
     """A completed pair has no forecast risk, so shrinking its 'probability'
     toward 50% would be shrinking a number that means nothing.
 
+    Being *called* MAKER is not enough. `MAKER_ALLOW_SINGLE_LEG` is on by
+    default, and a one-sided quote is a passive directional bid: it pays only
+    if the side it bet on wins, exactly like a taker. Exempting the whole
+    strategy family let the learner's evidence against a losing combination
+    pass through untouched on the very signals that carried the risk.
+
     Execution learning (fill rate, adverse selection) still applies to MAKER
-    through the learner's size controls. What it is exempt from is the
-    *directional* shrinkage, which assumes the number being shrunk is a
+    through the learner's size controls. What a locked pair is exempt from is
+    the *directional* shrinkage, which assumes the number being shrunk is a
     prediction.
     """
-    assert "MAKER" in _LOCKED_STRATEGIES
-    assert "TAKER" not in _LOCKED_STRATEGIES, \
-        "a directional taker is exactly what shrinkage is for"
+    def _signal(strategy, legs):
+        return TradeSignal(
+            strategy=strategy, event_id="e", market_id="m", asset="BTC",
+            timeframe="15min", outcome="YES", outcome_id="yes",
+            certainty=0.6, win_prob=0.6, market_price=0.5,
+            size_pct=0.02, reason="t", legs=legs,
+        )
+
+    pair = _signal("MAKER", [
+        QuoteLeg("YES", "yes", 0.47, 0.02, 0.55),
+        QuoteLeg("NO", "no", 0.47, 0.02, 0.45),
+    ])
+    single_leg = _signal("MAKER", [QuoteLeg("YES", "yes", 0.47, 0.02, 0.55)])
+    flat_maker = _signal("MAKER", [])
+    taker = _signal("TAKER", [QuoteLeg("YES", "yes", 0.52, 0.02, 0.60)])
+
+    assert _is_locked_pair(pair), "47c + 47c is a complete set below 1.00"
+    assert not _is_locked_pair(single_leg), \
+        "a one-sided maker quote is a directional bet and must be shrunk"
+    assert not _is_locked_pair(flat_maker), \
+        "a signal with no legs materialises one leg, so it is not a pair"
+    assert not _is_locked_pair(taker)
+
+    # A pair priced at or above 1.00 does not lock and is not exempt either.
+    assert not _is_locked_pair(_signal("MAKER", [
+        QuoteLeg("YES", "yes", 0.55, 0.02, 0.55),
+        QuoteLeg("NO", "no", 0.50, 0.02, 0.45),
+    ]))
 
 
 def test_settled_underperformance_reduces_directional_probability_and_edge():

@@ -324,6 +324,12 @@ class MakerStrategy(BaseStrategy):
             outcome="BOTH",
             outcome_id=market.get("yes_id", ""),
             certainty=min(0.95, max(fv_yes, fv_no)),
+            # A MAKER certainty is the fair value of the side we are quoted on
+            # (a probability, not the rescaled certainty the shared helper
+            # produces), so its floor is expressed as one: the strategy's own
+            # minimum quotable side. The pair lock and the per-leg edge are the
+            # real gates; this only has to agree with them.
+            mode_floor=config.MAKER_MIN_LEG_BID,
             win_prob=max(fv_yes, fv_no),
             market_price=max(bid_yes, bid_no),
             size_pct=size,
@@ -390,6 +396,7 @@ class MakerStrategy(BaseStrategy):
             outcome=outcome,
             outcome_id=outcome_id,
             certainty=min(0.95, fv),
+            mode_floor=config.MAKER_MIN_LEG_BID,
             win_prob=fv,
             market_price=price,
             size_pct=size,

@@ -45,12 +45,12 @@ _strategies = {
     "MAKER": MakerStrategy(),
 }
 
-# A completed pair is direction-independent, so neither of these carries
-# forecast risk on its own. They are still subject to *execution* learning
-# (fill rate, adverse selection) in the learner; what they are exempt from is
-# the directional shrinkage below, which would be meaningless on a locked
-# spread.
-_LOCKED_STRATEGIES = {"MAKER"}
+# A completed pair is direction-independent, so it carries no forecast risk.
+# It is still subject to *execution* learning (fill rate, adverse selection)
+# in the learner; what it is exempt from is the directional shrinkage below,
+# which would be meaningless on a locked spread. Membership of this family is
+# not enough to earn the exemption -- see `_is_locked_pair`: a MAKER signal
+# that is only one leg is a directional bid and is shrunk like any other bet.
 
 
 def _perf_note(name: str, learned: dict, code: str, detail: str = "") -> None:
@@ -93,6 +93,34 @@ def _performance_multiplier(learned: dict, name: str, sig) -> float:
     meta = float(cert_mults.get(name, 1.0) or 1.0)
     combo = float(cert_mults.get(f"{sig.strategy}:{sig.asset}:{sig.timeframe}", 1.0) or 1.0)
     return min(1.0, max(0.0, meta * combo))
+
+
+def _is_locked_pair(sig: TradeSignal) -> bool:
+    """True only for a *complete set*, not a lone bid -- from either strategy.
+
+    Two complementary legs priced so they sum below 1.00 are direction-free:
+    one of the two outcomes must win, so the set pays whatever happens, and its
+    profit is ``1 - (leg_yes + leg_no)`` per set. That is true of a MAKER pair
+    resting under the market and of a TAKER complete set crossing both asks;
+    the strategy name is not part of the property.
+
+    A single-leg quote is not that. A passive one-sided bid pays only if its
+    side wins and carries exactly the forecast risk a taker does -- the only
+    difference is where the order sits in the book. (This is why the name is
+    historical: the *maker* pair was the only complete set that could fire
+    when this was written.)
+    """
+    if not sig.is_multi_leg():
+        return False
+    try:
+        legs = sig.ensure_legs()
+        if len(legs) != 2:
+            return False
+        outcomes = {str(leg.outcome).upper() for leg in legs}
+        capital = sum(float(leg.price) for leg in legs)
+    except (TypeError, ValueError):
+        return False
+    return outcomes == {"YES", "NO"} and 0.0 < capital < 1.0
 
 
 def _score(sig: TradeSignal) -> float:
@@ -155,23 +183,35 @@ async def evaluate_all(
         if sig is None:
             continue
 
-        # Directional shrinkage. Applied to the win probability only: a locked
-        # spread has no forecast to be overconfident about.
-        if name not in _LOCKED_STRATEGIES:
+        # Directional shrinkage. A locked spread has no forecast to be
+        # overconfident about; anything directional -- including a *single-leg*
+        # MAKER quote -- is a probability and is shrunk like one.
+        if not _is_locked_pair(sig):
             mult = _performance_multiplier(learned, name, sig)
             if mult < 1.0:
                 original = sig.win_prob
                 sig.win_prob = _performance_adjusted_probability(original, mult)
                 # The edge has to survive the shrinkage, or the trade does not
                 # happen. Re-derive rather than assume: the gate that admitted
-                # this signal was evaluated on the un-shrunk number.
-                effective = sig.market_price / max(1.0 - 0.0, 1e-9)
+                # this signal was evaluated on the un-shrunk number, and it was
+                # evaluated against a price that already includes the fee.
+                #
+                # This used to divide the market price by (1 - 0.0), i.e. by
+                # one, so a fee-bearing taker was re-checked against a raw
+                # price and a 2% fee left no room in the check at all.
+                from strategies import book as booklib
+
+                fee_rate = float(market.get("fee_rate") or config.DEFAULT_FEE_RATE)
+                is_maker = name in config.MAKER_STRATEGIES
+                effective = booklib.effective_buy_price(
+                    sig.market_price, fee_rate, is_maker=is_maker
+                )
                 if sig.win_prob - effective < 0:
                     _perf_note(name, learned, "shrunk_below_price",
                                f"{original:.3f}->{sig.win_prob:.3f} vs {effective:.3f}")
                     log.info(
                         f"PERFORMANCE SKIP {name} {asset}: shrunk probability "
-                        f"{sig.win_prob:.3f} no longer beats price {effective:.3f}"
+                        f"{sig.win_prob:.3f} no longer beats effective price {effective:.3f}"
                     )
                     continue
                 sig.edge_at_entry = sig.win_prob - effective
@@ -187,9 +227,22 @@ async def evaluate_all(
 def _resolve_collision(signals: List[TradeSignal], learned: dict) -> List[TradeSignal]:
     """When both legs want the same market, keep the one that needs no forecast.
 
-    A MAKER pair buys a guaranteed payoff; a TAKER buys a probability. On the
+    A MAKER *pair* buys a guaranteed payoff; a TAKER buys a probability. On the
     same market, at the same moment, the guaranteed payoff wins unless the
     taker is also a locked complete set and locks more.
+
+    A *single-leg* MAKER quote is a probability too -- it is a passive
+    directional bid, and it pays only if the side it bet on wins. Preferring
+    any MAKER signal over any TAKER signal therefore let a directional maker
+    ask, priced one tick under the bid, suppress a taker that was crossing a
+    mispricing it had already cleared the fee-and-edge gates on. Observed end
+    to end in an offline replay: the taker produced a signal on six of six
+    markets (EV +9.7% to +36.4%) and reached zero of them, because MAKER also
+    signalled on all six -- always single-leg, because the other side's book
+    was one tick through the model's ceiling. Only a pair that actually locks
+    is direction-free, so only a pair outranks a taker by construction;
+    otherwise the two are ranked on the same number, expected profit per unit
+    of capital committed.
     """
     if len(signals) < 2:
         return sorted(signals, key=_score, reverse=True)
@@ -199,20 +252,35 @@ def _resolve_collision(signals: List[TradeSignal], learned: dict) -> List[TradeS
     if maker is None or taker is None:
         return sorted(signals, key=_score, reverse=True)
 
+    maker_locked = _is_locked_pair(maker)
     taker_locked = str(taker.outcome).upper() == "BOTH"
-    if not taker_locked:
-        _perf_note("TAKER", learned, "maker_preferred_on_market",
+
+    if maker_locked and not taker_locked:
+        _perf_note("TAKER", learned, "maker_pair_preferred_on_market",
                    "MAKER pair is direction-independent; TAKER defers")
         return [maker]
+    if taker_locked and not maker_locked:
+        _perf_note("MAKER", learned, "taker_locked_quote_preferred",
+                   "TAKER complete set locks; single-leg MAKER defers")
+        return [taker]
+    if maker_locked and taker_locked:
+        # Both locked: keep whichever locks more per unit of capital.
+        if _score(maker) >= _score(taker):
+            _perf_note("TAKER", learned, "maker_locks_more",
+                       f"maker={_score(maker):.4f} taker={_score(taker):.4f}")
+            return [maker]
+        _perf_note("MAKER", learned, "taker_locks_more",
+                   f"taker={_score(taker):.4f} maker={_score(maker):.4f}")
+        return [taker]
 
-    # Both locked: keep whichever locks more per unit of capital.
-    if _score(maker) >= _score(taker):
-        _perf_note("TAKER", learned, "maker_locks_more",
-                   f"maker={_score(maker):.4f} taker={_score(taker):.4f}")
-        return [maker]
-    _perf_note("MAKER", learned, "taker_locks_more",
-               f"taker={_score(taker):.4f} maker={_score(maker):.4f}")
-    return [taker]
+    # Neither is direction-free: same shape of risk, so rank them on the same
+    # number and say which one lost and why.
+    best = max(signals, key=_score)
+    loser = taker if best is maker else maker
+    _perf_note(loser.strategy, learned, "ranked_below_peer",
+               f"{loser.strategy} {_score(loser):.4f} vs "
+               f"{best.strategy} {_score(best):.4f} (profit per unit of capital)")
+    return [best]
 
 
 def merge_signals(all_signals: List[TradeSignal], state=None) -> List[TradeSignal]:

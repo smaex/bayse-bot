@@ -236,14 +236,9 @@ async def on_button(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
         log.info(f"[{cid}] PAUSED via button")
         await q.message.reply_text("⏸ Trading paused.")
     elif d == "resume":
-        await _set_paused(cid, False)
-        await _clear_daily(cid)
-        risk = _user_risks.get(cid)
-        if risk:
-            risk.paused = False
-            risk.peak_balance = 0
-        log.info(f"[{cid}] RESUMED via button")
-        await q.message.reply_text("▶️ Trading resumed.")
+        await q.message.reply_text(
+            await _apply_resume(cid, via="button"), parse_mode="Markdown"
+        )
     elif d == "resetlearning":
         from datetime import datetime, timezone
         user = await asyncio.to_thread(_safe_get_user, cid)
@@ -553,14 +548,7 @@ async def cmd_pause(update: Update, _ctx):
 @_guard
 async def cmd_resume(update: Update, _ctx):
     cid = str(update.effective_chat.id)
-    await _set_paused(cid, False)
-    await _clear_daily(cid)
-    risk = _user_risks.get(cid)
-    if risk:
-        risk.paused = False
-        risk.peak_balance = 0
-    log.info(f"[{cid}] RESUMED via /resume")
-    await update.message.reply_text("▶️ Trading resumed.")
+    await update.message.reply_text(await _apply_resume(cid, via="/resume"), parse_mode="Markdown")
 
 @_guard
 async def cmd_learning(update: Update, _ctx):
@@ -998,6 +986,54 @@ async def _set_paused(cid: str, paused: bool):
 
 async def _clear_daily(cid: str):
     _user_daily.pop(cid, None)
+
+
+async def _apply_resume(cid: str, *, via: str = "/resume") -> str:
+    """Lift every restriction one explicit resume is supposed to lift.
+
+    Clearing the pause flag alone was not enough: the daily loss stop, the
+    daily target and the drawdown stop are all recomputed from a baseline
+    captured at the start of the trading day, so the account was re-paused on
+    the very next cycle and the operator's override was silently discarded --
+    while the stall report told them "/resume overrides it explicitly".
+
+    The baseline itself is moved (see ``bot.reset_session_restrictions``), so
+    the account restarts with a full, bounded risk budget from its current
+    balance, and the reply says exactly that instead of a bare "resumed".
+    """
+    import bot as _bot
+
+    await _set_paused(cid, False)
+    await _clear_daily(cid)
+    try:
+        summary = await asyncio.to_thread(_bot.reset_session_restrictions, cid, "manual_resume")
+    except Exception as err:
+        log.error(f"[{cid}] session reset failed: {err}", exc_info=True)
+        summary = {"equity": 0.0, "booked_pnl": 0.0, "cleared_cooldowns": 0}
+    log.info(f"[{cid}] RESUMED via {via}")
+
+    booked = float(summary.get("booked_pnl") or 0.0)
+    lines = ["▶️ *Trading resumed*", ""]
+    if booked:
+        lines.append(
+            f"Today's result so far ({booked:+,.0f}) is now the baseline: the daily "
+            "loss limit and the daily target both measure from this point, so the "
+            "stop you just overrode cannot re-trigger on it."
+        )
+    else:
+        lines.append("The session baseline and the daily stops were reset from the current balance.")
+    if summary.get("cleared_cooldowns"):
+        lines.append(f"Cleared {summary['cleared_cooldowns']} trade cooldown(s).")
+    if summary.get("cleared_suspensions"):
+        # Strategy names are single uppercase words; no Markdown escaping is
+        # needed here and the debug helper that owns `_esc` is out of scope.
+        names = ", ".join(str(s) for s in summary["cleared_suspensions"])
+        lines.append(f"Lifted learner suspension(s) on: {names}.")
+    lines.append("")
+    lines.append(
+        "Open positions were never affected — they are monitored regardless of the pause."
+    )
+    return "\n".join(lines)
 
 
 # ── Notifications ─────────────────────────────────────────────────────────────

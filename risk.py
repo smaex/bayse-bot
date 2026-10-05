@@ -158,6 +158,55 @@ class RiskManager:
         """Capital committed to orders that are still waiting to be matched."""
         return max(0.0, self.deployed() - self.deployed_filled())
 
+    def maker_unpaired_notional(self) -> float:
+        """MAKER capital that is one-sided directional risk, not half a set.
+
+        A leg counts as unpaired when either:
+
+        * it is the *only* MAKER leg on its market -- a deliberately one-sided
+          quote, which is a standing directional bid and nothing else; or
+        * it is a confirmed fill whose opposite-outcome sibling has not filled
+          -- a partial fill of an intended pair, i.e. an open directional
+          position until the other leg completes it.
+
+        A two-sided resting quote is *not* unpaired. Neither leg has been
+        acquired yet, and the pair is the position. Charging it here would make
+        ``MAX_MAKER_UNPAIRED_PCT`` a second, tighter copy of
+        ``MAX_MAKER_NOTIONAL_PCT`` and forbid the strategy's main mode.
+
+        The config knob existed but was read by nothing, so the only ceiling on
+        a one-sided quote was the whole maker budget -- the direction the
+        production audit says lost money.
+        """
+        by_market: dict[str, list[dict]] = {}
+        for pos in self.open_positions.values():
+            if str(pos.get("strategy") or "").upper() not in _MAKER_STRATEGIES:
+                continue
+            market = str(pos.get("market_id") or "")
+            by_market.setdefault(market, []).append(pos)
+
+        total = 0.0
+        for legs in by_market.values():
+            outcomes = {str(leg.get("outcome") or "").upper() for leg in legs}
+            multi_leg = len(legs) > 1 and len(outcomes) > 1
+            filled_outcomes = {
+                str(leg.get("outcome") or "").upper()
+                for leg in legs
+                if position_is_filled(leg)
+            }
+            for leg in legs:
+                if not multi_leg:
+                    # One-sided by construction.
+                    total += float(leg.get("amount_ngn") or 0.0)
+                    continue
+                outcome = str(leg.get("outcome") or "").upper()
+                opposite_filled = any(
+                    o and o != outcome for o in filled_outcomes
+                )
+                if position_is_filled(leg) and not opposite_filled:
+                    total += float(leg.get("amount_ngn") or 0.0)
+        return total
+
     def can_trade(self, balance: float, amount: float, max_exposure: float = 0.30) -> bool:
         max_exposure = min(max_exposure, MAX_PORTFOLIO_EXPOSURE)
         if (self.deployed_filled() + amount) > balance * max_exposure:

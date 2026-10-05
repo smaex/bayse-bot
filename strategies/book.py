@@ -246,6 +246,34 @@ def notional(shares: float, price: float) -> float:
     return shares * price * config.CURRENCY_BASE_MULTIPLIER
 
 
+def level_notional(level, unit: float | None = None) -> float:
+    """Currency value of one order-book level, in the account's currency.
+
+    ``quantity`` is a share count and a share costs ``price * base multiplier``
+    (documented: NGN 100 per share at 1.00), so the notional is
+    ``quantity * price * unit``. The book's own ``total`` field is the same
+    number *when the exchange returns it in the requested currency* -- but the
+    field carries no unit in the payload, and reading it unscaled on an NGN
+    account understates depth by the 100x base multiplier, which turns real
+    liquidity into a false "insufficient depth" skip and clips sized orders to
+    a hundredth of the book. So the unambiguous share count is the primary
+    source and ``total`` is only the fallback when ``quantity`` is absent.
+    """
+    if unit is None:
+        unit = config.CURRENCY_BASE_MULTIPLIER
+    price = level_price(level)
+    if price is None:
+        return 0.0
+    qty = level_quantity(level)
+    if qty > 0:
+        return qty * price * float(unit)
+    try:
+        raw = float(level.get("total") if isinstance(level, dict) else 0.0)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+    return raw if math.isfinite(raw) and raw > 0 else 0.0
+
+
 # ── Size-aware execution price ────────────────────────────────────────────────
 
 def walk_asks(book: dict, budget: float) -> tuple[float, float, bool]:
