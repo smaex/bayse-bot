@@ -497,7 +497,7 @@ def test_resume_lifts_a_persisted_learner_suspension(monkeypatch):
     monkeypatch.setattr(database, "update_settings", lambda cid, s: saved.update(s))
     monkeypatch.setattr(database, "invalidate_user_cache", lambda cid=None: None)
 
-    summary = bot.reset_session_restrictions("c", "manual_resume")
+    summary = bot.reset_session_restrictions("c", "manual_resume", current_equity=1_000.0)
 
     assert summary["cleared_suspensions"] == ["TAKER"]
     assert "suspended_strategies" not in saved["learned"]

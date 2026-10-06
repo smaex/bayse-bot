@@ -719,6 +719,38 @@ def verdict(chat_id: str | None, *, now: float | None = None,
             "/why's 'Executor outcomes' line should list an outcome for each surviving signal.",
             "warn",
         )
+
+    # A historic fill must not make an account look healthy forever. The prior
+    # fall-through used lifetime process counts, so one fill at process start
+    # produced a green "recording fills" verdict even 950 minutes later. Keep
+    # specific current blockers (e.g. MAKER_QUOTE_UNCOMPETITIVE) above this
+    # general drought finding, but never describe a stale fill as current health.
+    if trade_gap_min is not None:
+        try:
+            import config
+
+            fill_stall_min = max(15.0, float(config.TRADE_STALL_ALERT_MIN))
+        except Exception:
+            fill_stall_min = 120.0
+        if trade_gap_min >= fill_stall_min:
+            latest_order = float(snapshot.get("last_order_placed", 0.0))
+            placed_after_fill = latest_order > last_trade
+            recency = (
+                "At least one order was placed after that fill, but no later fill is confirmed."
+                if placed_after_fill else "No order placement has been recorded since that fill."
+            )
+            return out(
+                "FILL_DROUGHT",
+                f"No recent confirmed fill — the last fill was "
+                f"{format_gap_minutes(trade_gap_min)} min ago.",
+                f"{int(snapshot.get('trades', 0))} confirmed fill(s) recorded in this process; "
+                f"{recency} {placed_total} order(s) placed in total.",
+                "Use /why and the recent executor outcomes to distinguish a quiet tape from "
+                "an execution problem. Do not lower edge or risk gates just to force a fill; "
+                "change pricing only after out-of-sample results support it.",
+                "warn",
+            )
+
     return out(
         "HEALTHY",
         "The trading pipeline is evaluating, placing orders and recording fills.",

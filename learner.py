@@ -185,15 +185,24 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
             pending = await asyncio.to_thread(database.get_unresolved, chat_id, older_than_minutes=1)
             for trade in pending:
                 try:
-                    # ── Stale-trade auto-expiry ───────────────────────────
-                    # If trade is older than 3x candle duration, expire to prevent phantom capital traps
+                    # ── Stale-trade cleanup ─────────────────────────────────
+                    # An age limit can clean up an empty orphan row, but it must
+                    # never turn a real exchange order/fill into a zero-PnL
+                    # settlement. Confirmed positions remain in the risk book
+                    # until the exchange reports resolution; otherwise the
+                    # temporary gap before payout sync looks like a drawdown.
                     _max_ages = {"5min": 900, "15min": 2700, "1h": 10800, "6h": 64800, "1d": 259200}
                     _age = __import__("time").time() - trade["created_at"].timestamp()
-                    if _age > _max_ages.get(trade.get("timeframe", ""), 3600):
-                        log.warning(f"[{chat_id}] STALE EXPIRE {trade['trade_id']} (age={_age/60:.0f}m)")
+                    if (
+                        _age > _max_ages.get(trade.get("timeframe", ""), 3600)
+                        and not trade.get("order_id")
+                        and float(trade.get("filled_quantity") or 0.0) <= 0
+                    ):
+                        log.warning(f"[{chat_id}] STALE EMPTY ROW EXPIRE {trade['trade_id']} "
+                                    f"(age={_age/60:.0f}m)")
                         await asyncio.to_thread(database.resolve_trade, trade["trade_id"], None, 0.0)
                         if user_risks and chat_id in user_risks:
-                            user_risks[chat_id].remove_position(trade["market_id"], order_id=trade.get("order_id", ""))
+                            user_risks[chat_id].remove_position(trade["market_id"])
                         continue
                     event   = await client.get_event(trade["event_id"])
                     status  = event.get("status", "").lower()

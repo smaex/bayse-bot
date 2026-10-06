@@ -6,8 +6,10 @@ Fixes: engine label removed from notifications (always MARKET now),
 
 import logging
 import asyncio
+import math
 import time
-from datetime import date
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -851,20 +853,41 @@ async def _status_text(cid: str) -> str:
         n_pos    = len(risk.open_positions)
         deployed = sum(p.get("amount_ngn", 0) for p in risk.open_positions.values())
 
-    # CRITICAL: get_balance_ngn() returns free/uncommitted cash only — it
-    # does NOT include capital currently locked in open positions. But
-    # day["start_balance"] (set in bot.py's _daily()) is always recorded as
-    # full EQUITY (free_cash + deployed). Comparing free cash directly
-    # against an equity baseline understated "today's profit" and
-    # overstated "drawdown from peak" by exactly the deployed amount —
-    # every single time the user checked /status while holding a position,
-    # which based on production logs is most of the time (0-5 open
-    # positions is the normal state, not the exception).
+    # get_balance_ngn() is free cash only; include deployed capital for the
+    # balance-sheet view. PnL, however, must match the realized-PnL basis used
+    # by the daily risk stops. Equity minus the day-start balance incorrectly
+    # called the whole account balance today's profit after a bad/zero resume
+    # baseline, and ignored the session PnL baseline captured by /resume.
     equity = free_cash + deployed
 
-    day    = _user_daily.get(cid) or s.get("daily_state", {})
-    profit = equity - day.get("start_balance", equity)
-    target = _calc_target(s, day.get("start_balance", equity))
+    today = datetime.now(ZoneInfo(config.TRADING_TIMEZONE)).date().isoformat()
+    day = _user_daily.get(cid) or s.get("daily_state", {}) or {}
+    if day.get("date") != today:
+        day = {}
+    try:
+        start_balance = float(day.get("start_balance") or 0.0)
+    except (TypeError, ValueError):
+        start_balance = 0.0
+    if not math.isfinite(start_balance) or start_balance <= 0:
+        start_balance = equity
+    try:
+        pnl_baseline = float(day.get("pnl_baseline") or 0.0)
+    except (TypeError, ValueError):
+        pnl_baseline = 0.0
+    if not math.isfinite(pnl_baseline):
+        pnl_baseline = 0.0
+    try:
+        realized_today = float(await asyncio.to_thread(
+            database.get_daily_resolved_pnl, cid, today, config.TRADING_TIMEZONE,
+        ))
+    except Exception:
+        # Status should remain readable if the ledger is temporarily down;
+        # the in-memory risk value is already session-relative when available.
+        realized_today = (
+            float(risk.daily_realized_pnl) + pnl_baseline if risk is not None else pnl_baseline
+        )
+    profit = realized_today - pnl_baseline
+    target = _calc_target(s, start_balance)
 
     if risk and risk.peak_balance:
         dd = max(0, (risk.peak_balance - equity) / risk.peak_balance)
@@ -874,7 +897,7 @@ async def _status_text(cid: str) -> str:
         "📊 *Bot Status*\n",
         f"Total equity: ₦{equity:,.2f}",
         f"Free cash: ₦{free_cash:,.2f}",
-        f"Today's profit: ₦{profit:+,.2f}",
+        f"Today's realized PnL: ₦{profit:+,.2f}",
     ]
     if target > 0:
         lines.append(f"Daily target: ₦{target:,.0f} ({min(profit/target*100,100) if target else 0:.0f}% done)")
@@ -984,44 +1007,78 @@ async def _set_paused(cid: str, paused: bool):
         _bot._active_users_cache_time = 0.0
 
 
-async def _clear_daily(cid: str):
-    _user_daily.pop(cid, None)
-
-
 async def _apply_resume(cid: str, *, via: str = "/resume") -> str:
-    """Lift every restriction one explicit resume is supposed to lift.
-
-    Clearing the pause flag alone was not enough: the daily loss stop, the
-    daily target and the drawdown stop are all recomputed from a baseline
-    captured at the start of the trading day, so the account was re-paused on
-    the very next cycle and the operator's override was silently discarded --
-    while the stall report told them "/resume overrides it explicitly".
-
-    The baseline itself is moved (see ``bot.reset_session_restrictions``), so
-    the account restarts with a full, bounded risk budget from its current
-    balance, and the reply says exactly that instead of a bare "resumed".
-    """
+    """Lift session stops only after capturing a valid current-equity baseline."""
+    import math
     import bot as _bot
 
-    await _set_paused(cid, False)
-    await _clear_daily(cid)
+    risk = _user_risks.get(cid)
+    client = _user_clients.get(cid)
+    current_equity = None
+    balance_source = ""
+
+    # /resume can arrive immediately after startup, before the user loop has
+    # populated RiskManager.current_free_cash. Prefer a fresh exchange balance
+    # so that this race cannot persist start_balance=0 and trip a zero-sized
+    # daily-loss limit on the next cycle.
+    if client is not None:
+        try:
+            free_cash = float(await client.get_balance_ngn())
+            deployed = float(risk.deployed()) if risk is not None else 0.0
+            candidate = free_cash + deployed
+            if math.isfinite(candidate) and candidate > 0:
+                current_equity = candidate
+                balance_source = "exchange"
+                if risk is not None:
+                    risk.current_free_cash = free_cash
+        except Exception as balance_err:
+            log.warning(f"[{cid}] fresh balance unavailable during /resume: {balance_err}")
+
+    # If the exchange read is temporarily unavailable, a positive cached equity
+    # is safer than inventing a zero baseline. Never fall back to zero.
+    if current_equity is None and risk is not None:
+        try:
+            candidate = float(risk.current_free_cash) + float(risk.deployed())
+            if math.isfinite(candidate) and candidate > 0:
+                current_equity = candidate
+                balance_source = "cached"
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    if current_equity is None:
+        return (
+            "⚠️ *Trading was not resumed.* I could not verify a positive current balance, "
+            "so no zero-sized risk baseline was saved. Check the account connection and "
+            "try /resume again."
+        )
+
     try:
-        summary = await asyncio.to_thread(_bot.reset_session_restrictions, cid, "manual_resume")
+        summary = await asyncio.to_thread(
+            _bot.reset_session_restrictions,
+            cid,
+            "manual_resume",
+            current_equity=current_equity,
+        )
     except Exception as err:
         log.error(f"[{cid}] session reset failed: {err}", exc_info=True)
-        summary = {"equity": 0.0, "booked_pnl": 0.0, "cleared_cooldowns": 0}
-    log.info(f"[{cid}] RESUMED via {via}")
+        return (
+            "⚠️ *Trading was not resumed.* The new session baseline could not be saved, "
+            "so the existing pause remains in effect. Try again shortly."
+        )
+
+    log.info(f"[{cid}] RESUMED via {via} using {balance_source} equity ₦{summary['equity']:,.2f}")
 
     booked = float(summary.get("booked_pnl") or 0.0)
     lines = ["▶️ *Trading resumed*", ""]
     if booked:
         lines.append(
-            f"Today's result so far ({booked:+,.0f}) is now the baseline: the daily "
+            f"Today's result so far ({booked:+,.2f}) is now the baseline: the daily "
             "loss limit and the daily target both measure from this point, so the "
             "stop you just overrode cannot re-trigger on it."
         )
     else:
-        lines.append("The session baseline and the daily stops were reset from the current balance.")
+        lines.append("The session baseline and the daily stops were reset from current equity.")
+    lines.append(f"Equity baseline: ₦{summary['equity']:,.2f}.")
     if summary.get("cleared_cooldowns"):
         lines.append(f"Cleared {summary['cleared_cooldowns']} trade cooldown(s).")
     if summary.get("cleared_suspensions"):
