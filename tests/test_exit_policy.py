@@ -195,6 +195,13 @@ def test_an_unbalanced_pair_is_never_burned():
     assert bot._paired_leg(risk, "m:YES:o1", "m") is None
 
     # Same side is not a set.
+    # The former 0.5-share / 0.5% tolerance treated this real difference as
+    # equal, then burned min(shares) and removed both rows, orphaning 0.1 share.
+    risk_near = RiskManager()
+    _position(risk_near, "m:YES:o1", "YES", 50.0)
+    _position(risk_near, "m:NO:o2", "NO", 49.9)
+    assert bot._paired_leg(risk_near, "m:YES:o1", "m") is None
+
     risk2 = RiskManager()
     _position(risk2, "m:YES:o1", "YES", 50.0)
     _position(risk2, "m:YES:o2", "YES", 50.0)

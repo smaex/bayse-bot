@@ -71,6 +71,10 @@ class TradeSignal:
     # so a single shared constant silently means "model probability >= 0.74"
     # for one and ">= 0.48" for the other. Strategies set this explicitly.
     mode_floor:            float = 0.0
+    # The strategy's fee-inclusive EV floor. Executors re-check executable
+    # prices against this after reading a fresh order book; zero means a
+    # strategy that leaves final price admission to the executor.
+    min_net_ev:            float = 0.0
     # Multi-leg decisions (two-sided MAKER quotes, complete-set takes).
     # Empty means "derive a single leg from the flat fields above".
     legs:                  list = field(default_factory=list)

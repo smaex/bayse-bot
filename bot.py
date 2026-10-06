@@ -4,6 +4,7 @@ Multi-user trading bot — one server, all users via Telegram.
 
 import asyncio
 import logging
+import math
 import os
 import signal
 import sys
@@ -29,7 +30,7 @@ import stall
 import feeds_direct
 import health
 import maintenance
-from risk import RiskManager, position_is_filled
+from risk import RiskManager, position_is_filled, share_quantities_match
 from client import BayseClient
 from config import (TELEGRAM_TOKEN, CURRENCY, SCAN_INTERVAL_SECONDS,
                     SYSTEMIC_RISK_HALT_MINS)
@@ -144,11 +145,39 @@ def _advance_trading_day(chat_id: str, balance: float, settings: dict) -> tuple[
     """
     today = _session_date()
     ds = _user_daily.get(chat_id)
-    if ds and ds.get("date") == today:
-        return ds, ""
-
-    ds = settings.get("daily_state", {}) or {}
+    if not ds or ds.get("date") != today:
+        ds = settings.get("daily_state", {}) or {}
     if ds.get("date") == today:
+        try:
+            start_balance = float(ds.get("start_balance") or 0.0)
+        except (TypeError, ValueError):
+            start_balance = 0.0
+        if math.isfinite(start_balance) and start_balance > 0:
+            _user_daily[chat_id] = ds
+            return ds, ""
+
+        # Recover legacy/corrupt same-day state written before /resume verified
+        # that a live balance was available. A zero baseline makes the daily
+        # loss budget exactly zero and pauses at PnL ₦+0. Rebase to the fresh
+        # equity passed by _user_loop, but do not clear an existing pause; an
+        # explicit /resume still owns lifting it.
+        try:
+            live_equity = float(balance)
+        except (TypeError, ValueError):
+            live_equity = 0.0
+        if math.isfinite(live_equity) and live_equity > 0:
+            ds = dict(ds)
+            ds["start_balance"] = live_equity
+            ds["target_hit"] = False
+            ds.setdefault("pnl_baseline", 0.0)
+            settings["daily_state"] = ds
+            _user_daily[chat_id] = ds
+            asyncio.create_task(asyncio.to_thread(database.update_settings, chat_id, settings))
+            log.error(
+                f"[{chat_id}] Repaired invalid same-day equity baseline to ₦{live_equity:,.2f}; "
+                "pause state is unchanged"
+            )
+            return ds, ""
         _user_daily[chat_id] = ds
         return ds, ""
 
@@ -208,66 +237,42 @@ def _daily(chat_id: str, balance: float, settings: dict) -> dict:
     return ds
 
 
-def reset_session_restrictions(chat_id: str, reason: str = "manual_resume") -> dict:
-    """Apply an explicit operator resume: lift this session's stops for real.
+def reset_session_restrictions(
+    chat_id: str, reason: str = "manual_resume", *, current_equity: float | None = None,
+) -> dict:
+    """Apply an explicit operator resume using a verified equity baseline.
 
-    ``/resume`` used to clear only ``settings["paused"]``, the in-memory
-    ``risk.paused`` flag and the cached day record. Every gate it was supposed
-    to override is *recomputed from the database on the next cycle*:
+    The day-loss stop, target, and drawdown stop all derive from the session
+    baseline. A zero/uninitialised in-memory balance used to be accepted here,
+    creating a zero-sized daily-loss budget; the next cycle then paused again
+    at ``₦+0`` even though the account had funds. Callers should pass a freshly
+    fetched equity when possible. The in-memory balance remains a fallback for
+    direct/internal callers, but a missing or invalid balance now fails closed
+    instead of persisting a broken baseline.
 
-      * the daily loss stop compares today's realised PnL with a limit derived
-        from ``day["start_balance"]``;
-      * the daily target compares it with ``daily_multiplier`` of the same
-        baseline, and ``risk.target_hit`` (which blocks evaluation outright)
-        is set from that comparison;
-      * the drawdown stop compares equity with ``risk.peak_balance``.
-
-    So the account was paused again one cycle later, with a fresh Telegram
-    message saying the loss limit had been reached -- the operator's override
-    was silently discarded, and the bot looked broken. The stall report even
-    promises the opposite: "wait for the trading-day rollover, or /resume to
-    override {reason} explicitly".
-
-    An override therefore has to move the *baseline* the stops measure
-    against, which is what this does:
-
-      * ``start_balance`` becomes the current equity, so the daily loss limit
-        (and the daily target) are measured from the resume point;
-      * ``pnl_baseline`` records today's already-realised PnL, so the profit
-        that was booked before the override cannot re-trip the same stop;
-      * ``target_hit`` and the in-memory counters are cleared so
-        ``risk.target_hit`` stops blocking evaluation;
-      * per-market trade cooldowns are dropped, since the operator has just
-        said "trade this account";
-      * a persisted learner strategy suspension is dropped, because that key
-        removes strategies from the scope entirely and the operator overriding
-        the stops means "trade this account", not "trade nothing".
-
-    Deliberately *not* cleared: the learned size/certainty multipliers (they
-    are evidence, not a stop -- /resetlearning is the command that forgets
-    evidence), ``risk.pending_markets`` (a lock held in a ``finally``, so a
-    resume cannot leak it), the exchange-minimum cache (it is exchange fact)
-    and ``global_state.systemic_halt_until`` (process-wide, so one account's
-    resume must never lift a market-wide halt).
-
-    The result is a *fresh* risk budget, not an unlimited one: the same
-    ``daily_loss_limit_pct`` and ``MAX_DAILY_LOSS_LIMIT_PCT`` bounds apply from
-    the new baseline. Returns a summary for the operator.
+    Already-realised PnL is captured separately in ``pnl_baseline`` so it does
+    not re-trigger the stop being overridden. This grants a fresh, bounded
+    risk budget, not an unlimited-loss day. Existing positions and process-wide
+    systemic halts are deliberately left untouched.
     """
     today = _session_date()
-    risk = _user_risks.get(chat_id)
-    equity = 0.0
-    if risk is not None:
-        try:
-            equity = max(0.0, float(risk.current_free_cash) + float(risk.deployed()))
-        except (TypeError, ValueError):
-            equity = 0.0
-
     user = database.get_user(chat_id, force_fresh=True)
     if not user:
-        log.warning(f"[{chat_id}] session reset requested for an unknown user")
-        return {"equity": 0.0, "booked_pnl": 0.0, "cleared_cooldowns": 0}
+        raise ValueError(f"Cannot resume unknown user {chat_id}")
     settings = dict(user.get("settings") or {})
+    risk = _user_risks.get(chat_id)
+
+    if current_equity is None and risk is not None:
+        try:
+            current_equity = float(risk.current_free_cash) + float(risk.deployed())
+        except (TypeError, ValueError, OverflowError) as err:
+            raise ValueError("Current account equity is unavailable; refusing to resume") from err
+    try:
+        equity = float(current_equity)
+    except (TypeError, ValueError, OverflowError) as err:
+        raise ValueError("Current account equity is unavailable; refusing to resume") from err
+    if not math.isfinite(equity) or equity <= 0:
+        raise ValueError("Current account equity is unavailable or zero; refusing to resume")
 
     booked_pnl = 0.0
     try:
@@ -289,7 +294,6 @@ def reset_session_restrictions(chat_id: str, reason: str = "manual_resume") -> d
     settings.pop("daily_loss_stopped_at", None)
     settings["session_reset_at"] = datetime.now(timezone.utc).isoformat()
     settings["session_reset_reason"] = reason
-    _user_daily[chat_id] = day
 
     # A persisted strategy suspension removes strategies from the account's
     # scope before any market is evaluated (`no_enabled_strategies` when it
@@ -307,6 +311,16 @@ def reset_session_restrictions(chat_id: str, reason: str = "manual_resume") -> d
     except Exception as suspension_err:
         log.debug(f"[{chat_id}] suspension clear skipped: {suspension_err}")
 
+    # Persist first. Do not tell Telegram that trading resumed (or clear the
+    # in-memory pause) if the baseline failed to reach the database.
+    try:
+        database.update_settings(chat_id, settings)
+        database.invalidate_user_cache(chat_id)
+    except Exception as err:
+        log.error(f"[{chat_id}] session reset could not be persisted: {err}", exc_info=True)
+        raise RuntimeError("Could not persist the resume baseline") from err
+
+    _user_daily[chat_id] = day
     if risk is not None:
         risk.paused = False
         risk.peak_balance = equity
@@ -324,15 +338,13 @@ def reset_session_restrictions(chat_id: str, reason: str = "manual_resume") -> d
     except Exception as cooldown_err:
         log.debug(f"[{chat_id}] cooldown clear skipped: {cooldown_err}")
 
-    try:
-        database.update_settings(chat_id, settings)
-        database.invalidate_user_cache(chat_id)
-    except Exception as err:
-        log.error(f"[{chat_id}] session reset could not be persisted: {err}", exc_info=True)
+    stall.note_state(chat_id, paused=False, paused_reason="")
+    global _active_users_cache_time
+    _active_users_cache_time = 0.0
 
     log.warning(
-        f"[{chat_id}] SESSION RESET ({reason}) — baseline ₦{equity:,.0f}, "
-        f"today's PnL before the override ₦{booked_pnl:+,.0f} excluded, "
+        f"[{chat_id}] SESSION RESET ({reason}) — equity baseline ₦{equity:,.2f}, "
+        f"today's PnL before the override ₦{booked_pnl:+,.2f} excluded, "
         f"{cleared_cooldowns} cooldown(s) cleared, "
         f"{len(cleared_suspensions)} suspension(s) cleared; stops now measure from now"
     )
@@ -969,11 +981,10 @@ def _paired_leg(risk, position_key: str, market_id: str):
     fill path. Requiring ``strategy == "MAKER"`` here is what left a taker set
     to be managed -- and sold -- as two independent directional bets.
 
-    Quantities must match, because only the overlap is a set: ``_burn_complete_set``
-    burns ``min(shares)`` and then drops both entries from the risk book, so an
-    imbalanced pair would leave the excess shares untracked. A pair that does
-    not match is left alone; the overlap still settles to 1.00, nothing is
-    lost, and the larger leg is managed as the directional position it is.
+    Quantities must match: ``_burn_complete_set`` burns ``min(shares)`` and
+    resolves both rows, so a partial-fill imbalance would otherwise leave the
+    excess shares untracked. Only exchange/float precision noise is tolerated;
+    a real mismatch is left alone and both fills remain in the risk book.
     """
     this = risk.open_positions.get(position_key)
     if not this or not this.get("confirmed_filled"):
@@ -996,7 +1007,7 @@ def _paired_leg(risk, position_key: str, market_id: str):
         other_qty = float(other.get("filled_quantity") or other.get("shares") or 0.0)
         if other_qty <= 0:
             continue
-        if abs(other_qty - this_qty) > max(0.5, 0.005 * max(other_qty, this_qty)):
+        if not share_quantities_match(other_qty, this_qty):
             log.warning(
                 f"[{position_key}] complete set on {market_id} is unbalanced "
                 f"({this_qty:.2f} vs {other_qty:.2f} shares) — not burning it; "
@@ -1381,7 +1392,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
     outcome_ids = sorted({
         pos.get("outcome_id")
         for pos in risk.open_positions.values()
-        if pos.get("outcome_id")
+        if pos.get("outcome_id") and not pos.get("awaiting_settlement")
     })
     books: dict[str, dict] = {}
     if outcome_ids:
@@ -1396,6 +1407,11 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
     stale_positions = []
 
     for position_key, pos in list(risk.open_positions.items()):
+        # A confirmed position whose market has closed is still real exposure
+        # until the resolution monitor reconciles the ledger and payout. Keep
+        # it in deployed equity, but stop retrying exit work on every 5s pass.
+        if pos.get("awaiting_settlement"):
+            continue
         market_id = pos.get("market_id") or position_key
         market = next((m for m in active_markets if m["market_id"] == market_id), None)
 
@@ -1862,10 +1878,10 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 log.error(f"[{chat_id}] EXIT order failed for {market_id}: {e}", exc_info=True)
 
     # ── Stale positions that rotated out of active_markets ───────────────
-    # These used to be dropped from the risk book with no cancellation, no DB
-    # settlement and no notification: the trade row stayed unresolved forever,
-    # the order could still be live on the exchange, and the user was told
-    # nothing. Cancel what is still cancellable, settle the row at ₦0, and say so.
+    # Unfilled orders can be cancelled and released. A confirmed fill must stay
+    # in the risk book until resolution_monitor records the actual payout: if we
+    # remove it here, free cash is still lower by the stake, so the same winning
+    # position can look like an immediate 10%+ drawdown until settlement syncs.
     for stale_key, stale_pos in stale_positions:
         order_id = stale_pos.get("order_id")
         filled = float(stale_pos.get("filled_quantity") or 0.0)
@@ -1884,12 +1900,17 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 chat_id, risk, stale_pos, stale_key,
                 "market rotated out and the order never filled",
             )
-        else:
-            # Either a confirmed fill (real position — settlement owns it) or
-            # nothing to cancel. Record why it left the risk book.
+        elif confirmed:
+            stale_pos["awaiting_settlement"] = True
             log.info(
-                f"[{chat_id}] Dropping stale tracked position {stale_pos.get('market_id')} "
-                f"(filled={filled:.2f}, confirmed={confirmed})"
+                f"[{chat_id}] Retaining filled position {stale_pos.get('market_id')} "
+                f"(filled={filled:.2f}) in risk equity until settlement is reconciled"
+            )
+        else:
+            # A tracked entry without an order id or confirmed fill cannot be
+            # reconciled as a position; remove only that empty reservation.
+            log.info(
+                f"[{chat_id}] Dropping stale empty reservation {stale_pos.get('market_id')}"
             )
             risk.remove_position(stale_key)
 
