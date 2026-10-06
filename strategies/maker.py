@@ -85,6 +85,13 @@ class MakerStrategy(BaseStrategy):
         super().__init__("MAKER")
         # market_id -> {"legs": {outcome: {...}}, "placed_at", "spot", "fv"}
         self.open_quotes: dict[str, dict] = {}
+        # market_id -> net filled quantity, positive = long YES. Inventory is a
+        # property of what we HOLD, so it deliberately outlives the quote that
+        # produced it: cancelling a resting leg must not erase the memory that
+        # its sibling filled, or the next quote has no idea which side to
+        # complete. The live loop also derives this from the risk book (see
+        # `inventory_skew`), which keeps it correct across a restart.
+        self.inventory: dict[str, float] = {}
 
     # ── Pure pricing core ────────────────────────────────────────────────────
 
@@ -284,7 +291,7 @@ class MakerStrategy(BaseStrategy):
             return None
         fv_yes, fv_no = fv_pair
 
-        inventory = self.inventory_skew(market_id)
+        inventory = self.inventory_skew(market_id, learned.get("open_positions"))
         result, detail = self.price_pair(
             fv_yes=fv_yes, fv_no=fv_no,
             book_yes=book_yes, book_no=book_no,
@@ -408,17 +415,68 @@ class MakerStrategy(BaseStrategy):
 
     # ── Quote lifecycle ──────────────────────────────────────────────────────
 
-    def inventory_skew(self, market_id: str) -> float:
-        """Ticks of skew: positive means we are already long YES.
+    def leg_still_worth_owning(
+        self, *, fair_value: float, bid: float, skew: float = 0.0
+    ) -> tuple[bool, str]:
+        """Re-run the value judgement for a bid we already have resting.
 
-        Driven by fills on this market, so it survives a restart only as long
-        as the quote does -- which is correct. Inventory is a property of what
-        we hold, and anything longer-lived belongs to the risk book.
+        Exactly the value half of :meth:`_price_leg`, against a *fresh* fair
+        value instead of the one the quote was priced off. It deliberately
+        ignores the book: the question here is not "where can this order rest"
+        but "if this fills, do we still own something worth more than we paid".
+        The completion leg of a half-filled pair needs that question answered
+        on every pass, because it is the one order we want to leave working.
         """
-        info = self.open_quotes.get(market_id)
-        if not info:
-            return 0.0
-        return float(info.get("inventory", 0.0))
+        if fair_value < MIN_QUOTABLE_FV or fair_value > MAX_QUOTABLE_FV:
+            return False, f"fv={fair_value:.3f} outside quotable band"
+        required = self.min_leg_edge(max(fair_value - config.MAKER_MIN_LEG_EDGE, 0.0))
+        edge = self.leg_edge(fair_value, float(bid))
+        floor_edge = max(0.5 * config.MAKER_MIN_LEG_EDGE, required + min(0.0, skew))
+        if edge < floor_edge:
+            return False, (
+                f"edge={edge:+.3f} < {floor_edge:+.3f} at bid {float(bid):.3f} "
+                f"(fv={fair_value:.3f})"
+            )
+        return True, f"bid {float(bid):.3f} still {edge:+.3f} under fv {fair_value:.3f}"
+
+    def inventory_skew(self, market_id: str, positions: dict | None = None) -> float:
+        """Net held quantity on this market: positive means we are already long YES.
+
+        Inventory is a property of what we hold, not of what is currently
+        resting, so it must survive a withdrawal, a requote or a restart.
+        When the caller hands in the risk book (the live loop does) the number
+        is derived from the positions themselves, which makes it correct even
+        after a process restart. Otherwise the fill ledger recorded by
+        :meth:`record_fill` is the fallback.
+
+        Getting this wrong is expensive in a specific way: if a withdrawal
+        erases the skew, the next quote on the market is priced as if we held
+        nothing, bids the same side again, and the position that was one fill
+        away from a locked set becomes an open directional bet instead.
+        """
+        if isinstance(positions, dict):
+            net = 0.0
+            for key, pos in positions.items():
+                if not isinstance(pos, dict):
+                    continue
+                if str(pos.get("market_id") or key) != str(market_id):
+                    continue
+                if str(pos.get("strategy") or "").upper() not in config.MAKER_STRATEGIES:
+                    continue
+                try:
+                    qty = float(pos.get("filled_quantity") or 0.0)
+                except (TypeError, ValueError):
+                    qty = 0.0
+                if qty <= 0.0:
+                    continue
+                net += qty if str(pos.get("outcome") or "").upper() == "YES" else -qty
+            if net:
+                return net
+        return float(self.inventory.get(market_id, 0.0))
+
+    def clear_inventory(self, market_id: str) -> None:
+        """Forget held inventory for a market (the set is closed or resolved)."""
+        self.inventory.pop(market_id, None)
 
     def track_quote(self, market_id: str, legs: list[dict], spot: float,
                     fv_yes: float = 0.0) -> None:
@@ -428,20 +486,15 @@ class MakerStrategy(BaseStrategy):
             "placed_at": time.time(),
             "spot": float(spot or 0.0),
             "fv_yes": float(fv_yes or 0.0),
-            "inventory": self.open_quotes.get(market_id, {}).get("inventory", 0.0),
         }
 
     def record_fill(self, market_id: str, outcome: str, shares: float) -> None:
         """A leg filled: skew the next quote toward completing the set."""
-        info = self.open_quotes.setdefault(market_id, {
-            "legs": {}, "placed_at": time.time(), "spot": 0.0,
-            "fv_yes": 0.0, "inventory": 0.0,
-        })
         signed = float(shares) if str(outcome).upper() == "YES" else -float(shares)
-        info["inventory"] = float(info.get("inventory", 0.0)) + signed
+        self.inventory[market_id] = float(self.inventory.get(market_id, 0.0)) + signed
         log.info(
             f"MAKER fill {market_id} {outcome} {shares:.2f}sh → "
-            f"inventory {info['inventory']:+.2f}"
+            f"inventory {self.inventory[market_id]:+.2f}"
         )
 
     def should_requote(self, market_id: str, spot: float = None) -> bool:
@@ -470,6 +523,7 @@ class MakerStrategy(BaseStrategy):
                 if leg.get("order_id")]
 
     def drop(self, market_id: str) -> None:
+        """Forget the quote. Inventory is kept -- it is about what we hold."""
         self.open_quotes.pop(market_id, None)
 
     async def cancel_all(self, client, market_id: str = None) -> int:
@@ -497,7 +551,9 @@ class MakerStrategy(BaseStrategy):
             if ids:
                 log.info(f"MAKER cancelled {len(ids)} leg(s) on {mid}")
             # Keep inventory: a leg may already have filled, and the next
-            # quote must still skew toward completing that set.
+            # quote must still skew toward completing that set. It lives in
+            # `self.inventory`, not in the quote record, precisely so that
+            # dropping the quote cannot drop the skew with it.
             self.open_quotes.pop(mid, None)
         return cancelled
 

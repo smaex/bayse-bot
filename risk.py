@@ -319,6 +319,12 @@ class RiskManager:
         if market_id in self.pending_markets:
             return True
         incoming_strat = (strategy or "").upper()
+        # Same-market maker legs that have already filled. They are positions,
+        # not resting quotes: the one order that can still be useful on this
+        # market is the quote that completes their set, and refusing it here is
+        # what made a half-filled pair impossible to finish (the executor
+        # separately requires any such quote to include the missing side).
+        completed_legs: set[str] = set()
         # A market can hold more than one tracked entry: the executor keys a
         # second position as "<market_id>:<outcome>:<order_id>". Looking up the
         # bare key alone made those entries invisible to this check.
@@ -332,6 +338,12 @@ class RiskManager:
                 != (existing_strat in _MAKER_STRATEGIES)
             )
             if not is_maker_pair:
+                # Same strategy family on this market.
+                if (incoming_strat in _MAKER_STRATEGIES
+                        and existing_strat in _MAKER_STRATEGIES
+                        and position_is_filled(pos)):
+                    completed_legs.add(key)
+                    continue
                 # Active position or pending limit order already exists for this
                 # exact market and strategy family.
                 return True
@@ -349,10 +361,23 @@ class RiskManager:
             # pay out, so the two strategies would be betting against each
             # other, and the pair loses outright whenever the two entry prices
             # sum to more than 1.00. An unknown side is treated as a conflict.
+            #
+            # Only a *position* can be on the other side, though. A resting
+            # order that has not filled is an order, not exposure -- the same
+            # rule the exposure ceiling and the drought clock already use.
+            # Blocking on it meant that while MAKER's two-sided quote rested on
+            # a market -- which is most of every candle -- a TAKER could not
+            # enter that market on either side, because one of the two passive
+            # legs always "opposed" it. That is a suppression with no risk
+            # behind it: if the passive leg ever fills, its price was cleared
+            # against the same fair value the taker's was, so the combination
+            # is a set bought below 1.00 rather than a bet against ourselves.
             if not outcome or existing_outcome != str(outcome).upper():
+                if not position_is_filled(pos):
+                    continue
                 log.info(
                     f"BLOCK opposite-side entry on {market_id}: {incoming_strat} "
-                    f"{outcome or '?'} vs open {existing_strat} {existing_outcome or '?'}"
+                    f"{outcome or '?'} vs filled {existing_strat} {existing_outcome or '?'}"
                 )
                 return True
 
@@ -362,7 +387,13 @@ class RiskManager:
         # block each other.
         if asset:
             incoming_is_maker = strategy.upper() in _MAKER_STRATEGIES
-            for existing_pos in self.open_positions.values():
+            for key, existing_pos in self.open_positions.items():
+                if key in completed_legs:
+                    # Same market, and this is the leg being completed: the
+                    # asset-level "one maker position per asset" rule is about
+                    # not stacking correlated exposure, and this quote is the
+                    # other half of exposure we already carry.
+                    continue
                 if existing_pos.get("asset") == asset:
                     existing_is_maker = (
                         existing_pos.get("strategy", "").upper() in _MAKER_STRATEGIES

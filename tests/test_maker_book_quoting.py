@@ -419,7 +419,17 @@ def test_already_in_sees_compound_keyed_positions():
     # Same strategy family on the same market: blocked even though the entry is
     # not stored under the bare market id.
     assert risk.already_in("m", strategy="MAKER", outcome="YES") is True
-    # A directional taker on the opposite side of that resting quote: blocked.
+    # A *resting* quote is an order, not a position: it cannot be on the other
+    # side of anything yet, so it must not suppress the taker. (While it did,
+    # a two-sided MAKER quote -- one leg always on the "wrong" side -- blocked
+    # the taker on the market for as long as it rested.)
+    assert risk.already_in("m", strategy="TAKER", outcome="NO") is False
+    assert risk.already_in("m", strategy="TAKER", outcome="YES") is False
+
+    # Once that same leg FILLS it is a position, and the opposite-side rule is
+    # real again: the two sides of one binary cannot both be bets for us.
+    risk.open_positions["m:YES:maker-1"]["confirmed_filled"] = True
+    risk.open_positions["m:YES:maker-1"]["filled_quantity"] = 10.0
     assert risk.already_in("m", strategy="TAKER", outcome="NO") is True
     assert risk.already_in("m", strategy="TAKER", outcome="YES") is False
 

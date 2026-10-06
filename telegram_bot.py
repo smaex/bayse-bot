@@ -1215,6 +1215,62 @@ async def notify_trade(
             log.error(f"notify_trade failed: {e}")
 
 
+async def notify_executing(
+    app, cid, strat, asset, tf, outcome, amount, *,
+    price: float | None = None, engine: str = "", legs=None,
+):
+    """An order is being sent to the exchange — before anything has filled.
+
+    The fill notice alone cannot describe this moment, and the gap it leaves is
+    the one the operator notices: between "signal" and "fill" an order can be
+    working, resting, partially filled or killed, and none of those states is
+    the same as a trade that happened. Sending this first means every execution
+    has a beginning the operator can see, whatever the outcome.
+    """
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_executing dropped for {cid}: no Telegram app available")
+        return
+    try:
+        amt_val = float(amount or 0.0)
+    except (TypeError, ValueError):
+        amt_val = 0.0
+    icon, name = _STRAT_ICONS.get((strat or "").upper(), ("🔔", strat or "Trade"))
+    esc = lambda s: (s or "").replace("\\", "").replace("_", "\\_").replace("*", "\\*")
+    try:
+        price_val = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        price_val = None
+
+    if legs:
+        rows = []
+        for leg in legs:
+            try:
+                leg_price = float(getattr(leg, "price", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                leg_price = 0.0
+            rows.append(f"{esc(getattr(leg, 'outcome', '?'))} @ {leg_price:.3f}")
+        direction_line = f"Legs: *{' + '.join(rows)}*\n"
+        price_line = ""
+    else:
+        direction_line = f"Direction: *{esc(outcome or '?')}*\n"
+        price_line = (
+            f"Limit price: *{price_val:.3f}*\n" if price_val is not None else ""
+        )
+    venue = f" on {esc(engine)}" if engine else ""
+    msg = (
+        f"🚀 *Order being executed*\n"
+        f"{icon} {esc(name)}{venue}\n"
+        f"Market: *{esc(asset)} {esc(tf)}*\n"
+        f"{direction_line}"
+        f"Size: *₦{amt_val:,.0f}*\n"
+        f"{price_line}"
+        f"_Sent to the exchange now. A fill notice follows if it executes; "
+        f"a zero-fill notice follows if it does not._"
+    )
+    await send_message(app, cid, msg, parse_mode="Markdown")
+
+
 async def notify_taker_fill(
     app, cid, asset, tf, outcome, shares, price, amount, *,
     complete_set: bool = False, leg_number: int = 1,
