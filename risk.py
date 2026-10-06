@@ -37,6 +37,24 @@ def position_is_filled(pos: dict) -> bool:
         return False
 
 
+def share_quantities_match(first: float, second: float) -> bool:
+    """True only when two exchange fills can be treated as the same quantity.
+
+    A half-share or half-percent tolerance is not harmless: a burn consumes
+    ``min(first, second)`` and dropping both records would orphan the difference.
+    Only float/serialization noise is tolerated here; real partial-fill
+    imbalance remains tracked as directional exposure.
+    """
+    try:
+        first, second = float(first), float(second)
+    except (TypeError, ValueError):
+        return False
+    if first < 0.0 or second < 0.0:
+        return False
+    tolerance = max(1e-6, 1e-8 * max(first, second))
+    return abs(first - second) <= tolerance
+
+
 class RiskManager:
     def __init__(self):
         self.peak_balance: float = 0.0

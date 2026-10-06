@@ -30,7 +30,7 @@ import stall
 import feeds_direct
 import health
 import maintenance
-from risk import RiskManager, position_is_filled
+from risk import RiskManager, position_is_filled, share_quantities_match
 from client import BayseClient
 from config import (TELEGRAM_TOKEN, CURRENCY, SCAN_INTERVAL_SECONDS,
                     SYSTEMIC_RISK_HALT_MINS)
@@ -981,11 +981,10 @@ def _paired_leg(risk, position_key: str, market_id: str):
     fill path. Requiring ``strategy == "MAKER"`` here is what left a taker set
     to be managed -- and sold -- as two independent directional bets.
 
-    Quantities must match, because only the overlap is a set: ``_burn_complete_set``
-    burns ``min(shares)`` and then drops both entries from the risk book, so an
-    imbalanced pair would leave the excess shares untracked. A pair that does
-    not match is left alone; the overlap still settles to 1.00, nothing is
-    lost, and the larger leg is managed as the directional position it is.
+    Quantities must match: ``_burn_complete_set`` burns ``min(shares)`` and
+    resolves both rows, so a partial-fill imbalance would otherwise leave the
+    excess shares untracked. Only exchange/float precision noise is tolerated;
+    a real mismatch is left alone and both fills remain in the risk book.
     """
     this = risk.open_positions.get(position_key)
     if not this or not this.get("confirmed_filled"):
@@ -1008,7 +1007,7 @@ def _paired_leg(risk, position_key: str, market_id: str):
         other_qty = float(other.get("filled_quantity") or other.get("shares") or 0.0)
         if other_qty <= 0:
             continue
-        if abs(other_qty - this_qty) > max(0.5, 0.005 * max(other_qty, this_qty)):
+        if not share_quantities_match(other_qty, this_qty):
             log.warning(
                 f"[{position_key}] complete set on {market_id} is unbalanced "
                 f"({this_qty:.2f} vs {other_qty:.2f} shares) — not burning it; "

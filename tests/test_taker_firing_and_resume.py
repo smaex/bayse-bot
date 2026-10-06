@@ -566,6 +566,7 @@ def test_a_complete_set_is_signalled_and_carries_no_directional_floor():
     assert signal.outcome == "BOTH"
     assert len(signal.legs) == 2
     assert signal.mode_floor == 0.0
+    assert signal.min_net_ev == pytest.approx(config.TAKER_MIN_NET_EV_DEFAULT)
     # 0.40 on the NO leg is below TAKER_MIN_MODEL_PROB -- and that is fine:
     # the leg is bought at 0.38 (fee-inclusive 0.384), not at even money.
     assert min(signal.legs[1].fair_value, signal.legs[1].fair_value) > 0

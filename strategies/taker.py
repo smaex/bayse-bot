@@ -317,6 +317,7 @@ class TakerStrategy(BaseStrategy):
             # the executor, the exactly-unsatisfiable "both complementary legs
             # above 0.55" requirement that `_leg_ev` was just freed from.
             mode_floor=0.0,
+            min_net_ev=min_net_ev,
             win_prob=max(p_yes, p_no),
             market_price=max(ask_yes, ask_no),
             size_pct=config.TAKER_COMPLETE_SET_SIZE_PCT,
@@ -428,6 +429,7 @@ class TakerStrategy(BaseStrategy):
             # and a 0.65 model against a 0.55 ask was refused as a probe,
             # after the EV gate had already approved it.
             mode_floor=probability_to_certainty(config.TAKER_MIN_MODEL_PROB),
+            min_net_ev=min_net_ev,
             win_prob=model_prob,
             market_price=ask,
             size_pct=size_pct,

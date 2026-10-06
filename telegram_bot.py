@@ -1139,11 +1139,18 @@ async def send_message(app: Application, chat_id: str, text: str, **kwargs):
         log.warning(f"send_message → {chat_id}: {e}")
 
 
-async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
+async def notify_trade(
+    app, cid: str, sig, amount: float, engine: str = "AMM", *,
+    fill_price: float | None = None, shares: float | None = None,
+):
     """
     Differentiated Telegram notification per strategy.
     Custom icons, titles, price info, and order-type badges.
     """
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_trade dropped for {cid}: no Telegram app available")
+        return
     strat = sig.strategy.upper()
     strat_meta = {
         "TAKER": ("🎯", "*TAKER* (Crossing the spread)"),
@@ -1164,8 +1171,12 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
     # expires unfilled does not read as a trade that happened.
     status_line = (
         "Status: resting post-only bid — *not filled yet*\n"
-        if engine == "CLOB_LIMIT" else ""
+        if engine == "CLOB_LIMIT" else
+        "Status: exchange-confirmed fill\n"
+        if fill_price is not None else ""
     )
+    shown_price = market_price if fill_price is None else fill_price
+    shares_line = f"Shares filled: *{float(shares):,.2f}*\n" if shares is not None else ""
     probability_line = (
         f"Signal score (heuristic): *{sig.certainty:.0%}*\n"
         f"Model win estimate: *{win_prob:.1%}* (not an observed win rate)\n"
@@ -1177,7 +1188,8 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
         f"{icon_strat} {title_strat}\n"
         f"Asset: *{sig.asset} {sig.timeframe}*\n"
         f"Direction: {dir_icon} *{sig.outcome}*\n"
-        f"Size: *₦{amount:,.0f}* @ price *{market_price:.3f}*\n"
+        f"Size: *₦{amount:,.0f}* @ price *{shown_price:.3f}*\n"
+        f"{shares_line}"
         f"{status_line}"
         f"{probability_line}"
         + (_code_span(reason) if reason else "")
@@ -1194,12 +1206,96 @@ async def notify_trade(app, cid: str, sig, amount: float, engine: str = "AMM"):
             )
             plain = (
                 f"{icon_strat} [{strat}] {sig.asset} {sig.timeframe} {dir_icon} {sig.outcome} "
-                f"₦{amount:,.0f} @ {market_price:.3f} ({fallback_probability})"
+                f"₦{amount:,.0f} @ {shown_price:.3f} ({fallback_probability})"
                 + (" — resting bid, not filled yet" if engine == "CLOB_LIMIT" else "")
+                + (f" — fill confirmed ({float(shares):,.2f} shares)" if shares is not None else "")
             )
             await app.bot.send_message(chat_id=cid, text=plain)
         except Exception as e:
             log.error(f"notify_trade failed: {e}")
+
+
+async def notify_taker_fill(
+    app, cid, asset, tf, outcome, shares, price, amount, *,
+    complete_set: bool = False, leg_number: int = 1,
+    pair_matched: bool | None = None,
+):
+    """Tell the operator about an exchange-confirmed TAKER fill immediately."""
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_taker_fill dropped for {cid}: no Telegram app available")
+        return
+    try:
+        shares_val = float(shares or 0.0)
+        price_val = float(price or 0.0)
+        amount_val = float(amount or 0.0)
+    except (TypeError, ValueError):
+        shares_val, price_val, amount_val = 0.0, 0.0, 0.0
+    if complete_set and leg_number == 1:
+        state = "_First complete-set leg is confirmed; the opposite leg is being attempted._"
+    elif complete_set and pair_matched is True:
+        state = "_Both outcomes filled in matched quantities; the set is being burned now._"
+    elif complete_set and pair_matched is False:
+        state = (
+            "_Both orders filled, but share counts differ. No burn was attempted; "
+            "both positions remain tracked._"
+        )
+    else:
+        state = "_This position is tracked from the confirmed fill._"
+    msg = (
+        f"🎯 *TAKER Fill Confirmed*\n"
+        f"Market: *{asset} {tf}*\n"
+        f"Outcome: *{outcome}*\n"
+        f"Shares: *{shares_val:,.2f}* @ *{price_val:.3f}*\n"
+        f"Actual cost: *₦{amount_val:,.0f}*\n"
+        f"{state}"
+    )
+    await send_message(app, cid, msg, parse_mode="Markdown")
+
+
+async def notify_taker_pair_partial(app, cid, asset, tf, entries, reason: str = ""):
+    """Warn when a structural TAKER only acquired one of its two legs."""
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_taker_pair_partial dropped for {cid}: no Telegram app available")
+        return
+    rows = []
+    for entry in entries or []:
+        try:
+            rows.append(
+                f"{entry.get('outcome', '?')}: {float(entry.get('shares') or 0.0):,.2f} "
+                f"shares @ {float(entry.get('price') or 0.0):.3f} "
+                f"(₦{float(entry.get('amount') or 0.0):,.0f})"
+            )
+        except (TypeError, ValueError):
+            continue
+    detail = "\n".join(rows) if rows else "No confirmed leg was recorded."
+    why = f"\nReason: {reason[:180]}" if reason else ""
+    msg = (
+        f"⚠️ *TAKER Complete Set — Partial Fill*\n"
+        f"Market: *{asset} {tf}*\n"
+        f"{detail}\n"
+        f"_Only one leg is exchange-confirmed; the opposite leg is not confirmed. "
+        f"No set burn was made; the confirmed exposure remains tracked for "
+        f"exit/settlement. Reconcile the exchange if the request timed out.{why}_"
+    )
+    await send_message(app, cid, msg, parse_mode="Markdown")
+
+
+async def notify_taker_burn_failed(app, cid, asset, tf, reason: str = ""):
+    """Explain that a complete set is still held when its burn fails."""
+    app = app or _bot_app
+    if not app:
+        log.warning(f"notify_taker_burn_failed dropped for {cid}: no Telegram app available")
+        return
+    why = f"\nReason: {reason[:180]}" if reason else ""
+    msg = (
+        f"⚠️ *TAKER Set Burn Not Completed*\n"
+        f"Market: *{asset} {tf}*\n"
+        f"Both filled legs remain tracked. The set still pays 1.00 at resolution; "
+        f"no profit has been booked yet.{why}"
+    )
+    await send_message(app, cid, msg, parse_mode="Markdown")
 
 
 async def notify_win(app, cid, _mid, asset, tf, strat, pnl):
