@@ -436,6 +436,46 @@ def test_the_live_path_can_send_the_completing_quote(monkeypatch):
     )
 
 
+def test_the_real_strategy_quotes_the_missing_side_after_a_fill(monkeypatch):
+    """The skew the completion depends on, driven through the real evaluate().
+
+    The executor can only place the completing quote if the strategy asks for
+    it: after a YES fill the next quote must contain NO, priced with the
+    inventory skew that makes the missing side worth paying up for.
+    """
+    monkeypatch.setattr(config, "USE_MEASURED_VOL", False)
+    from strategies.base import MarketState
+
+    learned = {
+        "open_positions": {
+            "market-pair:YES:filled": {
+                "market_id": MARKET_ID, "strategy": "MAKER", "outcome": "YES",
+                "confirmed_filled": True, "filled_quantity": 1_000.0,
+                "entry_price": 0.36,
+            },
+        },
+    }
+    # The NO book is close enough to the leg's ceiling that the skew is the
+    # binding number: unskewed the bid lands at 0.55, skewed at 0.57.
+    sig = asyncio.run(MakerStrategy().evaluate(
+        _market(), learned, MarketState(), spot_price=SPOT,
+        books={"yes": _book(0.34, 0.42), "no": _book(0.56, 0.60)},
+    ))
+
+    assert sig is not None, "a half-filled pair must still be worth quoting"
+    outcomes = {str(leg.outcome).upper() for leg in sig.ensure_legs()}
+    assert "NO" in outcomes, "the quote must contain the side that is missing"
+    no_leg = next(leg for leg in sig.ensure_legs()
+                  if str(leg.outcome).upper() == "NO")
+    assert no_leg.price >= 0.57, (
+        "the completing side must be skewed up toward the book, not left at "
+        "the 0.55 an unskewed quote would use"
+    )
+    yes_leg = next(leg for leg in sig.ensure_legs()
+                   if str(leg.outcome).upper() == "YES")
+    assert yes_leg.price + no_leg.price <= 1.0 - config.MAKER_PAIR_MIN_EDGE + 1e-9
+
+
 def test_a_second_maker_market_on_the_same_asset_is_still_blocked(monkeypatch):
     """The completion exemption is scoped to the market being completed."""
     monkeypatch.setattr(executor.config, "LIVE_TRADING", True)

@@ -12,7 +12,7 @@
 **Method:** each mechanism below is reproduced by this repository's own code,
 with the sequence of live calls (risk book → orchestrator → executor → quote
 lifecycle). The regression suite `tests/test_maker_pair_completion.py` is run
-against both trees: **13 of its 19 tests fail on the pre-fix code**. The 6 that
+against both trees: **14 of its 20 tests fail on the pre-fix code**. The 6 that
 pass are the controls -- the three "withdraw a completion leg that no longer
 deserves to rest" cases (which the old code got right for the wrong reason: it
 cancelled everything), "a second maker market on the same asset is still
@@ -116,10 +116,10 @@ announced its two-sided quote at placement via `notify_trade`'s
 
 ```
 $ .venv/bin/python -m pytest -q        # fixed tree
-368 passed in 46.06s                    # 347 before this change
+369 passed in 45.78s                    # 347 before this change
 
 $ git stash push bot.py executor.py risk.py strategies/__init__.py \
       strategies/maker.py telegram_bot.py
 $ .venv/bin/python -m pytest tests/test_maker_pair_completion.py -q
-13 failed, 6 passed                     # the 6 are the negative controls
+14 failed, 6 passed                     # the 6 are the negative controls
 ```
