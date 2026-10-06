@@ -20,7 +20,7 @@ import dataclasses
 
 from config import CURRENCY, FEE_FLOOR, MIN_PAYOUT_RATIO
 from strategies import book as booklib
-from risk import share_quantities_match
+from risk import position_is_filled, share_quantities_match
 
 log = logging.getLogger("executor")
 
@@ -944,20 +944,45 @@ async def _execute_logic(
     # sent. Per-asset limiting is what let a single resting quote on BTC block
     # a better opportunity elsewhere on BTC.
     if is_maker:
-        existing = sum(
-            1 for key, p in risk.open_positions.items()
-            if p.get("strategy") == "MAKER"
+        market_legs = [
+            p for key, p in risk.open_positions.items()
+            if str(p.get("strategy") or "").upper() in config.MAKER_STRATEGIES
             and (p.get("market_id", key) == sig.market_id
                  or str(key).startswith(f"{sig.market_id}:"))
-        )
-        if existing:
+        ]
+        resting = [p for p in market_legs if not position_is_filled(p)]
+        if resting:
             _stall_skip(chat_id, sig, "maker_quote_already_resting",
-                        f"{existing} MAKER leg(s) already resting on {sig.market_id}")
+                        f"{len(resting)} MAKER leg(s) already resting on {sig.market_id}")
             log.info(
                 f"[{chat_id}] SKIP MAKER {sig.asset} — a quote is already resting on "
                 f"{sig.market_id}"
             )
             return
+        # A leg that has already filled is a position, not a quote, so it must
+        # not block re-quoting the market outright -- blocking there is what
+        # made a half-filled pair impossible to finish, because the only order
+        # that could complete it was never sent. What it *does* restrict is
+        # what the new quote may be: it has to include the opposite side, or
+        # it is simply adding to the side we already hold.
+        held_outcomes = {
+            str(p.get("outcome") or "").upper() for p in market_legs
+        }
+        if market_legs:
+            wanted = {
+                str(getattr(leg, "outcome", "") or "").upper() for leg in legs
+            }
+            if not (wanted - held_outcomes):
+                _stall_skip(
+                    chat_id, sig, "maker_quote_would_double_filled_side",
+                    f"holding {sorted(o for o in held_outcomes if o)}; "
+                    f"legs {sorted(o for o in wanted if o)}",
+                )
+                log.info(
+                    f"[{chat_id}] SKIP MAKER {sig.asset} — a filled leg is already "
+                    f"held on {sig.market_id} and this quote only re-bids it"
+                )
+                return
         # Maker capital budget. Resting quotes reserve wallet funds and a
         # one-sided fill carries real directional risk, so the maker book gets
         # its own ceiling instead of borrowing the directional one.
@@ -1322,6 +1347,14 @@ async def _execute_logic(
         f"[{chat_id}] PLACING {sig.strategy} {sig.asset} {sig.timeframe} "
         f"{sig.outcome} | {order_type}/{time_in_force} "
         f"₦{amount:,.0f} @ {execution_price} (sig={sig.market_price:.3f}) | cert={sig.certainty:.0%}"
+    )
+    # An execution the operator cannot see coming is indistinguishable from no
+    # execution at all until it fills. Say it is being sent, then report what
+    # the exchange did with it.
+    await _notify_order_sent(
+        chat_id, sig, amount=amount,
+        price=limit_price if limit_price is not None else quote_price,
+        engine=engine,
     )
 
     try:
@@ -1973,6 +2006,10 @@ async def _place_complete_set_take(
         f"| budgets=₦{leg_amounts[0]:,.0f}/₦{leg_amounts[1]:,.0f} "
         f"| lock={live_lock_edge:+.1%}"
     )
+    await _notify_order_sent(
+        chat_id, sig, amount=committed, price=None, engine="CLOB",
+        legs=fresh_legs,
+    )
 
     placed: list[dict] = []
     failure_reason = ""
@@ -2273,6 +2310,30 @@ async def _place_complete_set_take(
             log.warning(f"[{chat_id}] TAKER burn-failure notification failed: {notify_error}")
 
     _trade_cooldown[cooldown_key] = time.time()
+
+
+async def _notify_order_sent(
+    chat_id: str, sig, *, amount: float,
+    price: float | None = None, engine: str = "", legs: list | None = None,
+) -> None:
+    """Tell the operator an order is on its way to the exchange.
+
+    Fires before the order is sent, so the message describes an *execution
+    attempt* rather than a result -- the fill, resting or zero-fill notice
+    still follows from wherever the order actually lands. Best-effort by
+    design: a Telegram failure must never delay or block a live order.
+    """
+    app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+    if not app_to_use:
+        return
+    try:
+        await telegram_bot.notify_executing(
+            app_to_use, chat_id, sig.strategy, sig.asset,
+            getattr(sig, "timeframe", ""), getattr(sig, "outcome", ""),
+            amount, price=price, engine=engine, legs=legs,
+        )
+    except Exception as exc:
+        log.warning(f"[{chat_id}] execution notification failed: {exc}")
 
 
 def _get_market_fee(market_id: str) -> float:

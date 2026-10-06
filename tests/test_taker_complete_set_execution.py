@@ -204,8 +204,11 @@ def test_single_taker_entry_notification_uses_the_confirmed_fill_price(taker_env
 
     _execute(taker_env, client, signal)
 
-    message = taker_env["app"].bot.messages[0]
-    assert "exchange-confirmed fill" in message
+    messages = taker_env["app"].bot.messages
+    # The execution notice comes first, then the fill notice: the operator can
+    # see the order go out, not only the trade that resulted from it.
+    assert "Order being executed" in messages[0]
+    message = next(m for m in messages if "exchange-confirmed fill" in m)
     assert "0.550" in message, "entry alert must use the confirmed fill, not the signal quote"
     assert len(taker_env["recorded"]) == 1
     assert len(taker_env["risk"].open_positions) == 1

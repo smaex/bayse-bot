@@ -847,12 +847,17 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                              next quote toward completing the set;
       * both legs filled  -> burn the complete set and realise the lock;
       * cancelled/expired -> settle the row at zero and free the reservation;
+      * sibling filled    -> keep resting while the pair still locks and the
+                             bid is still worth owning (`_completion_leg_verdict`);
       * stale or the oracle moved -> withdraw BOTH legs and re-quote.
 
     The rule that runs through all of it: **legs are withdrawn together.**
     Cancelling one leg of a two-sided quote and leaving the other resting is
     how a market maker acquires an unintended position -- the survivor is now
-    a one-sided bet nobody is hedging.
+    a one-sided bet nobody is hedging. The one order that is not a "survivor"
+    in that sense is the other half of an already-filled pair: it is the
+    completion of a set, and it is exempt from the quote clock for as long as
+    it still locks and is still worth owning.
 
     A cancelled-but-unconfirmable order is reported as still resting rather
     than dropped, so an operator is never told the book is clean when it is
@@ -942,6 +947,39 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
                 maker_strategy.open_quotes.pop(market_id, None)
                 continue
 
+            # ── Completion leg: the other half of this pair has filled ─────
+            # The survivor is not a standing quote any more, it is the order
+            # that completes a set -- and one fill away from a locked profit
+            # is exactly what this strategy exists to buy. It is therefore not
+            # subject to the standing-quote clock or to the oracle-move
+            # requote: withdrawing it here is what turned half a pair into an
+            # unhedged directional position that nobody asked for. It keeps
+            # resting while it is still worth owning and the pair still locks.
+            sibling = _filled_sibling(risk, pos, market_id)
+            if sibling is not None:
+                keep, why = _completion_leg_verdict(pos, sibling, market)
+                if keep:
+                    fillable, detail = await _completion_leg_can_fill(client, pos)
+                    if fillable:
+                        log.debug(
+                            f"[{chat_id}] MAKER completion leg "
+                            f"{pos.get('outcome')} on {market_id} stays: {why}"
+                        )
+                        continue
+                    # Worth owning, but the book has left it behind: it cannot
+                    # fill where it is. Withdraw it so the next pass re-quotes
+                    # it at the skewed price a completion is priced at.
+                    await _withdraw_resting_quote(
+                        chat_id, client, risk, pos, position_key,
+                        reason=f"completion leg buried, re-quoting: {detail}",
+                    )
+                    continue
+                await _withdraw_resting_quote(
+                    chat_id, client, risk, pos, position_key,
+                    reason=f"completion leg no longer worth holding: {why}",
+                )
+                continue
+
             # Still resting. Withdraw both legs when the quote is stale, when
             # the oracle has moved through it, or when settlement is close.
             quote = maker_strategy.open_quotes.get(market_id) or {}
@@ -969,6 +1007,148 @@ async def _manage_unfilled_maker_orders(chat_id: str, client, risk, settings: di
 
         except Exception as e:
             log.error(f"[{chat_id}] Maker order management error on {order_id}: {e}")
+
+
+def _filled_sibling(risk, pos: dict, market_id: str):
+    """The opposite-outcome leg of this market that has already filled.
+
+    Returns the sibling position dict or None. Used to recognise the half-built
+    pair: a quote whose other leg is now a confirmed position is no longer a
+    quote, and must be judged as a completion order instead of expiring on the
+    standing-quote clock.
+    """
+    outcome = str(pos.get("outcome") or "").upper()
+    for key, other in risk.open_positions.items():
+        if other is pos or not isinstance(other, dict):
+            continue
+        if str(other.get("market_id") or key) != str(market_id):
+            continue
+        if str(other.get("strategy") or "").upper() not in config.MAKER_STRATEGIES:
+            continue
+        if str(other.get("outcome") or "").upper() == outcome:
+            continue
+        try:
+            filled = float(other.get("filled_quantity") or 0.0) > 0.0
+        except (TypeError, ValueError):
+            filled = False
+        if not (other.get("confirmed_filled") or filled):
+            continue
+        return other
+    return None
+
+
+async def _completion_leg_can_fill(client, pos: dict):
+    """Is the completing bid still placed where it can fill?
+
+    A completion bid that the book has left behind cannot do the one job it
+    exists for: every seller hits the bids above it first. Holding it until the
+    candle ends is not patience, it is the same cancelled pair with a later
+    timestamp. It is withdrawn instead, so the next pass re-quotes the side at
+    the skewed price the strategy prices a completion at.
+
+    Fail *open* (keep the order) when the book cannot be read or is stale: a
+    missing price is not evidence that the order is buried, and churn on bad
+    data is worse than a bid that may still be first in line.
+    """
+    from strategies import book as booklib
+
+    outcome_id = pos.get("outcome_id")
+    try:
+        bid = float(pos.get("entry_price") or 0.0)
+    except (TypeError, ValueError):
+        return True, "unreadable bid"
+    if not outcome_id or bid <= 0:
+        return True, "nothing to check"
+    try:
+        book = await asyncio.wait_for(
+            client.get_orderbook(outcome_id, depth=5), timeout=1.5
+        )
+    except Exception as exc:
+        return True, f"book unavailable ({exc})"
+    if booklib.book_is_stale(book):
+        return True, "book stale"
+    price, code, detail = booklib.passive_bid_price(book, bid)
+    if price is None and code == "behind_book":
+        # `would_cross_book` is deliberately NOT a requote: the ask has come to
+        # our bid, which means it is about to fill rather than unable to.
+        return False, detail
+    return True, detail or "still competitive"
+
+
+def _completion_leg_verdict(pos: dict, sibling: dict, market: dict | None):
+    """Should the surviving leg of a half-filled pair keep resting?
+
+    It should while both of its reasons to exist still hold:
+
+      * the pair still locks against the price the sibling *actually* filled
+        at -- ``bid + sibling_fill <= 1 - MAKER_PAIR_MIN_EDGE`` -- because a
+        completion fill that costs more than the set pays is not a completion;
+      * the bid is still worth owning on its own, by the same edge rule that
+        priced it, against a fresh fair value.
+
+    Fails *closed* on missing information: with no market, no fresh oracle or
+    no fair value there is nothing to re-judge the bid with, and keeping a
+    priced-with-edge bid is the smaller error than cancelling the one order
+    that stands between an open position and a locked profit.
+    """
+    from strategies.model import fair_value_pair
+
+    try:
+        bid = float(pos.get("entry_price") or 0.0)
+        sibling_price = float(sibling.get("entry_price") or 0.0)
+    except (TypeError, ValueError):
+        return False, "unreadable bid prices"
+    if bid <= 0.0 or sibling_price <= 0.0:
+        return False, "no recorded price to judge the pair"
+
+    lock = 1.0 - (bid + sibling_price)
+    if lock < config.MAKER_PAIR_MIN_EDGE - 1e-9:
+        return False, (
+            f"pair no longer locks: bid {bid:.3f} + filled {sibling_price:.3f} "
+            f"= {bid + sibling_price:.3f} (needs <= "
+            f"{1.0 - config.MAKER_PAIR_MIN_EDGE:.3f})"
+        )
+
+    if not market:
+        return True, "market rotated out; holding the completion bid"
+    asset = str(pos.get("asset") or "")
+    spot = None
+    direct_price, direct_time = feeds_direct.get_direct_price(asset)
+    if direct_price and time.time() - direct_time <= config.FEED_STALE_SEC:
+        spot = direct_price
+    elif time.time() - feeds.spot_updated_at.get(asset, 0.0) <= config.FEED_STALE_SEC:
+        spot = feeds.spot.get(asset)
+    if not spot:
+        return True, "no fresh oracle to re-judge the bid; holding it"
+
+    synthetic = dict(market)
+    synthetic["asset"] = asset
+    synthetic["threshold"] = market.get("threshold") or pos.get("threshold")
+    fv_pair = fair_value_pair(asset, synthetic, strategy.global_state, spot)
+    if fv_pair is None:
+        return True, "no fair value available; holding the completion bid"
+    fv = fv_pair[0] if str(pos.get("outcome") or "").upper() == "YES" else fv_pair[1]
+
+    # The same skew that priced the quote has to be applied here, or the
+    # verdict is stricter than the rule that admitted the order: a completing
+    # leg is deliberately allowed a thinner edge than a fresh one, and
+    # re-judging it without that allowance would cancel exactly the order the
+    # skew was created to keep.
+    try:
+        held = float(sibling.get("filled_quantity") or 0.0)
+    except (TypeError, ValueError):
+        held = 0.0
+    net = held if str(sibling.get("outcome") or "").upper() == "YES" else -held
+    ticks = max(-config.MAKER_MAX_SKEW_TICKS,
+                min(config.MAKER_MAX_SKEW_TICKS, net))
+    leg_skew = ticks * config.MAKER_TICK
+    if str(pos.get("outcome") or "").upper() != "YES":
+        leg_skew = -leg_skew
+
+    from strategies.maker import maker_strategy
+    return maker_strategy.leg_still_worth_owning(
+        fair_value=fv, bid=bid, skew=leg_skew
+    )
 
 
 def _paired_leg(risk, position_key: str, market_id: str):
@@ -1101,6 +1281,8 @@ async def _burn_complete_set(
     try:
         from strategies import maker as maker_mod
         maker_mod.maker_strategy.open_quotes.pop(market_id, None)
+        # The set is closed: there is no longer an inventory to complete.
+        maker_mod.maker_strategy.clear_inventory(market_id)
     except Exception:
         pass
 
@@ -1259,6 +1441,7 @@ def _exit_decision(
     is_maker_pos: bool,
     confirmed_filled: bool,
     complete_set: bool = False,
+    completion_leg: bool = False,
 ) -> dict | None:
     """Decide whether one position should be exited, and why.
 
@@ -1304,7 +1487,13 @@ def _exit_decision(
 
     # A resting maker quote still unfilled near close is not a position we
     # want to acquire: withdraw it rather than let it fill into settlement.
-    if (is_maker_pos and not confirmed_filled
+    #
+    # The completion leg of a half-filled pair is the exception, and it is a
+    # real one: that order does not *acquire* a position, it finishes building
+    # a set, and it only keeps resting while `bid + sibling_fill` is below one.
+    # Cancelling it near the close takes the one fill that would have locked a
+    # profit and leaves the sibling as an unhedged directional bet.
+    if (is_maker_pos and not confirmed_filled and not completion_leg
             and secs < config.MAKER_LATE_CANCEL_SECS):
         return {"reason": "CANCEL_RESTING", "current_price": current_price,
                 "ev_hold": 0.0}
@@ -1483,6 +1672,13 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         # happens, so it must be burned rather than stopped or sold. A taker
         # complete set (two immediate FAK legs) is only ever seen here.
         paired = _paired_leg(risk, position_key, market_id)
+        # Half a pair: this leg is unfilled but its sibling is a confirmed
+        # position. That makes it a completion order rather than a standing
+        # quote, which changes what the late-candle cancel should do with it.
+        completion_leg = (
+            not bool(pos.get("confirmed_filled"))
+            and _filled_sibling(risk, pos, market_id) is not None
+        )
         decision = _exit_decision(
             outcome=outcome,
             w_est=w_est,
@@ -1494,6 +1690,7 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             is_maker_pos=str(pos.get("strategy") or "").upper() in config.MAKER_STRATEGIES,
             confirmed_filled=bool(pos.get("confirmed_filled")),
             complete_set=paired is not None,
+            completion_leg=completion_leg,
         )
         if decision is None:
             continue

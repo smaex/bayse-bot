@@ -163,6 +163,38 @@ def test_a_maker_pair_and_a_single_leg_are_not_described_the_same_way():
     assert "Single leg" in bot_one.messages[0]
 
 
+def test_execution_is_announced_before_the_fill_not_only_after():
+    """The operator asked to see trades go out, not only the ones that fill.
+
+    A fill notice cannot describe the moment an order is sent: it is silent
+    for every order that rests, partially fills or dies. This message is sent
+    first, so every execution has a beginning the operator can see.
+    """
+    bot, app = _app()
+    asyncio.run(tgb.notify_executing(
+        app, "c1", "TAKER", "BTC", "15min", "YES", 400.0,
+        price=0.553, engine="CLOB",
+    ))
+    message = bot.messages[0]
+    assert "Order being executed" in message
+    assert "BTC 15min" in message
+    assert "0.553" in message
+    assert "TAKER" in message
+
+
+def test_a_complete_set_execution_lists_both_legs():
+    """Two orders are being sent; the notice must not name only one side."""
+    bot, app = _app()
+    asyncio.run(tgb.notify_executing(
+        app, "c1", "TAKER", "BTC", "15min", "BOTH", 800.0,
+        legs=[QuoteLeg("YES", "y", 0.42, 0.02, 0.60),
+              QuoteLeg("NO", "n", 0.37, 0.02, 0.40)],
+        engine="CLOB",
+    ))
+    message = bot.messages[0]
+    assert "YES @ 0.420" in message and "NO @ 0.370" in message
+
+
 def test_an_unconfirmed_cancel_does_not_claim_the_money_came_back():
     """notify_unfilled says 'returned, no loss'. On an unconfirmed cancel the
     order can still fill, so that message would be a false assurance."""

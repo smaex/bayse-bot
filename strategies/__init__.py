@@ -95,6 +95,35 @@ def _performance_multiplier(learned: dict, name: str, sig) -> float:
     return min(1.0, max(0.0, meta * combo))
 
 
+def _resting_maker_markets(learned: dict) -> set[str]:
+    """Markets where a MAKER quote is already resting, unfilled.
+
+    A second quote on a market the maker is already quoting cannot become an
+    order -- the executor refuses it (`maker_quote_already_resting`). Letting
+    such a signal through to collision resolution anyway is not a no-op: a
+    MAKER *pair* outranks a TAKER by construction, so a duplicate that could
+    only ever be skipped was silently deleting real taker entries on every
+    market the maker happened to be quoting. Taker signals are rare enough
+    without being cancelled by an order that will never be sent.
+    """
+    resting: set[str] = set()
+    positions = (learned or {}).get("open_positions") or {}
+    for key, pos in positions.items():
+        if not isinstance(pos, dict):
+            continue
+        if str(pos.get("strategy") or "").upper() not in config.MAKER_STRATEGIES:
+            continue
+        if pos.get("confirmed_filled"):
+            continue
+        try:
+            if float(pos.get("filled_quantity") or 0.0) > 0.0:
+                continue
+        except (TypeError, ValueError):
+            pass
+        resting.add(str(pos.get("market_id") or key))
+    return resting
+
+
 def _is_locked_pair(sig: TradeSignal) -> bool:
     """True only for a *complete set*, not a lone bid -- from either strategy.
 
@@ -167,6 +196,7 @@ async def evaluate_all(
         return []
 
     signals: List[TradeSignal] = []
+    resting_maker = _resting_maker_markets(learned)
     # Stable order makes signal selection reproducible across restarts.
     for name in (n for n in ("TAKER", "MAKER") if n in names):
         strategy = _strategies.get(name)
@@ -181,6 +211,14 @@ async def evaluate_all(
             log.error(f"Strategy {name} error on {asset}: {exc}", exc_info=True)
             continue
         if sig is None:
+            continue
+
+        # An already-resting MAKER quote cannot be sent again, so its signal
+        # must not compete with a taker that can. See
+        # `_resting_maker_markets`.
+        if name in config.MAKER_STRATEGIES and sig.market_id in resting_maker:
+            _perf_note(name, learned, "maker_quote_already_resting",
+                       f"quote already resting on {sig.market_id}")
             continue
 
         # Directional shrinkage. A locked spread has no forecast to be
