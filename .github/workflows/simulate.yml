@@ -17,13 +17,20 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        
-    - name: Run Simulation
-      env:
-        # We mock these in simulation_test.py, but need dummy env vars for safety
-        TELEGRAM_TOKEN: "mock_token"
-        DATABASE_URL: "postgresql://mock@localhost:5432/mock"
-        ENCRYPTION_KEY: "mock_key_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx="
-      run: |
-        python3 scratch/simulation_test.py
+        pip install -r requirements.txt pytest
+
+    - name: Test simulation model
+      run: python -m pytest -q tests/test_simulation.py
+
+    - name: Run audited-economics simulation
+      run: >-
+        python tools/simulate_economics.py --paths 1000 --days 30 --stake 100
+        --output "$RUNNER_TEMP/monte_carlo_simulation.md"
+
+    - name: Upload simulation report
+      uses: actions/upload-artifact@v4
+      with:
+        name: monte-carlo-simulation
+        path: ${{ runner.temp }}/monte_carlo_simulation.md
+        if-no-files-found: error
+        retention-days: 14

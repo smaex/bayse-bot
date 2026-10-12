@@ -1,9 +1,11 @@
 import asyncio
+import math
 import time
 
 import pytest
 
 import executor
+from client import BayseClient
 from risk import RiskManager
 from strategies.base import TradeSignal
 
@@ -11,9 +13,11 @@ from strategies.base import TradeSignal
 class FakeClient:
     def __init__(self, quote):
         self.quote = quote
+        self.quote_calls = 0
         self.place_calls = []
 
     async def get_quote(self, **_kwargs):
+        self.quote_calls += 1
         if isinstance(self.quote, Exception):
             raise self.quote
         return self.quote
@@ -54,6 +58,136 @@ def _install(monkeypatch):
         }],
     )
     monkeypatch.setattr(executor.database, "get_alpha_trend", lambda *_args: 1.0)
+    monkeypatch.setattr(executor.database, "check_connection", lambda: True)
+
+
+def test_ambiguous_single_order_write_pauses_and_persists_the_account(monkeypatch):
+    _install(monkeypatch)
+    quote = {
+        "price": 0.60, "quantity": 2, "amount": 100,
+        "currencyBaseMultiplier": 100, "completeFill": True,
+    }
+
+    class _DispatchTimeoutClient(FakeClient):
+        async def place_order(self, **kwargs):
+            self.place_calls.append(kwargs)
+            raise TimeoutError("connection lost after order dispatch")
+
+    client = _DispatchTimeoutClient(quote)
+    risk = RiskManager()
+    settings = {
+        "mode": "balanced", "risk_pct": 2,
+        "mintrade": 100, "maxtrade": 5_000,
+    }
+    asyncio.run(executor._execute_logic(
+        "chat", _signal(), client, risk, settings, 20_000, 20_000,
+    ))
+
+    assert len(client.place_calls) == 1
+    assert risk.paused is True
+    assert settings["paused"] is True
+    assert settings["paused_reason"] == "order_reconciliation"
+
+
+def test_unavailable_trade_ledger_blocks_buy_before_exchange_write(monkeypatch):
+    _install(monkeypatch)
+    monkeypatch.setattr(executor.database, "check_connection", lambda: False)
+    client = FakeClient({
+        "price": 0.60, "quantity": 2, "amount": 100,
+        "currencyBaseMultiplier": 100, "completeFill": True,
+    })
+    risk = RiskManager()
+    settings = {
+        "mode": "balanced", "risk_pct": 2,
+        "mintrade": 100, "maxtrade": 5_000,
+    }
+
+    asyncio.run(executor._execute_logic(
+        "chat", _signal(), client, risk, settings, 20_000, 20_000,
+    ))
+
+    assert client.place_calls == []
+    assert risk.open_positions == {}
+    assert "exec:database_unavailable" in (
+        executor.stall._users.get("chat", {}).get("rejects") or {}
+    )
+
+
+def test_malformed_confirmed_share_quantity_is_not_booked_as_a_fill(monkeypatch):
+    _install(monkeypatch)
+    monkeypatch.setattr(executor, "_tg_app", None)
+    monkeypatch.setattr(executor.telegram_bot, "_bot_app", None)
+    response = {"order": {
+        "id": "buy-malformed", "status": "filled",
+        "filledSize": float("nan"), "avgFillPrice": 0.60,
+    }}
+
+    class _MalformedFillClient(FakeClient):
+        parse_filled_shares = staticmethod(BayseClient.parse_filled_shares)
+
+        async def place_order(self, **kwargs):
+            self.place_calls.append(kwargs)
+            return response
+
+        async def get_order(self, _order_id):
+            return response
+
+    client = _MalformedFillClient({
+        "price": 0.60, "quantity": 2, "amount": 100,
+        "currencyBaseMultiplier": 100, "completeFill": True,
+    })
+    risk = RiskManager()
+    settings = {
+        "mode": "balanced", "risk_pct": 2,
+        "mintrade": 100, "maxtrade": 5_000,
+    }
+
+    asyncio.run(executor._execute_logic(
+        "chat", _signal(), client, risk, settings, 20_000, 20_000,
+    ))
+
+    assert risk.open_positions == {}
+    assert risk.paused is True
+    assert settings["paused"] is True
+
+
+def test_confirmed_buy_without_ledger_row_pauses_with_position_tracked(monkeypatch):
+    _install(monkeypatch)
+    monkeypatch.setattr(executor.database, "record_trade", lambda **_kwargs: None)
+    monkeypatch.setattr(executor, "_tg_app", None)
+    monkeypatch.setattr(executor.telegram_bot, "_bot_app", None)
+
+    class _FilledClient(FakeClient):
+        parse_filled_shares = staticmethod(BayseClient.parse_filled_shares)
+
+        async def place_order(self, **kwargs):
+            self.place_calls.append(kwargs)
+            return {"order": {
+                "id": "buy-1", "status": "filled", "quantity": 2.0,
+                "avgFillPrice": 0.60, "totalCost": kwargs["amount"],
+            }}
+
+    client = _FilledClient({
+        "price": 0.60, "quantity": 2, "amount": 100,
+        "currencyBaseMultiplier": 100, "completeFill": True,
+    })
+    risk = RiskManager()
+    settings = {
+        "mode": "balanced", "risk_pct": 2,
+        "mintrade": 100, "maxtrade": 5_000,
+    }
+
+    asyncio.run(executor._execute_logic(
+        "chat", _signal(), client, risk, settings, 20_000, 20_000,
+    ))
+
+    assert len(client.place_calls) == 1
+    assert len(risk.open_positions) == 1
+    position = next(iter(risk.open_positions.values()))
+    assert position["ledger_reconciliation_pending"] is True
+    assert position["filled_quantity"] == 2.0
+    assert risk.paused is True
+    assert settings["paused"] is True
 
 
 def test_amm_quote_outage_does_not_fall_back_to_a_live_order(monkeypatch):
@@ -95,6 +229,41 @@ def test_low_certainty_probe_does_not_use_real_money(monkeypatch):
     assert client.place_calls == []
 
 
+def test_platform_minimum_never_overrides_the_per_trade_risk_cap(monkeypatch):
+    _install(monkeypatch)
+    client = FakeClient({
+        "price": 0.60, "quantity": 2, "amount": 100,
+        "currencyBaseMultiplier": 100, "completeFill": True,
+    })
+
+    # 1% of ₦1,000 is only ₦10. Even though the wallet and exchange minimum
+    # can fund ₦100, the minimum must not enlarge the risk-approved order.
+    asyncio.run(executor._execute_logic(
+        "chat", _signal(), client, RiskManager(),
+        {"mode": "safe", "risk_pct": 1, "mintrade": 100, "maxtrade": 5000},
+        1_000, 1_000,
+    ))
+
+    assert client.quote_calls == 0
+    assert client.place_calls == []
+
+
+def test_non_finite_amm_quote_is_rejected_before_pricing_or_placement(monkeypatch):
+    _install(monkeypatch)
+    client = FakeClient({
+        "price": 0.60, "quantity": float("inf"), "amount": 100,
+        "completeFill": True,
+    })
+
+    asyncio.run(executor._execute_logic(
+        "chat", _signal(), client, RiskManager(),
+        {"mode": "safe", "risk_pct": 1, "mintrade": 100, "maxtrade": 5000},
+        20_000, 20_000,
+    ))
+
+    assert client.place_calls == []
+
+
 def test_official_quote_amount_and_quantity_define_effective_buy_price():
     # Exact public documentation fixture (USD multiplier = 1).
     official_quote = {
@@ -123,6 +292,15 @@ def test_official_quote_amount_and_quantity_define_effective_buy_price():
     assert executor._clob_buy_effective_price(0.65, 0.05) == pytest.approx(
         2 / 3
     )
+
+
+def test_quote_cost_helper_marks_non_finite_cost_fields_invalid():
+    for quote in (
+        {"quantity": math.inf, "amount": 100},
+        {"quantity": 2, "amount": math.nan},
+        {"quantity": 2, "amount": 100, "fee": math.inf},
+    ):
+        assert math.isnan(executor._quote_effective_buy_price(quote))
 
 
 def test_book_timestamp_accepts_seconds_milliseconds_and_iso8601():
@@ -184,6 +362,7 @@ def _install_clob(monkeypatch):
         }],
     )
     monkeypatch.setattr(executor.database, "get_alpha_trend", lambda *_args: 1.0)
+    monkeypatch.setattr(executor.database, "check_connection", lambda: True)
     executor._trade_cooldown.clear()
 
 

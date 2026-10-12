@@ -107,6 +107,40 @@ def test_unfilled_maker_is_cancelled_without_sending_a_sell(monkeypatch):
     assert risk.open_positions == {}
 
 
+def test_exit_loop_does_not_replay_unresolved_cancel_or_ledger_state(monkeypatch):
+    _install_market(monkeypatch)
+    for reconciliation_flag in ("pending_cancel", "ledger_reconciliation_pending"):
+        risk = _risk_with_position(maker=True)
+        position = risk.open_positions["market-1"]
+        position["order_active"] = True
+        position[reconciliation_flag] = True
+        client = FakeExitClient()
+
+        asyncio.run(bot._evaluate_and_exit_positions("chat", client, risk, {}))
+
+        assert client.cancelled == []
+        assert client.sell_calls == []
+        assert "market-1" in risk.open_positions
+
+
+def test_active_maker_without_order_id_is_not_sold_or_forgotten(monkeypatch):
+    _install_market(monkeypatch)
+    risk = _risk_with_position(maker=True)
+    position = risk.open_positions["market-1"]
+    position["order_id"] = None
+    position["order_active"] = True
+    client = FakeExitClient()
+    settings = {}
+
+    asyncio.run(bot._evaluate_and_exit_positions("chat", client, risk, settings))
+
+    assert client.cancelled == []
+    assert client.sell_calls == []
+    assert "market-1" in risk.open_positions
+    assert risk.paused is True
+    assert settings["paused"] is True
+
+
 def test_exit_uses_desired_ngn_proceeds_and_confirmed_fill(monkeypatch):
     _install_market(monkeypatch)
     risk = _risk_with_position()
@@ -126,6 +160,98 @@ def test_exit_uses_desired_ngn_proceeds_and_confirmed_fill(monkeypatch):
     assert "max_slippage" not in sell
     assert risk.open_positions == {}
     assert risk.daily_realized_pnl == -105.0
+
+
+def test_exit_is_capped_at_this_bot_positions_not_other_wallet_shares(monkeypatch):
+    _install_market(monkeypatch)
+    risk = _risk_with_position()
+    client = FakeExitClient(current_value=1_000, sell_price=0.5)
+
+    async def portfolio_position(_outcome_id):
+        return {
+            "availableBalance": 20.0,
+            "balance": 20.0,
+            "sellPrice": 0.5,
+            "currentValue": 1_000.0,
+        }
+
+    client.get_position = portfolio_position
+    asyncio.run(bot._evaluate_and_exit_positions("chat", client, risk, {}))
+
+    assert len(client.sell_calls) == 1
+    assert client.sell_calls[0]["amount"] == 497.5
+
+
+def test_portfolio_read_outage_defers_exit_without_crashing_or_selling(monkeypatch):
+    _install_market(monkeypatch)
+    risk = _risk_with_position()
+    client = FakeExitClient()
+
+    async def unavailable_portfolio(_outcome_id):
+        raise TimeoutError("portfolio read failed")
+
+    client.get_position = unavailable_portfolio
+    asyncio.run(bot._evaluate_and_exit_positions("chat", client, risk, {}))
+
+    assert client.sell_calls == []
+    assert "market-1" in risk.open_positions
+    assert risk.paused is False
+
+
+def test_quote_read_outage_defers_exit_without_crashing_or_selling(monkeypatch):
+    _install_market(monkeypatch)
+    risk = _risk_with_position()
+    client = FakeExitClient()
+
+    async def unavailable_quote(*_args):
+        raise TimeoutError("quote read failed")
+
+    client.get_quote = unavailable_quote
+    asyncio.run(bot._evaluate_and_exit_positions("chat", client, risk, {}))
+
+    assert client.sell_calls == []
+    assert "market-1" in risk.open_positions
+    assert risk.paused is False
+
+
+def test_malformed_portfolio_balance_fails_closed_before_sell(monkeypatch):
+    _install_market(monkeypatch)
+    risk = _risk_with_position()
+    client = FakeExitClient()
+
+    async def malformed_position(_outcome_id):
+        return {
+            "availableBalance": float("nan"),
+            "sellPrice": 0.5,
+            "currentValue": 500.0,
+        }
+
+    client.get_position = malformed_position
+    settings = {}
+    asyncio.run(bot._evaluate_and_exit_positions("chat", client, risk, settings))
+
+    assert client.sell_calls == []
+    assert "market-1" in risk.open_positions
+    assert risk.paused is True
+    assert settings["paused_reason"] == "order_reconciliation"
+
+
+def test_ambiguous_sell_write_pauses_without_dropping_the_position(monkeypatch):
+    _install_market(monkeypatch)
+    risk = _risk_with_position()
+    client = FakeExitClient()
+
+    async def ambiguous_sell(**kwargs):
+        raise RuntimeError("connection timed out after dispatch")
+
+    client.place_order = ambiguous_sell
+    settings = {}
+    asyncio.run(bot._evaluate_and_exit_positions("chat", client, risk, settings))
+
+    assert "market-1" in risk.open_positions
+    assert risk.open_positions["market-1"]["exit_reconciliation_pending"] is True
+    assert risk.paused is True
+    assert settings["paused"] is True
 
 
 def test_amm_exit_sends_an_explicit_slippage_bound(monkeypatch):

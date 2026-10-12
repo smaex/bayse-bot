@@ -5,6 +5,7 @@ import time
 import json
 import asyncio
 import logging
+import math
 import aiohttp
 from typing import Optional, Sequence
 from config import (
@@ -18,6 +19,16 @@ from config import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _validated_balance(value, field: str) -> float:
+    try:
+        balance = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"wallet {field} is not numeric") from exc
+    if not math.isfinite(balance) or balance < 0.0:
+        raise ValueError(f"wallet {field} must be finite and non-negative")
+    return balance
 
 
 class RateLimiter:
@@ -214,10 +225,8 @@ class BayseClient:
                 if r.status == 429:
                     await asyncio.sleep(await self._retry_delay(r, attempt))
                     continue
-                if 500 <= r.status < 600 and attempt + 1 < API_READ_RETRIES:
-                    await r.read()
-                    await asyncio.sleep(min(0.25 * (2 ** attempt), 2.0))
-                    continue
+                # A 5xx may follow an accepted cancellation. Do not repeat the
+                # write; the caller must query the order and reconcile state.
                 r.raise_for_status()
                 if r.status == 204:
                     return {}
@@ -321,14 +330,18 @@ class BayseClient:
         )
 
     async def cancel_order(self, order_id: str) -> dict:
-        """Cancel an open limit order.
+        """Cancel an open limit order without replaying an ambiguous write.
 
-        Uses the documented batch delete endpoint which reliably returns 200 with result status,
-        and falls back to single order delete with empty JSON body to satisfy HMAC signature.
+        Use the batch endpoint first. Fall back to the documented single-order
+        endpoint only when the batch route is explicitly unsupported; network
+        and server errors may follow an accepted cancel and must be reconciled
+        by querying the order, not by issuing another DELETE.
         """
         try:
             return await self._delete("/v1/pm/orders/batch", body={"orderIds": [order_id]})
-        except Exception:
+        except aiohttp.ClientResponseError as batch_error:
+            if batch_error.status not in {404, 405}:
+                raise
             return await self._delete(f"/v1/pm/orders/{order_id}", body={})
 
     async def list_orders(self, page: int = 1, limit: int = 50) -> dict:
@@ -344,8 +357,17 @@ class BayseClient:
 
     async def get_balance_ngn(self) -> float:
         wallet = await self.get_wallet()
-        assets = wallet if isinstance(wallet, list) else wallet.get("assets", [])
+        if isinstance(wallet, list):
+            assets = wallet
+        elif isinstance(wallet, dict):
+            assets = wallet.get("assets", [])
+        else:
+            raise ValueError("wallet response is not an object or asset list")
+        if not isinstance(assets, list):
+            raise ValueError("wallet assets field is not a list")
         for asset in assets:
+            if not isinstance(asset, dict):
+                continue
             currency = (asset.get("currency") or asset.get("symbol") or "").upper()
             if currency == "NGN":
                 # CRITICAL: only trust availableBalance/available — these are
@@ -366,20 +388,15 @@ class BayseClient:
                 for field in ("availableBalance", "available"):
                     v = asset.get(field)
                     if v is not None:
-                        return float(v)
-                # Field genuinely absent (not just zero) — only NOW fall
-                # back to a different field, and log it clearly so this
-                # is visible rather than silently trusting a possibly
-                # wrong number.
-                for field in ("balance", "total"):
-                    v = asset.get(field)
-                    if v is not None:
-                        log.warning(
-                            f"get_balance_ngn: availableBalance/available "
-                            f"missing from API response, falling back to "
-                            f"'{field}'={v} — this may include locked funds"
-                        )
-                        return float(v)
+                        return _validated_balance(v, field)
+                # Total balance can include capital locked in open positions;
+                # using it as free cash both overstates order capacity and then
+                # double-counts deployed funds in equity. Without an explicit
+                # available-balance field, block new entries instead.
+                log.error(
+                    "get_balance_ngn: NGN wallet response has no "
+                    "availableBalance/available; treating free cash as zero"
+                )
                 return 0.0
         return 0.0
 
@@ -438,7 +455,13 @@ class BayseClient:
     async def get_position(self, outcome_id: str) -> dict | None:
         portfolio = await self.get_portfolio()
         rows = portfolio.get("outcomeBalances", []) if isinstance(portfolio, dict) else []
-        return next((row for row in rows if row.get("outcomeId") == outcome_id), None)
+        if not isinstance(rows, list):
+            return None
+        return next(
+            (row for row in rows
+             if isinstance(row, dict) and row.get("outcomeId") == outcome_id),
+            None,
+        )
 
     # ── Share operations ──────────────────────────────────────────────────────
 
@@ -477,20 +500,20 @@ class BayseClient:
                     value = float(order.get(field) or 0.0)
                 except (TypeError, ValueError):
                     continue
-                if value > 0:
+                if math.isfinite(value) and value > 0:
                     return value
 
         # Partial CLOB responses may remain status=open while exposing an
         # explicit filled field. Never use requested `size` or `amount`.
         for field in (
             "filledSize", "sharesFilled", "sharesMatched",
-            "amountMatched", "filledQuantity",
+            "filledQuantity",
         ):
             try:
                 value = float(order.get(field) or 0.0)
             except (TypeError, ValueError):
                 continue
-            if value > 0:
+            if math.isfinite(value) and value > 0:
                 return value
 
         return 0.0

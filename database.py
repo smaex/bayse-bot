@@ -47,7 +47,7 @@ DEFAULT_SETTINGS: dict = {
     "maxexposure":      15.0,
     "daily_multiplier": 3,
     "daily_target_ngn": 0,
-    "daily_loss_limit_pct": 5.0,
+    "daily_loss_limit_pct": config.DEFAULT_DAILY_LOSS_LIMIT_PCT,
     "paused":           True,
     "learned":          {},
     "mode":             "balanced",
@@ -79,7 +79,11 @@ _pool: psycopg2.pool.ThreadedConnectionPool | None = None
 # Simple in-memory caches with 15-second TTL
 _USER_CACHE: dict[str, tuple[float, dict]] = {}  # chat_id -> (timestamp, data)
 _ACTIVE_USERS_CACHE: tuple[float, list[dict]] | None = None
-_CACHE_TTL = 15.0  # seconds
+# Feed-triggered evaluations are much faster than database-backed settings
+# need to refresh. Explicit update/invalidate paths keep local writes immediate;
+# a minute TTL bounds out-of-process/admin-console staleness without issuing a
+# Supabase query for every market tick.
+_CACHE_TTL = 60.0  # seconds
 
 
 def _init_pool():

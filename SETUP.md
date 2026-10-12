@@ -5,7 +5,7 @@ The current deployment and safety instructions live in [README.md](README.md). T
 1. Install Python 3.11+, PostgreSQL, and `requirements.txt` in a virtual environment.
 2. Copy `.env.example` to `.env`.
 3. Set `TELEGRAM_TOKEN`, `DATABASE_URL`, `ENCRYPTION_KEY`, and `DASHBOARD_PASSWORD`.
-4. Keep `LIVE_TRADING=false` and `ALLOW_EXPERIMENTAL_STRATEGIES=false`.
+4. Keep `LIVE_TRADING=false` during validation. A fresh account is paused and uses the configured TAKER+MAKER BTC/ETH/SOL 5-/15-minute scope.
 5. Run `pytest -q`; all checks must pass.
 6. Start `python bot.py` and confirm `/live` returns 200 and `/ready` becomes 200. During a rolling update the new container reports `"role": "standby"` on `/live` (200) while `/ready` stays 503 until the old one hands over the lease — that is the deploy working, not stalling.
 7. Use Telegram `/start`, verify feeds with `/debug`, and inspect market discovery.

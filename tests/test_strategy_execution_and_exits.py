@@ -30,6 +30,10 @@ class MockClient(BayseClient):
     async def get_orderbooks(self, outcome_ids, depth=5):
         return {}
 
+    async def get_balance_ngn(self):
+        # These tests exercise order reconciliation, not the live wallet client.
+        return 20_000.0
+
     async def get_position(self, outcome_id):
         return {
             "availableBalance": 10,
@@ -38,14 +42,14 @@ class MockClient(BayseClient):
         }
 
     async def get_quote(self, *args, **kwargs):
-        return {"completeFill": True, "quantity": 10, "price": 0.85}
+        return {"completeFill": True, "quantity": 9.09, "price": 0.85}
 
     async def place_order(self, **kwargs):
         return {
             "order": {
                 "id": "exit-order-1",
                 "status": "filled",
-                "filledSize": 10,
+                "filledSize": 9.09,
                 "avgFillPrice": 0.85,
                 "amount": kwargs.get("amount", 800),
             }

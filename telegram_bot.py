@@ -486,7 +486,7 @@ async def cmd_set(update: Update, _ctx):
         try:
             pct = float(vals[0])
             max_risk_pct = config.MAX_TRADE_RISK * 100
-            if not 0.1 <= pct <= max_risk_pct: raise ValueError
+            if not math.isfinite(pct) or not 0.1 <= pct <= max_risk_pct: raise ValueError
             s["risk_pct"] = pct; msg = f"Risk per trade: {pct}%"
         except ValueError:
             await update.message.reply_text(
@@ -495,6 +495,8 @@ async def cmd_set(update: Update, _ctx):
     elif key == "mintrade":
         try:
             amt = float(vals[0])
+            if not math.isfinite(amt):
+                raise ValueError
             if amt < MIN_TRADE_NGN:
                 await update.message.reply_text(f"Minimum is ₦{MIN_TRADE_NGN} (Bayse platform limit)."); return
             s["mintrade"] = amt; msg = f"Min trade: ₦{amt:,.0f}"
@@ -503,7 +505,7 @@ async def cmd_set(update: Update, _ctx):
     elif key == "maxtrade":
         try:
             amount = float(vals[0])
-            if amount < MIN_TRADE_NGN:
+            if not math.isfinite(amount) or amount < MIN_TRADE_NGN:
                 raise ValueError
             s["maxtrade"] = amount; msg = f"Max trade: ₦{amount:,.0f}"
         except ValueError:
@@ -521,15 +523,19 @@ async def cmd_set(update: Update, _ctx):
     elif key == "dailymultiplier":
         try:
             m = float(vals[0])
-            if not 0 < m <= 100: raise ValueError
+            if not math.isfinite(m) or not 0 < m <= 100: raise ValueError
             s["daily_multiplier"] = m; s["daily_target_ngn"] = 0
             msg = f"Daily target: {m}% of starting balance"
         except ValueError:
             await update.message.reply_text("Enter 1–100."); return
     elif key == "dailytarget":
         try:
-            s["daily_target_ngn"] = float(vals[0]); s["daily_multiplier"] = 0
-            msg = f"Daily target: ₦{s['daily_target_ngn']:,.0f} fixed"
+            target = float(vals[0])
+            if not math.isfinite(target) or target < 0.0:
+                raise ValueError
+            s["daily_target_ngn"] = target
+            s["daily_multiplier"] = 0
+            msg = f"Daily target: ₦{target:,.0f} fixed"
         except ValueError:
             await update.message.reply_text("Enter a number."); return
     else:
@@ -577,6 +583,7 @@ async def cmd_resetlearning(update: Update, _ctx):
     risk = _user_risks.get(cid)
     if risk:
         risk.paused = bool(s.get("paused", True))
+        risk.pause_reason = str(s.get("paused_reason") or "") if risk.paused else ""
         risk.peak_balance = 0
     strat_list = ', '.join(name.replace('_', '\\_') for name in config.DEFAULT_STRATEGIES)
     log.info(f"[{cid}] /resetlearning — cleared learned; safe strategies={config.DEFAULT_STRATEGIES}")
@@ -990,6 +997,7 @@ async def _set_paused(cid: str, paused: bool):
         risk = _user_risks.get(cid)
         if risk is not None:
             risk.paused = bool(paused)
+            risk.pause_reason = "manual" if paused else ""
         try:
             import stall
 

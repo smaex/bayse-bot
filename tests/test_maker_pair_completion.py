@@ -117,9 +117,10 @@ def _fresh_oracle(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _clean_maker_state():
+def _clean_maker_state(monkeypatch):
     from strategies.maker import maker_strategy
 
+    monkeypatch.setattr(executor.database, "check_connection", lambda: True)
     maker_strategy.open_quotes.clear()
     # getattr: these tests are run against the pre-fix code as well, to prove
     # they are regressions rather than restatements of the new behaviour.
@@ -180,6 +181,205 @@ def _maker_env(monkeypatch, *, market=None):
 
 
 # ── 1. A half-filled pair keeps its completing leg resting ───────────────────
+
+def test_quote_withdrawal_cancels_every_live_legacy_leg(monkeypatch):
+    risk = _maker_env(monkeypatch)
+    positions = []
+    for outcome in ("YES", "NO", "NO"):
+        order_id = f"maker-{len(positions) + 1}"
+        position = _position(
+            order_id, outcome=outcome, outcome_id=outcome.lower(),
+            order_id=order_id, order_active=True,
+        )
+        key = f"market-pair:{outcome}:{order_id}"
+        risk.add_position(key, position)
+        positions.append((key, position))
+
+    class _CancelAllClient:
+        def __init__(self):
+            self.cancelled = []
+
+        async def cancel_order(self, order_id):
+            self.cancelled.append(order_id)
+
+        async def get_order(self, order_id):
+            return {"status": "cancelled", "filledSize": 0}
+
+        @staticmethod
+        def parse_filled_shares(_order):
+            return 0.0
+
+    client = _CancelAllClient()
+    result = asyncio.run(bot._withdraw_resting_quote(
+        CHAT, client, risk, positions[0][1], positions[0][0],
+        reason="legacy duplicate quote", settings={},
+    ))
+
+    assert set(client.cancelled) == {"maker-1", "maker-2", "maker-3"}
+    assert risk.open_positions == {}
+    assert result is True
+
+
+def test_executor_unwind_retains_a_partial_fill_when_cancel_is_unconfirmed(monkeypatch):
+    risk = _maker_env(monkeypatch)
+    risk.current_free_cash = 1_000.0
+    sig = SimpleNamespace(
+        market_id=MARKET_ID, event_id="event-pair", strategy="MAKER",
+        asset="BTC", timeframe="15min", outcome="YES", outcome_id="yes",
+    )
+
+    class _StillOpenClient:
+        async def cancel_order(self, _order_id):
+            return {"status": "open"}
+
+        async def get_order(self, _order_id):
+            return {"status": "open", "filledSize": 3.0, "avgFillPrice": 0.50}
+
+        @staticmethod
+        def parse_filled_shares(order):
+            return float(order.get("filledSize") or 0.0)
+
+    client = _StillOpenClient()
+    settings = {}
+    asyncio.run(executor._unwind_maker_legs(
+        CHAT, client,
+        [{
+            "outcome": "YES", "outcome_id": "yes", "order_id": "maker-untracked",
+            "price": 0.50, "amount": 500.0, "filled": 2.0,
+        }],
+        sig, reason="ledger persistence failed", risk=risk, settings=settings,
+    ))
+
+    position = risk.open_positions[f"{MARKET_ID}:YES:maker-untracked"]
+    assert position["filled_quantity"] == 3.0
+    assert position["amount_ngn"] == 150.0
+    assert position["order_active"] is True
+    assert position["pending_cancel"] is True
+    assert position["maker_ledger_missing"] is True
+    assert risk.current_free_cash == 500.0
+    assert risk.paused is True
+    assert settings["paused_reason"] == "order_reconciliation"
+
+
+def test_partial_immediate_fill_cancels_live_remainder_and_reconciles_cumulative_shares(monkeypatch):
+    _fresh_oracle(monkeypatch)
+    risk = _maker_env(monkeypatch)
+    risk.current_free_cash = 800.0
+    position = _position(
+        "maker-partial", outcome="YES", outcome_id="yes", entry_price=0.50,
+        amount_ngn=200.0, filled_quantity=2.0, confirmed_filled=True,
+        order_active=True,
+    )
+    risk.add_position("market-pair:YES:maker-partial", position)
+
+    class _PartialGtcClient:
+        def __init__(self):
+            self.cancelled = []
+
+        async def get_order(self, order_id):
+            status = "cancelled" if order_id in self.cancelled else "open"
+            return {"status": status, "filledSize": 3.0, "avgFillPrice": 0.50}
+
+        async def cancel_order(self, order_id):
+            self.cancelled.append(order_id)
+
+        @staticmethod
+        def parse_filled_shares(order):
+            return float(order.get("filledSize") or 0.0)
+
+    client = _PartialGtcClient()
+    asyncio.run(bot._manage_unfilled_maker_orders(
+        CHAT, client, risk, {"mode": "balanced"}
+    ))
+
+    assert client.cancelled == ["maker-partial"]
+    assert position["confirmed_filled"] is True
+    assert position["order_active"] is False
+    assert position["filled_quantity"] == 3.0
+    assert position["amount_ngn"] == 150.0
+    # Polling a later cumulative total is not a second debit of the same fill.
+    assert risk.current_free_cash == 800.0
+
+
+def test_burn_uses_guaranteed_payout_when_api_amount_is_malformed(monkeypatch):
+    _fresh_oracle(monkeypatch)
+    risk = _maker_env(monkeypatch)
+    risk.current_free_cash = 1_000.0
+    yes = _position(
+        "maker-yes", outcome="YES", outcome_id="yes", entry_price=0.30,
+        amount_ngn=300.0, filled_quantity=10.0, confirmed_filled=True,
+        order_active=False,
+    )
+    no = _position(
+        "maker-no", outcome="NO", outcome_id="no", entry_price=0.30,
+        amount_ngn=300.0, filled_quantity=10.0, confirmed_filled=True,
+        order_active=False,
+    )
+    risk.add_position("market-pair:YES:maker-yes", yes)
+    risk.add_position("market-pair:NO:maker-no", no)
+
+    class _MalformedBurnClient:
+        def __init__(self):
+            self.calls = []
+
+        async def burn_shares(self, market_id, quantity, currency):
+            self.calls.append((market_id, quantity, currency))
+            return {"amount": float("nan")}
+
+    client = _MalformedBurnClient()
+    asyncio.run(bot._burn_complete_set(
+        CHAT, client, risk, yes, "market-pair:YES:maker-yes",
+        market_id="market-pair", settings={"mode": "balanced"},
+    ))
+
+    assert client.calls == [("market-pair", 10.0, config.CURRENCY)]
+    assert risk.open_positions == {}
+    assert risk.current_free_cash == 2_000.0
+    assert risk.daily_realized_pnl == 400.0
+
+
+def test_ambiguous_burn_pauses_and_is_not_retried_automatically(monkeypatch):
+    _fresh_oracle(monkeypatch)
+    risk = _maker_env(monkeypatch)
+    yes = _position(
+        "maker-yes", outcome="YES", outcome_id="yes", entry_price=0.30,
+        amount_ngn=300.0, filled_quantity=10.0, confirmed_filled=True,
+        order_active=False,
+    )
+    no = _position(
+        "maker-no", outcome="NO", outcome_id="no", entry_price=0.30,
+        amount_ngn=300.0, filled_quantity=10.0, confirmed_filled=True,
+        order_active=False,
+    )
+    risk.add_position("market-pair:YES:maker-yes", yes)
+    risk.add_position("market-pair:NO:maker-no", no)
+
+    class _AmbiguousBurnClient:
+        def __init__(self):
+            self.calls = 0
+
+        async def burn_shares(self, *_args):
+            self.calls += 1
+            raise RuntimeError("timeout after dispatch")
+
+    client = _AmbiguousBurnClient()
+    settings = {"mode": "balanced"}
+    first = asyncio.run(bot._burn_complete_set(
+        CHAT, client, risk, yes, "market-pair:YES:maker-yes",
+        market_id="market-pair", settings=settings,
+    ))
+    second = asyncio.run(bot._burn_complete_set(
+        CHAT, client, risk, yes, "market-pair:YES:maker-yes",
+        market_id="market-pair", settings=settings,
+    ))
+
+    assert first is False and second is False
+    assert client.calls == 1
+    assert risk.paused is True
+    assert yes["burn_reconciliation_pending"] is True
+    assert no["burn_reconciliation_pending"] is True
+    assert len(risk.open_positions) == 2
+
 
 def test_a_completion_leg_survives_the_standing_quote_timeout(monkeypatch):
     """The oracle moved and the quote is old, but the sibling has filled.

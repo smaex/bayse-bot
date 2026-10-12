@@ -196,6 +196,7 @@ def test_unconfirmed_cancel_notifies_once_and_retains_the_position(monkeypatch):
 
     app = _FakeApp()
     monkeypatch.setattr(bot, "_tg_app", app)
+    monkeypatch.setattr(executor, "_tg_app", app)
     monkeypatch.setattr(bot, "active_markets", [{
         "market_id": "market-1", "threshold": 100.0, "secs_to_close": 400,
         "yes_price": 0.52, "no_price": 0.48,
@@ -206,14 +207,18 @@ def test_unconfirmed_cancel_notifies_once_and_retains_the_position(monkeypatch):
     risk.add_position("market-1", pos)
     client = _Client()
 
-    asyncio.run(bot._manage_unfilled_maker_orders("chat-1", client, risk, {}))
+    settings = {}
+    asyncio.run(bot._manage_unfilled_maker_orders("chat-1", client, risk, settings))
     assert client.cancels == ["maker-order-1"]
     assert "market-1" in risk.open_positions          # still live on the exchange
-    assert pos["unfilled_alerted"] is True
+    assert pos["pending_cancel"] is True
+    assert risk.paused is True
+    assert settings["paused_reason"] == "order_reconciliation"
     assert len(app.bot.messages) == 1
 
-    # A second cycle must not spam the user about the same order.
-    asyncio.run(bot._manage_unfilled_maker_orders("chat-1", client, risk, {}))
+    # A second cycle must not retry the ambiguous cancel or spam the user.
+    asyncio.run(bot._manage_unfilled_maker_orders("chat-1", client, risk, settings))
+    assert client.cancels == ["maker-order-1"]
     assert len(app.bot.messages) == 1
 
 

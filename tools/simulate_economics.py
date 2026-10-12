@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Monte Carlo economics simulator for audited Bayse strategy aggregates.
+"""Monte Carlo illustration from historical Bayse strategy aggregates.
 
-This is a risk illustration, not a backtest of the newly tightened signal
-policy. It uses only non-sensitive aggregate counts/PnL from the production
-audit and a Jeffreys beta posterior for uncertain win probability.
+This is not a backtest of the current TAKER implementation or its entry filters.
+It uses only non-sensitive aggregate counts/PnL from the production audit and
+represents uncertainty in win probability with a Jeffreys beta posterior.
 """
 
 from __future__ import annotations
@@ -35,6 +35,11 @@ class Scenario:
 
 
 def _poisson(rng: random.Random, mean: float) -> int:
+    mean = float(mean)
+    if not math.isfinite(mean) or mean < 0.0:
+        raise ValueError("Poisson mean must be finite and non-negative")
+    if mean == 0.0:
+        return 0
     threshold = math.exp(-mean)
     product = 1.0
     count = 0
@@ -50,10 +55,44 @@ def _quantile(values: list[float], probability: float) -> float:
     return ordered[index]
 
 
+def _validate_simulation(scenario: Scenario, *, days: int, paths: int, stake: float) -> float:
+    if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+        raise ValueError("days must be a positive integer")
+    if isinstance(paths, bool) or not isinstance(paths, int) or paths <= 0:
+        raise ValueError("paths must be a positive integer")
+    try:
+        stake = float(stake)
+        roi = float(scenario.roi)
+        fills_per_day = float(scenario.trades_per_day)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("stake, ROI, and fills per day must be numeric") from exc
+    if not math.isfinite(stake) or stake <= 0.0:
+        raise ValueError("stake must be finite and positive")
+    if (
+        isinstance(scenario.wins, bool)
+        or isinstance(scenario.trades, bool)
+        or not isinstance(scenario.wins, int)
+        or not isinstance(scenario.trades, int)
+        or scenario.trades <= 0
+        or scenario.wins < 0
+        or scenario.wins > scenario.trades
+    ):
+        raise ValueError("scenario wins/trades must be valid non-negative counts")
+    if not math.isfinite(roi) or roi <= -1.0:
+        raise ValueError("scenario ROI must be finite and greater than -100%")
+    if not math.isfinite(fills_per_day) or fills_per_day < 0.0:
+        raise ValueError("scenario fills per day must be finite and non-negative")
+    price = scenario.wins / scenario.trades / (1.0 + roi)
+    if not math.isfinite(price) or not 0.0 < price < 1.0:
+        raise ValueError("scenario implied effective price must be between zero and one")
+    return stake
+
+
 def simulate(
     scenario: Scenario, *, days: int = 30, paths: int = 20_000,
     stake: float = 100.0, seed: int = 20260910,
 ) -> dict:
+    stake = _validate_simulation(scenario, days=days, paths=paths, stake=stake)
     rng = random.Random(seed)
     p = scenario.implied_effective_price
     alpha = scenario.wins + 0.5
@@ -128,9 +167,9 @@ def render(paths: int, days: int, stake: float) -> str:
         "",
         f"Generated with `{paths:,}` paths, `{days}` days, and ₦{stake:,.0f} per simulated fill.",
         "",
-        "This is not a claim that the new SNIPE policy has been backtested. The repository does not contain raw tick/quote history, so the simulation uses audited aggregate economics and explicitly includes uncertainty in the true win rate.",
+        "This is a historical aggregate illustration, not a backtest of the current TAKER implementation, current MAKER quoting logic, or their entry filters. The repository does not contain raw tick/quote history, so the simulation uses audited aggregate economics and explicitly includes uncertainty in the true win rate.",
         "",
-        "| Scenario | Implied effective price | P(month profit) | P(month loss) | Median 30d PnL | 5%–95% range | Losing trading days | P(no losing trading day) |",
+        f"| Scenario | Implied effective price | P({days}d profit) | P({days}d loss) | Median {days}d PnL | 5%–95% range | Losing trading days | P(no losing trading day) |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     results = []
@@ -156,7 +195,7 @@ def render(paths: int, days: int, stake: float) -> str:
         "- Positive expectancy does **not** mean daily profit. Binary losses are lumpy; even the profitable MAKER BTC+SOL aggregate produces losing days in the simulation.",
         "- The probability of every calendar day being profitable is effectively zero because some days have losses or no fills.",
         "- Legacy all-asset SNIPE remains negative. SOL-only SNIPE is too close to break-even to justify material risk without fresh out-of-sample evidence.",
-        "- The tightened SNIPE policy should be judged by shadow/live-minimum fills recorded after deployment; aggregate historical results cannot reveal which old rows would pass every new tick-level and quote-level gate.",
+        "- Evaluate the current TAKER/MAKER implementations using out-of-sample shadow or minimum-size fills; these historical aggregates cannot reveal which old rows would pass today's signal, direct-oracle, fee, or live-book checks.",
         "",
         "## Model",
         "",

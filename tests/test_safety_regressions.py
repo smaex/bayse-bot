@@ -1,5 +1,6 @@
 import math
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -50,6 +51,22 @@ def test_rejected_order_quantity_is_not_counted_as_fill():
     ) == 0.0
 
 
+def test_non_finite_fill_quantities_are_never_counted_as_real_shares():
+    for invalid in (math.nan, math.inf, -math.inf):
+        assert BayseClient.parse_filled_shares(
+            {"status": "filled", "quantity": invalid}
+        ) == 0.0
+        assert BayseClient.parse_filled_shares(
+            {"status": "open", "filledSize": invalid}
+        ) == 0.0
+
+
+def test_currency_amount_matched_is_not_misread_as_share_quantity():
+    assert BayseClient.parse_filled_shares(
+        {"status": "open", "amountMatched": "250"}
+    ) == 0.0
+
+
 def test_ngn_settlement_uses_one_hundred_naira_per_share():
     # Ten shares bought at 0.60 cost ₦600 and settle for ₦1,000.
     assert _settlement_pnl(
@@ -90,6 +107,18 @@ def test_global_risk_policy_caps_user_exposure():
     assert config.MAX_TRADE_RISK <= 0.10
 
 
+def test_non_finite_exposure_inputs_fail_closed():
+    risk = RiskManager()
+    assert not risk.can_trade(math.nan, 100, 0.15)
+    assert not risk.can_trade(10_000, math.inf, 0.15)
+    assert not risk.can_trade(10_000, 100, math.nan)
+
+    risk.open_positions["bad"] = {
+        "confirmed_filled": True, "amount_ngn": math.nan,
+    }
+    assert not risk.can_trade(10_000, 100, 0.15)
+
+
 def test_unsafe_float_values_are_not_written_to_real_columns():
     assert _safe_float(9.4e-64) == 0.0
     assert _safe_float(math.inf, 7.0) == 7.0
@@ -123,6 +152,39 @@ def test_fresh_install_is_dry_run_and_the_roster_is_just_two_strategies():
     # A maker and a taker are charged differently, so both families are named.
     assert set(config.MAKER_STRATEGIES) == {"MAKER"}
     assert set(config.TAKER_STRATEGIES) == {"TAKER"}
+
+
+def test_env_template_and_global_risk_defaults_are_fail_safe():
+    template = Path(".env.example").read_text(encoding="utf-8")
+    assert "LIVE_TRADING=false" in template
+    assert "LIVE_TRADING=true" not in template
+
+    env = os.environ.copy()
+    for name in (
+        "LIVE_TRADING", "MAX_TRADE_RISK", "DEFAULT_DAILY_LOSS_LIMIT_PCT",
+        "MAX_DAILY_LOSS_LIMIT_PCT",
+    ):
+        env.pop(name, None)
+    result = subprocess.run(
+        [sys.executable, "-c", (
+            "import config; print(config.LIVE_TRADING); "
+            "print(config.MAX_TRADE_RISK); "
+            "print(config.DEFAULT_DAILY_LOSS_LIMIT_PCT)"
+        )],
+        check=True, capture_output=True, text=True, env=env,
+    )
+    assert result.stdout.splitlines() == ["False", "0.02", "3.0"]
+
+
+def test_non_finite_environment_risk_caps_are_rejected_at_startup():
+    env = os.environ.copy()
+    env["MAX_TRADE_RISK"] = "nan"
+    result = subprocess.run(
+        [sys.executable, "-c", "import config"],
+        capture_output=True, text=True, env=env,
+    )
+    assert result.returncode != 0
+    assert "MAX_TRADE_RISK must be finite" in result.stderr
 
 
 def test_new_accounts_start_paused():

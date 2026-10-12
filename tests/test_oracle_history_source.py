@@ -22,6 +22,7 @@ relay, deliberately, because blocking evaluations once caused 4-hour blackouts.
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 
 import pytest
@@ -30,6 +31,37 @@ import bot
 import config
 import feeds_direct
 import strategy
+
+
+def test_required_crypto_entry_oracle_never_falls_back_to_a_fresh_relay():
+    now = 1_000.0
+    relay_price, relay_time = 100_000.0, now
+
+    assert bot._entry_spot_price(
+        "BTC", 0.0, 0.0, relay_price, relay_time,
+        require_direct_oracle=True, now=now, max_age=30.0,
+    ) is None
+    assert bot._entry_spot_price(
+        "ETH", 3_000.0, now - 31.0, relay_price, relay_time,
+        require_direct_oracle=True, now=now, max_age=30.0,
+    ) is None
+    assert bot._entry_spot_price(
+        "SOL", 200.0, now - 5.0, relay_price, relay_time,
+        require_direct_oracle=True, now=now, max_age=30.0,
+    ) == 200.0
+
+
+def test_relay_entry_prices_are_still_validated_when_oracle_requirement_is_off():
+    now = 1_000.0
+    assert bot._entry_spot_price(
+        "BTC", 200.0, now, 199.0, now,
+        require_direct_oracle=False, now=now, max_age=30.0,
+    ) == 199.0
+    for bad_price in (0.0, -1.0, math.nan, math.inf):
+        assert bot._entry_spot_price(
+            "BTC", 200.0, now, bad_price, now,
+            require_direct_oracle=False, now=now, max_age=30.0,
+        ) is None
 
 
 @pytest.fixture

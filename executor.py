@@ -64,6 +64,25 @@ def _stall_skip(chat_id: str, sig, code: str, detail: str = "") -> None:
         pass
 
 
+async def _entry_database_ready(chat_id: str, sig) -> bool:
+    """Fail closed on new entries when the durable trade ledger is unavailable."""
+    try:
+        ready = await asyncio.to_thread(database.check_connection)
+    except Exception as exc:
+        ready = False
+        detail = str(exc)[:160]
+    else:
+        detail = "database health check returned false"
+    if ready is True:
+        return True
+    _stall_skip(chat_id, sig, "database_unavailable", detail)
+    log.error(
+        f"[{chat_id}] SKIP {getattr(sig, 'strategy', '?')} "
+        f"{getattr(sig, 'asset', '?')} — durable trade ledger is unavailable"
+    )
+    return False
+
+
 # MAKER singleton — needed to track open limit orders for requoting.
 # Imported lazily to avoid circular imports.
 _maker_strategy = None
@@ -84,13 +103,34 @@ def init_executor(markets, tg_app):
 
 # ── Float sanitisation ────────────────────────────────────────────────────────
 
+def _finite_float(value) -> float | None:
+    """Parse a finite number without allowing NaN/Infinity into risk math."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _sell_proceeds_for_shares(shares: float, price: float, fee_rate: float) -> float:
     """Conservative currency amount to request when liquidating shares.
 
     Bayse SELL `amount` means desired currency proceeds, not share quantity.
+    Invalid input returns zero so it cannot become a live order amount.
     """
-    gross = shares * price * config.CURRENCY_BASE_MULTIPLIER
-    return max(0.0, gross * (1.0 - _effective_fee(fee_rate, price)) * 0.98)
+    shares = _finite_float(shares)
+    price = _finite_float(price)
+    fee_rate = _finite_float(fee_rate)
+    unit = _finite_float(config.CURRENCY_BASE_MULTIPLIER)
+    if (
+        shares is None or price is None or fee_rate is None or unit is None
+        or shares <= 0.0 or not 0.0 < price < 1.0
+        or not 0.0 <= fee_rate < 1.0 or unit <= 0.0
+    ):
+        return 0.0
+    gross = shares * price * unit
+    proceeds = gross * (1.0 - _effective_fee(fee_rate, price)) * 0.98
+    return proceeds if math.isfinite(proceeds) and proceeds > 0.0 else 0.0
 
 
 def _safe_float(val, default: float = 0.0) -> float:
@@ -101,13 +141,14 @@ def _safe_float(val, default: float = 0.0) -> float:
     PostgreSQL REAL minimum is ~1.18e-38 and maximum ~3.4e38.
     Subnormal values crash psycopg2 with NumericValueOutOfRange.
     """
-    if val is None or not math.isfinite(val):
+    number = _finite_float(val)
+    if number is None:
         return default
-    if val != 0.0 and abs(val) < 1e-37:
+    if number != 0.0 and abs(number) < 1e-37:
         return 0.0          # subnormal → zero (safe for REAL)
-    if abs(val) > 3.4e38:
+    if abs(number) > 3.4e38:
         return default      # overflow → default
-    return float(val)
+    return number
 
 
 def _performance_size_multiplier(learned: dict, sig) -> float:
@@ -343,20 +384,53 @@ def _quote_effective_buy_price(quote: dict) -> float:
 
     Bayse defines BUY ``amount`` as total wallet spend and ``quantity`` as
     shares received. This handles both AMM embedded fees and CLOB share-
-    reducing fees without guessing from a configured fee rate.
+    reducing fees without guessing from a configured fee rate. Missing cost
+    fields return zero for legacy-payload fallback; malformed/non-finite
+    supplied fields return NaN so the caller rejects the quote.
     """
-    quantity = float(quote.get("quantity") or 0.0)
-    if quantity <= 0:
-        return 0.0
-    amount = float(quote.get("amount") or 0.0)
-    if amount <= 0:
-        amount = float(quote.get("costOfShares") or 0.0)
-        amount += float(quote.get("fee") or 0.0)
-    multiplier = float(
-        quote.get("currencyBaseMultiplier")
-        or config.CURRENCY_BASE_MULTIPLIER
+    if not isinstance(quote, dict):
+        return math.nan
+
+    numeric_fields = (
+        "price", "quantity", "amount", "costOfShares", "fee",
+        "currencyBaseMultiplier",
     )
-    return amount / (quantity * multiplier) if amount > 0 else 0.0
+    parsed: dict[str, float] = {}
+    for field in numeric_fields:
+        raw = quote.get(field)
+        if raw is None:
+            continue
+        value = _finite_float(raw)
+        if value is None:
+            return math.nan
+        parsed[field] = value
+
+    for field in ("price", "quantity", "amount", "costOfShares", "fee"):
+        if field in parsed and parsed[field] < 0.0:
+            return math.nan
+    if "price" in parsed and not 0.0 < parsed["price"] < 1.0:
+        return math.nan
+
+    quantity = parsed.get("quantity", 0.0)
+    if quantity <= 0.0:
+        return 0.0
+
+    amount = parsed.get("amount", 0.0)
+    if amount <= 0.0:
+        has_cost = "costOfShares" in parsed or "fee" in parsed
+        if not has_cost:
+            return 0.0
+        amount = parsed.get("costOfShares", 0.0) + parsed.get("fee", 0.0)
+    if amount <= 0.0:
+        return 0.0
+
+    multiplier = parsed.get("currencyBaseMultiplier")
+    if multiplier is None:
+        multiplier = _finite_float(config.CURRENCY_BASE_MULTIPLIER)
+    if multiplier is None or multiplier <= 0.0:
+        return math.nan
+    effective = amount / (quantity * multiplier)
+    return effective if math.isfinite(effective) and effective > 0.0 else math.nan
 
 
 # ── Main trade execution ──────────────────────────────────────────────────────
@@ -397,38 +471,143 @@ async def execute_trade(chat_id: str, sig, client, risk, settings: dict,
 
 
 
+def _order_has_malformed_financials(order: dict) -> bool:
+    """Detect non-finite or out-of-range numeric values in an order payload."""
+    if not isinstance(order, dict):
+        return True
+    fields = (
+        "quantity", "shares", "filledSize", "sharesFilled", "sharesMatched",
+        "amountMatched", "filledQuantity", "avgFillPrice", "price",
+        "totalCost", "amount", "costOfShares", "cost", "fee",
+        "proceeds", "netProceeds", "payout",
+    )
+    for field in fields:
+        raw = order.get(field)
+        if raw is None:
+            continue
+        value = _finite_float(raw)
+        if value is None:
+            return True
+        if field in {"avgFillPrice", "price"} and not 0.0 < value < 1.0:
+            return True
+        if field != "fee" and value < 0.0:
+            return True
+    return False
+
+
+def _order_has_malformed_fill_quantity(order: dict) -> bool:
+    """A zero parser result is not proof of no fill when fields are malformed."""
+    if not isinstance(order, dict):
+        return True
+    for field in (
+        "quantity", "shares", "filledSize", "sharesFilled",
+        "sharesMatched", "filledQuantity",
+    ):
+        raw = order.get(field)
+        if raw is None:
+            continue
+        value = _finite_float(raw)
+        if value is None or value < 0.0:
+            return True
+    return False
+
+
+def _order_fill_price(order: dict, fallback: float) -> tuple[float | None, bool]:
+    """Return a valid fill/limit price and whether the payload needs review."""
+    malformed = not isinstance(order, dict)
+    for field in ("avgFillPrice", "price"):
+        raw = order.get(field) if isinstance(order, dict) else None
+        if raw is None:
+            continue
+        value = _finite_float(raw)
+        if value is None or not 0.0 < value < 1.0:
+            malformed = True
+            continue
+        return value, malformed
+    value = _finite_float(fallback)
+    if value is not None and 0.0 < value < 1.0:
+        return value, True
+    return None, True
+
+
 def _order_actual_cost(order: dict, shares: float, fill_price: float) -> float:
-    """Cash actually debited for one BUY fill, fee included.
+    """Best available wallet debit for one confirmed BUY fill, including fees.
 
-    A CLOB BUY fee is taken out of the shares received, so ``shares`` (the
-    exchange's ``quantity``) has already paid it and the wallet debit for that
-    fill is the *gross* value plus the fee -- not ``shares * price``, which
-    understates it by the fee. The complete-set path recorded exactly that
-    understated number, so every locked pair was flattered by its own fees
-    while the single-leg path added them back. One helper, both paths.
-
-    The exchange's own total wins when present; otherwise the fee reported on
-    the fill is added explicitly, and a response that reports neither is
-    reconstructed from the confirmed quantity.
+    Prefer Bayse's explicit total, then the reported shares-cost plus fee. If
+    those fields are absent or malformed, reconstruct from finite confirmed
+    shares and price. The caller separately flags malformed payload fields and
+    alerts for reconciliation; it never drops an exchange-confirmed fill.
     """
-    unit = config.CURRENCY_BASE_MULTIPLIER
-    try:
-        fee = float(order.get("fee") or 0.0)
-    except (TypeError, ValueError):
-        fee = 0.0
-    total_cost = order.get("totalCost")
-    if total_cost is not None:
-        try:
-            return max(0.0, float(total_cost))
-        except (TypeError, ValueError):
-            pass
-    share_cost = order.get("costOfShares") or order.get("cost")
-    if share_cost is not None:
-        try:
-            return max(0.0, float(share_cost) + fee)
-        except (TypeError, ValueError):
-            pass
-    return max(0.0, float(shares) * float(fill_price) * unit + fee)
+    shares = _finite_float(shares)
+    fill_price = _finite_float(fill_price)
+    unit = _finite_float(config.CURRENCY_BASE_MULTIPLIER)
+    if (
+        shares is None or shares <= 0.0 or fill_price is None
+        or not 0.0 < fill_price < 1.0 or unit is None or unit <= 0.0
+    ):
+        return math.nan
+
+    raw_fee = order.get("fee") if isinstance(order, dict) else None
+    fee = 0.0 if raw_fee is None else _finite_float(raw_fee)
+    if fee is None:
+        return math.nan
+
+    if isinstance(order, dict):
+        total_cost = order.get("totalCost")
+        if total_cost is not None:
+            parsed_total = _finite_float(total_cost)
+            if parsed_total is not None and parsed_total > 0.0:
+                return parsed_total
+
+        for field in ("costOfShares", "cost"):
+            share_cost = order.get(field)
+            if share_cost is None:
+                continue
+            parsed_cost = _finite_float(share_cost)
+            if parsed_cost is not None and parsed_cost >= 0.0:
+                candidate = parsed_cost + fee
+                if math.isfinite(candidate) and candidate > 0.0:
+                    return candidate
+
+    reconstructed = shares * fill_price * unit + fee
+    return reconstructed if math.isfinite(reconstructed) and reconstructed > 0.0 else math.nan
+
+
+def _complete_set_payout(resp, shares: float) -> tuple[float | None, bool, str]:
+    """Reconstruct guaranteed set payout and distrust inconsistent API totals."""
+    shares = _finite_float(shares)
+    unit = _finite_float(config.CURRENCY_BASE_MULTIPLIER)
+    if shares is None or shares <= 0.0 or unit is None or unit <= 0.0:
+        return None, True, "invalid matched-share quantity or currency multiplier"
+    expected = shares * unit
+    if not math.isfinite(expected) or expected <= 0.0:
+        return None, True, "guaranteed set payout is non-finite"
+
+    if not isinstance(resp, dict):
+        return expected, True, "burn returned a non-object response; used guaranteed payout"
+    status = str(resp.get("status") or "").strip().lower()
+    failed_statuses = {"failed", "failure", "rejected", "error", "cancelled", "canceled"}
+    confirmed_statuses = {"success", "succeeded", "completed", "complete", "burned", "confirmed", "ok"}
+    if (
+        resp.get("success") is False or resp.get("ok") is False
+        or status in failed_statuses or resp.get("error")
+        or (status and status not in confirmed_statuses
+            and resp.get("success") is not True and resp.get("ok") is not True)
+    ):
+        return None, True, "burn response does not confirm success; outcome is ambiguous"
+
+    raw = next(
+        (resp.get(key) for key in ("amount", "proceeds", "payout")
+         if resp.get(key) is not None),
+        None,
+    )
+    if raw is None:
+        return expected, True, "burn response omitted payout; used guaranteed set payout"
+    reported = _finite_float(raw)
+    tolerance = max(0.01, expected * 1e-4)
+    if reported is None or reported <= 0.0 or abs(reported - expected) > tolerance:
+        return expected, True, "reported burn payout was malformed or inconsistent; used guaranteed set payout"
+    return reported, False, ""
 
 
 def _balanced_pair_amounts(legs, amount: float, *, min_order: float = 0.0,
@@ -453,24 +632,43 @@ def _balanced_pair_amounts(legs, amount: float, *, min_order: float = 0.0,
     whole set to the smallest size that clears it, and returns ``None`` when
     even that cannot be afforded. ``None`` means "do not send either leg".
     """
-    if len(legs) < 2 or amount <= 0:
+    try:
+        amount = float(amount)
+        min_order = float(min_order)
+        fee_rate = float(fee_rate)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not all(math.isfinite(value) for value in (amount, min_order, fee_rate))
+        or amount <= 0.0 or min_order < 0.0 or not 0.0 <= fee_rate < 1.0
+    ):
+        return None
+    if len(legs) < 2:
         return [amount] * len(legs)
-    effs = [
-        max(booklib.effective_buy_price(
-            float(getattr(leg, "price", 0.0) or 0.0), fee_rate, is_maker=is_maker
-        ), 1e-9)
-        for leg in legs
-    ]
+
+    effs = []
+    for leg in legs:
+        price = _finite_float(getattr(leg, "price", None))
+        if price is None or not 0.0 < price < 1.0:
+            return None
+        effective = booklib.effective_buy_price(
+            price, fee_rate, is_maker=is_maker
+        )
+        if not math.isfinite(effective) or effective <= 0.0:
+            return None
+        effs.append(effective)
     eff_max, eff_min = max(effs), min(effs)
 
     shares = amount / eff_max
     if min_order > 0 and shares * eff_min < min_order:
         shares = min_order / eff_min
-    amounts = [shares * eff for eff in effs]
+    amounts = [shares * effective for effective in effs]
 
-    # The pair's own ceiling is one per-leg budget for each leg: a balanced
-    # set may never cost more than two single-leg budgets, and every leg must
-    # clear the per-order minimum on its own or the exchange rejects it.
+    # The budget is a per-leg ceiling, not just a cap on the pair's combined
+    # notional. Raising a balanced pair to clear the minimum must not silently
+    # enlarge its expensive leg beyond the risk-sized per-leg budget.
+    if max(amounts) > amount + 1e-6:
+        return None
     if sum(amounts) > 2.0 * amount + 1e-6:
         return None
     if min_order > 0 and min(amounts) < min_order - 1e-6:
@@ -585,28 +783,119 @@ async def _execute_logic(
     chat_id: str, sig, client, risk, settings: dict,
     equity: float, free_cash: float, *, is_hedge: bool = False,
 ):
+    if not isinstance(settings, dict):
+        _stall_skip(chat_id, sig, "invalid_execution_settings", "settings must be a mapping")
+        log.error(f"[{chat_id}] SKIP trade — execution settings are not a mapping")
+        return
+
+    numeric_inputs = {
+        "equity": _finite_float(equity),
+        "free_cash": _finite_float(free_cash),
+        "risk_pct": _finite_float(settings.get("risk_pct", 2.0)),
+        "maxexposure": _finite_float(settings.get("maxexposure", 20.0)),
+        "mintrade": _finite_float(settings.get("mintrade", MIN_TRADE_NGN)),
+        "maxtrade": _finite_float(settings.get("maxtrade", 5_000.0)),
+        "market_price": _finite_float(getattr(sig, "market_price", None)),
+        "win_prob": _finite_float(getattr(sig, "win_prob", None)),
+        "certainty": _finite_float(getattr(sig, "certainty", None)),
+        "size_pct": _finite_float(getattr(sig, "size_pct", None)),
+        "mode_floor": _finite_float(getattr(sig, "mode_floor", 0.0)),
+        "min_net_ev": _finite_float(getattr(sig, "min_net_ev", 0.0)),
+        "max_trade_risk": _finite_float(config.MAX_TRADE_RISK),
+        "max_portfolio_exposure": _finite_float(config.MAX_PORTFOLIO_EXPOSURE),
+    }
+    invalid_values = [name for name, value in numeric_inputs.items() if value is None]
+    if invalid_values:
+        _stall_skip(chat_id, sig, "invalid_execution_numeric", ", ".join(invalid_values))
+        log.error(f"[{chat_id}] SKIP trade — invalid numeric inputs: {invalid_values}")
+        return
+
+    equity = numeric_inputs["equity"]
+    free_cash = numeric_inputs["free_cash"]
+    risk_pct_setting = numeric_inputs["risk_pct"]
+    max_exposure_pct = numeric_inputs["maxexposure"]
+    min_t = numeric_inputs["mintrade"]
+    max_t = numeric_inputs["maxtrade"]
+    signal_price = numeric_inputs["market_price"]
+    signal_prob = numeric_inputs["win_prob"]
+    signal_certainty = numeric_inputs["certainty"]
+    signal_size_pct = numeric_inputs["size_pct"]
+    signal_mode_floor = numeric_inputs["mode_floor"]
+    signal_min_ev = numeric_inputs["min_net_ev"]
+    global_risk_cap = numeric_inputs["max_trade_risk"]
+    global_exposure_cap = numeric_inputs["max_portfolio_exposure"]
+
+    if (
+        equity <= 0.0 or free_cash < 0.0 or risk_pct_setting <= 0.0
+        or max_exposure_pct <= 0.0 or min_t < 0.0 or max_t <= 0.0
+        or global_risk_cap <= 0.0 or global_exposure_cap <= 0.0
+        or not 0.0 < signal_price < 1.0
+        or not 0.0 <= signal_prob <= 1.0
+        or not 0.0 <= signal_certainty <= 1.0
+        or signal_size_pct < 0.0
+        or not 0.0 <= signal_mode_floor <= 1.0
+        or signal_min_ev < 0.0
+    ):
+        _stall_skip(chat_id, sig, "invalid_execution_numeric", "value outside permitted range")
+        log.error(f"[{chat_id}] SKIP trade — execution input outside permitted range")
+        return
+
+    # Preserve the internal signal contract (downstream logging and persistence
+    # expect numeric fields even if a manually constructed signal used strings).
+    sig.market_price = signal_price
+    sig.win_prob = signal_prob
+    sig.certainty = signal_certainty
+    sig.size_pct = signal_size_pct
+    sig.mode_floor = signal_mode_floor
+    sig.min_net_ev = signal_min_ev
+
+    mode = settings.get("mode", "balanced")
+    if not isinstance(mode, str) or mode not in {
+        "safe", "balanced", "aggressive", "full_send", "custom"
+    }:
+        _stall_skip(chat_id, sig, "invalid_execution_mode", str(mode))
+        log.error(f"[{chat_id}] SKIP trade — unsupported risk mode {mode!r}")
+        return
     is_maker = (sig.strategy == "MAKER")
-    legs     = sig.ensure_legs()
-    mode      = settings.get("mode", "balanced")
-    min_t     = settings.get("mintrade", MIN_TRADE_NGN)
-    max_t     = settings.get("maxtrade", 5_000)
-    max_exp   = min(
-        settings.get("maxexposure", 20.0) / 100.0,
-        config.MAX_PORTFOLIO_EXPOSURE,
+    legs = sig.ensure_legs()
+    if not legs:
+        _stall_skip(chat_id, sig, "invalid_execution_legs", "signal has no legs")
+        return
+    for leg in legs:
+        leg_price = _finite_float(getattr(leg, "price", None))
+        leg_size = _finite_float(getattr(leg, "size_pct", None))
+        leg_fair_value = _finite_float(getattr(leg, "fair_value", None))
+        if (
+            leg_price is None or not 0.0 < leg_price < 1.0
+            or leg_size is None or leg_size < 0.0
+            or leg_fair_value is None or not 0.0 <= leg_fair_value <= 1.0
+            or not getattr(leg, "outcome", None)
+            or not getattr(leg, "outcome_id", None)
+        ):
+            _stall_skip(chat_id, sig, "invalid_execution_legs", "malformed numeric or identity field")
+            log.error(f"[{chat_id}] SKIP trade — malformed execution leg for {sig.market_id}")
+            return
+    market_meta = next(
+        (m for m in active_markets if m.get("market_id") == sig.market_id), None
     )
-    learned   = settings.get("learned", {})
-    mult      = _performance_size_multiplier(learned, sig)
-    user_risk = min(
-        settings.get("risk_pct", 2.0) / 100.0,
-        config.MAX_TRADE_RISK,
-    )
-    declared  = None
-    engine    = "AMM"
-    quote_price = float(sig.market_price)
+    raw_market_min = (market_meta or {}).get("minimum_order_amount", MIN_TRADE_NGN)
+    market_min = _finite_float(raw_market_min)
+    if market_min is None or market_min < 0.0:
+        _stall_skip(chat_id, sig, "invalid_market_minimum", str(raw_market_min))
+        log.error(f"[{chat_id}] SKIP trade — invalid market minimum for {sig.market_id}")
+        return
+
+    max_exp = min(max_exposure_pct / 100.0, global_exposure_cap)
+    learned = settings.get("learned", {})
+    mult = _performance_size_multiplier(learned, sig)
+    user_risk = min(risk_pct_setting / 100.0, global_risk_cap)
+    declared = None
+    engine = "AMM"
+    quote_price = signal_price
     target_margin = {
         "safe": 0.03, "balanced": 0.01, "aggressive": 0.00,
         "full_send": 0.00, "custom": 0.01,
-    }.get(mode, 0.01)
+    }[mode]
 
     if risk.is_in_strict_mode() and sig.certainty < 0.40:
         _stall_skip(chat_id, sig, "strict_mode_near_daily_target",
@@ -626,38 +915,26 @@ async def _execute_logic(
     effective_max = sizing.effective_max
 
     if hard_cap < effective_min:
-        # If the account has sufficient free cash and bankroll for the exchange minimum order (e.g. ₦100),
-        # clamp to effective_min so smaller test balances (e.g. ₦1,000–₦4,999) can place ₦100 orders.
-        if free_cash >= effective_min * max(1, len(legs)) and equity >= 500.0:
-            log.info(
-                f"[{chat_id}] CLAMP TO MINIMUM {sig.strategy} {sig.asset} — risk budget ₦{hard_cap:,.0f} "
-                f"bumped to exchange minimum ₦{effective_min:,.0f} (equity=₦{equity:,.0f})"
-            )
-            amount = effective_min
-        else:
-            min_equity = effective_min / allowed_pct if allowed_pct > 0 else float("inf")
-            _stall_skip(chat_id, sig, "risk_budget_below_platform_minimum",
-                        f"min ₦{effective_min:,.0f} > budget ₦{hard_cap:,.0f}; "
-                        f"needs ≈ ₦{min_equity:,.0f} equity at {allowed_pct:.1%} risk")
-            log.info(
-                f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — platform/user minimum "
-                f"₦{effective_min:,.0f} exceeds the {allowed_pct:.1%} risk budget "
-                f"₦{hard_cap:,.0f} (equity needed ≈ ₦{min_equity:,.0f})"
-            )
-            return
-    else:
-        amount = min(equity * final_pct, hard_cap)
-        if amount < effective_min:
-            if free_cash >= effective_min * max(1, len(legs)) and equity >= 500.0:
-                amount = effective_min
-            else:
-                _stall_skip(chat_id, sig, "size_below_market_minimum",
-                            f"₦{amount:,.0f} < ₦{effective_min:,.0f}")
-                log.info(
-                    f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — Kelly amount "
-                    f"₦{amount:,.0f} is below minimum ₦{effective_min:,.0f}"
-                )
-                return
+        min_equity = effective_min / allowed_pct if allowed_pct > 0 else float("inf")
+        _stall_skip(chat_id, sig, "risk_budget_below_platform_minimum",
+                    f"min ₦{effective_min:,.0f} > budget ₦{hard_cap:,.0f}; "
+                    f"needs ≈ ₦{min_equity:,.0f} equity at {allowed_pct:.1%} risk")
+        log.info(
+            f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — platform/user minimum "
+            f"₦{effective_min:,.0f} exceeds the {allowed_pct:.1%} risk budget "
+            f"₦{hard_cap:,.0f} (equity needed ≈ ₦{min_equity:,.0f})"
+        )
+        return
+
+    amount = min(equity * final_pct, hard_cap)
+    if amount < effective_min:
+        _stall_skip(chat_id, sig, "size_below_market_minimum",
+                    f"₦{amount:,.0f} < ₦{effective_min:,.0f}")
+        log.info(
+            f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — Kelly amount "
+            f"₦{amount:,.0f} is below minimum ₦{effective_min:,.0f}"
+        )
+        return
 
     if config.TEST_MODE:
         if equity < config.TEST_MIN_BANKROLL:
@@ -678,26 +955,22 @@ async def _execute_logic(
     # Sizing is closed here, before any budget is checked, so that everything
     # downstream bounds the size that will actually be sent.
     #
-    # The exchange remembers a market's true minimum from a rejected order; a
-    # size under it is bumped up, and one that would need more than the
-    # account allows is not sent at all.
+    # A market minimum learned from a rejection cannot justify expanding a
+    # Kelly-sized order, even if the global hard cap would allow more. Skip
+    # rather than undoing performance shrinkage or the strategy's requested size.
     cached_min = _market_min_cache.get(sig.market_id, 0.0)
     if cached_min > 0 and amount < cached_min:
-        if cached_min <= hard_cap:
-            log.info(
-                f"[{chat_id}] BUMP {sig.strategy} {sig.asset} order ₦{amount:,.0f} → "
-                f"₦{cached_min:,.0f} (Bayse market minimum)"
-            )
-            amount = cached_min
-        else:
-            _stall_skip(chat_id, sig, "market_minimum_exceeds_budget",
-                        f"market min ₦{cached_min:,.0f} > max_trade ₦{max_t:,.0f} / free_cash ₦{free_cash:,.0f}")
-            log.info(
-                f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — market min ₦{cached_min:,.0f} "
-                f"exceeds max_trade(₦{max_t:,.0f}) or free_cash(₦{free_cash:,.0f})"
-            )
-            _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
-            return
+        _stall_skip(
+            chat_id, sig, "market_minimum_exceeds_size",
+            f"market min ₦{cached_min:,.0f} > sized amount ₦{amount:,.0f} "
+            f"(hard cap ₦{hard_cap:,.0f})",
+        )
+        log.info(
+            f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — learned market minimum "
+            f"₦{cached_min:,.0f} exceeds Kelly-sized amount ₦{amount:,.0f}"
+        )
+        _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+        return
 
     # Both multi-leg paths need equal share counts -- a set settles on
     # min(shares_yes, shares_no) -- so their per-leg stakes are derived here,
@@ -766,21 +1039,23 @@ async def _execute_logic(
         )
         return
 
+    fee_rate = _get_market_fee(sig.market_id)
+    if not math.isfinite(fee_rate) or not 0.0 <= fee_rate < 1.0:
+        _stall_skip(chat_id, sig, "invalid_market_fee", str(fee_rate))
+        log.error(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — invalid market fee")
+        return
+
     # ── EV check with pre-trade Quote ──────────────────────────────────────
     target_margin = {
         "safe": 0.03, "balanced": 0.01, "aggressive": 0.00,
         "full_send": 0.00, "custom": 0.01,
     }.get(mode, 0.01)
     if str(sig.strategy).upper() == "TAKER":
-        try:
-            signal_min_ev = float(getattr(sig, "min_net_ev", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            signal_min_ev = 0.0
         if signal_min_ev <= 0.0:
             signal_min_ev = config.TAKER_MIN_NET_EV_DEFAULT * {
                 "safe": 1.6, "balanced": 1.0, "aggressive": 0.7,
                 "full_send": 0.5, "custom": 1.0,
-            }.get(mode, 1.0)
+            }[mode]
         target_margin = max(target_margin, signal_min_ev)
 
     is_probe = sig.certainty < sig.mode_floor
@@ -803,8 +1078,20 @@ async def _execute_logic(
                 outcome_id=sig.outcome_id, side="BUY", amount=amount,
                 currency=CURRENCY
             )
-            q_price = float(quote.get("price") or sig.market_price)
-            q_qty = float(quote.get("quantity") or 0)
+            if not isinstance(quote, dict):
+                _stall_skip(chat_id, sig, "invalid_quote_payload", "quote is not an object")
+                return
+            raw_q_price = quote.get("price")
+            q_price = signal_price if raw_q_price is None else _finite_float(raw_q_price)
+            raw_q_qty = quote.get("quantity")
+            q_qty = 0.0 if raw_q_qty is None else _finite_float(raw_q_qty)
+            if (
+                q_price is None or not 0.0 < q_price < 1.0
+                or q_qty is None or q_qty < 0.0
+            ):
+                _stall_skip(chat_id, sig, "invalid_quote_numeric", "price or quantity is malformed")
+                log.warning(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — quote has invalid price/quantity")
+                return
             if quote.get("completeFill") is not True or q_qty <= 0:
                 _stall_skip(chat_id, sig, "quote_not_complete_fill")
                 log.info(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — quote does not confirm a complete fill")
@@ -815,24 +1102,31 @@ async def _execute_logic(
                 return
 
             quote_price = _quote_effective_buy_price(quote)
+            if not math.isfinite(quote_price):
+                _stall_skip(chat_id, sig, "invalid_quote_numeric", "non-finite quote cost fields")
+                log.warning(f"[{chat_id}] SKIP {sig.strategy} {sig.asset} — quote cost is malformed")
+                return
             if quote_price <= 0:
-                # Compatibility fallback for old quote payloads that omit
-                # amount/cost but still expose a quoted marginal price.
-                fee_rate = _get_market_fee(sig.market_id)
+                # Compatibility fallback for legacy payloads that omit
+                # amount/cost fields but still expose an executable price.
                 quote_price = _clob_buy_effective_price(q_price, fee_rate)
 
-            if quote_price <= 0:
+            if not math.isfinite(quote_price) or quote_price <= 0:
+                _stall_skip(chat_id, sig, "invalid_quote_price", str(quote_price))
                 log.warning(f"[{chat_id}] Invalid quote price {quote_price} returned. Skipping EV calculation.")
                 return
-            ev = sig.win_prob / quote_price - 1.0
+            ev = signal_prob / quote_price - 1.0
+            if not math.isfinite(ev):
+                _stall_skip(chat_id, sig, "invalid_quote_ev", str(ev))
+                return
 
             if ev < target_margin:
                 log.info(f"[{chat_id}] EV {ev:+.1%} too low at size ₦{amount:,.0f} (price={quote_price:.3f}). Scaling down...")
                 scaled_success = False
                 for scale in [0.5, 0.25]:
-                    scaled_amount = max(MIN_TRADE_NGN, round(amount * scale, -2))
-                    if scaled_amount <= MIN_TRADE_NGN or scaled_amount >= amount:
-                        scaled_amount = MIN_TRADE_NGN
+                    scaled_amount = max(effective_min, round(amount * scale, -2))
+                    if scaled_amount >= amount:
+                        continue
 
                     try:
                         scaled_quote = await client.get_quote(
@@ -840,25 +1134,35 @@ async def _execute_logic(
                             outcome_id=sig.outcome_id, side="BUY", amount=scaled_amount,
                             currency=CURRENCY
                         )
+                        if not isinstance(scaled_quote, dict):
+                            continue
                         if (
                             scaled_quote.get("completeFill") is not True
                             or scaled_quote.get("tradeGoesOverMaxLiability") is True
                         ):
                             continue
-                        sq_price = float(scaled_quote.get("price") or sig.market_price)
-                        sq_qty = float(scaled_quote.get("quantity") or 0)
-                        if sq_qty <= 0:
+                        raw_sq_price = scaled_quote.get("price")
+                        sq_price = signal_price if raw_sq_price is None else _finite_float(raw_sq_price)
+                        raw_sq_qty = scaled_quote.get("quantity")
+                        sq_qty = 0.0 if raw_sq_qty is None else _finite_float(raw_sq_qty)
+                        if (
+                            sq_price is None or not 0.0 < sq_price < 1.0
+                            or sq_qty is None or sq_qty <= 0.0
+                        ):
                             continue
-                        scaled_price = _quote_effective_buy_price(
-                            scaled_quote
-                        )
+                        scaled_price = _quote_effective_buy_price(scaled_quote)
+                        if not math.isfinite(scaled_price):
+                            continue
                         if scaled_price <= 0:
-                            fee_rate = _get_market_fee(sig.market_id)
                             scaled_price = _clob_buy_effective_price(
                                 sq_price, fee_rate
                             )
+                        if not math.isfinite(scaled_price) or scaled_price <= 0.0:
+                            continue
 
-                        scaled_ev = sig.win_prob / scaled_price - 1.0
+                        scaled_ev = signal_prob / scaled_price - 1.0
+                        if not math.isfinite(scaled_ev):
+                            continue
                         if scaled_ev >= target_margin:
                             log.info(
                                 f"[{chat_id}] Sizing down success! ₦{amount:,.0f} → ₦{scaled_amount:,.0f} "
@@ -986,11 +1290,15 @@ async def _execute_logic(
         # Maker capital budget. Resting quotes reserve wallet funds and a
         # one-sided fill carries real directional risk, so the maker book gets
         # its own ceiling instead of borrowing the directional one.
-        maker_notional = sum(
-            float(p.get("amount_ngn") or 0.0)
-            for p in risk.open_positions.values()
-            if p.get("strategy") == "MAKER"
-        )
+        maker_notional = 0.0
+        for position in risk.open_positions.values():
+            if position.get("strategy") != "MAKER":
+                continue
+            position_amount = _finite_float(position.get("amount_ngn", 0.0))
+            if position_amount is None or position_amount < 0.0:
+                maker_notional = math.inf
+                break
+            maker_notional += position_amount
         # `committed` is every leg of this decision, not one leg of it: a
         # two-sided quote reserves twice the per-leg budget, and a budget that
         # counts one leg lets the maker book hold twice its own ceiling.
@@ -1321,6 +1629,14 @@ async def _execute_logic(
         time_in_force = "FAK"
         limit_price = None
 
+    # Do not send a new exchange write unless the durable trade ledger is
+    # reachable. This check runs only after a signal passed pricing, book, and
+    # risk gates (not on every market tick), and protects cached user settings
+    # from turning a database outage into an unrecorded live entry.
+    if not await _entry_database_ready(chat_id, sig):
+        _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+        return
+
     # A complete-set take is two orders forming one position, so it cannot go
     # through the single-order path below.
     if is_complete_set_taker:
@@ -1371,18 +1687,45 @@ async def _execute_logic(
             stp_mode="CANCEL_OLDEST" if is_maker else "SKIP",
         )
         rtt_ms = (time.time() - t_order_start) * 1000.0
+        if not isinstance(resp, dict):
+            _stall_skip(chat_id, sig, "order_unconfirmed_fill", "non-object API response")
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, "unknown", "non-object API response"
+            )
+            _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+            return
         order = resp.get("order") or resp.get("clobOrder") or resp.get("ammOrder") or resp
+        if not isinstance(order, dict):
+            _stall_skip(chat_id, sig, "order_unconfirmed_fill", "malformed order object")
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, "unknown", "malformed order object"
+            )
+            _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+            return
 
-        shares_filled = client.parse_filled_shares(order)
-        filled_price  = float(order.get("avgFillPrice") or order.get("price") or quote_price)
-        order_id      = order.get("id") or order.get("orderId") or order.get("order_id")
-        order_status  = str(order.get("status") or "").lower()
+        try:
+            parsed_shares = _finite_float(client.parse_filled_shares(order) or 0.0)
+        except Exception:
+            parsed_shares = None
+        malformed_fill_quantity = (
+            parsed_shares is None or parsed_shares < 0.0
+            or _order_has_malformed_fill_quantity(order)
+        )
+        shares_filled = max(0.0, parsed_shares) if parsed_shares is not None else 0.0
+        filled_price, price_needs_review = _order_fill_price(order, quote_price)
+        payload_needs_review = _order_has_malformed_financials(order)
+        order_id = order.get("id") or order.get("orderId") or order.get("order_id")
+        order_status = str(order.get("status") or "").lower()
 
         # ── FAK / Zero-Fill Reasoning (Order is a Request, Not a Result) ────────
         # If the order was killed, rejected, or cancelled with 0 shares filled,
         # it is a Zero-Fill. Do NOT manufacture a phantom position or deduct cash.
         if shares_filled <= 0:
-            if order_status in ("cancelled", "killed", "rejected", "expired") or time_in_force == "FAK":
+            if (
+                order_status in ("cancelled", "canceled", "killed", "rejected", "expired")
+                and not malformed_fill_quantity
+                and not _order_has_malformed_fill_quantity(order)
+            ):
                 _stall_skip(chat_id, sig, "zero_fill_fak_killed",
                             f"order={order_id} status={order_status or 'unknown'}")
                 log.info(
@@ -1408,39 +1751,89 @@ async def _execute_logic(
                 if order_id:
                     try:
                         confirmed = await client.get_order(order_id)
-                        shares_filled = client.parse_filled_shares(confirmed)
-                        if shares_filled > 0:
-                            order = confirmed
-                            filled_price = float(
-                                confirmed.get("avgFillPrice")
-                                or confirmed.get("price")
-                                or filled_price
+                        confirmed_order = (
+                            confirmed.get("order") or confirmed.get("clobOrder") or confirmed
+                        ) if isinstance(confirmed, dict) else {}
+                        if not isinstance(confirmed_order, dict):
+                            confirmed_order = {}
+                        try:
+                            confirmed_shares = _finite_float(
+                                client.parse_filled_shares(confirmed_order) or 0.0
                             )
+                        except Exception:
+                            confirmed_shares = None
+                        malformed_fill_quantity = (
+                            confirmed_shares is None or confirmed_shares < 0.0
+                            or _order_has_malformed_fill_quantity(confirmed_order)
+                        )
+                        shares_filled = (
+                            max(0.0, confirmed_shares)
+                            if confirmed_shares is not None else 0.0
+                        )
+                        order_status = str(confirmed_order.get("status") or order_status).lower()
+                        if shares_filled > 0.0:
+                            order = confirmed_order
+                            filled_price, confirmed_price_review = _order_fill_price(
+                                confirmed_order, quote_price
+                            )
+                            price_needs_review = price_needs_review or confirmed_price_review
+                            payload_needs_review = (
+                                payload_needs_review
+                                or _order_has_malformed_financials(confirmed_order)
+                            )
+                            order_status = str(order.get("status") or order_status).lower()
                     except Exception as confirm_error:
                         log.error(f"[{chat_id}] Could not confirm ambiguous order {order_id}: {confirm_error}")
-                if shares_filled <= 0:
-                    log.critical(
-                        f"[{chat_id}] AMBIGUOUS ORDER {order_id} — accepted without a confirmed fill; "
-                        "new entries on this market are cooling down for manual reconciliation"
+                if (
+                    shares_filled <= 0
+                    and order_status in {
+                        "cancelled", "canceled", "killed", "rejected", "expired",
+                    }
+                    and not malformed_fill_quantity
+                    and not _order_has_malformed_fill_quantity(order)
+                ):
+                    _stall_skip(
+                        chat_id, sig, "zero_fill_fak_killed",
+                        f"order={order_id} status={order_status}",
                     )
-                    _stall_skip(chat_id, sig, "order_unconfirmed_fill",
-                                f"order={order_id} status={order_status}")
-                    try:
-                        app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
-                        if app_to_use:
-                            await telegram_bot.notify_order_unconfirmed(
-                                app_to_use, chat_id, sig.strategy, sig.asset,
-                                sig.timeframe, sig.outcome, amount, order_id,
+                    app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+                    if app_to_use:
+                        try:
+                            await telegram_bot.notify_unfilled(
+                                app_to_use, chat_id, sig.strategy,
+                                sig.asset, sig.timeframe, sig.outcome, amount,
                             )
-                    except Exception as ne:
-                        log.warning(f"notify_order_unconfirmed failed in executor: {ne}")
+                        except Exception as notify_error:
+                            log.warning(f"notify_unfilled failed in executor: {notify_error}")
+                    _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+                    return
+                if shares_filled <= 0:
+                    _stall_skip(
+                        chat_id, sig, "order_unconfirmed_fill",
+                        f"order={order_id} status={order_status}",
+                    )
+                    await _pause_for_order_reconciliation(
+                        chat_id, settings, risk, sig, order_id,
+                        f"no confirmed share quantity; status={order_status or 'unknown'}",
+                    )
                     _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
                     return
 
         # `amount` is the requested budget and can exceed the cost of a
         # partial FAK fill, so the debit is rebuilt from confirmed shares and
-        # the fee the exchange reported for this fill.
+        # the fee the exchange reported for this fill. If the exchange's
+        # financial fields are unusable, preserve the confirmed shares and
+        # reserve the full requested budget until a human reconciles the fill.
+        if filled_price is None:
+            filled_price = signal_price
+            price_needs_review = True
+        payload_needs_review = (
+            payload_needs_review or _order_has_malformed_financials(order)
+        )
         actual_ngn = _order_actual_cost(order, shares_filled, filled_price)
+        if not math.isfinite(actual_ngn) or actual_ngn <= 0.0:
+            actual_ngn = amount
+            payload_needs_review = True
 
         spot_vs_thresh = 0.0
         if market and market.get("threshold") and feeds.spot.get(sig.asset):
@@ -1462,6 +1855,15 @@ async def _execute_logic(
     except Exception as e:
         err = str(e)
         _stall_skip(chat_id, sig, "order_rejected_by_exchange", err[:150])
+        status_match = re.match(r"API\s+(\d{3})\b", err)
+        definite_rejection = bool(
+            status_match and int(status_match.group(1)) in {400, 401, 403, 404, 422}
+        )
+        if not definite_rejection:
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, "unknown",
+                f"BUY request raised after dispatch; exchange outcome is ambiguous: {err[:140]}",
+            )
         try:
             app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
             if app_to_use:
@@ -1483,6 +1885,48 @@ async def _execute_logic(
         # root cause of trades silently dying for hours with no visible error).
         _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
         return
+
+    # The exchange has confirmed a real fill. Put it into the in-memory risk
+    # book before any Telegram or database await so a slow/failing dependency
+    # cannot leave live shares invisible to exits and exposure checks.
+    position_key = (
+        f"{sig.market_id}:{sig.outcome}:{order_id}"
+        if is_hedge or sig.market_id in risk.open_positions
+        else sig.market_id
+    )
+    risk.add_position(position_key, {
+        "market_id": sig.market_id,
+        "trade_id": None,
+        "event_id": sig.event_id,
+        "order_id": order_id,
+        "outcome": sig.outcome,
+        "outcome_id": sig.outcome_id,
+        "entry_price": filled_price,
+        "amount_ngn": actual_ngn,
+        "filled_quantity": shares_filled,
+        "confirmed_filled": True,
+        "strategy": sig.strategy,
+        "asset": sig.asset,
+        "timeframe": sig.timeframe,
+        "threshold": market.get("threshold") if market else getattr(sig, "threshold", None),
+        "closing_date": market.get("closing_date") if market else "",
+        "placed_at": time.time(),
+    })
+    risk.current_free_cash -= actual_ngn
+    if malformed_fill_quantity:
+        risk.open_positions[position_key]["exit_reconciliation_pending"] = True
+        await _pause_for_order_reconciliation(
+            chat_id, settings, risk, sig, order_id,
+            "confirmed BUY response contains malformed or conflicting share quantities",
+        )
+    _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+    if payload_needs_review or price_needs_review:
+        reasons = []
+        if payload_needs_review:
+            reasons.append("malformed/non-finite order financial fields")
+        if price_needs_review:
+            reasons.append("fill price reconstructed from the executable quote")
+        await _notify_fill_reconciliation(chat_id, sig, order_id, "; ".join(reasons))
 
     # ── Notify FIRST — trade has happened on Bayse ────────────────────────
     # Always notify before DB write. If DB fails, user still knows about the trade.
@@ -1533,37 +1977,15 @@ async def _execute_logic(
                 f"[{chat_id}] DB record failed for {sig.asset} {sig.strategy}: {db_err}"
                 f" — order={order_id} executed; retaining an in-memory position for exit protection"
             )
-            app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
-            if app_to_use:
-                try:
-                    await telegram_bot.send_message(
-                        app_to_use, chat_id,
-                        f"🚨 Trade {order_id} executed but the database write failed after retries. "
-                        "The bot is tracking it in memory; check the Bayse portfolio before restarting.",
-                    )
-                except Exception:
-                    pass
 
-    position_key = (
-        f"{sig.market_id}:{sig.outcome}:{order_id}"
-        if is_hedge or sig.market_id in risk.open_positions
-        else sig.market_id
-    )
-    risk.add_position(position_key, {
-        "market_id":   sig.market_id,
-        "trade_id":    trade_id,    "event_id":   sig.event_id,
-        "order_id":    order_id,
-        "outcome":     sig.outcome, "outcome_id": sig.outcome_id,
-        "entry_price": filled_price, "amount_ngn": actual_ngn,
-        "filled_quantity": shares_filled, "confirmed_filled": True,
-        "strategy":    sig.strategy, "asset":      sig.asset,
-        "timeframe":   sig.timeframe,
-        "threshold":   market.get("threshold") if market else getattr(sig, "threshold", None),
-        "closing_date": market.get("closing_date") if market else "",
-        "placed_at":   time.time(),
-    })
-    risk.current_free_cash -= actual_ngn
-    _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+    if trade_id:
+        risk.open_positions[position_key]["trade_id"] = trade_id
+    else:
+        risk.open_positions[position_key]["ledger_reconciliation_pending"] = True
+        await _pause_for_order_reconciliation(
+            chat_id, settings, risk, sig, order_id,
+            "confirmed BUY fill has no durable database trade row",
+        )
 
 
 async def _place_maker_quote(
@@ -1604,33 +2026,106 @@ async def _place_maker_quote(
                 stp_mode="CANCEL_OLDEST",
             )
         except Exception as exc:
-            await _unwind_maker_legs(chat_id, client, placed, sig,
-                                     reason=f"placement failed: {exc}")
+            await _unwind_maker_legs(
+                chat_id, client, placed, sig,
+                reason=f"placement failed: {exc}", risk=risk, settings=settings,
+            )
             _stall_skip(chat_id, sig, "maker_place_failed", f"{leg.outcome}: {exc}"[:200])
             log.warning(f"[{chat_id}] MAKER {leg.outcome} placement failed: {exc}")
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, "unknown",
+                f"MAKER {leg.outcome} request outcome is ambiguous: {str(exc)[:160]}",
+            )
             _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
             return
 
-        order = resp.get("order") or resp.get("clobOrder") or resp
+        order = (
+            (resp.get("order") or resp.get("clobOrder") or resp)
+            if isinstance(resp, dict) else {}
+        )
+        if not isinstance(order, dict):
+            order = {}
         order_id = order.get("id") or order.get("orderId") or order.get("order_id")
         if not order_id:
-            await _unwind_maker_legs(chat_id, client, placed, sig,
-                                     reason=f"no order id for {leg.outcome}")
+            await _unwind_maker_legs(
+                chat_id, client, placed, sig,
+                reason=f"no order id for {leg.outcome}", risk=risk, settings=settings,
+            )
             _stall_skip(chat_id, sig, "maker_place_no_order_id", leg.outcome)
             log.error(f"[{chat_id}] MAKER {leg.outcome} placed with no order id")
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, "unknown",
+                f"MAKER {leg.outcome} response has no reconcilable order id",
+            )
             _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
             return
 
         # A post-only order can still cross in flight if the book moved between
-        # our read and this call. Treat any immediate fill as a real fill.
-        filled = client.parse_filled_shares(order)
+        # our read and this call. Keep its live remainder under management too.
+        try:
+            filled = _finite_float(client.parse_filled_shares(order) or 0.0)
+        except Exception:
+            filled = None
+        fill_status = str(order.get("status") or "").strip().lower()
+        terminal_status = fill_status in {
+            "filled", "completed", "cancelled", "canceled", "expired",
+            "rejected", "killed",
+        }
+        if filled is None or filled < 0.0:
+            _stall_skip(
+                chat_id, sig, "maker_malformed_fill_quantity",
+                f"{leg.outcome} order={order_id}",
+            )
+            placed.append({
+                "outcome": leg.outcome,
+                "outcome_id": leg.outcome_id,
+                "order_id": order_id,
+                "price": float(leg.price),
+                "amount": leg_amount,
+                "filled": 0.0,
+                "order_active": True,
+                "fill_status": fill_status,
+                "fill_review": True,
+            })
+            await _unwind_maker_legs(
+                chat_id, client, placed, sig,
+                reason="malformed placement fill quantity",
+                risk=risk, settings=settings,
+            )
+            _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+            return
+        fill_price, fill_price_review = _order_fill_price(order, leg.price)
+        if fill_price is None:
+            fill_price = float(leg.price)
+            fill_price_review = True
+        filled_cost = (
+            filled * fill_price * config.CURRENCY_BASE_MULTIPLIER
+            if filled > 0.0 else 0.0
+        )
+        if not math.isfinite(filled_cost) or (filled > 0.0 and filled_cost <= 0.0):
+            filled_cost = leg_amount
+            fill_price_review = True
+        if terminal_status and filled <= 0.0:
+            _stall_skip(chat_id, sig, "maker_zero_fill", f"{leg.outcome} status={fill_status}")
+            await _unwind_maker_legs(
+                chat_id, client, placed, sig,
+                reason=f"{leg.outcome} ended without a fill",
+                risk=risk, settings=settings,
+            )
+            _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+            return
         placed.append({
-            "outcome":    leg.outcome,
-            "outcome_id": leg.outcome_id,
-            "order_id":   order_id,
-            "price":      float(leg.price),
-            "amount":     leg_amount,
-            "filled":     filled,
+            "outcome":       leg.outcome,
+            "outcome_id":    leg.outcome_id,
+            "order_id":      order_id,
+            "price":         fill_price if filled > 0.0 else float(leg.price),
+            # While any remainder is live the exchange can still reserve the
+            # full stake. After a terminal full fill, track its actual debit.
+            "amount":        filled_cost if terminal_status and filled > 0.0 else leg_amount,
+            "filled":        filled,
+            "order_active":  not terminal_status,
+            "fill_status":   fill_status,
+            "fill_review":   fill_price_review,
         })
         log.info(
             f"[{chat_id}] MAKER LEG PLACED | {sig.asset} {leg.outcome} "
@@ -1668,7 +2163,10 @@ async def _place_maker_quote(
         # wallet funds with no DB row and no risk entry is unreconcileable, so
         # withdraw the whole quote rather than leave it resting.
         log.error(f"[{chat_id}] MAKER quote placed but no leg recorded — cancelling all")
-        await _unwind_maker_legs(chat_id, client, placed, sig, reason="no leg recorded")
+        await _unwind_maker_legs(
+            chat_id, client, placed, sig, reason="no leg recorded",
+            risk=risk, settings=settings,
+        )
         return
 
     if tracked < len(placed):
@@ -1678,16 +2176,20 @@ async def _place_maker_quote(
             f"[{chat_id}] MAKER quote only {tracked}/{len(placed)} legs recorded — "
             f"cancelling all"
         )
-        await _unwind_maker_legs(chat_id, client, placed, sig, reason="partial tracking")
+        await _unwind_maker_legs(
+            chat_id, client, placed, sig, reason="partial tracking",
+            risk=risk, settings=settings,
+        )
         return
 
     _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
 
+    quote_amount = sum(float(entry["amount"]) for entry in placed)
     app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
     if app_to_use:
         try:
             await telegram_bot.notify_trade(
-                app_to_use, chat_id, sig, amount * len(placed), engine="CLOB_LIMIT"
+                app_to_use, chat_id, sig, quote_amount, engine="CLOB_LIMIT"
             )
         except Exception as ne:
             log.error(f"[{chat_id}] MAKER quote notification failed: {ne}")
@@ -1731,7 +2233,10 @@ async def _record_maker_leg(
     # taker position AND two maker legs, and keying by market id alone let one
     # silently overwrite another, dropping it from exit management.
     leg_key = f"{sig.market_id}:{entry['outcome']}:{entry['order_id']}"
-    is_filled = float(entry.get("filled") or 0.0) > 0
+    filled = _finite_float(entry.get("filled") or 0.0)
+    if filled is None or filled < 0.0:
+        filled = 0.0
+    is_filled = filled > 0.0
     risk.add_position(leg_key, {
         "market_id":       sig.market_id,
         "trade_id":        trade_id,
@@ -1741,8 +2246,9 @@ async def _record_maker_leg(
         "outcome_id":      entry["outcome_id"],
         "entry_price":     entry["price"],
         "amount_ngn":      entry["amount"],
-        "filled_quantity": float(entry.get("filled") or 0.0),
+        "filled_quantity": filled,
         "confirmed_filled": is_filled,
+        "order_active":    bool(entry.get("order_active", not is_filled)),
         "strategy":        sig.strategy,
         "asset":           sig.asset,
         "timeframe":       sig.timeframe,
@@ -1751,33 +2257,300 @@ async def _record_maker_leg(
         "placed_at":       time.time(),
         "quote_leg":       True,
     })
+    amount = _finite_float(entry.get("amount"))
+    if amount is None or amount < 0.0:
+        risk.remove_position(leg_key)
+        return None
+    # Bayse reserves GTC order cash on acceptance. Debit once at placement;
+    # later fill polling only changes the position classification and cost.
+    risk.current_free_cash -= amount
     if is_filled:
-        risk.current_free_cash -= float(entry["amount"])
-        _get_maker().record_fill(sig.market_id, entry["outcome"], entry["filled"])
+        _get_maker().record_fill(sig.market_id, entry["outcome"], filled)
+        stall.note_trade(chat_id, market_id=sig.market_id)
+        if entry.get("fill_review"):
+            await _notify_fill_reconciliation(
+                chat_id, sig, entry.get("order_id"),
+                "immediate MAKER fill price was reconstructed from its limit",
+            )
     return trade_id
 
 
 async def _unwind_maker_legs(
-    chat_id: str, client, placed: list[dict], sig, *, reason: str
+    chat_id: str, client, placed: list[dict], sig, *, reason: str,
+    risk, settings: dict,
 ) -> None:
-    """Withdraw every leg of a partially-placed quote.
+    """Cancel and reconcile every leg before discarding a MAKER quote.
 
-    Cancelling one leg and leaving the other is how a market maker acquires an
-    unintended position: the survivor is now a one-sided bet nobody is
-    hedging. All or nothing, every time.
+    A failed placement/ledger write does not make a Bayse order disappear. Keep
+    any fill or possibly-live remainder visible in the risk book, and pause if
+    the exchange cannot prove the order is terminal.
     """
+    terminal_statuses = {
+        "filled", "completed", "cancelled", "canceled", "expired",
+        "rejected", "killed",
+    }
+    cancel_attempted = False
+    unresolved = False
+
     for entry in placed:
+        order_id = entry.get("order_id")
+        if not order_id:
+            unresolved = True
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, "unknown",
+                f"MAKER leg has no order id after {reason}",
+            )
+            continue
+
         try:
-            await client.cancel_order(entry["order_id"])
+            await client.cancel_order(order_id)
+            cancel_attempted = True
+        except Exception as cancel_error:
+            log.warning(
+                f"[{chat_id}] MAKER cancel request for {order_id} failed; "
+                f"checking exchange state: {cancel_error}"
+            )
+            cancel_attempted = True
+
+        key = f"{sig.market_id}:{entry.get('outcome', '?')}:{order_id}"
+        position = risk.open_positions.get(key)
+        try:
+            state = await client.get_order(order_id)
+            if not isinstance(state, dict):
+                raise ValueError("post-cancel order query returned a non-object")
+            status = str(state.get("status") or "").strip().lower()
+            try:
+                exchange_shares = _finite_float(
+                    client.parse_filled_shares(state) or 0.0
+                )
+            except Exception:
+                exchange_shares = None
+            initial_shares = _finite_float(entry.get("filled") or 0.0)
+            if position is not None:
+                position_shares = _finite_float(
+                    position.get("filled_quantity") or 0.0
+                )
+                if position_shares is None or position_shares < 0.0:
+                    raise ValueError("tracked MAKER fill quantity is malformed")
+                initial_shares = max(initial_shares or 0.0, position_shares)
+            if (
+                exchange_shares is None or exchange_shares < 0.0
+                or initial_shares is None or initial_shares < 0.0
+            ):
+                raise ValueError("post-cancel MAKER fill quantity is malformed")
+
+            shares = max(initial_shares, exchange_shares)
+            terminal = status in terminal_statuses
+            if status in {"filled", "completed"} and shares <= 0.0:
+                raise ValueError("exchange reports a filled order without shares")
+            price, price_needs_review = _order_fill_price(
+                state, entry.get("price")
+            )
+            if shares > 0.0 and price is None:
+                raise ValueError("confirmed MAKER fill has no valid price")
+            if price is None:
+                price = _finite_float(entry.get("price"))
+            if price is None or not 0.0 < price < 1.0:
+                raise ValueError("MAKER order limit price is malformed")
+            cost = shares * price * config.CURRENCY_BASE_MULTIPLIER
+            if shares > 0.0 and (not math.isfinite(cost) or cost <= 0.0):
+                raise ValueError("confirmed MAKER fill cost is malformed")
+        except Exception as reconcile_error:
+            unresolved = True
+            # The placement response is still evidence of any immediate fill.
+            # Retain that lower bound and the full accepted reservation; never
+            # turn a query failure into an assumed zero-fill cancellation.
+            known_shares = _finite_float(entry.get("filled") or 0.0)
+            if known_shares is None or known_shares < 0.0:
+                known_shares = 0.0
+            known_price = _finite_float(entry.get("price"))
+            if known_price is None or not 0.0 < known_price < 1.0:
+                known_price = 0.5
+            known_cost = known_shares * known_price * config.CURRENCY_BASE_MULTIPLIER
+            if position is None:
+                reserved = _finite_float(entry.get("amount"))
+                reserved = reserved if reserved is not None and reserved >= 0.0 else 0.0
+                position = {
+                    "market_id": sig.market_id,
+                    "trade_id": entry.get("trade_id"),
+                    "event_id": sig.event_id,
+                    "order_id": order_id,
+                    "outcome": entry.get("outcome"),
+                    "outcome_id": entry.get("outcome_id"),
+                    "entry_price": known_price,
+                    "amount_ngn": known_cost if known_shares > 0.0 else reserved,
+                    "filled_quantity": known_shares,
+                    "confirmed_filled": known_shares > 0.0,
+                    "order_active": True,
+                    "pending_cancel": True,
+                    "strategy": sig.strategy,
+                    "asset": sig.asset,
+                    "timeframe": sig.timeframe,
+                    "placed_at": time.time(),
+                    "maker_ledger_missing": not bool(entry.get("trade_id")),
+                    "ledger_reconciliation_pending": (
+                        known_shares > 0.0 and not bool(entry.get("trade_id"))
+                    ),
+                }
+                risk.add_position(key, position)
+                current_cash = _finite_float(risk.current_free_cash)
+                if current_cash is not None:
+                    risk.current_free_cash = current_cash - reserved
+                if known_shares > 0.0:
+                    stall.note_trade(chat_id, market_id=sig.market_id)
+                    _get_maker().record_fill(
+                        sig.market_id, entry.get("outcome", ""), known_shares
+                    )
+            else:
+                position["order_active"] = True
+                position["pending_cancel"] = True
+                position["maker_ledger_missing"] = not bool(position.get("trade_id"))
+                position["ledger_reconciliation_pending"] = bool(
+                    position.get("filled_quantity") and not position.get("trade_id")
+                )
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, order_id,
+                f"MAKER cancel/fill reconciliation failed after {reason}: "
+                f"{str(reconcile_error)[:140]}",
+            )
+            continue
+
+        if terminal and shares <= 0.0:
+            if position is not None:
+                trade_id = position.get("trade_id")
+                if trade_id:
+                    try:
+                        await asyncio.to_thread(
+                            database.resolve_trade, trade_id, None, 0.0
+                        )
+                    except Exception as db_error:
+                        log.error(
+                            f"[{chat_id}] cancelled MAKER row {trade_id} "
+                            f"could not be settled: {db_error}"
+                        )
+                risk.remove_position(key)
             log.info(
-                f"[{chat_id}] MAKER unwound {entry['outcome']} {entry['order_id']} ({reason})"
+                f"[{chat_id}] MAKER unwound {entry.get('outcome')} {order_id} "
+                f"({reason}; confirmed zero fill)"
             )
-        except Exception as exc:
-            log.critical(
-                f"[{chat_id}] MAKER LEG {entry['order_id']} ({entry['outcome']}) "
-                f"could not be cancelled after {reason}: {exc}"
+            continue
+
+        position_was_tracked = position is not None
+        previous_shares = _finite_float(entry.get("filled") or 0.0) or 0.0
+        if position_was_tracked:
+            tracked_shares = _finite_float(
+                position.get("filled_quantity") or 0.0
+            ) or 0.0
+            previous_shares = max(previous_shares, tracked_shares)
+        newly_filled = (
+            max(0.0, shares - previous_shares)
+            if position_was_tracked else shares
+        )
+        if position is None:
+            reserved = _finite_float(entry.get("amount"))
+            if reserved is None or reserved < 0.0:
+                unresolved = True
+                await _pause_for_order_reconciliation(
+                    chat_id, settings, risk, sig, order_id,
+                    "MAKER accepted reservation is malformed",
+                )
+                continue
+            position = {
+                "market_id": sig.market_id,
+                "trade_id": entry.get("trade_id"),
+                "event_id": sig.event_id,
+                "order_id": order_id,
+                "outcome": entry.get("outcome"),
+                "outcome_id": entry.get("outcome_id"),
+                "entry_price": price,
+                "amount_ngn": cost if shares > 0.0 else reserved,
+                "filled_quantity": shares,
+                "confirmed_filled": shares > 0.0,
+                "order_active": not terminal,
+                "strategy": sig.strategy,
+                "asset": sig.asset,
+                "timeframe": sig.timeframe,
+                "placed_at": time.time(),
+                "maker_ledger_missing": not bool(entry.get("trade_id")),
+                "ledger_reconciliation_pending": (
+                    shares > 0.0 and not bool(entry.get("trade_id"))
+                ),
+            }
+            risk.add_position(key, position)
+            current_cash = _finite_float(risk.current_free_cash)
+            if current_cash is not None:
+                risk.current_free_cash = current_cash - reserved
+        else:
+            position["entry_price"] = price
+            position["amount_ngn"] = cost if shares > 0.0 else position.get("amount_ngn", 0.0)
+            position["filled_quantity"] = shares
+            position["confirmed_filled"] = shares > 0.0
+            position["order_active"] = not terminal
+
+        position["filled_quantity"] = shares
+        position["confirmed_filled"] = shares > 0.0
+        position["order_active"] = not terminal
+        if terminal:
+            position.pop("pending_cancel", None)
+        else:
+            position["pending_cancel"] = True
+            unresolved = True
+
+        trade_id = position.get("trade_id")
+        pause_reasons = []
+        if trade_id and shares > 0.0:
+            try:
+                await asyncio.to_thread(
+                    database.update_trade_fill, trade_id, cost, shares, price
+                )
+            except Exception as db_error:
+                log.critical(
+                    f"[{chat_id}] MAKER fill {order_id} remains in memory; "
+                    f"ledger update failed: {db_error}"
+                )
+                pause_reasons.append(
+                    "confirmed MAKER fill could not be persisted to its ledger row"
+                )
+        elif shares > 0.0:
+            position["maker_ledger_missing"] = True
+            position["ledger_reconciliation_pending"] = True
+            unresolved = True
+            pause_reasons.append(
+                "confirmed MAKER fill has no durable ledger trade row"
             )
-    if placed:
+
+        if newly_filled > 0.0:
+            stall.note_trade(chat_id, market_id=sig.market_id)
+            _get_maker().record_fill(sig.market_id, entry.get("outcome", ""), newly_filled)
+        if price_needs_review and shares > 0.0:
+            await _notify_fill_reconciliation(
+                chat_id, sig, order_id,
+                "MAKER unwind fill price reconstructed from posted limit",
+            )
+        if not terminal:
+            pause_reasons.append(
+                f"MAKER order remains live after cancel request ({reason})"
+            )
+        if pause_reasons:
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, order_id, "; ".join(pause_reasons),
+            )
+        if terminal:
+            log.info(
+                f"[{chat_id}] MAKER unwound {entry.get('outcome')} {order_id} "
+                f"({reason}; terminal status={status}, shares={shares:.4f})"
+            )
+
+    if cancel_attempted:
+        try:
+            risk.current_free_cash = await client.get_balance_ngn()
+        except Exception as balance_error:
+            log.warning(
+                f"[{chat_id}] free-cash refresh after MAKER unwind failed: "
+                f"{balance_error}"
+            )
+
+    if placed and not unresolved:
         _get_maker().drop(sig.market_id)
 
 
@@ -2013,6 +2786,7 @@ async def _place_complete_set_take(
 
     placed: list[dict] = []
     failure_reason = ""
+    ledger_record_failed = False
     spot_vs_thresh = 0.0
     spot_now = feeds.spot.get(sig.asset) or 0.0
     threshold = (market or {}).get("threshold")
@@ -2038,57 +2812,74 @@ async def _place_complete_set_take(
             )
             _stall_skip(chat_id, sig, "complete_set_leg_failed", failure_reason)
             log.warning(f"[{chat_id}] complete-set {leg.outcome} leg failed: {exc}")
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, "unknown", failure_reason
+            )
             break
 
         order = (
             (resp.get("order") or resp.get("clobOrder") or resp)
             if isinstance(resp, dict) else {}
         )
+        if not isinstance(order, dict):
+            order = {}
         order_id = order.get("id") or order.get("orderId") or order.get("order_id")
         order_status = str(order.get("status") or "").lower()
         try:
-            shares = float(client.parse_filled_shares(order) or 0.0)
+            shares = _finite_float(client.parse_filled_shares(order) or 0.0)
         except Exception:
             shares = 0.0
+        if shares is None:
+            shares = 0.0
+        malformed_fill_quantity = _order_has_malformed_fill_quantity(order)
 
         if shares <= 0.0:
             # A FAK response without confirmed quantity is not a tracked
             # position. If the exchange returned a non-terminal/ambiguous
             # status, query once before reporting that no fill is confirmed.
-            terminal_zero_fill = order_status in {
-                "cancelled", "canceled", "killed", "rejected", "expired",
-            }
+            terminal_zero_fill = (
+                order_status in {
+                    "cancelled", "canceled", "killed", "rejected", "expired",
+                }
+                and not _order_has_malformed_fill_quantity(order)
+            )
             if order_id and not terminal_zero_fill:
                 try:
                     confirmed = await client.get_order(order_id)
                     confirmed_order = (
                         confirmed.get("order") or confirmed.get("clobOrder") or confirmed
                     ) if isinstance(confirmed, dict) else {}
-                    confirmed_shares = float(
+                    if not isinstance(confirmed_order, dict):
+                        confirmed_order = {}
+                    confirmed_shares = _finite_float(
                         client.parse_filled_shares(confirmed_order) or 0.0
                     )
-                    if confirmed_shares > 0.0:
+                    order_status = str(confirmed_order.get("status") or order_status).lower()
+                    if confirmed_shares is not None and confirmed_shares > 0.0:
                         order = confirmed_order
-                        order_status = str(order.get("status") or order_status).lower()
                         shares = confirmed_shares
+                        malformed_fill_quantity = _order_has_malformed_fill_quantity(order)
                 except Exception as confirm_error:
                     log.error(
                         f"[{chat_id}] Could not confirm complete-set order {order_id}: "
                         f"{confirm_error}"
                     )
             if shares <= 0.0:
-                terminal_zero_fill = order_status in {
-                    "cancelled", "canceled", "killed", "rejected", "expired",
-                }
+                terminal_zero_fill = (
+                    order_status in {
+                        "cancelled", "canceled", "killed", "rejected", "expired",
+                    }
+                    and not _order_has_malformed_fill_quantity(order)
+                )
                 failure_reason = (
                     f"{leg.outcome} @ {cap:.3f} has no exchange-confirmed fill "
                     f"(status={order_status or 'unknown'})"
                 )
                 _stall_skip(chat_id, sig, "complete_set_leg_zero_fill", failure_reason)
                 log.info(f"[{chat_id}] {failure_reason}")
-                if not placed:
-                    app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
-                    if terminal_zero_fill:
+                if terminal_zero_fill:
+                    if not placed:
+                        app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
                         try:
                             await telegram_bot.notify_unfilled(
                                 app_to_use, chat_id, sig.strategy, sig.asset,
@@ -2096,26 +2887,24 @@ async def _place_complete_set_take(
                             )
                         except Exception as notify_error:
                             log.warning(f"notify_unfilled failed: {notify_error}")
-                    else:
-                        try:
-                            await telegram_bot.notify_order_unconfirmed(
-                                app_to_use, chat_id, sig.strategy, sig.asset,
-                                sig.timeframe, leg.outcome, leg_amount,
-                                order_id or "unknown",
-                            )
-                        except Exception as notify_error:
-                            log.warning(
-                                f"notify_order_unconfirmed failed: {notify_error}"
-                            )
+                else:
+                    await _pause_for_order_reconciliation(
+                        chat_id, settings, risk, sig, order_id or "unknown",
+                        failure_reason,
+                    )
                 break
 
-        try:
-            fill_price = float(order.get("avgFillPrice") or order.get("price") or asks[index])
-        except (TypeError, ValueError):
+        fill_price, price_needs_review = _order_fill_price(order, asks[index])
+        payload_needs_review = _order_has_malformed_financials(order)
+        if fill_price is None:
             fill_price = asks[index]
-        if not math.isfinite(fill_price) or fill_price <= 0:
-            fill_price = asks[index]
+            price_needs_review = True
         actual_cost = _order_actual_cost(order, shares, fill_price)
+        if not math.isfinite(actual_cost) or actual_cost <= 0.0:
+            # The fill is real, but its cost fields are not. Reserve the order's
+            # requested budget rather than understate capital at risk.
+            actual_cost = leg_amount
+            payload_needs_review = True
         tracking_id = str(order_id or f"local-{uuid.uuid4().hex}")
         entry = {
             "outcome": leg.outcome,
@@ -2127,6 +2916,7 @@ async def _place_complete_set_take(
             "shares": shares,
             "amount": actual_cost,
             "requested_amount": leg_amount,
+            "fill_reconciliation_pending": malformed_fill_quantity,
         }
         placed.append(entry)
         stall.note_order(chat_id, sig.strategy, placed=True, reason="filled")
@@ -2154,12 +2944,35 @@ async def _place_complete_set_take(
             "closing_date": (market or {}).get("closing_date", ""),
             "placed_at": time.time(),
             "complete_set_leg": True,
+            "exit_reconciliation_pending": malformed_fill_quantity,
         })
         risk.current_free_cash -= actual_cost
+        if malformed_fill_quantity:
+            failure_reason = (
+                f"{leg.outcome} fill has malformed/conflicting quantity fields; "
+                "no additional leg or burn will be attempted"
+            )
+            for pair_entry in placed:
+                tracked_position = risk.open_positions.get(pair_entry["tracking_id"])
+                if tracked_position is not None:
+                    tracked_position["exit_reconciliation_pending"] = True
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, order_id,
+                failure_reason,
+            )
         if risk.current_free_cash < -1e-6:
             log.critical(
                 f"[{chat_id}] TAKER complete-set actual debit exceeded tracked free cash by "
                 f"₦{abs(risk.current_free_cash):,.2f}"
+            )
+        if payload_needs_review or price_needs_review:
+            reasons = []
+            if payload_needs_review:
+                reasons.append("malformed/non-finite order financial fields")
+            if price_needs_review:
+                reasons.append("fill price reconstructed from the executable ask")
+            await _notify_fill_reconciliation(
+                chat_id, sig, order_id, "; ".join(reasons)
             )
 
         pair_matched = (
@@ -2214,25 +3027,36 @@ async def _place_complete_set_take(
                     f"[{chat_id}] complete-set DB record failed for {order_id}: {db_err}; "
                     "the confirmed position remains tracked in memory"
                 )
-                if app_to_use:
-                    try:
-                        await telegram_bot.send_message(
-                            app_to_use, chat_id,
-                            f"🚨 TAKER fill {order_id or leg.outcome} is tracked in memory, "
-                            "but its database row could not be saved after retries. "
-                            "Check the exchange portfolio before restarting.",
-                        )
-                    except Exception:
-                        pass
 
         if trade_id:
             risk.open_positions[risk_key]["trade_id"] = trade_id
+        else:
+            for pair_entry in placed:
+                tracked_position = risk.open_positions.get(pair_entry["tracking_id"])
+                if tracked_position is not None:
+                    tracked_position["ledger_reconciliation_pending"] = True
+            risk.open_positions[risk_key]["ledger_reconciliation_pending"] = True
+            ledger_record_failed = True
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, order_id,
+                "confirmed complete-set BUY fill has no durable database trade row",
+            )
         entry["trade_id"] = trade_id
+        if ledger_record_failed or malformed_fill_quantity:
+            break
         log.info(
             f"[{chat_id}] COMPLETE-SET LEG FILLED | {sig.asset} {leg.outcome} "
             f"{shares:.4f}sh @ {fill_price:.3f} ₦{actual_cost:,.0f} "
             f"| order={order_id or 'unknown'}"
         )
+
+    if ledger_record_failed:
+        _trade_cooldown[cooldown_key] = time.time()
+        return
+
+    if any(entry.get("fill_reconciliation_pending") for entry in placed):
+        _trade_cooldown[cooldown_key] = time.time()
+        return
 
     if len(placed) < len(legs):
         if placed:
@@ -2252,10 +3076,16 @@ async def _place_complete_set_take(
     # the excess shares: leave both fills tracked until they can be managed or
     # resolved without losing quantity.
     if not share_quantities_match(placed[0]["shares"], placed[1]["shares"]):
-        log.warning(
-            f"[{chat_id}] complete-set fills are imbalanced "
+        imbalance = (
+            f"complete-set fills are imbalanced "
             f"({placed[0]['shares']:.4f} vs {placed[1]['shares']:.4f} shares); "
-            "not burning or removing either tracked position"
+            "both positions remain tracked and were not burned"
+        )
+        log.critical(f"[{chat_id}] {imbalance}")
+        await _pause_for_order_reconciliation(
+            chat_id, settings, risk, sig,
+            ",".join(str(entry.get("order_id") or "unknown") for entry in placed),
+            imbalance,
         )
         _trade_cooldown[cooldown_key] = time.time()
         return
@@ -2263,23 +3093,53 @@ async def _place_complete_set_take(
     sets = min(entry["shares"] for entry in placed)
     try:
         resp = await client.burn_shares(sig.market_id, sets, CURRENCY)
-        proceeds = float(
-            (resp or {}).get("amount") or (resp or {}).get("proceeds")
-            or (resp or {}).get("payout")
-            or (sets * config.CURRENCY_BASE_MULTIPLIER)
-        )
-        total_cost = sum(entry["amount"] for entry in placed)
+        proceeds, payout_needs_review, payout_reason = _complete_set_payout(resp, sets)
+        if proceeds is None:
+            for entry in placed:
+                position = risk.open_positions.get(entry["tracking_id"])
+                if position is not None:
+                    position["burn_reconciliation_pending"] = True
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, f"burn:{sig.market_id}", payout_reason
+            )
+            _trade_cooldown[cooldown_key] = time.time()
+            return
+        if payout_needs_review:
+            await _notify_fill_reconciliation(
+                chat_id, sig, f"burn:{sig.market_id}", payout_reason
+            )
+
+        costs = [_finite_float(entry.get("amount")) for entry in placed]
+        current_cash = _finite_float(risk.current_free_cash)
+        if (
+            any(cost is None or cost <= 0.0 for cost in costs)
+            or current_cash is None
+        ):
+            for entry in placed:
+                position = risk.open_positions.get(entry["tracking_id"])
+                if position is not None:
+                    position["burn_reconciliation_pending"] = True
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, f"burn:{sig.market_id}",
+                "burn succeeded but tracked cost/free-cash values are malformed",
+            )
+            _trade_cooldown[cooldown_key] = time.time()
+            return
+
+        total_cost = sum(costs)
         pnl = proceeds - total_cost
-        risk.current_free_cash += proceeds
+        if not math.isfinite(total_cost) or total_cost <= 0.0 or not math.isfinite(pnl):
+            raise ValueError("complete-set cost or realized PnL is invalid")
+        risk.current_free_cash = current_cash + proceeds
         risk.add_pnl(pnl)
         for entry in placed:
             risk.remove_position(entry["tracking_id"])
-        for entry in placed:
+        for entry, leg_cost in zip(placed, costs):
             if entry.get("trade_id"):
                 try:
-                    leg_pnl = proceeds / len(placed) - entry["amount"]
+                    leg_pnl = proceeds / len(placed) - leg_cost
                     await asyncio.to_thread(
-                        database.resolve_trade, entry["trade_id"], True, leg_pnl
+                        database.resolve_trade, entry["trade_id"], leg_pnl >= 0.0, leg_pnl
                     )
                 except Exception as db_err:
                     log.error(f"[{chat_id}] burn reconciliation failed: {db_err}")
@@ -2297,17 +3157,18 @@ async def _place_complete_set_take(
         except Exception as notify_error:
             log.warning(f"[{chat_id}] complete-set burn notification failed: {notify_error}")
     except Exception as exc:
-        log.error(
-            f"[{chat_id}] complete-set burn failed on {sig.market_id}: {exc} "
-            "— both confirmed legs remain tracked and settle to 1.00 as a set"
+        for entry in placed:
+            position = risk.open_positions.get(entry["tracking_id"])
+            if position is not None:
+                position["burn_reconciliation_pending"] = True
+        await _pause_for_order_reconciliation(
+            chat_id, settings, risk, sig, f"burn:{sig.market_id}",
+            f"burn request outcome is ambiguous: {exc}",
         )
-        app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
-        try:
-            await telegram_bot.notify_taker_burn_failed(
-                app_to_use, chat_id, sig.asset, sig.timeframe, str(exc),
-            )
-        except Exception as notify_error:
-            log.warning(f"[{chat_id}] TAKER burn-failure notification failed: {notify_error}")
+        log.error(
+            f"[{chat_id}] complete-set burn failed on {sig.market_id}: {exc}; "
+            "both legs remain tracked pending manual reconciliation"
+        )
 
     _trade_cooldown[cooldown_key] = time.time()
 
@@ -2336,6 +3197,54 @@ async def _notify_order_sent(
         log.warning(f"[{chat_id}] execution notification failed: {exc}")
 
 
+async def _pause_for_order_reconciliation(
+    chat_id: str, settings: dict, risk, sig, order_id, reason: str
+) -> None:
+    """Pause the account until an ambiguous exchange order is reconciled."""
+    risk.paused = True
+    if hasattr(risk, "pause_reason"):
+        risk.pause_reason = "order_reconciliation"
+    settings["paused"] = True
+    settings["paused_reason"] = "order_reconciliation"
+    try:
+        await asyncio.to_thread(database.update_settings, chat_id, settings)
+    except Exception as exc:
+        log.critical(f"[{chat_id}] Could not persist reconciliation pause: {exc}")
+    message = (
+        f"🚨 Trading paused: order {order_id or 'unknown'} for "
+        f"{getattr(sig, 'asset', '?')} needs manual reconciliation. "
+        f"Verify the Bayse orders/portfolio before resuming. Reason: {reason[:160]}"
+    )
+    app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+    if app_to_use:
+        try:
+            await telegram_bot.send_message(app_to_use, chat_id, message)
+        except Exception as exc:
+            log.error(f"[{chat_id}] reconciliation-pause alert failed: {exc}")
+    log.critical(f"[{chat_id}] {message}")
+
+
+async def _notify_fill_reconciliation(chat_id: str, sig, order_id, reason: str) -> None:
+    """Alert when an exchange-confirmed fill required estimated accounting."""
+    message = (
+        f"🚨 Fill reconciliation required for order {order_id or 'unknown'} "
+        f"({getattr(sig, 'asset', '?')} {getattr(sig, 'strategy', '?')}). "
+        f"The fill remains tracked conservatively; verify shares and cash debit "
+        f"in Bayse before restarting. Reason: {reason[:180]}"
+    )
+    log.critical(f"[{chat_id}] {message}")
+    app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+    if app_to_use:
+        try:
+            await telegram_bot.send_message(app_to_use, chat_id, message)
+        except Exception as exc:
+            log.error(f"[{chat_id}] fill-reconciliation alert failed: {exc}")
+
+
 def _get_market_fee(market_id: str) -> float:
     market = next((m for m in active_markets if m["market_id"] == market_id), None)
-    return market.get("fee_rate", 0.02) if market else 0.02
+    raw_fee = market.get("fee_rate", 0.02) if market else 0.02
+    fee_rate = _finite_float(raw_fee)
+    if fee_rate is None or not 0.0 <= fee_rate < 1.0:
+        return math.nan
+    return fee_rate
