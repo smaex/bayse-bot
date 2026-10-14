@@ -124,9 +124,11 @@ def test_the_risk_setting_is_a_ceiling_not_a_suggestion():
     assert _run(_sig(size_pct=0.50), settings).final_pct <= 0.01 + 1e-9
 
 
-def test_the_mode_ceiling_binds_when_risk_setting_is_above_it():
+def test_the_global_trade_risk_cap_binds_when_user_setting_is_absurd():
     settings = _settings(risk_pct=50.0)   # absurd on purpose
-    assert _run(_sig(size_pct=0.50), settings).final_pct == pytest.approx(0.05)
+    assert _run(_sig(size_pct=0.50), settings).final_pct == pytest.approx(
+        config.MAX_TRADE_RISK
+    )
 
 
 def test_a_decaying_edge_halves_the_size(monkeypatch):

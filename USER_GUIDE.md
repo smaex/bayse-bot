@@ -17,7 +17,7 @@
 - `/mode` — safe, balanced, or aggressive presets within operator ceilings.
 - `/set assets BTC ETH SOL` — choose assets.
 - `/set timeframes 5min 15min` — choose timeframes.
-- `/set strategies SNIPE` — choose permitted strategies.
+- `/set strategies TAKER MAKER` — choose from the operator-permitted strategies (currently TAKER and MAKER).
 - `/set risk 1` — request 1% risk per trade; the global ceiling still applies.
 - `/set maxexposure 10` — request 10% maximum deployed exposure; the global ceiling still applies.
 - `/pause` — block new entries while position monitoring continues.
@@ -32,4 +32,4 @@ Paused accounts do not open new positions. Existing positions are still monitore
 
 ## Expectations
 
-No mode guarantees profit. Prediction-market positions can lose their entire stake, and high win rate alone does not prove profitability. Judge results by realized net PnL after fees and slippage, return on capital, and drawdown over a meaningful sample. Single-leg CLOB MAKER is available as an opt-in strategy; experimental multi-leg and latency strategies require operator approval.
+No mode guarantees profit. Prediction-market positions can lose their entire stake, and high win rate alone does not prove profitability. Judge results by realized net PnL after fees and slippage, return on capital, and drawdown over a meaningful sample. The configured new-account scope is TAKER+MAKER on BTC/ETH/SOL at 5- and 15-minute timeframes, and new accounts remain paused until an operator explicitly resumes them. A configured strategy is not a promise of positive expectancy; review realized net PnL and drawdown before increasing risk.

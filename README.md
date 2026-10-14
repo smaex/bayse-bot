@@ -6,16 +6,16 @@ A multi-user prediction-market trading service controlled through Telegram. It w
 
 ## Safe operating model
 
-The production path is intentionally narrow:
+The production path is intentionally bounded:
 
-- New accounts start **paused**, limited to BTC/SOL 15-minute single-leg MAKER—the combinations supported by the current production audit.
+- New accounts start **paused**. The configured default scope is TAKER+MAKER on BTC/ETH/SOL at 5- and 15-minute timeframes; this is a code/configuration default, not a claim that every strategy/market combination is profitable.
 - A trade requires fresh data, a complete executable quote, sufficient modeled edge, and room under both per-trade and portfolio limits.
 - Requested order size is never treated as proof of a fill; exposure is created only from exchange-confirmed filled quantity.
 - The default global ceilings are 2% per trade, 15% total exposure, and a 3% daily realized-loss stop.
-- Single-leg CLOB MAKER is permitted and remains subject to per-asset performance controls. SNIPE is available only in the conservative SOL/15-minute scope by default; broaden it only during paper validation. ARB, paired-sniper, oracle-arb, and dual-leg midmarket-maker remain experimental and are blocked unless the operator explicitly sets `ALLOW_EXPERIMENTAL_STRATEGIES=true`.
-- A read-only complete-set monitor looks for fee-adjusted BUY→BURN and MINT→SELL CLOB discrepancies. It never submits orders because Bayse batches are best-effort rather than atomic.
+- TAKER entries include a directional path and a separately revalidated CLOB complete-set path. Complete-set legs are sent sequentially, every confirmed partial fill is tracked, and shares are burned only when the two fills match; this is not an atomic exchange batch.
+- Historical performance findings are policy evidence from their stated dates, not a live profitability guarantee. In particular, legacy SNIPE measurements do not establish the expectancy of the current TAKER implementation. Review current fills, net PnL, and drawdown before enabling live trading.
 - Telegram polling, feed tasks, scanning, and user loops are supervised. `/live` reports process liveness; `/ready` reports whether startup and the singleton lease are healthy.
-- A trading drought is a reported condition, not a mystery. Per-gate rejection counters plus a prioritised verdict (`/why`) distinguish "no candidate cleared its edge and risk gates" from "the account is paused", "feeds are stale", "no markets were discovered", and "LIVE_TRADING=false means we never send orders". Day-scoped safety stops (`daily_loss_limit`, `daily_target`, `drawdown`) expire at the configured trading-day boundary; a manual `/pause` never expires by itself.
+- A trading drought is a reported condition, not a mystery. Per-gate rejection counters plus a prioritised verdict (`/why`) distinguish "no candidate cleared its edge and risk gates" from "the account is paused", "feeds are stale", "no markets were discovered", and "LIVE_TRADING=false means we never send orders". Day-scoped safety stops (`daily_loss_limit`, `daily_target`, `drawdown`) expire at the configured trading-day boundary; a manual `/pause` never expires by itself. An `order_reconciliation` pause also remains in force until an operator verifies the exchange state and explicitly resumes.
 - One database-backed owner lease prevents two deployments from trading the same users at once.
 
 These are ceilings, not profit targets. Start smaller, review exchange fills and realized net PnL, and promote strategies only after enough out-of-sample evidence.
@@ -88,7 +88,6 @@ DEFAULT_DAILY_LOSS_LIMIT_PCT=3.0
 MAX_DAILY_LOSS_LIMIT_PCT=5.0
 MAX_DRAWDOWN_STOP=0.10
 REQUIRE_DIRECT_ORACLE=true
-ALLOW_EXPERIMENTAL_STRATEGIES=false
 TRADING_TIMEZONE=Africa/Lagos
 ```
 

@@ -167,6 +167,55 @@ def test_rollover_expires_only_the_in_memory_drawdown_flag(monkeypatch):
     assert settings["paused"] is False
 
 
+def test_feed_evaluation_uses_bounded_user_cache_not_forced_db_read(monkeypatch):
+    calls = []
+    chat = "u-cache"
+    risk = RiskManager()
+    monkeypatch.setitem(bot._user_clients, chat, object())
+    monkeypatch.setitem(bot._user_risks, chat, risk)
+
+    def cached_get_user(chat_id, force_fresh=False):
+        calls.append((chat_id, force_fresh))
+        return {"chat_id": chat_id, "settings": {"paused": True}}
+
+    monkeypatch.setattr(bot.database, "get_user", cached_get_user)
+    asyncio.run(bot._evaluate_single_user_locked({"chat_id": chat}))
+
+    assert calls == [(chat, False)]
+
+
+def test_unpersisted_reconciliation_pause_survives_trading_day_rollover(monkeypatch):
+    monkeypatch.setattr(bot.database, "update_settings", lambda cid, s: None)
+    chat = "u-reconciliation"
+    bot._user_daily[chat] = {"date": "2000-01-01"}
+    risk = RiskManager()
+    risk.paused = True
+    risk.pause_reason = "order_reconciliation"
+    settings = {"paused": False, "daily_state": {"date": "2000-01-01"}}
+
+    _roll(chat, 1_000.0, settings, {chat: risk})
+
+    assert risk.paused is True
+    assert risk.pause_reason == "order_reconciliation"
+    assert bot._risk_pause_active(risk) is True
+    assert bot._risk_pause_requires_operator(risk) is True
+
+
+def test_unresolved_risk_pause_is_not_cleared_by_drawdown_recovery_or_daily_reset():
+    risk = RiskManager()
+    risk.peak_balance = 1_000.0
+    risk.paused = True
+    risk.pause_reason = "order_reconciliation"
+
+    assert risk.check_drawdown(1_000.0) is False
+    risk.last_reset_date = "2000-01-01"
+    risk.current_free_cash = 1_000.0
+    risk.reset_daily_if_needed()
+
+    assert risk.paused is True
+    assert risk.pause_reason == "order_reconciliation"
+
+
 def test_same_day_rollover_is_idempotent(monkeypatch):
     calls = []
     monkeypatch.setattr(bot.database, "update_settings", lambda cid, s: calls.append(cid))
@@ -331,6 +380,7 @@ def test_watchdog_stays_quiet_while_the_pipeline_is_working(monkeypatch):
     monkeypatch.setattr(bot.telegram_bot, "send_message", sent.send)
     monkeypatch.setattr(bot, "_tg_app", object())
     monkeypatch.setattr(bot, "_active_users_cache", [{"chat_id": chat, "settings": {}}])
+    monkeypatch.setattr(bot, "_worst_feed_age_sec", lambda _now: 0.0)
     bot._user_risks.setdefault(chat, RiskManager())
 
     stall.note_state(chat, paused=False, dry_run=False)

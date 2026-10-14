@@ -3,6 +3,7 @@ Risk manager: position sizing, drawdown control, exposure limits.
 """
 
 import logging
+import math
 import time
 
 import config
@@ -22,6 +23,15 @@ def _is_maker(strategy: str) -> bool:
     return str(strategy or "").upper() in _MAKER_STRATEGIES
 
 
+def _position_amount(pos: dict) -> float:
+    """Return a valid non-negative notional, or infinity to fail closed."""
+    try:
+        amount = float(pos.get("amount_ngn", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return math.inf
+    return amount if math.isfinite(amount) and amount >= 0.0 else math.inf
+
+
 def position_is_filled(pos: dict) -> bool:
     """True only when the exchange has confirmed shares for this position.
 
@@ -32,9 +42,10 @@ def position_is_filled(pos: dict) -> bool:
     if pos.get("confirmed_filled"):
         return True
     try:
-        return float(pos.get("filled_quantity") or 0.0) > 0.0
+        quantity = float(pos.get("filled_quantity") or 0.0)
     except (TypeError, ValueError):
         return False
+    return math.isfinite(quantity) and quantity > 0.0
 
 
 def share_quantities_match(first: float, second: float) -> bool:
@@ -49,7 +60,10 @@ def share_quantities_match(first: float, second: float) -> bool:
         first, second = float(first), float(second)
     except (TypeError, ValueError):
         return False
-    if first < 0.0 or second < 0.0:
+    if (
+        not math.isfinite(first) or not math.isfinite(second)
+        or first < 0.0 or second < 0.0
+    ):
         return False
     tolerance = max(1e-6, 1e-8 * max(first, second))
     return abs(first - second) <= tolerance
@@ -61,6 +75,7 @@ class RiskManager:
         self.daily_target: float = 0.0
         self.mode: str = "balanced"
         self.paused: bool = False
+        self.pause_reason: str = ""
         self.current_free_cash: float = 0.0
         self.open_positions: dict[str, dict] = {}  # market_id → position
         self.daily_realized_pnl: float = 0.0
@@ -86,7 +101,11 @@ class RiskManager:
         return self.paused
 
     def update_peak(self, balance: float):
-        if balance > self.peak_balance:
+        try:
+            balance = float(balance)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(balance) and balance > self.peak_balance:
             self.peak_balance = balance
 
     def reset_daily_if_needed(self):
@@ -97,11 +116,15 @@ class RiskManager:
             log.info(f"Daily risk reset: profit was ₦{self.daily_realized_pnl:,.0f}")
             self.daily_realized_pnl = 0.0
             self.last_reset_date = today
-            # If the risk manager paused from yesterday's drawdown, reset the baseline for the new day
-            # so the bot never stays permanently silent across trading days
-            if self.paused:
-                log.info("Daily risk reset: clearing drawdown pause for new trading day")
+            # Drawdown and daily-loss stops are session-scoped. Reconciliation
+            # and operator pauses must survive a date rollover even if
+            # persistence of the pause failed.
+            if self.paused and self.pause_reason in {
+                "", "drawdown", "daily_loss_limit", "daily_target"
+            }:
+                log.info("Daily risk reset: clearing day-scoped pause for new trading day")
                 self.paused = False
+                self.pause_reason = ""
                 self.peak_balance = self.current_free_cash
                 self._dd_breach_since = 0.0
 
@@ -110,6 +133,14 @@ class RiskManager:
         self.check_drawdown(balance)
 
     def check_drawdown(self, balance: float) -> bool:
+        try:
+            balance = float(balance)
+        except (TypeError, ValueError):
+            log.error("Drawdown check rejected a non-numeric balance")
+            return False
+        if not math.isfinite(balance) or balance < 0.0:
+            log.error("Drawdown check rejected a non-finite or negative balance")
+            return False
         if self.peak_balance <= 0:
             self.peak_balance = balance
             return True
@@ -131,12 +162,20 @@ class RiskManager:
                         "All trading paused."
                     )
                 self.paused = True
+                if self.pause_reason in {"", "drawdown"}:
+                    self.pause_reason = "drawdown"
             return not self.paused
-        # Drawdown condition no longer true — reset the debounce clock.
+        # Drawdown condition no longer true — reset the debounce clock. A
+        # drawdown recovery must not clear an operator or reconciliation pause.
         self._dd_breach_since = 0.0
-        if self.paused and dd < MAX_DRAWDOWN_STOP * 0.25:
+        if (
+            self.paused
+            and self.pause_reason in {"", "drawdown"}
+            and dd < MAX_DRAWDOWN_STOP * 0.25
+        ):
             log.info(f"Drawdown recovered to {dd:.1%} — resuming trading")
             self.paused = False
+            self.pause_reason = ""
         return not self.paused
 
     def deployed(self) -> float:
@@ -150,10 +189,7 @@ class RiskManager:
         This is the *balance-sheet* view. It is NOT the number the entry-exposure
         cap uses — see ``deployed_filled`` for why.
         """
-        return sum(
-            p.get("amount_ngn", 0.0)
-            for p in self.open_positions.values()
-        )
+        return sum(_position_amount(p) for p in self.open_positions.values())
 
     def deployed_filled(self) -> float:
         """Capital in positions the exchange has actually executed.
@@ -167,7 +203,7 @@ class RiskManager:
         at INFO with no gate counter and no notification.
         """
         return sum(
-            p.get("amount_ngn", 0.0)
+            _position_amount(p)
             for p in self.open_positions.values()
             if position_is_filled(p)
         )
@@ -215,21 +251,48 @@ class RiskManager:
             for leg in legs:
                 if not multi_leg:
                     # One-sided by construction.
-                    total += float(leg.get("amount_ngn") or 0.0)
+                    amount = _position_amount(leg)
+                    if not math.isfinite(amount):
+                        return math.inf
+                    total += amount
                     continue
                 outcome = str(leg.get("outcome") or "").upper()
                 opposite_filled = any(
                     o and o != outcome for o in filled_outcomes
                 )
                 if position_is_filled(leg) and not opposite_filled:
-                    total += float(leg.get("amount_ngn") or 0.0)
+                    amount = _position_amount(leg)
+                    if not math.isfinite(amount):
+                        return math.inf
+                    total += amount
         return total
 
     def can_trade(self, balance: float, amount: float, max_exposure: float = 0.30) -> bool:
-        max_exposure = min(max_exposure, MAX_PORTFOLIO_EXPOSURE)
-        if (self.deployed_filled() + amount) > balance * max_exposure:
+        """Fail closed when account, position, or limit values are malformed."""
+        try:
+            balance = float(balance)
+            amount = float(amount)
+            max_exposure = float(max_exposure)
+            portfolio_cap = float(MAX_PORTFOLIO_EXPOSURE)
+        except (TypeError, ValueError):
+            log.error("Exposure check rejected non-numeric balance, amount, or limit")
+            return False
+        if (
+            not all(math.isfinite(value) for value in
+                    (balance, amount, max_exposure, portfolio_cap))
+            or balance <= 0.0 or amount < 0.0 or max_exposure < 0.0
+            or portfolio_cap < 0.0
+        ):
+            log.error("Exposure check rejected non-finite or negative risk values")
+            return False
+        max_exposure = min(max_exposure, portfolio_cap)
+        deployed = self.deployed_filled()
+        if not math.isfinite(deployed) or deployed < 0.0:
+            log.error("Exposure check rejected invalid tracked position notional")
+            return False
+        if (deployed + amount) > balance * max_exposure:
             log.info(
-                f"Exposure cap: filled=₦{self.deployed_filled():,.0f} + "
+                f"Exposure cap: filled=₦{deployed:,.0f} + "
                 f"₦{amount:,.0f} > {max_exposure:.0%} of ₦{balance:,.0f} "
                 f"(resting orders ₦{self.deployed_resting():,.0f} excluded)"
             )

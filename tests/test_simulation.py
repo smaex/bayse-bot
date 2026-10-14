@@ -22,9 +22,28 @@ def test_positive_expectancy_simulation_still_contains_losing_months():
     assert result["p05"] < result["median"] < result["p95"]
 
 
-def test_committed_report_discloses_simulation_limitations():
+def test_committed_report_discloses_simulation_limitations_and_period():
     report = render(paths=50, days=5, stake=100)
 
-    assert "not a claim" in report
+    assert "not a backtest of the current TAKER implementation" in report
     assert "does **not** mean daily profit" in report
     assert "SNIPE all assets (legacy policy)" in report
+    assert "P(5d profit)" in report
+    assert "Median 5d PnL" in report
+    assert "Median 30d PnL" not in report
+
+
+def test_zero_fill_rate_and_invalid_simulation_inputs_are_handled():
+    scenario = Scenario("no fills", wins=1, trades=2, roi=0.0,
+                        trades_per_day=0, note="")
+    result = simulate(scenario, paths=10, days=5, seed=7)
+    assert result["median"] == 0.0
+    assert result["month_positive"] == 0.0
+    assert result["month_loss"] == 0.0
+
+    with pytest.raises(ValueError, match="paths"):
+        simulate(scenario, paths=0)
+    with pytest.raises(ValueError, match="days"):
+        simulate(scenario, days=0)
+    with pytest.raises(ValueError, match="stake"):
+        simulate(scenario, stake=float("inf"))

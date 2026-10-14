@@ -1,3 +1,4 @@
+import math
 import os
 
 try:
@@ -19,9 +20,12 @@ def _env_float(name: str, default: float) -> float:
     if raw is None:
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError as exc:
         raise RuntimeError(f"{name} must be numeric, got {raw!r}") from exc
+    if not math.isfinite(value):
+        raise RuntimeError(f"{name} must be finite, got {raw!r}")
+    return value
 
 
 def _env_int(name: str, default: int) -> int:
@@ -304,7 +308,7 @@ DEFAULT_FEE_RATE = _env_float("DEFAULT_FEE_RATE", 0.02)
 # Environment overrides are fractions: 0.10 means 10%.
 MAX_DRAWDOWN_STOP      = _env_float("MAX_DRAWDOWN_STOP", 0.10)
 MAX_PORTFOLIO_EXPOSURE = _env_float("MAX_PORTFOLIO_EXPOSURE", 0.15)
-MAX_TRADE_RISK         = _env_float("MAX_TRADE_RISK", 0.05)
+MAX_TRADE_RISK         = _env_float("MAX_TRADE_RISK", 0.02)
 DEFAULT_DAILY_LOSS_LIMIT_PCT = _env_float("DEFAULT_DAILY_LOSS_LIMIT_PCT", 3.0)
 MAX_DAILY_LOSS_LIMIT_PCT = _env_float("MAX_DAILY_LOSS_LIMIT_PCT", 5.0)
 TRADING_TIMEZONE = os.getenv("TRADING_TIMEZONE", "Africa/Lagos")

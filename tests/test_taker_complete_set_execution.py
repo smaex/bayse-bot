@@ -125,6 +125,7 @@ def taker_env(monkeypatch):
     monkeypatch.setattr(executor, "active_markets", [market])
     monkeypatch.setattr(executor, "_trade_cooldown", {})
     monkeypatch.setattr(executor.database, "get_alpha_trend", lambda *_args: 1.0)
+    monkeypatch.setattr(executor.database, "check_connection", lambda: True)
     monkeypatch.setattr(executor, "_tg_app", SimpleNamespace(bot=_FakeBot()))
 
     recorded = []
@@ -232,6 +233,69 @@ def test_first_leg_is_persisted_tracked_and_notified_if_second_order_fails(taker
     assert any("TAKER Fill Confirmed" in message for message in messages)
     assert any("only one leg" in message.lower() for message in messages)
     assert stall._users[CHAT_ID]["trades"] == 1
+
+
+def test_missing_ledger_row_stops_a_pair_before_placing_the_next_leg(taker_env, monkeypatch):
+    monkeypatch.setattr(executor.database, "record_trade", lambda **_kwargs: None)
+    client = _FakeClient()
+
+    _execute(taker_env, client)
+
+    assert len(client.place_calls) == 1
+    assert client.burn_calls == []
+    assert len(taker_env["risk"].open_positions) == 1
+    position = next(iter(taker_env["risk"].open_positions.values()))
+    assert position["ledger_reconciliation_pending"] is True
+    assert taker_env["risk"].paused is True
+
+
+def test_malformed_positive_pair_fill_stops_before_the_next_leg_or_burn(taker_env):
+    class _MalformedQuantityClient(_FakeClient):
+        async def place_order(self, **kwargs):
+            self.place_calls.append(kwargs)
+            ask = booklib.best_ask(self.books[kwargs["outcome_id"]])
+            return {"order": {
+                "id": f"order-{len(self.place_calls)}",
+                "status": "filled",
+                "quantity": 2.0,
+                "filledSize": float("nan"),
+                "avgFillPrice": ask,
+                "totalCost": kwargs["amount"],
+            }}
+
+    client = _MalformedQuantityClient()
+
+    _execute(taker_env, client)
+
+    assert len(client.place_calls) == 1
+    assert client.burn_calls == []
+    assert len(taker_env["recorded"]) == 1
+    assert len(taker_env["risk"].open_positions) == 1
+    position = next(iter(taker_env["risk"].open_positions.values()))
+    assert position["filled_quantity"] == 2.0
+    assert position["exit_reconciliation_pending"] is True
+    assert taker_env["risk"].paused is True
+
+
+def test_ambiguous_taker_burn_pauses_and_is_not_retried(taker_env):
+    class _BurnTimeoutClient(_FakeClient):
+        async def burn_shares(self, market_id, quantity, currency):
+            self.burn_calls.append((market_id, quantity, currency))
+            raise TimeoutError("response lost after burn dispatch")
+
+    client = _BurnTimeoutClient()
+    _execute(taker_env, client)
+
+    assert len(client.burn_calls) == 1
+    assert taker_env["risk"].paused is True
+    assert len(taker_env["risk"].open_positions) == 2
+    assert all(
+        position.get("burn_reconciliation_pending")
+        for position in taker_env["risk"].open_positions.values()
+    )
+
+    _execute(taker_env, client)
+    assert len(client.burn_calls) == 1
 
 
 def test_pair_execution_rechecks_both_fresh_prices_before_sending_either_leg(taker_env):

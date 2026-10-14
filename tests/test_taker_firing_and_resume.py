@@ -34,6 +34,7 @@
 """
 
 import asyncio
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -637,6 +638,17 @@ def test_balanced_pair_amounts_account_for_the_taker_fee():
     assert shares[0] == pytest.approx(shares[1], rel=1e-9)
 
 
+def test_balancing_never_raises_a_leg_above_its_risk_sized_budget():
+    from strategies.base import QuoteLeg
+
+    # The minimum forces 1.5x more notional on the expensive leg. Although the
+    # pair total is still less than 2x the budget, that leg alone must not
+    # exceed the per-leg risk ceiling.
+    legs = [QuoteLeg("YES", "yes", 0.60, 0.02, 0.65),
+            QuoteLeg("NO", "no", 0.40, 0.02, 0.35)]
+    assert executor._balanced_pair_amounts(legs, 130.0, min_order=100.0) is None
+
+
 def test_balanced_pair_amounts_fail_closed_when_it_cannot_clear_minimums():
     from strategies.base import QuoteLeg
 
@@ -668,3 +680,11 @@ def test_a_buy_fill_costs_its_fee_not_just_its_shares():
         {"status": "filled", "quantity": 200.0, "avgFillPrice": 0.46, "fee": 0.0},
         200.0, 0.46,
     ) == pytest.approx(9_200.0)
+    assert executor._order_actual_cost(
+        {"totalCost": math.nan, "quantity": 150.0, "avgFillPrice": 0.65, "fee": 250.0},
+        150.0, 0.65,
+    ) == pytest.approx(10_000.0)
+    assert math.isnan(executor._order_actual_cost(
+        {"quantity": 150.0, "avgFillPrice": 0.65, "fee": math.inf},
+        150.0, 0.65,
+    ))

@@ -320,6 +320,7 @@ def maker_env(monkeypatch):
     }])
     monkeypatch.setattr(executor, "_trade_cooldown", {})
     monkeypatch.setattr(executor.database, "get_alpha_trend", lambda *_a: 1.0)
+    monkeypatch.setattr(executor.database, "check_connection", lambda: True)
     recorded = []
     monkeypatch.setattr(
         executor.database, "record_trade",
@@ -331,7 +332,7 @@ def maker_env(monkeypatch):
     notified = []
 
     async def _notify(app, cid, sig, amount, engine="AMM"):
-        notified.append((sig.market_price, engine))
+        notified.append((sig.market_price, engine, amount))
 
     monkeypatch.setattr(executor.telegram_bot, "notify_trade", _notify)
     monkeypatch.setattr(executor, "_tg_app", object())
@@ -441,6 +442,50 @@ def test_a_complete_set_lock_is_always_allowed():
     assert risk.already_in("m", strategy="TAKER", outcome="BOTH") is False
 
 
+def test_malformed_maker_fill_response_is_cancelled_before_the_next_leg(maker_env):
+    from strategies.base import QuoteLeg
+
+    class _MalformedFillClient(_MakerClient):
+        def __init__(self, books):
+            super().__init__(books)
+            self.cancelled = []
+
+        async def place_order(self, **kwargs):
+            self.place_calls.append(kwargs)
+            return {"order": {
+                "id": f"maker-{len(self.place_calls)}",
+                "status": "open",
+                "filledSize": float("nan"),
+            }}
+
+        async def cancel_order(self, order_id):
+            self.cancelled.append(order_id)
+
+        async def get_order(self, _order_id):
+            return {"status": "cancelled", "filledSize": 0.0}
+
+        @staticmethod
+        def parse_filled_shares(order):
+            return float(order.get("filledSize") or 0.0)
+
+    client = _MalformedFillClient({
+        "yes": _book(bids=[0.46], asks=[0.52]),
+        "no": _book(bids=[0.50], asks=[0.56]),
+    })
+    signal = _maker_signal(
+        market_price=0.46, outcome="BOTH", certainty=0.60, win_prob=0.55,
+        legs=[QuoteLeg("YES", "yes", 0.46, 0.02, 0.55),
+              QuoteLeg("NO", "no", 0.50, 0.02, 0.45)],
+    )
+
+    risk = _run(maker_env, signal, client)
+
+    assert len(client.place_calls) == 1
+    assert client.cancelled == ["maker-1"]
+    assert risk.open_positions == {}
+    assert risk.paused is False
+
+
 def test_a_two_leg_quote_is_placed_with_equal_share_counts(maker_env):
     """A set settles on min(shares_yes, shares_no).
 
@@ -482,3 +527,5 @@ def test_a_two_leg_quote_is_placed_with_equal_share_counts(maker_env):
     assert len(risk.open_positions) == 2
     assert all(p["amount_ngn"] == pytest.approx(stake)
                for p, stake in zip(risk.open_positions.values(), stakes))
+    assert maker_env["notified"][-1][1] == "CLOB_LIMIT"
+    assert maker_env["notified"][-1][2] == pytest.approx(sum(stakes))

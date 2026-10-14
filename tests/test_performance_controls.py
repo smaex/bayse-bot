@@ -132,7 +132,7 @@ def test_new_accounts_default_to_both_strategies_and_stay_paused():
     assert database.DEFAULT_SETTINGS["timeframes"] == ["15min", "5min"]
     assert database.DEFAULT_SETTINGS["mode"] == "balanced"
     assert database.DEFAULT_SETTINGS["maxexposure"] == 15.0
-    assert database.DEFAULT_SETTINGS["daily_loss_limit_pct"] == 5.0
+    assert database.DEFAULT_SETTINGS["daily_loss_limit_pct"] == config.DEFAULT_DAILY_LOSS_LIMIT_PCT == 3.0
     assert database.DEFAULT_SETTINGS["paused"] is True
 
 

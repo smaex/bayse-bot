@@ -1,4 +1,8 @@
 import asyncio
+from types import SimpleNamespace
+
+import aiohttp
+import pytest
 
 from client import BayseClient
 
@@ -16,6 +20,42 @@ class CapturingClient(BayseClient):
     async def _public_post(self, path, body):
         self.public_posts.append((path, body))
         return {"completeFill": True}
+
+
+def test_ambiguous_cancel_5xx_is_not_replayed_through_the_fallback_endpoint():
+    class _Response:
+        status = 503
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def raise_for_status(self):
+            raise aiohttp.ClientResponseError(
+                request_info=None, history=(), status=503, message="server error"
+            )
+
+    class _Session:
+        closed = False
+
+        def __init__(self):
+            self.delete_urls = []
+
+        def delete(self, url, **_kwargs):
+            self.delete_urls.append(url)
+            return _Response()
+
+    client = BayseClient("public", "secret")
+    session = _Session()
+    client._session = session
+
+    with pytest.raises(aiohttp.ClientResponseError):
+        asyncio.run(client.cancel_order("order-1"))
+
+    assert len(session.delete_urls) == 1
+    assert session.delete_urls[0].endswith("/v1/pm/orders/batch")
 
 
 def test_market_order_matches_documented_amm_shape():
@@ -91,6 +131,52 @@ def test_mint_and_burn_request_quantity_is_wallet_amount():
     assert client.writes[0][1] == {"quantity": 100, "currency": "NGN"}
     assert client.writes[1][0] == "/v1/pm/markets/market/burn"
     assert client.writes[1][1] == {"quantity": 100, "currency": "NGN"}
+
+
+def test_get_position_ignores_malformed_portfolio_rows():
+    client = CapturingClient()
+
+    async def malformed_portfolio():
+        return {"outcomeBalances": [None, "bad", {"outcomeId": "yes", "balance": 3}]}
+
+    client.get_portfolio = malformed_portfolio
+    assert asyncio.run(client.get_position("yes")) == {
+        "outcomeId": "yes", "balance": 3,
+    }
+    async def malformed_rows():
+        return {"outcomeBalances": {"not": "a list"}}
+
+    client.get_portfolio = malformed_rows
+    assert asyncio.run(client.get_position("yes")) is None
+
+
+def test_wallet_balance_requires_a_finite_non_negative_available_amount():
+    client = CapturingClient()
+
+    async def wallet_payload():
+        return {"assets": [{"currency": "NGN", "availableBalance": "1250.50"}]}
+
+    client.get_wallet = wallet_payload
+    assert asyncio.run(client.get_balance_ngn()) == 1250.50
+
+    async def missing_free_cash():
+        return {"assets": [{"currency": "NGN", "balance": "10000"}]}
+
+    client.get_wallet = missing_free_cash
+    # Total/balance can include locked positions; it is not free cash.
+    assert asyncio.run(client.get_balance_ngn()) == 0.0
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -1.0, "not-a-number"])
+def test_wallet_rejects_malformed_or_negative_available_balance(bad_value):
+    client = CapturingClient()
+
+    async def wallet_payload():
+        return {"assets": [{"currency": "NGN", "availableBalance": bad_value}]}
+
+    client.get_wallet = wallet_payload
+    with pytest.raises(ValueError):
+        asyncio.run(client.get_balance_ngn())
 
 
 def test_batch_orders_use_idempotency_but_are_not_assumed_atomic():
