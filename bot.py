@@ -9,6 +9,12 @@ import os
 import signal
 import sys
 import time
+
+# Production runs `python bot.py`. Telegram imports `bot` for session resets;
+# both names MUST reference this module, not a second copy of its live state.
+# Register before importing modules that can import us back.
+if __name__ == "__main__":
+    sys.modules["bot"] = sys.modules[__name__]
 from types import SimpleNamespace
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -401,6 +407,17 @@ def reset_session_restrictions(
     global _active_users_cache_time
     _active_users_cache_time = 0.0
 
+    # Sizing diagnostics must not turn a successfully persisted resume into a
+    # failure message if legacy settings contain an invalid numeric value.
+    sizing_summary = {}
+    try:
+        ceiling = executor.account_risk_ceiling(settings)
+        minimum = max(executor.MIN_TRADE_NGN, float(settings.get("mintrade", 100)))
+        if math.isfinite(ceiling) and ceiling > 0 and math.isfinite(minimum):
+            sizing_summary = {"order_budget": equity * ceiling, "minimum_order": minimum}
+    except (TypeError, ValueError, OverflowError):
+        log.warning(f"[{chat_id}] resume sizing diagnostics unavailable; check account settings")
+
     log.warning(
         f"[{chat_id}] SESSION RESET ({reason}) — equity baseline ₦{equity:,.2f}, "
         f"today's PnL before the override ₦{booked_pnl:+,.2f} excluded, "
@@ -412,6 +429,7 @@ def reset_session_restrictions(
         "booked_pnl": booked_pnl,
         "cleared_cooldowns": cleared_cooldowns,
         "cleared_suspensions": cleared_suspensions,
+        **sizing_summary,
     }
 
 

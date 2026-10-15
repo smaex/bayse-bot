@@ -542,7 +542,7 @@ async def run_learning(chat_id: str) -> tuple[dict, str]:
     learned["pantry_raid_active"] = False
 
     s["learned"] = learned
-    await asyncio.to_thread(database.update_settings, chat_id, s)
+    await asyncio.to_thread(database.merge_settings, chat_id, {"learned": learned})
 
     overall = await asyncio.to_thread(database.all_time_stats, chat_id)
     lines   = [
