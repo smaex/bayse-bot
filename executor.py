@@ -692,6 +692,16 @@ class _Sizing:
     effective_max: float  # largest order the user allows
 
 
+def account_risk_ceiling(settings: dict) -> float:
+    """Per-leg ceiling shared by execution and operator-facing diagnostics."""
+    mode_cap = {
+        "safe": 0.03, "balanced": 0.05, "aggressive": 0.08,
+        "full_send": 0.10, "custom": 0.05,
+    }.get(settings.get("mode", "balanced"), 0.05)
+    return min(float(settings.get("risk_pct", 2.0)) / 100.0,
+               config.MAX_TRADE_RISK, mode_cap)
+
+
 async def _size_for_signal(
     sig, settings: dict, risk, *, chat_id: str, equity: float, free_cash: float,
     n_legs: int, mode: str, mult: float, user_risk: float,
@@ -747,14 +757,7 @@ async def _size_for_signal(
     if risk.is_on_probation():
         raw_pct *= 0.50
 
-    mode_cap_pct = {
-        "safe": 0.03,
-        "balanced": 0.05,
-        "aggressive": 0.08,
-        "full_send": 0.10,
-        "custom": 0.05,
-    }.get(mode, 0.05)
-    allowed_pct = min(user_risk, mode_cap_pct)
+    allowed_pct = min(user_risk, account_risk_ceiling(settings))
     final_pct = min(raw_pct, allowed_pct)
 
     market_meta = next(

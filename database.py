@@ -376,6 +376,31 @@ def update_settings(chat_id: str, settings: dict):
         _ACTIVE_USERS_CACHE = (now, users_list)
 
 
+def merge_settings(chat_id: str, patch: dict) -> dict:
+    """Atomically patch top-level keys without restoring a stale pause/baseline.
+
+    The learner runs ledger queries between reading and saving settings. A
+    whole-blob save could overwrite a concurrent /resume with its old pause.
+    Merge in PostgreSQL against the current row, not the learner's snapshot.
+    """
+    with _cx() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "UPDATE users SET settings = "
+                "(COALESCE(settings, '{}')::jsonb || %s::jsonb)::text "
+                "WHERE chat_id = %s RETURNING settings",
+                (json.dumps(patch), chat_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError(f"Cannot update settings for unknown user {chat_id}")
+            current = json.loads(row["settings"])
+    # Invalidate rather than re-cache a snapshot that another writer may have
+    # superseded after our transaction committed.
+    invalidate_user_cache(chat_id)
+    return {**DEFAULT_SETTINGS, **current}
+
+
 def invalidate_user_cache(chat_id: str = None):
     global _ACTIVE_USERS_CACHE
     _ACTIVE_USERS_CACHE = None

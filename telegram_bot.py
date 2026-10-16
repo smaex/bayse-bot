@@ -915,9 +915,13 @@ async def _status_text(cid: str) -> str:
         f"All-time: {stats['wins']}/{stats['total']} wins "
         f"({stats['win_rate']:.0%} WR) ₦{stats['total_pnl']:+,.0f}",
         "",
-        f"Status: {'⏸ Paused' if s.get('paused') else '🟢 Active'}",
+        f"Status: {'⏸ Paused' if s.get('paused') or (risk is not None and risk.paused) else '🟢 Active'}",
         f"Mode: *{s.get('mode','balanced').title()}*",
     ]
+    if s.get("paused") or (risk is not None and risk.paused):
+        reason = (getattr(risk, "pause_reason", "") if risk is not None and risk.paused else "")
+        reason = reason or s.get("paused_reason") or "manual"
+        lines.append(f"Pause reason: {_code_span(reason)} — /why for details.")
     return "\n".join(lines)
 
 
@@ -1087,6 +1091,15 @@ async def _apply_resume(cid: str, *, via: str = "/resume") -> str:
     else:
         lines.append("The session baseline and the daily stops were reset from current equity.")
     lines.append(f"Equity baseline: ₦{summary['equity']:,.2f}.")
+    budget = summary.get("order_budget")
+    minimum = summary.get("minimum_order")
+    if budget is not None and minimum is not None and budget < minimum:
+        lines.append(
+            f"⚠️ Entry orders are still blocked: your per-order risk budget is only "
+            f"₦{budget:,.2f}, below the ₦{minimum:,.2f} minimum order. "
+            "Resume clears the pause, not the sizing limits. More equity is needed "
+            "under the current risk policy; /why shows other entry blockers."
+        )
     if summary.get("cleared_cooldowns"):
         lines.append(f"Cleared {summary['cleared_cooldowns']} trade cooldown(s).")
     if summary.get("cleared_suspensions"):
