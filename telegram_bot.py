@@ -878,22 +878,15 @@ async def _status_text(cid: str) -> str:
     if not math.isfinite(start_balance) or start_balance <= 0:
         start_balance = equity
     try:
-        pnl_baseline = float(day.get("pnl_baseline") or 0.0)
-    except (TypeError, ValueError):
-        pnl_baseline = 0.0
-    if not math.isfinite(pnl_baseline):
-        pnl_baseline = 0.0
-    try:
         realized_today = float(await asyncio.to_thread(
             database.get_daily_resolved_pnl, cid, today, config.TRADING_TIMEZONE,
         ))
     except Exception:
-        # Status should remain readable if the ledger is temporarily down;
-        # the in-memory risk value is already session-relative when available.
-        realized_today = (
-            float(risk.daily_realized_pnl) + pnl_baseline if risk is not None else pnl_baseline
-        )
-    profit = realized_today - pnl_baseline
+        # Status should remain readable if the ledger is temporarily down; the
+        # in-memory value is the real total for the day as of the last cycle.
+        realized_today = float(risk.daily_realized_pnl) if risk is not None else 0.0
+    # The day's real total. The resume baseline is retired, so nothing is hidden.
+    profit = realized_today
     target = _calc_target(s, start_balance)
 
     if risk and risk.peak_balance:
@@ -1082,15 +1075,16 @@ async def _apply_resume(cid: str, *, via: str = "/resume") -> str:
 
     booked = float(summary.get("booked_pnl") or 0.0)
     lines = ["▶️ *Trading resumed*", ""]
-    if booked:
+    lines.append(
+        f"Today's result so far ({booked:+,.2f}) still counts toward the daily loss "
+        "limit and the daily target. /resume only lifts the pause."
+    )
+    if summary.get("loss_limit_reached"):
         lines.append(
-            f"Today's result so far ({booked:+,.2f}) is now the baseline: the daily "
-            "loss limit and the daily target both measure from this point, so the "
-            "stop you just overrode cannot re-trigger on it."
+            "⚠️ The daily loss limit is already reached, so new entries will pause "
+            "again on the next check."
         )
-    else:
-        lines.append("The session baseline and the daily stops were reset from current equity.")
-    lines.append(f"Equity baseline: ₦{summary['equity']:,.2f}.")
+    lines.append(f"Account equity now: ₦{summary['equity']:,.2f}.")
     budget = summary.get("order_budget")
     minimum = summary.get("minimum_order")
     if budget is not None and minimum is not None and budget < minimum:

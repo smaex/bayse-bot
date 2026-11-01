@@ -49,7 +49,7 @@ def check(main_coro):
     assert "Entry orders are still blocked" in text
     assert not risk.paused and not risk.pause_reason
     assert not bot._risk_pause_active(risk)
-    assert runtime["_user_daily"][cid]["pnl_baseline"] == -50.0
+    assert runtime["_user_daily"][cid]["pnl_baseline"] == 0.0
     assert not saved["paused"]
     assert runtime["_active_users_cache_time"] == 0.0
 asyncio.run = check

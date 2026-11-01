@@ -354,6 +354,10 @@ def reset_session_restrictions(
     if not math.isfinite(equity) or equity <= 0:
         raise ValueError("Current account equity is unavailable or zero; refusing to resume")
 
+    # /resume lifts the pause and nothing else. Today's realised PnL, the
+    # target progress, the loss stop and the gain-lock peak keep counting from
+    # the start of the trading day. Only a new trading day, or a day with no
+    # record yet, starts a fresh day state.
     booked_pnl = 0.0
     try:
         booked_pnl = float(
@@ -362,12 +366,29 @@ def reset_session_restrictions(
     except Exception as err:
         log.warning(f"[{chat_id}] session reset could not read today's realised PnL: {err}")
 
-    day = {
-        "date": today,
-        "start_balance": equity,
-        "target_hit": False,
-        "pnl_baseline": booked_pnl,
-    }
+    existing = settings.get("daily_state")
+    try:
+        existing_start = float((existing or {}).get("start_balance") or 0.0)
+    except (TypeError, ValueError):
+        existing_start = 0.0
+    if (
+        isinstance(existing, dict) and existing.get("date") == today
+        and math.isfinite(existing_start) and existing_start > 0
+    ):
+        day = dict(existing)
+        day["start_balance"] = existing_start
+        # Legacy baselines written by earlier resumes are retired: the day's
+        # total is always the real total.
+        day["pnl_baseline"] = 0.0
+        # The target re-checks against the real total on the next cycle.
+        day["target_hit"] = False
+    else:
+        day = {
+            "date": today,
+            "start_balance": equity,
+            "target_hit": False,
+            "pnl_baseline": 0.0,
+        }
     settings["daily_state"] = day
     settings["paused"] = False
     settings.pop("paused_reason", None)
@@ -404,9 +425,10 @@ def reset_session_restrictions(
     if risk is not None:
         risk.paused = False
         risk.pause_reason = ""
-        risk.peak_balance = equity
+        if not (risk.peak_balance and math.isfinite(float(risk.peak_balance))):
+            risk.peak_balance = equity
         risk._dd_breach_since = 0.0
-        risk.daily_realized_pnl = 0.0
+        risk.daily_realized_pnl = booked_pnl
         risk.daily_target = 0.0
         risk.last_reset_date = today
 
@@ -435,14 +457,16 @@ def reset_session_restrictions(
         log.warning(f"[{chat_id}] resume sizing diagnostics unavailable; check account settings")
 
     log.warning(
-        f"[{chat_id}] SESSION RESET ({reason}) — equity baseline ₦{equity:,.2f}, "
-        f"today's PnL before the override ₦{booked_pnl:+,.2f} excluded, "
+        f"[{chat_id}] SESSION RESET ({reason}) — equity ₦{equity:,.2f}, "
+        f"today's realised PnL ₦{booked_pnl:+,.2f} kept, "
         f"{cleared_cooldowns} cooldown(s) cleared, "
-        f"{len(cleared_suspensions)} suspension(s) cleared; stops now measure from now"
+        f"{len(cleared_suspensions)} suspension(s) cleared; stops keep measuring the whole day"
     )
+    loss_limit = _daily_loss_limit(settings, float(day["start_balance"]))
     return {
         "equity": equity,
         "booked_pnl": booked_pnl,
+        "loss_limit_reached": booked_pnl <= -loss_limit,
         "cleared_cooldowns": cleared_cooldowns,
         "cleared_suspensions": cleared_suspensions,
         **sizing_summary,
@@ -467,19 +491,22 @@ async def _roll_trading_day(chat_id: str, equity: float, settings: dict) -> None
 
 
 def _session_pnl_for_day(profit: float, day: dict) -> float:
-    """Today's realised PnL measured from the session's own baseline.
+    """Today's realised PnL, which is the real total for the trading day.
 
-    ``pnl_baseline`` is what an explicit /resume records (see
-    ``reset_session_restrictions``): the result already booked when the
-    operator overrode the stop. Subtracting it is what makes the override
-    hold. Without a resume the baseline is ``0.0``, so this is the plain daily
-    PnL the stops have always used.
+    This used to subtract a ``pnl_baseline`` that /resume recorded, so a
+    pause-and-resume hid every loss booked before it. /resume now only lifts
+    the pause, so the stops and the target always measure the whole day.
+    ``day`` is kept in the signature for existing callers.
     """
-    try:
-        baseline = float((day or {}).get("pnl_baseline") or 0.0)
-    except (TypeError, ValueError):
-        baseline = 0.0
-    return float(profit) - baseline
+    return float(profit)
+
+
+def _daily_loss_limit(settings: dict, start_balance: float) -> float:
+    pct = min(
+        max(float(settings.get("daily_loss_limit_pct", config.DEFAULT_DAILY_LOSS_LIMIT_PCT)), 0.1),
+        config.MAX_DAILY_LOSS_LIMIT_PCT,
+    )
+    return start_balance * pct / 100.0
 
 
 def _daily_target(settings: dict, start: float) -> float:
