@@ -377,3 +377,60 @@ def test_unfunded_two_leg_minimum_is_refused_before_any_order(taker_env):
 
     assert client.place_calls == []
     assert taker_env["risk"].open_positions == {}
+
+
+class _PartialFirstLegClient(_FakeClient):
+    """Leg 1 fills only part of its planned size; leg 2 fills what it is sent."""
+
+    def __init__(self, first_leg_shares):
+        super().__init__()
+        self.first_leg_shares = first_leg_shares
+
+    async def place_order(self, **kwargs):
+        if not self.place_calls:
+            self.place_calls.append(kwargs)
+            ask = booklib.best_ask(self.books[kwargs["outcome_id"]])
+            return {"order": {
+                "id": "order-1", "status": "filled",
+                "quantity": self.first_leg_shares, "avgFillPrice": ask,
+                "totalCost": self.first_leg_shares * ask * config.CURRENCY_BASE_MULTIPLIER,
+            }}
+        return await super().place_order(**kwargs)
+
+
+def test_second_leg_is_sized_to_the_first_legs_actual_shares(taker_env):
+    # The plan buys about 7.2 shares a leg (₦400 YES at 0.55). If leg 1 only
+    # fills 5, leg 2 must buy 5 as well, or the set cannot be burned and the
+    # account pauses with an unhedged excess (found in the 2026-11-01 audit).
+    client = _PartialFirstLegClient(first_leg_shares=5.0)
+
+    _execute(taker_env, client)
+
+    assert len(client.place_calls) == 2
+    assert len(client.burn_calls) == 1, "a matched 5-share pair should burn"
+    assert client.burn_calls[0][1] == pytest.approx(5.0, abs=0.05)
+    messages = taker_env["app"].bot.messages
+    assert not any("share counts differ" in message.lower() for message in messages)
+
+
+class _ExpensiveFirstLegClient(_FakeClient):
+    """Leg 1 fills well above its ask, so the set no longer locks at leg 2's price."""
+
+    async def place_order(self, **kwargs):
+        if not self.place_calls:
+            self.place_calls.append(kwargs)
+            return {"order": {
+                "id": "order-1", "status": "filled",
+                "quantity": 5.0, "avgFillPrice": 0.62,
+                "totalCost": 5.0 * 0.62 * config.CURRENCY_BASE_MULTIPLIER,
+            }}
+        return await super().place_order(**kwargs)
+
+
+def test_second_leg_is_not_sent_when_first_fill_loses_the_lock(taker_env):
+    client = _ExpensiveFirstLegClient()
+
+    _execute(taker_env, client)
+
+    assert len(client.place_calls) == 1, "leg 2 must not be bought into a loss"
+    assert client.burn_calls == []

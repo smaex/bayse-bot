@@ -2865,6 +2865,28 @@ async def _place_complete_set_take(
         zip(fresh_legs, leg_amounts, limit_prices)
     ):
         leg_amount = float(leg_amount)
+        if index == 1 and placed:
+            # Size the second leg to the shares the first leg actually holds.
+            # A planned amount buys the planned shares; a partial first fill
+            # would otherwise leave the two legs unequal, the burn refused and
+            # the account paused with an unhedged excess.
+            first = placed[0]
+            first_shares = float(first["shares"])
+            first_cost = booklib.effective_buy_price(float(first["price"]), fee_rate, is_maker=False)
+            # Leg 2 fills at its live ask, not the limit cap; sizing on the cap
+            # would over-buy whenever the ask is below it and leave the pair
+            # unbalanced.
+            second_cost = float(effective_asks[index])
+            if first_cost + second_cost > 1.0 - config.COMPLETE_SET_TAKER_MIN_EDGE + 1e-9:
+                # The first fill came in above the price that still locks the
+                # set. Do not buy the second leg into a loss; the partial path
+                # below reports the unpaired first leg.
+                failure_reason = (
+                    f"first leg filled at {float(first['price']):.3f}, above the price that "
+                    f"still locks the set; second leg not sent"
+                )
+                break
+            leg_amount = min(leg_amount, first_shares * second_cost * config.CURRENCY_BASE_MULTIPLIER)
         try:
             resp = await client.place_order(
                 event_id=sig.event_id, market_id=sig.market_id,
