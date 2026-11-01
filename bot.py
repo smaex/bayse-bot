@@ -619,6 +619,25 @@ async def _check_position_drift(chat_id: str, client, settings: dict, risk) -> N
     """Compare tracked filled shares with the exchange; pause on confirmed drift."""
     rows = await _portfolio_cache.rows(chat_id, client, max_age=0)  # fresh read
     drift = ops_controls.find_share_drift(risk.open_positions, rows)
+    if drift:
+        # The exchange is authoritative for shares held. When the confirmed
+        # ledger row already matches it, only the in-memory copy is stale:
+        # correct that and do not pause.
+        trades = await asyncio.to_thread(database.get_all_unresolved, chat_id)
+        ledger = {str(t["order_id"]): t.get("filled_quantity")
+                  for t in trades if t.get("order_id")}
+        auto, _manual = ops_controls.split_drift_by_ledger(drift, risk.open_positions, ledger)
+        for d in auto:
+            pos = risk.open_positions.get(d["market_id"])
+            if pos is None:
+                continue
+            log.warning(
+                f"[{chat_id}] Position share count corrected from exchange: "
+                f"in-memory {d['tracked']:.4f} → {d['held']:.4f} (ledger agrees)"
+            )
+            pos["filled_quantity"] = d["held"]
+        auto_keys = {(d["market_id"], d["outcome_id"]) for d in auto}
+        drift = [d for d in drift if (d["market_id"], d["outcome_id"]) not in auto_keys]
     current = {(d["market_id"], d["outcome_id"]) for d in drift}
     gate = _drift_gates.setdefault(chat_id, ops_controls.DriftGate())
     confirmed = gate.observe(current)

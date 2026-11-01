@@ -77,6 +77,29 @@ def untracked_holdings(positions: dict[str, dict], portfolio_rows) -> list[dict]
     return out
 
 
+def split_drift_by_ledger(drift: list[dict], positions: dict[str, dict],
+                          ledger_fill_by_order: dict[str, float]) -> tuple[list[dict], list[dict]]:
+    """Separate drift the exchange and the ledger agree on from real disagreement.
+
+    ``auto``: the ledger's confirmed fill for the position's order equals the
+    exchange balance. The exchange and the ledger agree, so the bot's in-memory
+    copy is the stale value and can be corrected without an operator.
+
+    ``manual``: no ledger row, or the ledger and exchange disagree. Only then is
+    the cause unknown and the account paused for reconciliation.
+    """
+    auto: list[dict] = []
+    manual: list[dict] = []
+    for d in drift:
+        pos = positions.get(d["market_id"]) or {}
+        ledger = _finite(ledger_fill_by_order.get(str(pos.get("order_id") or "")))
+        if ledger is not None and share_quantities_match(ledger, d["held"]):
+            auto.append(d)
+        else:
+            manual.append(d)
+    return auto, manual
+
+
 class DriftGate:
     """Confirms drift only when the same mismatch is seen on two consecutive checks.
 
