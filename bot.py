@@ -187,7 +187,7 @@ def _session_date() -> str:
 # Safety stops that are scoped to one trading day and must expire with it.
 # A manual pause (no reason, or "manual") is deliberately absent: only the
 # operator can lift that one.
-_SESSION_PAUSE_REASONS = ("daily_target", "daily_loss_limit", "drawdown")
+_SESSION_PAUSE_REASONS = ("daily_target", "daily_loss_limit", "drawdown", "gain_giveback")
 
 
 def _risk_pause_active(risk) -> bool:
@@ -619,6 +619,25 @@ async def _check_position_drift(chat_id: str, client, settings: dict, risk) -> N
     """Compare tracked filled shares with the exchange; pause on confirmed drift."""
     rows = await _portfolio_cache.rows(chat_id, client, max_age=0)  # fresh read
     drift = ops_controls.find_share_drift(risk.open_positions, rows)
+    if drift:
+        # The exchange is authoritative for shares held. When the confirmed
+        # ledger row already matches it, only the in-memory copy is stale:
+        # correct that and do not pause.
+        trades = await asyncio.to_thread(database.get_all_unresolved, chat_id)
+        ledger = {str(t["order_id"]): t.get("filled_quantity")
+                  for t in trades if t.get("order_id")}
+        auto, _manual = ops_controls.split_drift_by_ledger(drift, risk.open_positions, ledger)
+        for d in auto:
+            pos = risk.open_positions.get(d["market_id"])
+            if pos is None:
+                continue
+            log.warning(
+                f"[{chat_id}] Position share count corrected from exchange: "
+                f"in-memory {d['tracked']:.4f} → {d['held']:.4f} (ledger agrees)"
+            )
+            pos["filled_quantity"] = d["held"]
+        auto_keys = {(d["market_id"], d["outcome_id"]) for d in auto}
+        drift = [d for d in drift if (d["market_id"], d["outcome_id"]) not in auto_keys]
     current = {(d["market_id"], d["outcome_id"]) for d in drift}
     gate = _drift_gates.setdefault(chat_id, ops_controls.DriftGate())
     confirmed = gate.observe(current)
@@ -999,6 +1018,41 @@ async def _user_loop(chat_id: str):
                 await telegram_bot.send_message(
                     app_to_use, chat_id,
                     f"🎯 *Daily target reached!* ₦{session_profit:+,.0f}\n/resume to override.",
+                    parse_mode="Markdown",
+                )
+            continue
+
+        # ── Gain lock: protect part of a winning day ──────────────────────
+        # Wins never move the loss baseline. This only stops new entries when
+        # a day's gain gives back past the floor. The peak lives in the day's
+        # state, so a new trading day or a /resume starts it again at zero.
+        peak_before = float(day.get("peak_profit", 0.0) or 0.0)
+        new_peak, gain_locked, gain_floor = ops_controls.gain_lock_state(
+            session_profit, peak_before, day["start_balance"],
+            config.GAIN_LOCK_ARM_FRACTION, config.GAIN_LOCK_KEEP_FRACTION,
+        )
+        if new_peak > peak_before:
+            day["peak_profit"] = new_peak
+            settings["daily_state"] = day
+            await asyncio.to_thread(database.update_settings, chat_id, settings)
+        if gain_locked:
+            settings["paused"] = True
+            settings["paused_reason"] = "gain_giveback"
+            risk.paused = True
+            risk.pause_reason = "gain_giveback"
+            await asyncio.to_thread(database.update_settings, chat_id, settings)
+            log.warning(
+                f"[{chat_id}] GAIN LOCK: session ₦{session_profit:+,.0f} fell to the "
+                f"₦{gain_floor:,.0f} floor (peak ₦{new_peak:,.0f}) — new entries paused"
+            )
+            app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+            if app_to_use:
+                await telegram_bot.send_message(
+                    app_to_use, chat_id,
+                    f"🔒 *Gain lock* — today's gain has given back to ₦{session_profit:+,.0f} "
+                    f"(peak ₦{new_peak:+,.0f}, floor ₦{gain_floor:+,.0f}). New entries are "
+                    "paused until the next trading day. Open positions remain monitored.\n"
+                    "/resume restarts the session from the current balance.",
                     parse_mode="Markdown",
                 )
             continue

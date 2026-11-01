@@ -318,6 +318,12 @@ MAX_PORTFOLIO_EXPOSURE = _env_float("MAX_PORTFOLIO_EXPOSURE", 0.15)
 MAX_TRADE_RISK         = _env_float("MAX_TRADE_RISK", 0.02)
 DEFAULT_DAILY_LOSS_LIMIT_PCT = _env_float("DEFAULT_DAILY_LOSS_LIMIT_PCT", 3.0)
 MAX_DAILY_LOSS_LIMIT_PCT = _env_float("MAX_DAILY_LOSS_LIMIT_PCT", 5.0)
+# Gain lock: once the day's gain reaches ARM_FRACTION of the start balance, the
+# bot keeps at least KEEP_FRACTION of its peak gain. Falling below that pauses
+# new entries until the next trading day or an explicit /resume. Losses always
+# count. ARM_FRACTION <= 0 disables the lock.
+GAIN_LOCK_ARM_FRACTION  = _env_float("GAIN_LOCK_ARM_FRACTION", 0.02)
+GAIN_LOCK_KEEP_FRACTION = _env_float("GAIN_LOCK_KEEP_FRACTION", 0.5)
 TRADING_TIMEZONE = os.getenv("TRADING_TIMEZONE", "Africa/Lagos")
 
 # Fail closed on crypto entries if the independent Binance oracle is missing.

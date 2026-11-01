@@ -398,6 +398,7 @@ def test_bot_drift_check_pauses_only_on_second_consecutive_mismatch(monkeypatch)
         paused.append(reason)
 
     monkeypatch.setattr(bot, "_pause_position_reconciliation", fake_pause)
+    monkeypatch.setattr(bot.database, "get_all_unresolved", lambda chat_id: [])
     risk = _Risk({"m1": _pos("y", 10.0, order_id="o1")})
     client = _ExchangeClient(portfolio_rows=[_row("y", 7.0)])
 
@@ -405,3 +406,53 @@ def test_bot_drift_check_pauses_only_on_second_consecutive_mismatch(monkeypatch)
     assert paused == [], "first mismatch may be an in-flight sell; do not pause"
     asyncio.run(bot._check_position_drift("c-drift", client, {}, risk))
     assert len(paused) == 1 and "position drift on y" in paused[0]
+
+
+# ── Drift: exchange truth vs ledger ──────────────────────────────────────────
+# Production 2026-11-01: tracked 2.49 in memory, exchange 2.35, ledger row 2.35.
+# The exchange and the ledger agreed, so the bot should correct its own copy and
+# not pause. A pause is only right when the ledger and the exchange disagree.
+
+def test_drift_auto_corrects_when_ledger_agrees_with_exchange():
+    positions = {"m1": _pos("y", 2.49, order_id="o1")}
+    drift = ops.find_share_drift(positions, [_row("y", 2.35)])
+    auto, manual = ops.split_drift_by_ledger(drift, positions, {"o1": 2.35})
+    assert [d["market_id"] for d in auto] == ["m1"]
+    assert manual == []
+
+
+def test_drift_still_pauses_when_ledger_disagrees_with_exchange():
+    positions = {"m1": _pos("y", 2.49, order_id="o1")}
+    drift = ops.find_share_drift(positions, [_row("y", 2.35)])
+    auto, manual = ops.split_drift_by_ledger(drift, positions, {"o1": 2.49})
+    assert auto == []
+    assert [d["market_id"] for d in manual] == ["m1"]
+
+
+def test_drift_pauses_when_there_is_no_ledger_row():
+    positions = {"m1": _pos("y", 2.49, order_id="o1")}
+    drift = ops.find_share_drift(positions, [_row("y", 2.35)])
+    auto, manual = ops.split_drift_by_ledger(drift, positions, {})
+    assert auto == []
+    assert [d["market_id"] for d in manual] == ["m1"]
+
+
+def test_bot_drift_check_corrects_in_memory_share_count_when_ledger_agrees(monkeypatch):
+    import bot
+    bot._drift_gates.clear()
+    bot._portfolio_cache = ops.PortfolioCache(ttl_seconds=10.0)
+    paused = []
+
+    async def fake_pause(*a, **k):
+        paused.append(a)
+
+    monkeypatch.setattr(bot, "_pause_position_reconciliation", fake_pause)
+    monkeypatch.setattr(bot.database, "get_all_unresolved",
+                        lambda chat_id: [{"order_id": "o1", "filled_quantity": 2.35}])
+    risk = _Risk({"m1": _pos("y", 2.49, order_id="o1")})
+    client = _ExchangeClient(portfolio_rows=[_row("y", 2.35)])
+
+    asyncio.run(bot._check_position_drift("c-agree", client, {}, risk))
+    asyncio.run(bot._check_position_drift("c-agree", client, {}, risk))
+    assert paused == [], "exchange and ledger agree: no pause"
+    assert risk.open_positions["m1"]["filled_quantity"] == pytest.approx(2.35)

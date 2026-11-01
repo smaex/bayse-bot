@@ -77,6 +77,29 @@ def untracked_holdings(positions: dict[str, dict], portfolio_rows) -> list[dict]
     return out
 
 
+def split_drift_by_ledger(drift: list[dict], positions: dict[str, dict],
+                          ledger_fill_by_order: dict[str, float]) -> tuple[list[dict], list[dict]]:
+    """Separate drift the exchange and the ledger agree on from real disagreement.
+
+    ``auto``: the ledger's confirmed fill for the position's order equals the
+    exchange balance. The exchange and the ledger agree, so the bot's in-memory
+    copy is the stale value and can be corrected without an operator.
+
+    ``manual``: no ledger row, or the ledger and exchange disagree. Only then is
+    the cause unknown and the account paused for reconciliation.
+    """
+    auto: list[dict] = []
+    manual: list[dict] = []
+    for d in drift:
+        pos = positions.get(d["market_id"]) or {}
+        ledger = _finite(ledger_fill_by_order.get(str(pos.get("order_id") or "")))
+        if ledger is not None and share_quantities_match(ledger, d["held"]):
+            auto.append(d)
+        else:
+            manual.append(d)
+    return auto, manual
+
+
 class DriftGate:
     """Confirms drift only when the same mismatch is seen on two consecutive checks.
 
@@ -152,6 +175,24 @@ def mark_positions(positions: dict[str, dict], portfolio_rows, multiplier: float
     if not math.isfinite(total):
         raise MarkUnavailable("marked value is not finite")
     return total
+
+
+def gain_lock_state(session_profit: float, peak_profit: float, start_balance: float,
+                    arm_fraction: float, keep_fraction: float) -> tuple[float, bool, float | None]:
+    """Track the day's peak session gain and decide whether the giveback lock fires.
+
+    Returns ``(new_peak, locked, floor)``. The lock arms once the peak reaches
+    ``arm_fraction`` of the day's start balance. From then on, the floor is
+    ``keep_fraction`` of the peak, and falling to or below it locks new entries.
+    Losses count the same way: a session below the floor is locked.
+    """
+    peak = max(float(peak_profit or 0.0), float(session_profit))
+    if not (arm_fraction > 0.0 and math.isfinite(start_balance) and start_balance > 0.0):
+        return peak, False, None
+    if peak < start_balance * arm_fraction:
+        return peak, False, None
+    floor = peak * keep_fraction
+    return peak, float(session_profit) <= floor, floor
 
 
 class PortfolioCache:
