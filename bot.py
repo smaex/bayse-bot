@@ -577,6 +577,11 @@ async def start_user(chat_id: str):
                 # book held the market permanently. Age it from the ledger row.
                 "placed_at": restored_at,
                 "restored": True,
+                # The trailing exit needs the highest price seen before the
+                # restart. `peak_saved` is what the ledger already holds, so the
+                # next persist only writes a real move.
+                "peak_price": _restored_peak(t),
+                "peak_saved": _restored_peak(t) if t.get("peak_price") is not None else None,
             })
 
     if chat_id not in _user_tasks or _user_tasks[chat_id].done():
@@ -1899,6 +1904,95 @@ async def _withdraw_resting_quote(
 
 
 
+# Persist the trailing peak only when it has moved this far. One write per
+# cycle per position would be a steady egress and log drain for no benefit.
+PEAK_PERSIST_STEP = 0.01
+
+
+def _restored_peak(row: dict) -> float:
+    """Trailing peak for a position restored from the ledger.
+
+    Rows written before the peak column existed have none, so they fall back
+    to entry, which is the old behaviour. A peak is never below entry.
+    """
+    try:
+        entry = float(row.get("entry_price") or 0.0)
+    except (TypeError, ValueError):
+        entry = 0.0
+    try:
+        peak = float(row.get("peak_price"))
+    except (TypeError, ValueError):
+        return entry
+    if not math.isfinite(peak):
+        return entry
+    return max(entry, peak)
+
+
+def _peak_persist_due(*, saved, peak: float) -> bool:
+    """True when the peak should be written to the ledger."""
+    if saved is None:
+        return True
+    return peak - float(saved) >= PEAK_PERSIST_STEP - 1e-12
+
+
+def _exit_bid(book, market, outcome: str) -> float | None:
+    """The price a decision is made on this cycle, or None if there is none.
+
+    The best bid is the price we can sell at. When the book is missing (a
+    fetch timeout, an AMM market, or an empty bid side) the quoted side price
+    keeps the stops alive instead of going dark. That is safe because every
+    sale re-checks the real proceeds with a sell quote first, and a take-profit
+    must still clear its net-gain check on that quote. The entry price is never
+    used: it silently disables the price-based exits.
+    """
+    from strategies import book as booklib
+
+    if booklib.is_usable(book):
+        bid = booklib.best_bid(book)
+        if bid is not None:
+            return float(bid)
+    if not market:
+        return None
+    try:
+        value = float(market.get("yes_price" if outcome == "YES" else "no_price"))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and 0.0 < value < 1.0 else None
+
+
+def _exit_retry_delay(failures: int) -> float:
+    """Seconds to wait before retrying a stop that did not fill.
+
+    Doubles from 30s and is capped at 5 minutes, so a stop still tries but does
+    not hammer a thin book every 15-second cycle.
+    """
+    if failures <= 0:
+        return 0.0
+    return min(30.0 * (2 ** (failures - 1)), 300.0)
+
+
+def _stop_retry_blocked(pos: dict, *, now: float) -> bool:
+    return now < float(pos.get("exit_retry_at") or 0.0)
+
+
+def _sub_minimum_notice_due(pos: dict) -> bool:
+    """True the first time a position is found below the sell minimum."""
+    if pos.get("sub_minimum_notified"):
+        return False
+    pos["sub_minimum_notified"] = True
+    return True
+
+
+async def _notify_chat(chat_id: str, text: str) -> None:
+    app = _tg_app or getattr(telegram_bot, "_bot_app", None)
+    if app is None:
+        return
+    try:
+        await telegram_bot.send_message(app, chat_id, text)
+    except Exception as err:
+        log.warning(f"[{chat_id}] exit notice could not be sent: {err}")
+
+
 def _exit_decision(
     *,
     outcome: str,
@@ -2163,14 +2257,28 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         # Executable bid for the side we hold -- we are selling, so the bid is
         # the price we can actually hit. A mid is not executable.
         book = books.get(pos.get("outcome_id") or "")
-        bid = booklib.best_bid(book) if booklib.is_usable(book) else None
+        bid = _exit_bid(book, market, outcome)
         if bid is None:
-            bid = (market.get("yes_price") if outcome == "YES"
-                   else market.get("no_price")) if market else None
-        if bid is None:
-            bid = entry_price
+            # No honest price to decide on this cycle. Hold and say so once.
+            if not pos.get("no_bid_notified"):
+                pos["no_bid_notified"] = True
+                log.warning(
+                    f"[{chat_id}] exit decision skipped on {market_id}: no executable bid"
+                )
+            continue
+        pos.pop("no_bid_notified", None)
 
         pos["peak_price"] = max(pos.get("peak_price", entry_price), float(bid))
+        if pos.get("trade_id") and _peak_persist_due(
+            saved=pos.get("peak_saved"), peak=pos["peak_price"]
+        ):
+            try:
+                await asyncio.to_thread(
+                    database.update_trade_peak, pos["trade_id"], pos["peak_price"]
+                )
+                pos["peak_saved"] = pos["peak_price"]
+            except Exception as peak_err:
+                log.warning(f"[{chat_id}] peak not persisted for {market_id}: {peak_err}")
 
         # Both legs of a complete set are held: the set pays 1.00 whatever
         # happens, so it must be burned rather than stopped or sold. A taker
@@ -2197,6 +2305,8 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             completion_leg=completion_leg,
         )
         if decision is None:
+            continue
+        if decision["reason"] == "STOP_LOSS" and _stop_retry_blocked(pos, now=time.time()):
             continue
         positions_to_exit.append(_exit_plan(
             market_id, position_key, pos, market, w_est=w_est,
@@ -2512,10 +2622,20 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                         f"(value=₦{sell_amount:,.2f})"
                     )
                     continue
-                log.warning(
-                    f"[{chat_id}] EXIT deferred for {market_id}: tracked position "
-                    f"value ₦{sell_amount:,.2f} is below sell minimum ₦{min_sell:,.0f}"
-                )
+                # The exchange rejects sells below its minimum, so no exit can
+                # be placed. Say so once, rather than every cycle.
+                if _sub_minimum_notice_due(pos):
+                    log.warning(
+                        f"[{chat_id}] EXIT blocked for {market_id}: position value "
+                        f"₦{sell_amount:,.2f} is below the sell minimum ₦{min_sell:,.0f}"
+                    )
+                    await _notify_chat(
+                        chat_id,
+                        f"⚠️ *Exit blocked on {market_id}*\n\n"
+                        f"The position is now worth ₦{sell_amount:,.2f}, below the "
+                        f"₦{min_sell:,.0f} minimum Bayse accepts for a sell. The bot cannot "
+                        "sell it, so it will be held to resolution.",
+                    )
                 continue
 
             if (
@@ -2695,6 +2815,19 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                         "cancelled", "canceled", "killed", "rejected", "expired",
                     } and not executor._order_has_malformed_fill_quantity(order)
                     if terminal_no_fill:
+                        if exit_reason == "STOP_LOSS":
+                            # A stop that does not fill is retried, but on a
+                            # backoff rather than every cycle.
+                            pos["exit_failures"] = int(pos.get("exit_failures") or 0) + 1
+                            delay = _exit_retry_delay(pos["exit_failures"])
+                            pos["exit_retry_at"] = time.time() + delay
+                            if pos["exit_failures"] in (1, 10):
+                                await _notify_chat(
+                                    chat_id,
+                                    f"⚠️ *Stop-loss did not fill on {market_id}*\n\n"
+                                    f"{pos['exit_failures']} attempt(s) so far. The position is "
+                                    f"still open; the next try is in {delay:.0f}s.",
+                                )
                         log.warning(
                             f"[{chat_id}] EXIT order {order_id} had a confirmed zero fill; "
                             "keeping position"

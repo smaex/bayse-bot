@@ -245,7 +245,6 @@ MAKER_TICK = 0.01
 # realistic chance to fill before timeout; anything deeper is buried behind
 # the queue and is skipped with a named reason.
 MAKER_MAX_TICKS_BEHIND_BEST_BID = 1
-TAKE_PROFIT_PRICE_TARGET = 0.82  # absolute take-profit price target
 
 # Order-book freshness. Bayse's documented level schema does not promise a
 # timestamp, so an undated book is not treated as stale -- but a book whose

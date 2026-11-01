@@ -226,6 +226,8 @@ def init_db():
                 )
             """)
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS filled_quantity REAL")
+            # Highest bid seen while held. The trailing exit needs it after a restart.
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS peak_price REAL")
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_trades_user
                 ON trades(chat_id, created_at DESC)
@@ -555,6 +557,16 @@ def update_trade_fill(
                   entry_price = %s
             WHERE trade_id = %s AND resolved_at IS NULL""",
         (amount_ngn, filled_quantity, entry_price, trade_id),
+    )
+
+
+def update_trade_peak(trade_id: str, peak_price: float) -> None:
+    """Store the highest price seen while held. Never lowers a stored peak."""
+    _execute(
+        """UPDATE trades
+              SET peak_price = GREATEST(COALESCE(peak_price, 0), %s)
+            WHERE trade_id = %s AND resolved_at IS NULL""",
+        (peak_price, trade_id),
     )
 
 
