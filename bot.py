@@ -726,8 +726,8 @@ async def _user_loop(chat_id: str):
         # ── Drawdown auto-recovery guard ─────────────────────────────────────
         # If the account was paused due to drawdown, but equity has recovered
         # (e.g. resting maker orders cancelled, transient balance drop cleared,
-        # or deposit made), automatically clear the pause so the bot isn't
-        # permanently stuck dead.
+        # or deposit made), automatically clear the pause. Uses the same resume
+        # rule as risk.check_drawdown, so the two can never disagree.
         if (
             (settings.get("paused") and settings.get("paused_reason") == "drawdown")
             or (risk.paused and getattr(risk, "pause_reason", "") == "drawdown")
@@ -735,8 +735,7 @@ async def _user_loop(chat_id: str):
             peak = risk.peak_balance
             if peak > 0:
                 current_dd = (peak - equity) / peak
-                # If drawdown is now safe (< 50% of MAX_DRAWDOWN_STOP, i.e. < 5%)
-                if current_dd < config.MAX_DRAWDOWN_STOP * 0.5:
+                if current_dd < risk.drawdown_resume_threshold():
                     log.info(
                         f"[{chat_id}] DRAWDOWN RECOVERED: dd={current_dd:.1%} "
                         f"(equity=₦{equity:,.0f}, peak=₦{peak:,.0f}) — auto-resuming trading"

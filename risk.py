@@ -7,7 +7,9 @@ import math
 import time
 
 import config
-from config import MAX_DRAWDOWN_STOP, MAX_PORTFOLIO_EXPOSURE, TRADING_TIMEZONE
+from config import (
+    DRAWDOWN_RESUME_FRACTION, MAX_DRAWDOWN_STOP, MAX_PORTFOLIO_EXPOSURE, TRADING_TIMEZONE,
+)
 
 log = logging.getLogger(__name__)
 
@@ -134,6 +136,11 @@ class RiskManager:
         self.update_peak(balance)
         self.check_drawdown(balance)
 
+    @staticmethod
+    def drawdown_resume_threshold() -> float:
+        """Drawdown below which a drawdown pause may be released (single rule)."""
+        return MAX_DRAWDOWN_STOP * DRAWDOWN_RESUME_FRACTION
+
     def check_drawdown(self, balance: float) -> bool:
         try:
             balance = float(balance)
@@ -173,7 +180,7 @@ class RiskManager:
         if (
             self.paused
             and self.pause_reason in {"", "drawdown"}
-            and dd < MAX_DRAWDOWN_STOP * 0.25
+            and dd < self.drawdown_resume_threshold()
         ):
             log.info(f"Drawdown recovered to {dd:.1%} — resuming trading")
             self.paused = False

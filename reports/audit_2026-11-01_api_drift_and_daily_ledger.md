@@ -36,12 +36,22 @@ Confirmed NOT bugs, checked against the code:
 - Fee formula, `minimumOrderAmount` default, `outcomeId` and the `order` response key, batch place cap of 20, `Idempotency-Key` handling, HMAC signature scheme, timestamp window, `parse_filled_shares`: all match the docs.
 - Unfilled or phantom orders settle with `won=None, pnl=0`. This is harmless.
 
-## 2. Decisions for the operator
+## 2. Decisions and follow-ups
 
-1. **Burn payouts that cannot be verified now pause the account.** This is deliberate. A paused account is recoverable, while booked phantom cash is not. Expect more reconciliation pauses in the first days after deploy if the live API reports payouts in a shape the code does not expect. Check the first few notices.
-2. **Drawdown resume threshold is inconsistent.** `risk.check_drawdown` resumes below `MAX_DRAWDOWN_STOP × 0.25`. `_user_loop` auto-recovers below `MAX_DRAWDOWN_STOP × 0.5`. The loop usually wins, because it clears `risk.paused` first. This is a risk-appetite choice, so it is NOT changed. Pick one value and align both sites (0.25 is the more conservative choice).
-3. **Rate-limit constants are conservative.** `config.py` uses WRITE 15 and READ 25 per second. The docs allow 20 and 30. Left unchanged. Note that batch cancel and batch place charge one write token per item, and `client` charges one per HTTP call. Under-counting is possible if batch calls are ever used at scale. The bot does not batch cancels today.
-4. **Historical burns may have booked phantom cash.** Any complete-set burn since this integration went live would have sent shares as the wallet amount. Look in the logs and notifications for `reported burn payout` and `used guaranteed set payout` (the old wording). Each such event means the bot credited a guaranteed payout the wallet may not hold. Reconcile the account's wallet balance against the bot's tracked free cash and the `trades` PnL for those dates.
+1. **Unverifiable burn payouts pause the account.** Deliberate. A pause is recoverable; booked phantom cash is not. Expect more reconciliation pauses right after deploy.
+2. **Drawdown resume threshold: decided at 0.25 × stop (2.5% with the 10% stop), one value for every path.** `config.DRAWDOWN_RESUME_FRACTION` is the single source, and `RiskManager.drawdown_resume_threshold()` is the single rule. The user-loop auto-recovery used 0.5 and now uses the same rule.
+   Reasoning: the stop already fired at 10%. Releasing at 5% re-risks capital while still 5% under peak, on a noisy cost-basis equity measure. The bot is not stranded by the stricter line, because day-scoped drawdown pauses expire at the trading-day boundary and the peak re-bases there (README, "Day-scoped safety stops"). The stricter line therefore only delays intraday re-entry, and the account resumes the next trading day. Override with `DRAWDOWN_RESUME_FRACTION` if you want a different appetite.
+3. **Rate-limit constants are conservative.** `config.py` uses WRITE 15 and READ 25 per second; the docs allow 20 and 30. Left unchanged. Batch cancel and batch place charge one write token per item, and `client` charges one per HTTP call, so batched use at scale would under-count.
+4. **Past phantom bookings: a read-only tool, and a run that only you can do.** The alerts are sent to Telegram and to the critical log. Nothing persists them in the database, and the sandbox has no production logs, database or API access. Run:
+
+   ```
+   python tools/reconcile_burn_payouts.py --logs '/path/to/bot/logs/*.log'
+   python tools/reconcile_burn_payouts.py --logs '/path/to/bot/logs/*.log' --check-accounts
+   ```
+
+   The first command lists accounts with booked phantom bookings and post-fix pauses. `--check-accounts` (run where `DATABASE_URL` and the encryption key are set) reads each account's NGN wallet and portfolio. It reports the complete sets still held per market. Those shares were never burned, so burn them with the fixed code. The tool never writes.
+   Compare each account's wallet NGN with the bot's `/status` free cash. The gap should be roughly the booked amounts. The old alert text carries no amounts, so the tool cannot compute the phantom total by itself.
+   Also search the Telegram chat history for `Fill reconciliation required`, because those alerts are not stored elsewhere.
 
 ## 3. Verify live before trusting
 
@@ -84,5 +94,5 @@ Gaps versus the references, in priority order:
 ## 6. Not done in this pass
 
 - Items 2 to 4 in section 4 (exchange position drift check, mark-to-market equity, startup account sweep). Each needs its own design and tests.
-- Section 2, decision 2 (drawdown threshold) needs an operator choice.
+- Running `tools/reconcile_burn_payouts.py --check-accounts` against production (section 2, item 4).
 - Live verification in section 3.

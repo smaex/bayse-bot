@@ -307,6 +307,13 @@ DEFAULT_FEE_RATE = _env_float("DEFAULT_FEE_RATE", 0.02)
 # ── Risk ─────────────────────────────────────────────────────────────────────
 # Environment overrides are fractions: 0.10 means 10%.
 MAX_DRAWDOWN_STOP      = _env_float("MAX_DRAWDOWN_STOP", 0.10)
+# A drawdown pause releases only once drawdown is back below this FRACTION of
+# the stop (0.25 x 10% = 2.5%). One value for every resume path; it used to be
+# 0.25 in risk.py and 0.5 in the user loop, so the effective rule depended on
+# which check ran first.
+DRAWDOWN_RESUME_FRACTION = _env_float("DRAWDOWN_RESUME_FRACTION", 0.25)
+if not 0.0 <= DRAWDOWN_RESUME_FRACTION < 1.0:
+    raise RuntimeError("DRAWDOWN_RESUME_FRACTION must be in [0, 1)")
 MAX_PORTFOLIO_EXPOSURE = _env_float("MAX_PORTFOLIO_EXPOSURE", 0.15)
 MAX_TRADE_RISK         = _env_float("MAX_TRADE_RISK", 0.02)
 DEFAULT_DAILY_LOSS_LIMIT_PCT = _env_float("DEFAULT_DAILY_LOSS_LIMIT_PCT", 3.0)
