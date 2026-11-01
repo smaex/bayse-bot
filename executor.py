@@ -3208,6 +3208,15 @@ async def _place_complete_set_take(
                 )
             else:
                 orphan_pos["orphan_exit_due"] = True
+            orphan_trade_id = placed[0].get("trade_id")
+            if orphan_trade_id:
+                try:
+                    await asyncio.to_thread(database.set_trade_orphan, orphan_trade_id)
+                except Exception as flag_error:
+                    log.critical(
+                        f"[{chat_id}] orphan flag for trade {orphan_trade_id} not "
+                        f"persisted; it survives only until restart: {flag_error}"
+                    )
             failure_reason = (
                 f"{failure_reason}; the second leg did not fill within "
                 f"{int(config.COMPLETE_SET_ORPHAN_RETRY_SECONDS)}s, so the first "

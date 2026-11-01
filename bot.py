@@ -582,6 +582,7 @@ async def start_user(chat_id: str):
                 # next persist only writes a real move.
                 "peak_price": _restored_peak(t),
                 "peak_saved": _restored_peak(t) if t.get("peak_price") is not None else None,
+                "orphan_exit_due": _restored_orphan_flag(t),
             })
 
     if chat_id not in _user_tasks or _user_tasks[chat_id].done():
@@ -1993,6 +1994,11 @@ async def _notify_chat(chat_id: str, text: str) -> None:
         log.warning(f"[{chat_id}] exit notice could not be sent: {err}")
 
 
+def _restored_orphan_flag(trade_row: dict) -> bool:
+    """The persisted orphan flag of a ledger row (absent or NULL means no)."""
+    return trade_row.get("orphan_exit_due") is True
+
+
 def _orphan_exit_due(pos: dict, *, paired) -> bool:
     """A filled complete-set leg whose sibling never filled, and whose retry
     window has closed. It holds no hedge, so it is sold rather than managed."""
@@ -2246,6 +2252,21 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         if secs < config.EXIT_MIN_SECS_REMAINING:
             continue
 
+        # An orphan is sold before any fair-value or spot check. Its sale needs
+        # only the executable bid, and it has no hedge left to protect, so a
+        # missing model estimate must not keep it held.
+        if _orphan_exit_due(pos, paired=_paired_leg(risk, position_key, market_id)):
+            orphan_bid = _exit_bid(books.get(pos.get("outcome_id") or ""), market, outcome)
+            if orphan_bid is not None:
+                positions_to_exit.append(_exit_plan(
+                    market_id, position_key, pos, market,
+                    w_est=float("nan"),  # no model estimate is used for an orphan sale
+                    current_price=float(orphan_bid),
+                    ev_hold=0.0,
+                    exit_reason="ORPHAN_EXIT",
+                ))
+            continue
+
         if not threshold or not spot_price or not entry_price:
             continue
 
@@ -2310,12 +2331,6 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             complete_set=paired is not None,
             completion_leg=completion_leg,
         )
-        if _orphan_exit_due(pos, paired=paired):
-            decision = {
-                "reason": "ORPHAN_EXIT",
-                "current_price": float(bid),
-                "ev_hold": 0.0,
-            }
         if decision is None:
             continue
         if decision["reason"] == "STOP_LOSS" and _stop_retry_blocked(pos, now=time.time()):

@@ -506,3 +506,15 @@ def test_lock_loss_on_retry_flags_orphan_when_window_closes(taker_env, monkeypat
         if pos.get("orphan_exit_due")
     ]
     assert len(flagged) == 1
+
+
+def test_orphan_flag_is_persisted_to_the_ledger(taker_env, monkeypatch):
+    monkeypatch.setattr(config, "COMPLETE_SET_ORPHAN_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(config, "COMPLETE_SET_ORPHAN_RETRY_INTERVAL", 0.0)
+    persisted = []
+    monkeypatch.setattr(executor.database, "set_trade_orphan", lambda trade_id: persisted.append(trade_id))
+    client = _ScriptedSecondLegClient(leg2_script=[0.0])
+
+    _execute(taker_env, client)
+
+    assert persisted == ["trade-1"], "a restart must not forget the orphan must be sold"
