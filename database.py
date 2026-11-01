@@ -226,6 +226,13 @@ def init_db():
                 )
             """)
             cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS filled_quantity REAL")
+            # Highest bid seen while held. The trailing exit needs it after a restart.
+            cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS peak_price REAL")
+            # A filled complete-set leg whose pair never filled must be sold.
+            # The flag is durable so a restart cannot turn it into a normal hold.
+            cur.execute(
+                "ALTER TABLE trades ADD COLUMN IF NOT EXISTS orphan_exit_due BOOLEAN DEFAULT FALSE"
+            )
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_trades_user
                 ON trades(chat_id, created_at DESC)
@@ -555,6 +562,26 @@ def update_trade_fill(
                   entry_price = %s
             WHERE trade_id = %s AND resolved_at IS NULL""",
         (amount_ngn, filled_quantity, entry_price, trade_id),
+    )
+
+
+def update_trade_peak(trade_id: str, peak_price: float) -> None:
+    """Store the highest price seen while held. Never lowers a stored peak."""
+    _execute(
+        """UPDATE trades
+              SET peak_price = GREATEST(COALESCE(peak_price, 0), %s)
+            WHERE trade_id = %s AND resolved_at IS NULL""",
+        (peak_price, trade_id),
+    )
+
+
+def set_trade_orphan(trade_id: str) -> None:
+    """Mark an open leg as an orphan to be sold (its complete-set pair failed)."""
+    _execute(
+        """UPDATE trades
+              SET orphan_exit_due = %s
+            WHERE trade_id = %s AND resolved_at IS NULL""",
+        (True, trade_id),
     )
 
 

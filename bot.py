@@ -354,6 +354,10 @@ def reset_session_restrictions(
     if not math.isfinite(equity) or equity <= 0:
         raise ValueError("Current account equity is unavailable or zero; refusing to resume")
 
+    # /resume lifts the pause and nothing else. Today's realised PnL, the
+    # target progress, the loss stop and the gain-lock peak keep counting from
+    # the start of the trading day. Only a new trading day, or a day with no
+    # record yet, starts a fresh day state.
     booked_pnl = 0.0
     try:
         booked_pnl = float(
@@ -362,12 +366,29 @@ def reset_session_restrictions(
     except Exception as err:
         log.warning(f"[{chat_id}] session reset could not read today's realised PnL: {err}")
 
-    day = {
-        "date": today,
-        "start_balance": equity,
-        "target_hit": False,
-        "pnl_baseline": booked_pnl,
-    }
+    existing = settings.get("daily_state")
+    try:
+        existing_start = float((existing or {}).get("start_balance") or 0.0)
+    except (TypeError, ValueError):
+        existing_start = 0.0
+    if (
+        isinstance(existing, dict) and existing.get("date") == today
+        and math.isfinite(existing_start) and existing_start > 0
+    ):
+        day = dict(existing)
+        day["start_balance"] = existing_start
+        # Legacy baselines written by earlier resumes are retired: the day's
+        # total is always the real total.
+        day["pnl_baseline"] = 0.0
+        # The target re-checks against the real total on the next cycle.
+        day["target_hit"] = False
+    else:
+        day = {
+            "date": today,
+            "start_balance": equity,
+            "target_hit": False,
+            "pnl_baseline": 0.0,
+        }
     settings["daily_state"] = day
     settings["paused"] = False
     settings.pop("paused_reason", None)
@@ -404,9 +425,10 @@ def reset_session_restrictions(
     if risk is not None:
         risk.paused = False
         risk.pause_reason = ""
-        risk.peak_balance = equity
+        if not (risk.peak_balance and math.isfinite(float(risk.peak_balance))):
+            risk.peak_balance = equity
         risk._dd_breach_since = 0.0
-        risk.daily_realized_pnl = 0.0
+        risk.daily_realized_pnl = booked_pnl
         risk.daily_target = 0.0
         risk.last_reset_date = today
 
@@ -435,14 +457,16 @@ def reset_session_restrictions(
         log.warning(f"[{chat_id}] resume sizing diagnostics unavailable; check account settings")
 
     log.warning(
-        f"[{chat_id}] SESSION RESET ({reason}) — equity baseline ₦{equity:,.2f}, "
-        f"today's PnL before the override ₦{booked_pnl:+,.2f} excluded, "
+        f"[{chat_id}] SESSION RESET ({reason}) — equity ₦{equity:,.2f}, "
+        f"today's realised PnL ₦{booked_pnl:+,.2f} kept, "
         f"{cleared_cooldowns} cooldown(s) cleared, "
-        f"{len(cleared_suspensions)} suspension(s) cleared; stops now measure from now"
+        f"{len(cleared_suspensions)} suspension(s) cleared; stops keep measuring the whole day"
     )
+    loss_limit = _daily_loss_limit(settings, float(day["start_balance"]))
     return {
         "equity": equity,
         "booked_pnl": booked_pnl,
+        "loss_limit_reached": booked_pnl <= -loss_limit,
         "cleared_cooldowns": cleared_cooldowns,
         "cleared_suspensions": cleared_suspensions,
         **sizing_summary,
@@ -467,19 +491,22 @@ async def _roll_trading_day(chat_id: str, equity: float, settings: dict) -> None
 
 
 def _session_pnl_for_day(profit: float, day: dict) -> float:
-    """Today's realised PnL measured from the session's own baseline.
+    """Today's realised PnL, which is the real total for the trading day.
 
-    ``pnl_baseline`` is what an explicit /resume records (see
-    ``reset_session_restrictions``): the result already booked when the
-    operator overrode the stop. Subtracting it is what makes the override
-    hold. Without a resume the baseline is ``0.0``, so this is the plain daily
-    PnL the stops have always used.
+    This used to subtract a ``pnl_baseline`` that /resume recorded, so a
+    pause-and-resume hid every loss booked before it. /resume now only lifts
+    the pause, so the stops and the target always measure the whole day.
+    ``day`` is kept in the signature for existing callers.
     """
-    try:
-        baseline = float((day or {}).get("pnl_baseline") or 0.0)
-    except (TypeError, ValueError):
-        baseline = 0.0
-    return float(profit) - baseline
+    return float(profit)
+
+
+def _daily_loss_limit(settings: dict, start_balance: float) -> float:
+    pct = min(
+        max(float(settings.get("daily_loss_limit_pct", config.DEFAULT_DAILY_LOSS_LIMIT_PCT)), 0.1),
+        config.MAX_DAILY_LOSS_LIMIT_PCT,
+    )
+    return start_balance * pct / 100.0
 
 
 def _daily_target(settings: dict, start: float) -> float:
@@ -550,6 +577,12 @@ async def start_user(chat_id: str):
                 # book held the market permanently. Age it from the ledger row.
                 "placed_at": restored_at,
                 "restored": True,
+                # The trailing exit needs the highest price seen before the
+                # restart. `peak_saved` is what the ledger already holds, so the
+                # next persist only writes a real move.
+                "peak_price": _restored_peak(t),
+                "peak_saved": _restored_peak(t) if t.get("peak_price") is not None else None,
+                "orphan_exit_due": _restored_orphan_flag(t),
             })
 
     if chat_id not in _user_tasks or _user_tasks[chat_id].done():
@@ -1872,6 +1905,106 @@ async def _withdraw_resting_quote(
 
 
 
+# Persist the trailing peak only when it has moved this far. One write per
+# cycle per position would be a steady egress and log drain for no benefit.
+PEAK_PERSIST_STEP = 0.01
+
+
+def _restored_peak(row: dict) -> float:
+    """Trailing peak for a position restored from the ledger.
+
+    Rows written before the peak column existed have none, so they fall back
+    to entry, which is the old behaviour. A peak is never below entry.
+    """
+    try:
+        entry = float(row.get("entry_price") or 0.0)
+    except (TypeError, ValueError):
+        entry = 0.0
+    try:
+        peak = float(row.get("peak_price"))
+    except (TypeError, ValueError):
+        return entry
+    if not math.isfinite(peak):
+        return entry
+    return max(entry, peak)
+
+
+def _peak_persist_due(*, saved, peak: float) -> bool:
+    """True when the peak should be written to the ledger."""
+    if saved is None:
+        return True
+    return peak - float(saved) >= PEAK_PERSIST_STEP - 1e-12
+
+
+def _exit_bid(book, market, outcome: str) -> float | None:
+    """The price a decision is made on this cycle, or None if there is none.
+
+    The best bid is the price we can sell at. When the book is missing (a
+    fetch timeout, an AMM market, or an empty bid side) the quoted side price
+    keeps the stops alive instead of going dark. That is safe because every
+    sale re-checks the real proceeds with a sell quote first, and a take-profit
+    must still clear its net-gain check on that quote. The entry price is never
+    used: it silently disables the price-based exits.
+    """
+    from strategies import book as booklib
+
+    if booklib.is_usable(book):
+        bid = booklib.best_bid(book)
+        if bid is not None:
+            return float(bid)
+    if not market:
+        return None
+    try:
+        value = float(market.get("yes_price" if outcome == "YES" else "no_price"))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and 0.0 < value < 1.0 else None
+
+
+def _exit_retry_delay(failures: int) -> float:
+    """Seconds to wait before retrying a stop that did not fill.
+
+    Doubles from 30s and is capped at 5 minutes, so a stop still tries but does
+    not hammer a thin book every 15-second cycle.
+    """
+    if failures <= 0:
+        return 0.0
+    return min(30.0 * (2 ** (failures - 1)), 300.0)
+
+
+def _stop_retry_blocked(pos: dict, *, now: float) -> bool:
+    return now < float(pos.get("exit_retry_at") or 0.0)
+
+
+def _sub_minimum_notice_due(pos: dict) -> bool:
+    """True the first time a position is found below the sell minimum."""
+    if pos.get("sub_minimum_notified"):
+        return False
+    pos["sub_minimum_notified"] = True
+    return True
+
+
+async def _notify_chat(chat_id: str, text: str) -> None:
+    app = _tg_app or getattr(telegram_bot, "_bot_app", None)
+    if app is None:
+        return
+    try:
+        await telegram_bot.send_message(app, chat_id, text)
+    except Exception as err:
+        log.warning(f"[{chat_id}] exit notice could not be sent: {err}")
+
+
+def _restored_orphan_flag(trade_row: dict) -> bool:
+    """The persisted orphan flag of a ledger row (absent or NULL means no)."""
+    return trade_row.get("orphan_exit_due") is True
+
+
+def _orphan_exit_due(pos: dict, *, paired) -> bool:
+    """A filled complete-set leg whose sibling never filled, and whose retry
+    window has closed. It holds no hedge, so it is sold rather than managed."""
+    return bool(pos.get("orphan_exit_due")) and paired is None
+
+
 def _exit_decision(
     *,
     outcome: str,
@@ -2119,6 +2252,21 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         if secs < config.EXIT_MIN_SECS_REMAINING:
             continue
 
+        # An orphan is sold before any fair-value or spot check. Its sale needs
+        # only the executable bid, and it has no hedge left to protect, so a
+        # missing model estimate must not keep it held.
+        if _orphan_exit_due(pos, paired=_paired_leg(risk, position_key, market_id)):
+            orphan_bid = _exit_bid(books.get(pos.get("outcome_id") or ""), market, outcome)
+            if orphan_bid is not None:
+                positions_to_exit.append(_exit_plan(
+                    market_id, position_key, pos, market,
+                    w_est=float("nan"),  # no model estimate is used for an orphan sale
+                    current_price=float(orphan_bid),
+                    ev_hold=0.0,
+                    exit_reason="ORPHAN_EXIT",
+                ))
+            continue
+
         if not threshold or not spot_price or not entry_price:
             continue
 
@@ -2136,14 +2284,28 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
         # Executable bid for the side we hold -- we are selling, so the bid is
         # the price we can actually hit. A mid is not executable.
         book = books.get(pos.get("outcome_id") or "")
-        bid = booklib.best_bid(book) if booklib.is_usable(book) else None
+        bid = _exit_bid(book, market, outcome)
         if bid is None:
-            bid = (market.get("yes_price") if outcome == "YES"
-                   else market.get("no_price")) if market else None
-        if bid is None:
-            bid = entry_price
+            # No honest price to decide on this cycle. Hold and say so once.
+            if not pos.get("no_bid_notified"):
+                pos["no_bid_notified"] = True
+                log.warning(
+                    f"[{chat_id}] exit decision skipped on {market_id}: no executable bid"
+                )
+            continue
+        pos.pop("no_bid_notified", None)
 
         pos["peak_price"] = max(pos.get("peak_price", entry_price), float(bid))
+        if pos.get("trade_id") and _peak_persist_due(
+            saved=pos.get("peak_saved"), peak=pos["peak_price"]
+        ):
+            try:
+                await asyncio.to_thread(
+                    database.update_trade_peak, pos["trade_id"], pos["peak_price"]
+                )
+                pos["peak_saved"] = pos["peak_price"]
+            except Exception as peak_err:
+                log.warning(f"[{chat_id}] peak not persisted for {market_id}: {peak_err}")
 
         # Both legs of a complete set are held: the set pays 1.00 whatever
         # happens, so it must be burned rather than stopped or sold. A taker
@@ -2170,6 +2332,8 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             completion_leg=completion_leg,
         )
         if decision is None:
+            continue
+        if decision["reason"] == "STOP_LOSS" and _stop_retry_blocked(pos, now=time.time()):
             continue
         positions_to_exit.append(_exit_plan(
             market_id, position_key, pos, market, w_est=w_est,
@@ -2485,10 +2649,20 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                         f"(value=₦{sell_amount:,.2f})"
                     )
                     continue
-                log.warning(
-                    f"[{chat_id}] EXIT deferred for {market_id}: tracked position "
-                    f"value ₦{sell_amount:,.2f} is below sell minimum ₦{min_sell:,.0f}"
-                )
+                # The exchange rejects sells below its minimum, so no exit can
+                # be placed. Say so once, rather than every cycle.
+                if _sub_minimum_notice_due(pos):
+                    log.warning(
+                        f"[{chat_id}] EXIT blocked for {market_id}: position value "
+                        f"₦{sell_amount:,.2f} is below the sell minimum ₦{min_sell:,.0f}"
+                    )
+                    await _notify_chat(
+                        chat_id,
+                        f"⚠️ *Exit blocked on {market_id}*\n\n"
+                        f"The position is now worth ₦{sell_amount:,.2f}, below the "
+                        f"₦{min_sell:,.0f} minimum Bayse accepts for a sell. The bot cannot "
+                        "sell it, so it will be held to resolution.",
+                    )
                 continue
 
             if (
@@ -2569,6 +2743,9 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 exit_slippage = 0.05
             elif exit_reason == "REVERSAL_EXIT":
                 exit_slippage = 0.08
+            elif exit_reason == "ORPHAN_EXIT":
+                # Urgent, but the orphan has no edge left to protect.
+                exit_slippage = 0.10
             else:
                 exit_slippage = 0.20
 
@@ -2668,6 +2845,19 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                         "cancelled", "canceled", "killed", "rejected", "expired",
                     } and not executor._order_has_malformed_fill_quantity(order)
                     if terminal_no_fill:
+                        if exit_reason == "STOP_LOSS":
+                            # A stop that does not fill is retried, but on a
+                            # backoff rather than every cycle.
+                            pos["exit_failures"] = int(pos.get("exit_failures") or 0) + 1
+                            delay = _exit_retry_delay(pos["exit_failures"])
+                            pos["exit_retry_at"] = time.time() + delay
+                            if pos["exit_failures"] in (1, 10):
+                                await _notify_chat(
+                                    chat_id,
+                                    f"⚠️ *Stop-loss did not fill on {market_id}*\n\n"
+                                    f"{pos['exit_failures']} attempt(s) so far. The position is "
+                                    f"still open; the next try is in {delay:.0f}s.",
+                                )
                         log.warning(
                             f"[{chat_id}] EXIT order {order_id} had a confirmed zero fill; "
                             "keeping position"

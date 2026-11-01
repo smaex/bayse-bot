@@ -186,6 +186,11 @@ TAKER_MAX_SIZE_PCT = 0.05
 # own (see strategies/taker.py) so a partial batch fill is never a loss.
 COMPLETE_SET_TAKER_MIN_EDGE = _env_float("COMPLETE_SET_TAKER_MIN_EDGE", 0.015)
 TAKER_COMPLETE_SET_SIZE_PCT = _env_float("TAKER_COMPLETE_SET_SIZE_PCT", 0.02)
+# A complete-set leg 2 that definitively does not fill is re-attempted for this
+# long while the lock still holds at its live ask. After that the filled first
+# leg is an orphan: it is sold, not held as a directional bet.
+COMPLETE_SET_ORPHAN_RETRY_SECONDS = _env_float("COMPLETE_SET_ORPHAN_RETRY_SECONDS", 90.0)
+COMPLETE_SET_ORPHAN_RETRY_INTERVAL = _env_float("COMPLETE_SET_ORPHAN_RETRY_INTERVAL", 3.0)
 
 # ── MAKER ─────────────────────────────────────────────────────────────────────
 # Makers pay no fee on Bayse CLOB, so a maker fill at price b against a fair
@@ -245,7 +250,6 @@ MAKER_TICK = 0.01
 # realistic chance to fill before timeout; anything deeper is buried behind
 # the queue and is skipped with a named reason.
 MAKER_MAX_TICKS_BEHIND_BEST_BID = 1
-TAKE_PROFIT_PRICE_TARGET = 0.82  # absolute take-profit price target
 
 # Order-book freshness. Bayse's documented level schema does not promise a
 # timestamp, so an undated book is not treated as stale -- but a book whose

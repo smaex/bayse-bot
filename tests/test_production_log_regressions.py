@@ -77,15 +77,18 @@ def test_resume_uses_fresh_equity_before_lifting_the_pause(monkeypatch):
     day = saved["daily_state"]
     assert saved["paused"] is False
     assert day["start_balance"] == 1_780.75
-    assert day["pnl_baseline"] == -18.06
+    assert day["pnl_baseline"] == 0.0  # retired: the day total is the real total
     assert risk.current_free_cash == 1_780.75
-    assert risk.peak_balance == 1_780.75
+    # The drawdown peak is kept: /resume lifts the pause and nothing else.
+    assert risk.peak_balance == 1_798.75
     assert "Trading resumed" in text
-    assert "Equity baseline: ₦1,780.75" in text
+    assert "Account equity now: ₦1,780.75" in text
 
+    # The day's real loss still counts. It is within the limit, so the loss
+    # stop does not re-pause on the next check.
     session_pnl = bot._session_pnl_for_day(-18.06, day)
     loss_limit = day["start_balance"] * config.DEFAULT_DAILY_LOSS_LIMIT_PCT / 100
-    assert session_pnl == 0.0
+    assert session_pnl == -18.06
     assert session_pnl > -loss_limit
 
 
@@ -188,7 +191,7 @@ def test_status_reports_realized_session_pnl_not_total_equity(monkeypatch):
     )
 
     text = asyncio.run(telegram_bot._status_text(chat))
-    assert "Today's realized PnL: ₦+0.00" in text
+    assert "Today's realized PnL: ₦-18.06" in text
     assert "Today's realized PnL: ₦+1,780.75" not in text
     assert "Total equity: ₦1,780.75" in text
 

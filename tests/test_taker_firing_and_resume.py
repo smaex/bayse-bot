@@ -411,21 +411,20 @@ def test_a_single_leg_maker_quote_is_capped_by_the_unpaired_budget(monkeypatch):
 
 # ── 4. Resume clears the restriction it claims to override ────────────────────
 
-def test_session_pnl_is_measured_from_the_resume_baseline():
+def test_session_pnl_counts_the_whole_day_even_after_a_resume():
     import bot
 
     day = {"date": "2026-10-05", "start_balance": 6_650.0,
            "target_hit": False, "pnl_baseline": -350.0}
 
-    # ₦350 of losses booked before the operator resumed do not count again.
-    assert bot._session_pnl_for_day(-350.0, day) == 0.0
-    # New losses after the resume do.
-    assert bot._session_pnl_for_day(-420.0, day) == -70.0
-    # A normal day (no resume) is unchanged.
+    # Losses booked earlier in the day still count. /resume no longer hides them.
+    assert bot._session_pnl_for_day(-350.0, day) == -350.0
+    assert bot._session_pnl_for_day(-420.0, day) == -420.0
+    # A normal day is unchanged.
     assert bot._session_pnl_for_day(-120.0, {"date": "x", "start_balance": 1.0}) == -120.0
 
 
-def test_resume_moves_the_baseline_and_persists_it(monkeypatch):
+def test_resume_only_lifts_the_pause_and_keeps_the_day(monkeypatch):
     import bot
     import database
 
@@ -433,11 +432,10 @@ def test_resume_moves_the_baseline_and_persists_it(monkeypatch):
 
     monkeypatch.setattr(
         database, "get_user",
-        lambda chat_id, force_fresh=False: {"chat_id": chat_id, "settings": {"paused": True,
-                                                "paused_reason": "daily_loss_limit",
-                                                "daily_state": {"date": bot._session_date(),
-                                                                "start_balance": 7_000.0,
-                                                                "target_hit": True}}},
+        lambda chat_id, force_fresh=False: {"chat_id": chat_id, "settings": {
+            "paused": True, "paused_reason": "daily_loss_limit",
+            "daily_state": {"date": bot._session_date(), "start_balance": 7_000.0,
+                            "target_hit": True, "peak_profit": 60.0}}},
     )
     monkeypatch.setattr(database, "get_daily_resolved_pnl", lambda *a, **k: -350.0)
     monkeypatch.setattr(database, "update_settings", lambda cid, s: saved.update(s))
@@ -458,17 +456,20 @@ def test_resume_moves_the_baseline_and_persists_it(monkeypatch):
     assert summary["booked_pnl"] == -350.0
     assert summary["equity"] == 6_650.0
     assert summary["cleared_cooldowns"] == 1
+    assert summary["loss_limit_reached"] is True  # -350 is past 3% of 7,000
 
+    # Only the pause is lifted. The day's start, its peak and its total stay.
     assert saved["paused"] is False
     assert "paused_reason" not in saved
     day = saved["daily_state"]
-    assert day["pnl_baseline"] == -350.0
-    assert day["start_balance"] == 6_650.0
-    assert day["target_hit"] is False
+    assert day["start_balance"] == 7_000.0
+    assert day["pnl_baseline"] == 0.0
+    assert day["peak_profit"] == 60.0, "the gain-lock peak survives a resume"
+    assert day["target_hit"] is False, "the target re-checks against the real total"
 
     assert risk.paused is False
-    assert risk.peak_balance == 6_650.0
-    assert risk.daily_realized_pnl == 0.0
+    assert risk.peak_balance == 7_000.0
+    assert risk.daily_realized_pnl == -350.0
     assert ("c", "m1", "TAKER") not in executor._trade_cooldown
     assert ("other", "m1", "TAKER") in executor._trade_cooldown, \
         "another account's cooldowns are not ours to clear"
@@ -506,18 +507,18 @@ def test_resume_lifts_a_persisted_learner_suspension(monkeypatch):
     assert saved["learned"]["size_multipliers"] == {"TAKER": 0.5}
 
 
-def test_a_resumed_account_cannot_be_re_paused_by_the_same_loss():
+def test_a_resumed_account_is_re_paused_while_the_day_is_past_the_limit():
     import bot
     import config as cfg
 
     start = 6_650.0
     limit = start * cfg.DEFAULT_DAILY_LOSS_LIMIT_PCT / 100.0
     day = {"date": bot._session_date(), "start_balance": start,
-           "target_hit": False, "pnl_baseline": -350.0}
+           "target_hit": False, "pnl_baseline": 0.0}
 
-    # The loss stop, the way `_user_loop` evaluates it.
-    assert bot._session_pnl_for_day(-350.0, day) > -limit
-    # And the daily target, which set `risk.target_hit` and blocked evaluation.
+    # /resume does not forgive the loss: the stop re-checks the real total.
+    assert bot._session_pnl_for_day(-350.0, day) <= -limit
+    # The target is still far away on this day.
     assert bot._session_pnl_for_day(-350.0, day) < bot._daily_target(
         {"daily_multiplier": 3}, start
     )
