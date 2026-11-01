@@ -53,6 +53,31 @@ class RateLimiter:
                 self._tokens -= 1
 
 
+# Wallet value of one complete set, in each currency's base unit. Matches the
+# docs' currencyBaseMultiplier (1 for USD, 100 for NGN).
+_BASE_MULTIPLIER = {"USD": 1.0, "NGN": 100.0}
+
+
+def wallet_quantity_for_shares(shares: float, currency: str) -> float:
+    """Convert a complete-set count into the wallet amount the API expects.
+
+    Rounded DOWN to the cent: burning a fraction of a kobo less than we hold is
+    harmless dust, whereas rounding up asks the exchange to burn shares we do
+    not own.
+    """
+    multiplier = _BASE_MULTIPLIER.get(str(currency).upper())
+    if multiplier is None:
+        raise ValueError(f"unsupported currency for share operations: {currency!r}")
+    value = float(shares)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"share quantity must be a positive finite number, got {shares!r}")
+    cents = math.floor(round(value * multiplier * 100.0, 6))
+    amount = cents / 100.0
+    if amount <= 0:
+        raise ValueError(f"share quantity {shares!r} is below one cent of wallet value")
+    return amount
+
+
 class BayseClient:
     def __init__(self, public_key: str, secret_key: str):
         self.public_key = public_key
@@ -338,14 +363,48 @@ class BayseClient:
         by querying the order, not by issuing another DELETE.
         """
         try:
-            return await self._delete("/v1/pm/orders/batch", body={"orderIds": [order_id]})
+            resp = await self._delete("/v1/pm/orders/batch", body={"orderIds": [order_id]})
         except aiohttp.ClientResponseError as batch_error:
             if batch_error.status not in {404, 405}:
                 raise
             return await self._delete(f"/v1/pm/orders/{order_id}", body={})
+        # Batch cancel returns HTTP 200 even when an individual ID is refused.
+        # Treat an explicit per-ID failure as a failure, not as a cancel.
+        for item in resp.get("results") or []:
+            if str(item.get("orderId", order_id)) == str(order_id) and item.get("success") is False:
+                error = item.get("error") or {}
+                code = error.get("code") or error.get("message") or "unknown"
+                raise RuntimeError(f"cancel rejected for order {order_id}: {code}")
+        return resp
 
-    async def list_orders(self, page: int = 1, limit: int = 50) -> dict:
-        return await self._get("/v1/pm/orders", params={"page": page, "limit": limit})
+    async def list_orders(self, page: int = 1, size: int = 50, status: str | None = None) -> dict:
+        """One page of the account's orders. Statuses are lowercase on the wire."""
+        params: dict = {"page": page, "size": size}
+        if status:
+            params["status"] = status.lower()
+        return await self._get("/v1/pm/orders", params=params)
+
+    async def list_open_orders(self, page_size: int = 100, max_pages: int = 50) -> list[dict]:
+        """Every order still resting on the book, following pagination.
+
+        The API filters one status per request, so this asks for each live
+        status in turn. The array key is ``orders``.
+        """
+        found: list[dict] = []
+        seen: set[str] = set()
+        for status in ("open", "partial_filled"):
+            for page in range(1, max_pages + 1):
+                resp = await self.list_orders(page=page, size=page_size, status=status)
+                rows = resp.get("orders") if isinstance(resp, dict) else resp
+                rows = rows or []
+                for row in rows:
+                    oid = str(row.get("id") or row.get("orderId") or "")
+                    if oid and oid not in seen:
+                        seen.add(oid)
+                        found.append(row)
+                if len(rows) < page_size:
+                    break
+        return found
 
     async def get_order(self, order_id: str) -> dict:
         return await self._get(f"/v1/pm/orders/{order_id}")
@@ -400,8 +459,8 @@ class BayseClient:
                 return 0.0
         return 0.0
 
-    async def get_pnl(self) -> dict:
-        return await self._get("/v1/pm/pnl")
+    async def get_pnl(self, currency: str = CURRENCY) -> dict:
+        return await self._get("/v1/pm/pnl", params={"currency": currency})
 
     async def get_liquidity_rewards(self, page: int = 1, size: int = 100) -> dict:
         """Liquidity reward payouts — GET /v1/pm/liquidity-rewards.
@@ -422,11 +481,15 @@ class BayseClient:
 
         Pure so it can be tested without a network, and so the stall report
         can state whether MAKER's resting quotes actually earned anything.
+
+        Reward payouts are denominated in USD (docs), not in the bot's trading
+        currency. Totals are returned with ``currency`` set so a caller cannot
+        add them to NGN balances without converting first.
         """
         rows = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(rows, list):
             return {"epochs": 0, "markets": 0, "payout": 0.0, "paid": 0.0,
-                    "unpaid": 0.0, "samples": 0}
+                    "unpaid": 0.0, "samples": 0, "currency": "USD"}
         payout = paid = unpaid = 0.0
         samples = 0
         markets = set()
@@ -447,7 +510,7 @@ class BayseClient:
             if row.get("marketId"):
                 markets.add(row["marketId"])
         return {"epochs": len(rows), "markets": len(markets), "payout": payout,
-                "paid": paid, "unpaid": unpaid, "samples": samples}
+                "paid": paid, "unpaid": unpaid, "samples": samples, "currency": "USD"}
 
     async def get_portfolio(self) -> dict:
         return await self._get("/v1/pm/portfolio")
@@ -465,16 +528,22 @@ class BayseClient:
 
     # ── Share operations ──────────────────────────────────────────────────────
 
-    async def burn_shares(self, market_id: str, quantity: float, currency: str = CURRENCY) -> dict:
+    async def burn_shares(self, market_id: str, shares: float, currency: str = CURRENCY) -> dict:
+        """Burn ``shares`` complete sets (YES+NO pairs) back into wallet funds.
+
+        The endpoint's ``quantity`` is a WALLET amount in ``currency`` (a
+        complete set is worth one base unit: ₦100 or $1), not a share count.
+        """
         return await self._post(
             f"/v1/pm/markets/{market_id}/burn",
-            {"quantity": quantity, "currency": currency},
+            {"quantity": wallet_quantity_for_shares(shares, currency), "currency": currency},
         )
 
-    async def mint_shares(self, market_id: str, quantity: float, currency: str = CURRENCY) -> dict:
+    async def mint_shares(self, market_id: str, shares: float, currency: str = CURRENCY) -> dict:
+        """Mint ``shares`` complete sets. Same wallet-amount rule as burn."""
         return await self._post(
             f"/v1/pm/markets/{market_id}/mint",
-            {"quantity": quantity, "currency": currency},
+            {"quantity": wallet_quantity_for_shares(shares, currency), "currency": currency},
         )
 
     # ── Helper ────────────────────────────────────────────────────────────────

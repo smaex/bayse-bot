@@ -52,30 +52,35 @@ async def emergency_shutdown():
         except Exception as e:
             log.error(f"❌ Failed to pause user {cid}: {e}")
 
-        # B. Cancel all Open Orders via API
+        # B. Cancel all resting orders via API. The listing is paginated and
+        # filtered server-side on lowercase statuses; a per-ID rejection is a
+        # failure that must be reported, never logged as a success.
+        client = None
         try:
             client = BayseClient(pub, sec)
-            orders_resp = await client.list_orders(limit=100)
-            orders = orders_resp if isinstance(orders_resp, list) else orders_resp.get('orders', [])
-            
-            # Filter for open orders only
-            open_orders = [o for o in orders if o.get('status') in ['OPEN', 'PARTIALLY_FILLED', 'PENDING']]
-            
+            open_orders = await client.list_open_orders()
             if not open_orders:
                 log.info(f"No open orders found for user {cid}.")
             else:
                 log.info(f"Cancelling {len(open_orders)} open orders for {cid}...")
+                cancelled = failed = 0
                 for o in open_orders:
-                    oid = o.get('orderId') or o.get('id')
+                    oid = o.get('id') or o.get('orderId')
                     try:
                         await client.cancel_order(oid)
-                        log.info(f"  Successfully cancelled order {oid}")
+                        cancelled += 1
                     except Exception as ex:
+                        failed += 1
                         log.error(f"  Failed to cancel order {oid}: {ex}")
-            
-            await client.close()
+                log.info(f"  Cancelled {cancelled}, failed {failed} for {cid}")
         except Exception as e:
             log.error(f"❌ API connection failed for user {cid}: {e}")
+        finally:
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
 
     log.info("🚨 EMERGENCY SHUTDOWN COMPLETE 🚨")
     log.info("Bot logic is now PAUSED for all users. Pending orders have been cleared.")

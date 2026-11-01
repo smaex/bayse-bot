@@ -231,6 +231,37 @@ def init_db():
                     value TEXT NOT NULL
                 )
             """)
+            # Append-only ledger of realized PnL, one row per movement (partial
+            # liquidation or final resolution). Daily loss/target stops sum this
+            # by the day each movement happened, so a partial stop-out counts
+            # immediately instead of waiting for the position to fully resolve.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trade_pnl_events (
+                    id        BIGSERIAL PRIMARY KEY,
+                    trade_id  TEXT NOT NULL,
+                    chat_id   TEXT NOT NULL,
+                    event_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    pnl_ngn   REAL NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_trade_pnl_events_day
+                ON trade_pnl_events(chat_id, event_at)
+            """)
+            # One-time backfill for databases written before the ledger existed.
+            # The config insert is the guard: it is atomic, so two processes
+            # starting together cannot both backfill.
+            cur.execute(
+                "INSERT INTO config (key, value) VALUES ('trade_pnl_events_v1', 'done') "
+                "ON CONFLICT (key) DO NOTHING RETURNING key"
+            )
+            if cur.fetchone() is not None:
+                cur.execute("""
+                    INSERT INTO trade_pnl_events (trade_id, chat_id, event_at, pnl_ngn)
+                    SELECT trade_id, chat_id, COALESCE(resolved_at, NOW()), pnl_ngn
+                      FROM trades
+                     WHERE pnl_ngn IS NOT NULL AND pnl_ngn <> 0
+                """)
         conn.commit()
     log.info("Database ready (Supabase / PostgreSQL)")
 
@@ -468,12 +499,17 @@ def record_trade(chat_id: str, **kw) -> str:
 def resolve_trade(trade_id: str, won: bool | None, pnl_ngn: float):
     won_val = 1 if won is True else (0 if won is False else None)
     _execute(
-        """UPDATE trades
-              SET won = %s,
-                  pnl_ngn = COALESCE(pnl_ngn, 0) + %s,
-                  resolved_at = NOW()
-            WHERE trade_id = %s AND resolved_at IS NULL""",
-        (won_val, pnl_ngn, trade_id),
+        """WITH upd AS (
+               UPDATE trades
+                  SET won = %s,
+                      pnl_ngn = COALESCE(pnl_ngn, 0) + %s,
+                      resolved_at = NOW()
+                WHERE trade_id = %s AND resolved_at IS NULL
+                RETURNING trade_id, chat_id
+           )
+           INSERT INTO trade_pnl_events (trade_id, chat_id, event_at, pnl_ngn)
+           SELECT trade_id, chat_id, NOW(), %s FROM upd""",
+        (won_val, pnl_ngn, trade_id, pnl_ngn),
     )
 
 
@@ -496,14 +532,23 @@ def update_trade_remaining(
     trade_id: str, amount_ngn: float, filled_quantity: float,
     realized_pnl: float = 0.0,
 ) -> None:
-    """Persist the cost basis left after a partial liquidation."""
+    """Persist the cost basis left after a partial liquidation.
+
+    The realized leg is also written to the PnL ledger on the day it happens,
+    so the daily loss/target stops see it before the trade fully resolves.
+    """
     _execute(
-        """UPDATE trades
-              SET amount_ngn = %s,
-                  filled_quantity = %s,
-                  pnl_ngn = COALESCE(pnl_ngn, 0) + %s
-            WHERE trade_id = %s AND resolved_at IS NULL""",
-        (amount_ngn, filled_quantity, realized_pnl, trade_id),
+        """WITH upd AS (
+               UPDATE trades
+                  SET amount_ngn = %s,
+                      filled_quantity = %s,
+                      pnl_ngn = COALESCE(pnl_ngn, 0) + %s
+                WHERE trade_id = %s AND resolved_at IS NULL
+                RETURNING trade_id, chat_id
+           )
+           INSERT INTO trade_pnl_events (trade_id, chat_id, event_at, pnl_ngn)
+           SELECT trade_id, chat_id, NOW(), %s FROM upd""",
+        (amount_ngn, filled_quantity, realized_pnl, trade_id, realized_pnl),
     )
 
 
@@ -791,15 +836,16 @@ def get_alpha_trend(chat_id: str, strategy: str, asset: str, days: int = 7) -> f
 def get_daily_resolved_pnl(
     chat_id: str, date_str: str, trading_timezone: str = "Africa/Lagos",
 ) -> float:
-    """Return PnL for a calendar day in the configured trading timezone."""
-    try:
-        row = _fetch_one("""
-            SELECT SUM(pnl_ngn) AS pnl
-            FROM trades
-            WHERE chat_id = %s AND won IS NOT NULL
-              AND (resolved_at AT TIME ZONE %s)::DATE = %s::DATE
-        """, (chat_id, trading_timezone, date_str))
-        return float(row["pnl"] or 0.0) if row else 0.0
-    except Exception as e:
-        log.error(f"get_daily_resolved_pnl error: {e}")
-        return 0.0
+    """Return realized PnL booked on a calendar day in the trading timezone.
+
+    Sums the append-only ledger, so partial-exit PnL counts on the day it was
+    realized. Errors propagate: a caller that cannot read the ledger must not
+    treat the day's loss as zero (fail-open).
+    """
+    row = _fetch_one("""
+        SELECT COALESCE(SUM(pnl_ngn), 0) AS pnl
+          FROM trade_pnl_events
+         WHERE chat_id = %s
+           AND (event_at AT TIME ZONE %s)::DATE = %s::DATE
+    """, (chat_id, trading_timezone, date_str))
+    return float(row["pnl"] or 0.0) if row else 0.0

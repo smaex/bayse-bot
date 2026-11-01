@@ -125,7 +125,9 @@ class RiskManager:
                 log.info("Daily risk reset: clearing day-scoped pause for new trading day")
                 self.paused = False
                 self.pause_reason = ""
-                self.peak_balance = self.current_free_cash
+                # Peak is tracked on equity (free cash + deployed), the same
+                # basis as update_balance; free cash alone understates it.
+                self.peak_balance = float(self.current_free_cash) + self.deployed()
                 self._dd_breach_since = 0.0
 
     def update_balance(self, balance: float):

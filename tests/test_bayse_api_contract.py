@@ -123,14 +123,16 @@ def test_quote_uses_public_non_mutating_endpoint():
 
 
 def test_mint_and_burn_request_quantity_is_wallet_amount():
+    # Docs: the request `quantity` is a WALLET amount in `currency`. A complete
+    # set is one base unit (₦100), so 100 shares is a ₦10,000 request.
     client = CapturingClient()
     asyncio.run(client.mint_shares("market", 100, "NGN"))
     asyncio.run(client.burn_shares("market", 100, "NGN"))
 
     assert client.writes[0][0] == "/v1/pm/markets/market/mint"
-    assert client.writes[0][1] == {"quantity": 100, "currency": "NGN"}
+    assert client.writes[0][1] == {"quantity": 10000.0, "currency": "NGN"}
     assert client.writes[1][0] == "/v1/pm/markets/market/burn"
-    assert client.writes[1][1] == {"quantity": 100, "currency": "NGN"}
+    assert client.writes[1][1] == {"quantity": 10000.0, "currency": "NGN"}
 
 
 def test_get_position_ignores_malformed_portfolio_rows():

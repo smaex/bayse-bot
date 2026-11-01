@@ -301,7 +301,7 @@ def test_partial_immediate_fill_cancels_live_remainder_and_reconciles_cumulative
     assert risk.current_free_cash == 800.0
 
 
-def test_burn_uses_guaranteed_payout_when_api_amount_is_malformed(monkeypatch):
+def test_burn_with_malformed_payout_pauses_instead_of_booking_guaranteed_cash(monkeypatch):
     _fresh_oracle(monkeypatch)
     risk = _maker_env(monkeypatch)
     risk.current_free_cash = 1_000.0
@@ -327,15 +327,20 @@ def test_burn_uses_guaranteed_payout_when_api_amount_is_malformed(monkeypatch):
             return {"amount": float("nan")}
 
     client = _MalformedBurnClient()
-    asyncio.run(bot._burn_complete_set(
+    result = asyncio.run(bot._burn_complete_set(
         CHAT, client, risk, yes, "market-pair:YES:maker-yes",
         market_id="market-pair", settings={"mode": "balanced"},
     ))
 
+    # The burn was sent as shares; the payout cannot be verified, so the
+    # bot must not credit ₦2,000 of cash or book ₦400 of PnL on a guess.
     assert client.calls == [("market-pair", 10.0, config.CURRENCY)]
-    assert risk.open_positions == {}
-    assert risk.current_free_cash == 2_000.0
-    assert risk.daily_realized_pnl == 400.0
+    assert result is False
+    assert risk.paused is True
+    assert risk.current_free_cash == 1_000.0
+    assert risk.daily_realized_pnl == 0.0
+    assert yes["burn_reconciliation_pending"] is True
+    assert no["burn_reconciliation_pending"] is True
 
 
 def test_ambiguous_burn_pauses_and_is_not_retried_automatically(monkeypatch):

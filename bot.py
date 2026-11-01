@@ -813,10 +813,18 @@ async def _user_loop(chat_id: str):
         # ── Daily target ───────────────────────────────────────────────────
         day    = _daily(chat_id, equity, settings)
         session_date = _session_date()
-        profit = await asyncio.to_thread(
-            database.get_daily_resolved_pnl,
-            chat_id, session_date, config.TRADING_TIMEZONE,
-        )
+        try:
+            profit = await asyncio.to_thread(
+                database.get_daily_resolved_pnl,
+                chat_id, session_date, config.TRADING_TIMEZONE,
+            )
+        except Exception as pnl_err:
+            # The loss and target stops cannot be evaluated without the ledger.
+            # Treating an unreadable day as zero loss would disable the stop
+            # for this cycle, so new entries are skipped until it reads again.
+            log.error(f"[{chat_id}] daily PnL unavailable; no new entries this cycle: {pnl_err}")
+            stall.reject(chat_id, "cycle", "daily_pnl_unavailable", str(pnl_err)[:120])
+            continue
         # Everything already realised before an explicit /resume belongs to a
         # baseline the operator has overridden (see
         # `reset_session_restrictions`). Both the loss stop and the target are
