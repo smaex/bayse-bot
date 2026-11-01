@@ -2861,9 +2861,52 @@ async def _place_complete_set_take(
     if threshold and spot_now:
         spot_vs_thresh = (spot_now - threshold) / threshold
 
-    for index, (leg, leg_amount, cap) in enumerate(
-        zip(fresh_legs, leg_amounts, limit_prices)
-    ):
+    plan = list(zip(fresh_legs, leg_amounts, limit_prices))
+    orphan_deadline: float | None = None
+
+    async def _leg2_retry_allowed(index_: int) -> bool:
+        """True when a definitively unfilled second leg may be re-attempted.
+
+        Only a definite miss with leg 1 confirmed qualifies; an ambiguous
+        outcome (exception, non-terminal zero fill) pauses instead. The first
+        call opens the retry window. Each retry waits, re-reads leg 2's book
+        and refreshes its ask, so the lock and sizing checks see live prices.
+        Returns False once the window has closed.
+        """
+        nonlocal orphan_deadline
+        if index_ != 1 or len(placed) != 1:
+            return False
+        if orphan_deadline is None:
+            orphan_deadline = time.time() + float(config.COMPLETE_SET_ORPHAN_RETRY_SECONDS)
+        while time.time() < orphan_deadline:
+            await asyncio.sleep(float(config.COMPLETE_SET_ORPHAN_RETRY_INTERVAL))
+            if time.time() >= orphan_deadline:
+                break
+            try:
+                book = await asyncio.wait_for(
+                    client.get_orderbook(legs[1].outcome_id, depth=5), timeout=2.5,
+                )
+            except Exception as book_error:
+                log.warning(f"[{chat_id}] orphan leg retry book read failed: {book_error}")
+                continue
+            if (
+                not isinstance(book, dict) or not booklib.is_usable(book)
+                or booklib.book_is_stale(book)
+            ):
+                continue
+            ask = booklib.best_ask(book)
+            if ask is None:
+                continue
+            asks[1] = ask
+            effective_asks[1] = booklib.effective_buy_price(ask, fee_rate, is_maker=False)
+            retry_leg, retry_amount, retry_cap = plan[1]
+            plan[1] = (dataclasses.replace(retry_leg, price=ask), retry_amount, retry_cap)
+            return True
+        return False
+
+    index = 0
+    while index < len(plan):
+        leg, leg_amount, cap = plan[index]
         leg_amount = float(leg_amount)
         if index == 1 and placed:
             # Size the second leg to the shares the first leg actually holds.
@@ -2881,6 +2924,8 @@ async def _place_complete_set_take(
                 # The first fill came in above the price that still locks the
                 # set. Do not buy the second leg into a loss; the partial path
                 # below reports the unpaired first leg.
+                if await _leg2_retry_allowed(index):
+                    continue
                 failure_reason = (
                     f"first leg filled at {float(first['price']):.3f}, above the price that "
                     f"still locks the set; second leg not sent"
@@ -2967,6 +3012,8 @@ async def _place_complete_set_take(
                 )
                 _stall_skip(chat_id, sig, "complete_set_leg_zero_fill", failure_reason)
                 log.info(f"[{chat_id}] {failure_reason}")
+                if terminal_zero_fill and await _leg2_retry_allowed(index):
+                    continue
                 if terminal_zero_fill:
                     if not placed:
                         app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
@@ -3139,6 +3186,7 @@ async def _place_complete_set_take(
             f"{shares:.4f}sh @ {fill_price:.3f} ₦{actual_cost:,.0f} "
             f"| order={order_id or 'unknown'}"
         )
+        index += 1
 
     if ledger_record_failed:
         _trade_cooldown[cooldown_key] = time.time()
@@ -3149,6 +3197,22 @@ async def _place_complete_set_take(
         return
 
     if len(placed) < len(legs):
+        if placed and orphan_deadline is not None and len(placed) == 1:
+            # Leg 2 definitively did not fill inside the retry window. Leg 1 is
+            # a directional orphan: flag it so the exit loop sells it.
+            orphan_pos = risk.open_positions.get(placed[0]["tracking_id"])
+            if orphan_pos is None:
+                log.critical(
+                    f"[{chat_id}] orphan first leg {placed[0]['tracking_id']} is not "
+                    "tracked in risk; it must be closed manually"
+                )
+            else:
+                orphan_pos["orphan_exit_due"] = True
+            failure_reason = (
+                f"{failure_reason}; the second leg did not fill within "
+                f"{int(config.COMPLETE_SET_ORPHAN_RETRY_SECONDS)}s, so the first "
+                "leg is being sold"
+            )
         if placed:
             app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
             try:

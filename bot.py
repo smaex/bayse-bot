@@ -1993,6 +1993,12 @@ async def _notify_chat(chat_id: str, text: str) -> None:
         log.warning(f"[{chat_id}] exit notice could not be sent: {err}")
 
 
+def _orphan_exit_due(pos: dict, *, paired) -> bool:
+    """A filled complete-set leg whose sibling never filled, and whose retry
+    window has closed. It holds no hedge, so it is sold rather than managed."""
+    return bool(pos.get("orphan_exit_due")) and paired is None
+
+
 def _exit_decision(
     *,
     outcome: str,
@@ -2304,6 +2310,12 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
             complete_set=paired is not None,
             completion_leg=completion_leg,
         )
+        if _orphan_exit_due(pos, paired=paired):
+            decision = {
+                "reason": "ORPHAN_EXIT",
+                "current_price": float(bid),
+                "ev_hold": 0.0,
+            }
         if decision is None:
             continue
         if decision["reason"] == "STOP_LOSS" and _stop_retry_blocked(pos, now=time.time()):
@@ -2716,6 +2728,9 @@ async def _evaluate_and_exit_positions(chat_id: str, client, risk, settings: dic
                 exit_slippage = 0.05
             elif exit_reason == "REVERSAL_EXIT":
                 exit_slippage = 0.08
+            elif exit_reason == "ORPHAN_EXIT":
+                # Urgent, but the orphan has no edge left to protect.
+                exit_slippage = 0.10
             else:
                 exit_slippage = 0.20
 

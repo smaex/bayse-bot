@@ -427,10 +427,82 @@ class _ExpensiveFirstLegClient(_FakeClient):
         return await super().place_order(**kwargs)
 
 
-def test_second_leg_is_not_sent_when_first_fill_loses_the_lock(taker_env):
+def test_second_leg_is_not_sent_when_first_fill_loses_the_lock(taker_env, monkeypatch):
+    monkeypatch.setattr(config, "COMPLETE_SET_ORPHAN_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(config, "COMPLETE_SET_ORPHAN_RETRY_INTERVAL", 0.0)
     client = _ExpensiveFirstLegClient()
 
     _execute(taker_env, client)
 
     assert len(client.place_calls) == 1, "leg 2 must not be bought into a loss"
     assert client.burn_calls == []
+
+
+class _ScriptedSecondLegClient(_FakeClient):
+    """Leg 1 fills normally. Each leg-2 attempt follows ``leg2_script``:
+    ``0.0`` is a terminal zero-fill (FAK found no liquidity), ``None`` fills."""
+
+    def __init__(self, leg2_script):
+        super().__init__()
+        self.leg2_script = list(leg2_script)
+
+    async def place_order(self, **kwargs):
+        if len(self.place_calls) == 0:
+            return await super().place_order(**kwargs)
+        self.place_calls.append(kwargs)
+        behaviour = self.leg2_script.pop(0) if self.leg2_script else None
+        if behaviour == 0.0:
+            return {"order": {
+                "id": f"order-retry-{len(self.place_calls)}", "status": "cancelled",
+                "quantity": 0.0, "avgFillPrice": None, "totalCost": 0.0,
+            }}
+        # Undo the append done by super() so the call is recorded exactly once.
+        self.place_calls.pop()
+        return await super().place_order(**kwargs)
+
+
+def test_missed_second_leg_is_retried_while_the_lock_holds(taker_env, monkeypatch):
+    monkeypatch.setattr(config, "COMPLETE_SET_ORPHAN_RETRY_SECONDS", 60.0)
+    monkeypatch.setattr(config, "COMPLETE_SET_ORPHAN_RETRY_INTERVAL", 0.0)
+    client = _ScriptedSecondLegClient(leg2_script=[0.0, None])
+
+    _execute(taker_env, client)
+
+    assert len(client.burn_calls) == 1, "the retried second leg should complete the set"
+    assert not any(
+        pos.get("orphan_exit_due") for pos in taker_env["risk"].open_positions.values()
+    )
+
+
+def test_unfilled_second_leg_after_window_flags_first_leg_for_exit(taker_env, monkeypatch):
+    monkeypatch.setattr(config, "COMPLETE_SET_ORPHAN_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(config, "COMPLETE_SET_ORPHAN_RETRY_INTERVAL", 0.0)
+    client = _ScriptedSecondLegClient(leg2_script=[0.0])
+
+    _execute(taker_env, client)
+
+    assert client.burn_calls == [], "an unhedged leg must not be burned"
+    flagged = [
+        pos for pos in taker_env["risk"].open_positions.values()
+        if pos.get("orphan_exit_due")
+    ]
+    assert len(flagged) == 1, "the first leg is the orphan and must be sold"
+    assert flagged[0]["outcome"] == "YES"
+    messages = taker_env["app"].bot.messages
+    assert not any("manual reconciliation" in message for message in messages), \
+        "a definite miss is an orphan to sell, not a reconciliation pause"
+
+
+def test_lock_loss_on_retry_flags_orphan_when_window_closes(taker_env, monkeypatch):
+    monkeypatch.setattr(config, "COMPLETE_SET_ORPHAN_RETRY_SECONDS", 0.0)
+    monkeypatch.setattr(config, "COMPLETE_SET_ORPHAN_RETRY_INTERVAL", 0.0)
+    client = _ExpensiveFirstLegClient()
+
+    _execute(taker_env, client)
+
+    assert len(client.place_calls) == 1
+    flagged = [
+        pos for pos in taker_env["risk"].open_positions.values()
+        if pos.get("orphan_exit_due")
+    ]
+    assert len(flagged) == 1
