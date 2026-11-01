@@ -22,7 +22,9 @@ def test_partial_exit_persists_remaining_cost_and_realized_pnl(monkeypatch):
     query, params = calls[0]
     assert "filled_quantity = %s" in query
     assert "COALESCE(pnl_ngn, 0) + %s" in query
-    assert params == (300.0, 5.0, -52.5, "trade-1")
+    # The realized leg is also written to the PnL ledger, only if the update applied.
+    assert "INSERT INTO trade_pnl_events" in query
+    assert params == (300.0, 5.0, -52.5, "trade-1", -52.5)
 
 
 def test_daily_pnl_uses_configured_trading_timezone(monkeypatch):
@@ -37,8 +39,18 @@ def test_daily_pnl_uses_configured_trading_timezone(monkeypatch):
 
     assert pnl == 125
     query, params = calls[0]
-    assert "AT TIME ZONE %s" in query
-    assert params == ("chat", "Africa/Lagos", "2026-09-10")
+    # The day is the trading-timezone calendar day, expressed as a half-open
+    # range on event_at so the (chat_id, event_at) index can serve it.
+    assert "::DATE" not in query
+    assert "event_at >= %s" in query and "event_at < %s" in query
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    lagos = ZoneInfo("Africa/Lagos")
+    assert params == (
+        "chat",
+        datetime(2026, 9, 10, tzinfo=lagos),
+        datetime(2026, 9, 11, tzinfo=lagos),
+    )
 
 
 def test_resolution_is_idempotent_and_adds_prior_partial_pnl(monkeypatch):
@@ -50,4 +62,5 @@ def test_resolution_is_idempotent_and_adds_prior_partial_pnl(monkeypatch):
     query, params = calls[0]
     assert "COALESCE(pnl_ngn, 0) + %s" in query
     assert "resolved_at IS NULL" in query
-    assert params == (1, 200.0, "trade-1")
+    assert "INSERT INTO trade_pnl_events" in query
+    assert params == (1, 200.0, "trade-1", 200.0)

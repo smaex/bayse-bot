@@ -42,15 +42,22 @@ from client import BayseClient
 from config import (TELEGRAM_TOKEN, CURRENCY, SCAN_INTERVAL_SECONDS,
                     SYSTEMIC_RISK_HALT_MINS)
 from strategies.utils import realized_vol_hourly
+import log_throttle
+import ops_controls
 
+_stdout_handler = logging.StreamHandler(sys.stdout)
+# Per-tick SKIP / EV / DRY RUN / PAUSED lines repeat for every user on every
+# price tick; collapse repeats so the log volume stays bounded.
+log_throttle.attach(_stdout_handler)
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[_stdout_handler],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 log = logging.getLogger(__name__)
+_daily_pnl_error_throttle = log_throttle.Throttle(interval_seconds=60.0)
 
 
 def _fresh_positive_price(
@@ -117,6 +124,15 @@ _owns_singleton                           = False
 _last_market_eval: dict[str, float] = {}
 _user_eval_locks: dict[str, asyncio.Lock] = {}
 _background_tasks: set[asyncio.Task] = set()
+
+# ── Exchange-state controls (see ops_controls.py) ─────────────────────────────
+DRIFT_CHECK_SECONDS = 300.0           # position-vs-portfolio check cadence per user
+_portfolio_cache = ops_controls.PortfolioCache(ttl_seconds=10.0)
+_swept_chats: set[str] = set()         # users whose startup order sweep has passed
+_drift_gates: dict[str, ops_controls.DriftGate] = {}
+_drift_checked_at: dict[str, float] = {}
+_sweep_retry_at: dict[str, float] = {}
+_housekeeping_throttle = log_throttle.Throttle(interval_seconds=60.0)
 
 _active_users_cache:      list[dict] = []
 _active_users_cache_time: float      = 0.0
@@ -562,6 +578,69 @@ async def _supervise_user_loop(chat_id: str):
             backoff = min(backoff * 2.0, 30.0)
 
 
+async def _book_value(chat_id: str, client, risk) -> float:
+    """Account value of the tracked book in NGN, marked to the exchange.
+
+    Filled positions are valued at their bid (what selling now would realise),
+    unfilled ones at cost. The portfolio is read only when a filled position
+    exists. Raises when a position cannot be priced, so the caller skips the
+    cycle rather than valuing it at cost.
+    """
+    rows: list = []
+    if any(position_is_filled(p) for p in risk.open_positions.values()):
+        rows = await _portfolio_cache.rows(chat_id, client)
+    return ops_controls.mark_positions(
+        risk.open_positions, rows, config.CURRENCY_BASE_MULTIPLIER,
+    )
+
+
+async def _startup_order_sweep(chat_id: str, client, risk) -> int:
+    """Cancel open exchange orders the bot does not track.
+
+    Runs once per process before the user's first evaluation. Any failure keeps
+    the user out of trading until a later attempt succeeds.
+    """
+    open_orders = await client.list_open_orders()
+    trades = await asyncio.to_thread(database.get_all_unresolved, chat_id)
+    known = ops_controls.known_order_ids(risk.open_positions.values(), trades)
+    stale = ops_controls.orders_to_cancel(open_orders, known)
+    if not stale:
+        return 0
+    log.warning(f"[{chat_id}] STARTUP SWEEP: cancelling {len(stale)} untracked open order(s)")
+    result = await client.cancel_orders(stale)
+    if result["failed"]:
+        raise RuntimeError(
+            f"{len(result['failed'])} untracked order(s) could not be cancelled"
+        )
+    return result["cancelled"]
+
+
+async def _check_position_drift(chat_id: str, client, settings: dict, risk) -> None:
+    """Compare tracked filled shares with the exchange; pause on confirmed drift."""
+    rows = await _portfolio_cache.rows(chat_id, client, max_age=0)  # fresh read
+    drift = ops_controls.find_share_drift(risk.open_positions, rows)
+    current = {(d["market_id"], d["outcome_id"]) for d in drift}
+    gate = _drift_gates.setdefault(chat_id, ops_controls.DriftGate())
+    confirmed = gate.observe(current)
+    for d in drift:
+        if (d["market_id"], d["outcome_id"]) not in confirmed:
+            continue
+        pos = risk.open_positions.get(d["market_id"])
+        if pos is None:
+            continue
+        await _pause_position_reconciliation(
+            chat_id, settings, risk, pos, pos.get("order_id"),
+            f"position drift on {d['outcome_id']}: tracked {d['tracked']:.4f} shares, "
+            f"exchange holds {d['held']:.4f}",
+        )
+    for extra in ops_controls.untracked_holdings(risk.open_positions, rows):
+        if _housekeeping_throttle.allow(f"untracked:{chat_id}:{extra['outcome_id']}"):
+            log.warning(
+                f"[{chat_id}] Exchange holds {extra['held']:.4f} shares of untracked "
+                f"outcome {extra['outcome_id']} (not acted on)"
+            )
+
+
 async def _user_loop(chat_id: str):
     """5-second housekeeping loop per user.
 
@@ -592,10 +671,41 @@ async def _user_loop(chat_id: str):
             log.warning(f"[{chat_id}] Balance fetch failed: {e}")
             continue
 
-        equity = free_cash + risk.deployed()
+        try:
+            book = await _book_value(chat_id, client, risk)
+        except Exception as mark_err:
+            # Equity cannot be computed from an unpriced book. Skip the cycle
+            # rather than fall back to cost, which would hide losses.
+            if _housekeeping_throttle.allow(f"mark:{chat_id}"):
+                log.warning(f"[{chat_id}] Position mark unavailable; no entries or exits this cycle: {mark_err}")
+            continue
+        equity = free_cash + book
         health.touch(f"user:{chat_id}", equity=round(equity, 2))
         risk.update_balance(equity)
         risk.update_peak(equity)
+
+        if chat_id not in _swept_chats and time.monotonic() >= _sweep_retry_at.get(chat_id, 0.0):
+            try:
+                cancelled = await _startup_order_sweep(chat_id, client, risk)
+                _swept_chats.add(chat_id)
+                if cancelled:
+                    log.info(f"[{chat_id}] Startup sweep cancelled {cancelled} stale order(s)")
+            except Exception as sweep_err:
+                _sweep_retry_at[chat_id] = time.monotonic() + 60.0
+                if _housekeeping_throttle.allow(f"sweep:{chat_id}"):
+                    log.warning(f"[{chat_id}] Startup order sweep incomplete; trading held: {sweep_err}")
+                continue
+        if chat_id not in _swept_chats:
+            continue
+
+        _now = time.monotonic()
+        if risk.open_positions and _now - _drift_checked_at.get(chat_id, -DRIFT_CHECK_SECONDS) >= DRIFT_CHECK_SECONDS:
+            _drift_checked_at[chat_id] = _now
+            try:
+                await _check_position_drift(chat_id, client, settings, risk)
+            except Exception as drift_err:
+                if _housekeeping_throttle.allow(f"drift:{chat_id}"):
+                    log.warning(f"[{chat_id}] Position drift check failed: {drift_err}")
 
         # ── Structured status log every 5 minutes ─────────────────────────
         current_min = int(time.time() // 60)
@@ -726,8 +836,8 @@ async def _user_loop(chat_id: str):
         # ── Drawdown auto-recovery guard ─────────────────────────────────────
         # If the account was paused due to drawdown, but equity has recovered
         # (e.g. resting maker orders cancelled, transient balance drop cleared,
-        # or deposit made), automatically clear the pause so the bot isn't
-        # permanently stuck dead.
+        # or deposit made), automatically clear the pause. Uses the same resume
+        # rule as risk.check_drawdown, so the two can never disagree.
         if (
             (settings.get("paused") and settings.get("paused_reason") == "drawdown")
             or (risk.paused and getattr(risk, "pause_reason", "") == "drawdown")
@@ -735,8 +845,7 @@ async def _user_loop(chat_id: str):
             peak = risk.peak_balance
             if peak > 0:
                 current_dd = (peak - equity) / peak
-                # If drawdown is now safe (< 50% of MAX_DRAWDOWN_STOP, i.e. < 5%)
-                if current_dd < config.MAX_DRAWDOWN_STOP * 0.5:
+                if current_dd < risk.drawdown_resume_threshold():
                     log.info(
                         f"[{chat_id}] DRAWDOWN RECOVERED: dd={current_dd:.1%} "
                         f"(equity=₦{equity:,.0f}, peak=₦{peak:,.0f}) — auto-resuming trading"
@@ -813,10 +922,22 @@ async def _user_loop(chat_id: str):
         # ── Daily target ───────────────────────────────────────────────────
         day    = _daily(chat_id, equity, settings)
         session_date = _session_date()
-        profit = await asyncio.to_thread(
-            database.get_daily_resolved_pnl,
-            chat_id, session_date, config.TRADING_TIMEZONE,
-        )
+        try:
+            profit = await asyncio.to_thread(
+                database.get_daily_resolved_pnl,
+                chat_id, session_date, config.TRADING_TIMEZONE,
+            )
+        except Exception as pnl_err:
+            # The loss and target stops cannot be evaluated without the ledger.
+            # Treating an unreadable day as zero loss would disable the stop
+            # for this cycle, so new entries are skipped until it reads again.
+            # The cycle repeats every few seconds during an outage, so the log
+            # line is rate-limited per chat. The stall reason is still recorded
+            # every cycle.
+            if _daily_pnl_error_throttle.allow(str(chat_id)):
+                log.error(f"[{chat_id}] daily PnL unavailable; no new entries this cycle: {pnl_err}")
+            stall.reject(chat_id, "cycle", "daily_pnl_unavailable", str(pnl_err)[:120])
+            continue
         # Everything already realised before an explicit /resume belongs to a
         # baseline the operator has overridden (see
         # `reset_session_restrictions`). Both the loss stop and the target are

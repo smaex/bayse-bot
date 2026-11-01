@@ -10,6 +10,7 @@ Only subscribe to symbols confirmed on the Bayse realtime WS feed.
 import asyncio
 import json
 import logging
+import log_throttle
 import time
 import websockets
 
@@ -17,6 +18,7 @@ import health
 from config import WS_MARKETS_URL, WS_REALTIME_URL
 
 log = logging.getLogger(__name__)
+_error_frame_throttle = log_throttle.Throttle(interval_seconds=60.0)
 
 # Live Bayse-relay spot prices and their actual receive times.
 spot: dict[str, float] = {}
@@ -30,6 +32,8 @@ prev_yes: dict[str, float] = {}
 
 _bayse_task: asyncio.Task | None = None
 _subscribed_ids: set[str] = set()
+# Bayse caps each WS connection at 10 messages/s; 0.15s keeps subscribes under ~6.7/s.
+_SUBSCRIBE_PACING_SEC = 0.15
 
 # Confirmed symbols on the Bayse realtime WS.
 # DO NOT add BNBUSDT, ADAUSDT, USDJPY, EURJPY, etc. — they are not provided.
@@ -126,8 +130,17 @@ async def bayse_feed(event_ids: list[str], on_update=None):
                     await ws.send(json.dumps({
                         "type": "subscribe", "channel": "prices", "eventId": eid
                     }))
+                    # Bayse allows 10 messages/s per connection and drops the
+                    # excess with an error frame. Stay under that ceiling.
+                    await asyncio.sleep(_SUBSCRIBE_PACING_SEC)
                 async for raw in ws:
                     for msg in _parse_frames(raw):
+                        if msg.get("type") == "error":
+                            # The socket stays open after an error frame, so a
+                            # burst would otherwise log once per frame.
+                            if _error_frame_throttle.allow("markets"):
+                                log.warning(f"Markets feed server error: {msg.get('message') or msg}")
+                            continue
                         _handle_market(msg, on_update)
         except Exception as e:
             log.warning(f"Markets feed error: {e}. Reconnect in {backoff}s")

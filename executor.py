@@ -583,8 +583,11 @@ def _complete_set_payout(resp, shares: float) -> tuple[float | None, bool, str]:
     if not math.isfinite(expected) or expected <= 0.0:
         return None, True, "guaranteed set payout is non-finite"
 
+    # A confirmed burn whose cash receipt cannot be read is NOT booked at the
+    # guaranteed amount: that would credit balance the wallet may not hold.
+    # Route it to reconciliation (proceeds=None) instead.
     if not isinstance(resp, dict):
-        return expected, True, "burn returned a non-object response; used guaranteed payout"
+        return None, True, "burn returned a non-object response; cash received is unverified"
     status = str(resp.get("status") or "").strip().lower()
     failed_statuses = {"failed", "failure", "rejected", "error", "cancelled", "canceled"}
     confirmed_statuses = {"success", "succeeded", "completed", "complete", "burned", "confirmed", "ok"}
@@ -602,11 +605,16 @@ def _complete_set_payout(resp, shares: float) -> tuple[float | None, bool, str]:
         None,
     )
     if raw is None:
-        return expected, True, "burn response omitted payout; used guaranteed set payout"
+        return None, True, "burn response omitted payout; cash received is unverified"
     reported = _finite_float(raw)
-    tolerance = max(0.01, expected * 1e-4)
+    # The request is rounded down to the kobo, so proceeds may sit up to one
+    # cent below shares * multiplier.
+    tolerance = max(0.02, expected * 1e-4)
     if reported is None or reported <= 0.0 or abs(reported - expected) > tolerance:
-        return expected, True, "reported burn payout was malformed or inconsistent; used guaranteed set payout"
+        return None, True, (
+            f"reported burn payout {raw!r} disagrees with {expected:.2f} for "
+            f"{shares:.4f} sets; cash received is unverified"
+        )
     return reported, False, ""
 
 

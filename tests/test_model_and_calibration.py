@@ -248,7 +248,8 @@ def test_liquidity_reward_summary_totals_the_epochs():
     ]}
     summary = BayseClient.summarize_liquidity_rewards(payload)
     assert summary == {"epochs": 3, "markets": 2, "payout": 11.75,
-                       "paid": 9.75, "unpaid": 2.00, "samples": 20}
+                       "paid": 9.75, "unpaid": 2.00, "samples": 20,
+                       "currency": "USD"}
 
 
 def test_liquidity_reward_summary_survives_a_bad_payload():

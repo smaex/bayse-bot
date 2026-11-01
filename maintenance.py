@@ -157,6 +157,15 @@ def void_nonsensical_amounts(report: MaintenanceReport, apply: bool) -> None:
         return
     applied = 0
     if apply:
+        # Zeroing a row's PnL must also retract its ledger movements, or the
+        # daily loss stop would keep counting PnL the trade no longer carries.
+        _apply(
+            "DELETE FROM trade_pnl_events WHERE trade_id IN ("
+            "SELECT trade_id FROM trades "
+            "WHERE amount_ngn IS NULL OR amount_ngn < 0 "
+            "OR entry_price IS NULL OR entry_price <= 0 OR entry_price >= 1 "
+            "OR filled_quantity < 0)"
+        )
         applied = _apply(
             "UPDATE trades SET won = NULL, pnl_ngn = 0, resolved_at = NULL, "
             "amount_ngn = CASE WHEN amount_ngn IS NULL OR amount_ngn < 0 "

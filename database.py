@@ -13,7 +13,8 @@ import threading
 import time
 import copy
 from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import psycopg2
 import psycopg2.extras
@@ -96,6 +97,14 @@ def _init_pool():
     log.info("Supabase connection pool ready (min=2, max=15)")
 
 
+# Validate a pooled connection only when it has sat idle this long. Every
+# checkout used to run SELECT 1 first, which was roughly one extra round trip
+# per operation (about 9.4M in production since June). Supabase drops idle
+# connections, so an actively used connection needs no probe.
+PING_IDLE_SECONDS = 30.0
+_CONN_LAST_USED: dict[int, float] = {}  # id(conn) -> monotonic time of last checkout end
+
+
 @contextmanager
 def _cx():
     if _pool is None:
@@ -103,14 +112,16 @@ def _cx():
     conn = None
     try:
         conn = _pool.getconn()
-        # Validate — Supabase drops idle connections
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-        except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            log.warning("Dead DB connection detected — reconnecting")
-            _pool.putconn(conn, close=True)
-            conn = _pool.getconn()
+        last = _CONN_LAST_USED.get(id(conn))
+        if last is None or time.monotonic() - last >= PING_IDLE_SECONDS:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                log.warning("Dead DB connection detected — reconnecting")
+                _pool.putconn(conn, close=True)
+                _CONN_LAST_USED.pop(id(conn), None)
+                conn = _pool.getconn()
         yield conn
         conn.commit()
     except Exception:
@@ -119,6 +130,7 @@ def _cx():
         raise
     finally:
         if conn:
+            _CONN_LAST_USED[id(conn)] = time.monotonic()
             _pool.putconn(conn)
 
 
@@ -231,6 +243,54 @@ def init_db():
                     value TEXT NOT NULL
                 )
             """)
+            # Append-only ledger of realized PnL, one row per movement (partial
+            # liquidation or final resolution). Daily loss/target stops sum this
+            # by the day each movement happened, so a partial stop-out counts
+            # immediately instead of waiting for the position to fully resolve.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS trade_pnl_events (
+                    id        BIGSERIAL PRIMARY KEY,
+                    trade_id  TEXT NOT NULL,
+                    chat_id   TEXT NOT NULL,
+                    event_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    pnl_ngn   REAL NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_trade_pnl_events_day
+                ON trade_pnl_events(chat_id, event_at)
+            """)
+            # Open trades are polled every cycle; index only the open rows.
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_trades_open
+                ON trades(chat_id, created_at) WHERE resolved_at IS NULL
+            """)
+            # Supabase exposes every public table through the anon and
+            # authenticated roles. Keep the ledger closed like the other tables
+            # (RLS on, no public grants). The bot connects as the table owner,
+            # which bypasses RLS. The guard lets plain Postgres run this too.
+            cur.execute("ALTER TABLE trade_pnl_events ENABLE ROW LEVEL SECURITY")
+            cur.execute("""
+                DO $$ BEGIN
+                    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+                        REVOKE ALL ON trade_pnl_events FROM anon, authenticated;
+                    END IF;
+                END $$
+            """)
+            # One-time backfill for databases written before the ledger existed.
+            # The config insert is the guard: it is atomic, so two processes
+            # starting together cannot both backfill.
+            cur.execute(
+                "INSERT INTO config (key, value) VALUES ('trade_pnl_events_v1', 'done') "
+                "ON CONFLICT (key) DO NOTHING RETURNING key"
+            )
+            if cur.fetchone() is not None:
+                cur.execute("""
+                    INSERT INTO trade_pnl_events (trade_id, chat_id, event_at, pnl_ngn)
+                    SELECT trade_id, chat_id, COALESCE(resolved_at, NOW()), pnl_ngn
+                      FROM trades
+                     WHERE pnl_ngn IS NOT NULL AND pnl_ngn <> 0
+                """)
         conn.commit()
     log.info("Database ready (Supabase / PostgreSQL)")
 
@@ -468,13 +528,19 @@ def record_trade(chat_id: str, **kw) -> str:
 def resolve_trade(trade_id: str, won: bool | None, pnl_ngn: float):
     won_val = 1 if won is True else (0 if won is False else None)
     _execute(
-        """UPDATE trades
-              SET won = %s,
-                  pnl_ngn = COALESCE(pnl_ngn, 0) + %s,
-                  resolved_at = NOW()
-            WHERE trade_id = %s AND resolved_at IS NULL""",
-        (won_val, pnl_ngn, trade_id),
+        """WITH upd AS (
+               UPDATE trades
+                  SET won = %s,
+                      pnl_ngn = COALESCE(pnl_ngn, 0) + %s,
+                      resolved_at = NOW()
+                WHERE trade_id = %s AND resolved_at IS NULL
+                RETURNING trade_id, chat_id
+           )
+           INSERT INTO trade_pnl_events (trade_id, chat_id, event_at, pnl_ngn)
+           SELECT trade_id, chat_id, NOW(), %s FROM upd""",
+        (won_val, pnl_ngn, trade_id, pnl_ngn),
     )
+    _invalidate_daily_pnl()
 
 
 def update_trade_fill(
@@ -496,15 +562,25 @@ def update_trade_remaining(
     trade_id: str, amount_ngn: float, filled_quantity: float,
     realized_pnl: float = 0.0,
 ) -> None:
-    """Persist the cost basis left after a partial liquidation."""
+    """Persist the cost basis left after a partial liquidation.
+
+    The realized leg is also written to the PnL ledger on the day it happens,
+    so the daily loss/target stops see it before the trade fully resolves.
+    """
     _execute(
-        """UPDATE trades
-              SET amount_ngn = %s,
-                  filled_quantity = %s,
-                  pnl_ngn = COALESCE(pnl_ngn, 0) + %s
-            WHERE trade_id = %s AND resolved_at IS NULL""",
-        (amount_ngn, filled_quantity, realized_pnl, trade_id),
+        """WITH upd AS (
+               UPDATE trades
+                  SET amount_ngn = %s,
+                      filled_quantity = %s,
+                      pnl_ngn = COALESCE(pnl_ngn, 0) + %s
+                WHERE trade_id = %s AND resolved_at IS NULL
+                RETURNING trade_id, chat_id
+           )
+           INSERT INTO trade_pnl_events (trade_id, chat_id, event_at, pnl_ngn)
+           SELECT trade_id, chat_id, NOW(), %s FROM upd""",
+        (amount_ngn, filled_quantity, realized_pnl, trade_id, realized_pnl),
     )
+    _invalidate_daily_pnl()
 
 
 def get_unresolved(chat_id: str, older_than_minutes: int = 6) -> list[dict]:
@@ -788,18 +864,76 @@ def get_alpha_trend(chat_id: str, strategy: str, asset: str, days: int = 7) -> f
         return 1.0
 
 
+# Daily PnL is read every 5 s per user. The figure only changes when the ledger
+# is written, and every local write clears this cache, so a short TTL bounds
+# only out-of-process writes.
+_DAILY_PNL_TTL = 15.0  # seconds
+_DAILY_PNL_CACHE: dict[tuple[str, str, str], tuple[float, float]] = {}
+_DAILY_PNL_LOCK = threading.Lock()
+
+
+def _invalidate_daily_pnl(chat_id: str | None = None) -> None:
+    """Drop cached daily PnL for one chat, or for every chat when none is given."""
+    with _DAILY_PNL_LOCK:
+        if chat_id is None:
+            _DAILY_PNL_CACHE.clear()
+            return
+        for key in [k for k in _DAILY_PNL_CACHE if k[0] == str(chat_id)]:
+            del _DAILY_PNL_CACHE[key]
+
+
 def get_daily_resolved_pnl(
     chat_id: str, date_str: str, trading_timezone: str = "Africa/Lagos",
 ) -> float:
-    """Return PnL for a calendar day in the configured trading timezone."""
-    try:
-        row = _fetch_one("""
-            SELECT SUM(pnl_ngn) AS pnl
-            FROM trades
-            WHERE chat_id = %s AND won IS NOT NULL
-              AND (resolved_at AT TIME ZONE %s)::DATE = %s::DATE
-        """, (chat_id, trading_timezone, date_str))
-        return float(row["pnl"] or 0.0) if row else 0.0
-    except Exception as e:
-        log.error(f"get_daily_resolved_pnl error: {e}")
-        return 0.0
+    """Return realized PnL booked on a calendar day in the trading timezone.
+
+    Sums the append-only ledger, so partial-exit PnL counts on the day it was
+    realized. Errors propagate: a caller that cannot read the ledger must not
+    treat the day's loss as zero (fail-open).
+
+    The day is a half-open range on ``event_at`` so the ``(chat_id, event_at)``
+    index can serve it. A cast on the column would force a scan.
+    """
+    key = (str(chat_id), str(date_str), str(trading_timezone))
+    now = time.monotonic()
+    with _DAILY_PNL_LOCK:
+        hit = _DAILY_PNL_CACHE.get(key)
+    if hit is not None and now - hit[0] < _DAILY_PNL_TTL:
+        return hit[1]
+
+    zone = ZoneInfo(trading_timezone)
+    day = date.fromisoformat(str(date_str))
+    start = datetime.combine(day, datetime.min.time(), tzinfo=zone)
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=zone)
+    row = _fetch_one("""
+        SELECT COALESCE(SUM(pnl_ngn), 0) AS pnl
+          FROM trade_pnl_events
+         WHERE chat_id = %s
+           AND event_at >= %s
+           AND event_at < %s
+    """, (chat_id, start, end))
+    value = float(row["pnl"] or 0.0) if row else 0.0
+    with _DAILY_PNL_LOCK:
+        _DAILY_PNL_CACHE[key] = (now, value)
+    return value
+
+
+def get_unresolved_for_chats(chat_ids, older_than_minutes: int = 6) -> dict[str, list[dict]]:
+    """Unresolved trades for many users in one query, grouped by chat id.
+
+    The resolution monitor used to query per user every cycle. One query per
+    cycle serves every user; the partial index on open trades keeps it cheap.
+    """
+    ids = [str(c) for c in chat_ids]
+    grouped: dict[str, list[dict]] = {cid: [] for cid in ids}
+    if not ids:
+        return grouped
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)).isoformat()
+    rows = _fetch_all("""
+        SELECT * FROM trades
+        WHERE chat_id = ANY(%s) AND resolved_at IS NULL
+          AND created_at < %s::TIMESTAMPTZ
+    """, (ids, cutoff))
+    for row in rows:
+        grouped.setdefault(str(row["chat_id"]), []).append(row)
+    return grouped
