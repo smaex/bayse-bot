@@ -1684,6 +1684,9 @@ async def _execute_logic(
         engine=engine,
     )
 
+    # What the exchange has confirmed so far. If anything fails after this
+    # point, the shares exist and must still be tracked.
+    confirmed_fill: dict = {}
     try:
         t_order_start = time.time()
         resp  = await client.place_order(
@@ -1727,6 +1730,11 @@ async def _execute_logic(
         payload_needs_review = _order_has_malformed_financials(order)
         order_id = order.get("id") or order.get("orderId") or order.get("order_id")
         order_status = str(order.get("status") or "").lower()
+        if shares_filled > 0.0:
+            confirmed_fill.update(
+                shares=shares_filled, order_id=order_id,
+                price=_order_fill_price(order, quote_price)[0],
+            )
 
         # ── FAK / Zero-Fill Reasoning (Order is a Request, Not a Result) ────────
         # If the order was killed, rejected, or cancelled with 0 shares filled,
@@ -1865,6 +1873,46 @@ async def _execute_logic(
 
     except Exception as e:
         err = str(e)
+        if confirmed_fill.get("shares", 0.0) > 0.0:
+            # The exchange already filled this order. Calling it a rejection
+            # would hide live shares from exits and exposure checks, so record
+            # the confirmed quantity and pause for reconciliation instead.
+            log.critical(
+                f"[{chat_id}] BUY {sig.market_id} filled on the exchange but "
+                f"post-fill processing failed: {err[:160]}"
+            )
+            fill_price = confirmed_fill.get("price") or quote_price
+            fill_shares = float(confirmed_fill["shares"])
+            fill_key = (
+                f"{sig.market_id}:{sig.outcome}:{confirmed_fill.get('order_id')}"
+                if is_hedge or sig.market_id in risk.open_positions
+                else sig.market_id
+            )
+            risk.add_position(fill_key, {
+                "market_id": sig.market_id,
+                "trade_id": None,
+                "event_id": sig.event_id,
+                "order_id": confirmed_fill.get("order_id"),
+                "outcome": sig.outcome,
+                "outcome_id": sig.outcome_id,
+                "entry_price": float(fill_price),
+                "amount_ngn": float(amount),
+                "filled_quantity": fill_shares,
+                "confirmed_filled": True,
+                "strategy": sig.strategy,
+                "asset": sig.asset,
+                "timeframe": sig.timeframe,
+                "placed_at": time.time(),
+                "ledger_reconciliation_pending": True,
+                "exit_reconciliation_pending": True,
+            })
+            risk.current_free_cash -= float(amount)
+            await _pause_for_order_reconciliation(
+                chat_id, settings, risk, sig, confirmed_fill.get("order_id") or "unknown",
+                f"BUY filled but post-fill processing failed: {err[:140]}",
+            )
+            _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
+            return
         _stall_skip(chat_id, sig, "order_rejected_by_exchange", err[:150])
         status_match = re.match(r"API\s+(\d{3})\b", err)
         definite_rejection = bool(
@@ -2043,10 +2091,19 @@ async def _place_maker_quote(
             )
             _stall_skip(chat_id, sig, "maker_place_failed", f"{leg.outcome}: {exc}"[:200])
             log.warning(f"[{chat_id}] MAKER {leg.outcome} placement failed: {exc}")
-            await _pause_for_order_reconciliation(
-                chat_id, settings, risk, sig, "unknown",
-                f"MAKER {leg.outcome} request outcome is ambiguous: {str(exc)[:160]}",
+            # A definite 4xx (for example a post-only order that would cross) means
+            # the exchange did not accept the order, so there is nothing to
+            # reconcile. Only an ambiguous failure pauses the account, as the
+            # taker path already does.
+            status_match = re.match(r"API\s+(\d{3})\b", str(exc))
+            definite_rejection = bool(
+                status_match and int(status_match.group(1)) in {400, 401, 403, 404, 422}
             )
+            if not definite_rejection:
+                await _pause_for_order_reconciliation(
+                    chat_id, settings, risk, sig, "unknown",
+                    f"MAKER {leg.outcome} request outcome is ambiguous: {str(exc)[:160]}",
+                )
             _trade_cooldown[_cooldown_key(chat_id, sig.market_id, sig.strategy)] = time.time()
             return
 
