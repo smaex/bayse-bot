@@ -177,6 +177,24 @@ def mark_positions(positions: dict[str, dict], portfolio_rows, multiplier: float
     return total
 
 
+def gain_lock_state(session_profit: float, peak_profit: float, start_balance: float,
+                    arm_fraction: float, keep_fraction: float) -> tuple[float, bool, float | None]:
+    """Track the day's peak session gain and decide whether the giveback lock fires.
+
+    Returns ``(new_peak, locked, floor)``. The lock arms once the peak reaches
+    ``arm_fraction`` of the day's start balance. From then on, the floor is
+    ``keep_fraction`` of the peak, and falling to or below it locks new entries.
+    Losses count the same way: a session below the floor is locked.
+    """
+    peak = max(float(peak_profit or 0.0), float(session_profit))
+    if not (arm_fraction > 0.0 and math.isfinite(start_balance) and start_balance > 0.0):
+        return peak, False, None
+    if peak < start_balance * arm_fraction:
+        return peak, False, None
+    floor = peak * keep_fraction
+    return peak, float(session_profit) <= floor, floor
+
+
 class PortfolioCache:
     """Short-lived portfolio read shared by the mark and the drift check."""
 

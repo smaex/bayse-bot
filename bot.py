@@ -187,7 +187,7 @@ def _session_date() -> str:
 # Safety stops that are scoped to one trading day and must expire with it.
 # A manual pause (no reason, or "manual") is deliberately absent: only the
 # operator can lift that one.
-_SESSION_PAUSE_REASONS = ("daily_target", "daily_loss_limit", "drawdown")
+_SESSION_PAUSE_REASONS = ("daily_target", "daily_loss_limit", "drawdown", "gain_giveback")
 
 
 def _risk_pause_active(risk) -> bool:
@@ -1018,6 +1018,41 @@ async def _user_loop(chat_id: str):
                 await telegram_bot.send_message(
                     app_to_use, chat_id,
                     f"🎯 *Daily target reached!* ₦{session_profit:+,.0f}\n/resume to override.",
+                    parse_mode="Markdown",
+                )
+            continue
+
+        # ── Gain lock: protect part of a winning day ──────────────────────
+        # Wins never move the loss baseline. This only stops new entries when
+        # a day's gain gives back past the floor. The peak lives in the day's
+        # state, so a new trading day or a /resume starts it again at zero.
+        peak_before = float(day.get("peak_profit", 0.0) or 0.0)
+        new_peak, gain_locked, gain_floor = ops_controls.gain_lock_state(
+            session_profit, peak_before, day["start_balance"],
+            config.GAIN_LOCK_ARM_FRACTION, config.GAIN_LOCK_KEEP_FRACTION,
+        )
+        if new_peak > peak_before:
+            day["peak_profit"] = new_peak
+            settings["daily_state"] = day
+            await asyncio.to_thread(database.update_settings, chat_id, settings)
+        if gain_locked:
+            settings["paused"] = True
+            settings["paused_reason"] = "gain_giveback"
+            risk.paused = True
+            risk.pause_reason = "gain_giveback"
+            await asyncio.to_thread(database.update_settings, chat_id, settings)
+            log.warning(
+                f"[{chat_id}] GAIN LOCK: session ₦{session_profit:+,.0f} fell to the "
+                f"₦{gain_floor:,.0f} floor (peak ₦{new_peak:,.0f}) — new entries paused"
+            )
+            app_to_use = _tg_app or getattr(telegram_bot, "_bot_app", None)
+            if app_to_use:
+                await telegram_bot.send_message(
+                    app_to_use, chat_id,
+                    f"🔒 *Gain lock* — today's gain has given back to ₦{session_profit:+,.0f} "
+                    f"(peak ₦{new_peak:+,.0f}, floor ₦{gain_floor:+,.0f}). New entries are "
+                    "paused until the next trading day. Open positions remain monitored.\n"
+                    "/resume restarts the session from the current balance.",
                     parse_mode="Markdown",
                 )
             continue
