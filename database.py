@@ -13,7 +13,8 @@ import threading
 import time
 import copy
 from contextlib import contextmanager
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import psycopg2
 import psycopg2.extras
@@ -258,6 +259,11 @@ def init_db():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_trade_pnl_events_day
                 ON trade_pnl_events(chat_id, event_at)
+            """)
+            # Open trades are polled every cycle; index only the open rows.
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_trades_open
+                ON trades(chat_id, created_at) WHERE resolved_at IS NULL
             """)
             # Supabase exposes every public table through the anon and
             # authenticated roles. Keep the ledger closed like the other tables
@@ -534,6 +540,7 @@ def resolve_trade(trade_id: str, won: bool | None, pnl_ngn: float):
            SELECT trade_id, chat_id, NOW(), %s FROM upd""",
         (won_val, pnl_ngn, trade_id, pnl_ngn),
     )
+    _invalidate_daily_pnl()
 
 
 def update_trade_fill(
@@ -573,6 +580,7 @@ def update_trade_remaining(
            SELECT trade_id, chat_id, NOW(), %s FROM upd""",
         (amount_ngn, filled_quantity, realized_pnl, trade_id, realized_pnl),
     )
+    _invalidate_daily_pnl()
 
 
 def get_unresolved(chat_id: str, older_than_minutes: int = 6) -> list[dict]:
@@ -856,6 +864,24 @@ def get_alpha_trend(chat_id: str, strategy: str, asset: str, days: int = 7) -> f
         return 1.0
 
 
+# Daily PnL is read every 5 s per user. The figure only changes when the ledger
+# is written, and every local write clears this cache, so a short TTL bounds
+# only out-of-process writes.
+_DAILY_PNL_TTL = 15.0  # seconds
+_DAILY_PNL_CACHE: dict[tuple[str, str, str], tuple[float, float]] = {}
+_DAILY_PNL_LOCK = threading.Lock()
+
+
+def _invalidate_daily_pnl(chat_id: str | None = None) -> None:
+    """Drop cached daily PnL for one chat, or for every chat when none is given."""
+    with _DAILY_PNL_LOCK:
+        if chat_id is None:
+            _DAILY_PNL_CACHE.clear()
+            return
+        for key in [k for k in _DAILY_PNL_CACHE if k[0] == str(chat_id)]:
+            del _DAILY_PNL_CACHE[key]
+
+
 def get_daily_resolved_pnl(
     chat_id: str, date_str: str, trading_timezone: str = "Africa/Lagos",
 ) -> float:
@@ -864,11 +890,50 @@ def get_daily_resolved_pnl(
     Sums the append-only ledger, so partial-exit PnL counts on the day it was
     realized. Errors propagate: a caller that cannot read the ledger must not
     treat the day's loss as zero (fail-open).
+
+    The day is a half-open range on ``event_at`` so the ``(chat_id, event_at)``
+    index can serve it. A cast on the column would force a scan.
     """
+    key = (str(chat_id), str(date_str), str(trading_timezone))
+    now = time.monotonic()
+    with _DAILY_PNL_LOCK:
+        hit = _DAILY_PNL_CACHE.get(key)
+    if hit is not None and now - hit[0] < _DAILY_PNL_TTL:
+        return hit[1]
+
+    zone = ZoneInfo(trading_timezone)
+    day = date.fromisoformat(str(date_str))
+    start = datetime.combine(day, datetime.min.time(), tzinfo=zone)
+    end = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=zone)
     row = _fetch_one("""
         SELECT COALESCE(SUM(pnl_ngn), 0) AS pnl
           FROM trade_pnl_events
          WHERE chat_id = %s
-           AND (event_at AT TIME ZONE %s)::DATE = %s::DATE
-    """, (chat_id, trading_timezone, date_str))
-    return float(row["pnl"] or 0.0) if row else 0.0
+           AND event_at >= %s
+           AND event_at < %s
+    """, (chat_id, start, end))
+    value = float(row["pnl"] or 0.0) if row else 0.0
+    with _DAILY_PNL_LOCK:
+        _DAILY_PNL_CACHE[key] = (now, value)
+    return value
+
+
+def get_unresolved_for_chats(chat_ids, older_than_minutes: int = 6) -> dict[str, list[dict]]:
+    """Unresolved trades for many users in one query, grouped by chat id.
+
+    The resolution monitor used to query per user every cycle. One query per
+    cycle serves every user; the partial index on open trades keeps it cheap.
+    """
+    ids = [str(c) for c in chat_ids]
+    grouped: dict[str, list[dict]] = {cid: [] for cid in ids}
+    if not ids:
+        return grouped
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)).isoformat()
+    rows = _fetch_all("""
+        SELECT * FROM trades
+        WHERE chat_id = ANY(%s) AND resolved_at IS NULL
+          AND created_at < %s::TIMESTAMPTZ
+    """, (ids, cutoff))
+    for row in rows:
+        grouped.setdefault(str(row["chat_id"]), []).append(row)
+    return grouped

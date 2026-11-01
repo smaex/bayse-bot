@@ -181,8 +181,13 @@ async def resolution_monitor(user_clients: dict, user_risks: dict = None, tg_app
 
     while True:
         await asyncio.sleep(30)
-        for chat_id, client in list(user_clients.items()):
-            pending = await asyncio.to_thread(database.get_unresolved, chat_id, older_than_minutes=1)
+        clients = list(user_clients.items())
+        # One query serves every user this cycle (was one query per user).
+        grouped = await asyncio.to_thread(
+            database.get_unresolved_for_chats, [cid for cid, _ in clients], 1,
+        ) if clients else {}
+        for chat_id, client in clients:
+            pending = grouped.get(str(chat_id), [])
             for trade in pending:
                 try:
                     # ── Stale-trade cleanup ─────────────────────────────────

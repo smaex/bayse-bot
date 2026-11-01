@@ -39,8 +39,18 @@ def test_daily_pnl_uses_configured_trading_timezone(monkeypatch):
 
     assert pnl == 125
     query, params = calls[0]
-    assert "AT TIME ZONE %s" in query
-    assert params == ("chat", "Africa/Lagos", "2026-09-10")
+    # The day is the trading-timezone calendar day, expressed as a half-open
+    # range on event_at so the (chat_id, event_at) index can serve it.
+    assert "::DATE" not in query
+    assert "event_at >= %s" in query and "event_at < %s" in query
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    lagos = ZoneInfo("Africa/Lagos")
+    assert params == (
+        "chat",
+        datetime(2026, 9, 10, tzinfo=lagos),
+        datetime(2026, 9, 11, tzinfo=lagos),
+    )
 
 
 def test_resolution_is_idempotent_and_adds_prior_partial_pnl(monkeypatch):

@@ -377,6 +377,30 @@ class BayseClient:
                 raise RuntimeError(f"cancel rejected for order {order_id}: {code}")
         return resp
 
+    async def cancel_orders(self, order_ids: list[str]) -> dict:
+        """Cancel many orders with the batch endpoint, at most 100 per request.
+
+        Returns ``{"cancelled": n, "failed": [ids]}``. An id is failed when the
+        exchange refuses it or leaves it out of the response. A transport error
+        propagates: the write may have been accepted, so the caller must
+        re-query open orders before it trusts the result.
+        """
+        from ops_controls import CANCEL_BATCH_LIMIT, chunk
+
+        cancelled = 0
+        failed: list[str] = []
+        for batch in chunk([str(i) for i in order_ids if i], CANCEL_BATCH_LIMIT):
+            resp = await self._delete("/v1/pm/orders/batch", body={"orderIds": batch})
+            results = resp.get("results") or [] if isinstance(resp, dict) else []
+            ok = {str(item.get("orderId")) for item in results
+                  if isinstance(item, dict) and item.get("success") is True}
+            for oid in batch:
+                if oid in ok:
+                    cancelled += 1
+                else:
+                    failed.append(oid)
+        return {"cancelled": cancelled, "failed": failed}
+
     async def list_orders(self, page: int = 1, size: int = 50, status: str | None = None) -> dict:
         """One page of the account's orders. Statuses are lowercase on the wire."""
         params: dict = {"page": page, "size": size}
