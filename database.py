@@ -96,6 +96,14 @@ def _init_pool():
     log.info("Supabase connection pool ready (min=2, max=15)")
 
 
+# Validate a pooled connection only when it has sat idle this long. Every
+# checkout used to run SELECT 1 first, which was roughly one extra round trip
+# per operation (about 9.4M in production since June). Supabase drops idle
+# connections, so an actively used connection needs no probe.
+PING_IDLE_SECONDS = 30.0
+_CONN_LAST_USED: dict[int, float] = {}  # id(conn) -> monotonic time of last checkout end
+
+
 @contextmanager
 def _cx():
     if _pool is None:
@@ -103,14 +111,16 @@ def _cx():
     conn = None
     try:
         conn = _pool.getconn()
-        # Validate — Supabase drops idle connections
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-        except (psycopg2.OperationalError, psycopg2.InterfaceError):
-            log.warning("Dead DB connection detected — reconnecting")
-            _pool.putconn(conn, close=True)
-            conn = _pool.getconn()
+        last = _CONN_LAST_USED.get(id(conn))
+        if last is None or time.monotonic() - last >= PING_IDLE_SECONDS:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                log.warning("Dead DB connection detected — reconnecting")
+                _pool.putconn(conn, close=True)
+                _CONN_LAST_USED.pop(id(conn), None)
+                conn = _pool.getconn()
         yield conn
         conn.commit()
     except Exception:
@@ -119,6 +129,7 @@ def _cx():
         raise
     finally:
         if conn:
+            _CONN_LAST_USED[id(conn)] = time.monotonic()
             _pool.putconn(conn)
 
 
@@ -247,6 +258,18 @@ def init_db():
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_trade_pnl_events_day
                 ON trade_pnl_events(chat_id, event_at)
+            """)
+            # Supabase exposes every public table through the anon and
+            # authenticated roles. Keep the ledger closed like the other tables
+            # (RLS on, no public grants). The bot connects as the table owner,
+            # which bypasses RLS. The guard lets plain Postgres run this too.
+            cur.execute("ALTER TABLE trade_pnl_events ENABLE ROW LEVEL SECURITY")
+            cur.execute("""
+                DO $$ BEGIN
+                    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+                        REVOKE ALL ON trade_pnl_events FROM anon, authenticated;
+                    END IF;
+                END $$
             """)
             # One-time backfill for databases written before the ledger existed.
             # The config insert is the guard: it is atomic, so two processes

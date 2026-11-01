@@ -42,15 +42,21 @@ from client import BayseClient
 from config import (TELEGRAM_TOKEN, CURRENCY, SCAN_INTERVAL_SECONDS,
                     SYSTEMIC_RISK_HALT_MINS)
 from strategies.utils import realized_vol_hourly
+import log_throttle
 
+_stdout_handler = logging.StreamHandler(sys.stdout)
+# Per-tick SKIP / EV / DRY RUN / PAUSED lines repeat for every user on every
+# price tick; collapse repeats so the log volume stays bounded.
+log_throttle.attach(_stdout_handler)
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[_stdout_handler],
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 log = logging.getLogger(__name__)
+_daily_pnl_error_throttle = log_throttle.Throttle(interval_seconds=60.0)
 
 
 def _fresh_positive_price(
@@ -821,7 +827,11 @@ async def _user_loop(chat_id: str):
             # The loss and target stops cannot be evaluated without the ledger.
             # Treating an unreadable day as zero loss would disable the stop
             # for this cycle, so new entries are skipped until it reads again.
-            log.error(f"[{chat_id}] daily PnL unavailable; no new entries this cycle: {pnl_err}")
+            # The cycle repeats every few seconds during an outage, so the log
+            # line is rate-limited per chat. The stall reason is still recorded
+            # every cycle.
+            if _daily_pnl_error_throttle.allow(str(chat_id)):
+                log.error(f"[{chat_id}] daily PnL unavailable; no new entries this cycle: {pnl_err}")
             stall.reject(chat_id, "cycle", "daily_pnl_unavailable", str(pnl_err)[:120])
             continue
         # Everything already realised before an explicit /resume belongs to a

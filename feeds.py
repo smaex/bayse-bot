@@ -10,6 +10,7 @@ Only subscribe to symbols confirmed on the Bayse realtime WS feed.
 import asyncio
 import json
 import logging
+import log_throttle
 import time
 import websockets
 
@@ -17,6 +18,7 @@ import health
 from config import WS_MARKETS_URL, WS_REALTIME_URL
 
 log = logging.getLogger(__name__)
+_error_frame_throttle = log_throttle.Throttle(interval_seconds=60.0)
 
 # Live Bayse-relay spot prices and their actual receive times.
 spot: dict[str, float] = {}
@@ -134,7 +136,10 @@ async def bayse_feed(event_ids: list[str], on_update=None):
                 async for raw in ws:
                     for msg in _parse_frames(raw):
                         if msg.get("type") == "error":
-                            log.warning(f"Markets feed server error: {msg.get('message') or msg}")
+                            # The socket stays open after an error frame, so a
+                            # burst would otherwise log once per frame.
+                            if _error_frame_throttle.allow("markets"):
+                                log.warning(f"Markets feed server error: {msg.get('message') or msg}")
                             continue
                         _handle_market(msg, on_update)
         except Exception as e:
